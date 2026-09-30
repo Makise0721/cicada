@@ -103,10 +103,11 @@ async def test_bootstrap_passes_system_prompt_to_agent():
         tool_capabilities=("tools",),
         system_prompt="be terse",
     )
-    # K1 落地前请求仍为空 system_prompt; 此处只断言组装行为, 与 K0 测试约定一致
+    # K1 已落地: 请求逐轮携带 system_prompt; 这里一并核对组装行为与请求透传
     assert app.agent._system_prompt == "be terse"
     result = await app.agent.run("x")
     assert result.stop_reason == "stop"
+    assert model.requests[0].system_prompt == "be terse"
     await app.aclose()
 
 
