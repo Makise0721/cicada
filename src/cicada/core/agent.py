@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
@@ -92,16 +93,28 @@ class Agent:
 
         stop_reason: StopReason = "stop"
         error: str | None = None
+        model_calls: list[ModelCallCompleted] = []
 
         for turn_index in range(self._max_turns):
             if cancel.cancelled:
                 stop_reason = "aborted"
                 break
             self._emit(TurnStarted(run_id, turn_index))
+            started = time.monotonic()
             done, text, calls = await self._collect_assistant(session, cancel)
+            elapsed_s = time.monotonic() - started
 
             if cancel.cancelled and done.stop_reason != "error":
-                done = StreamDone("aborted")
+                # 终结行已被消费后取消仍判 aborted, 但保留已取得的计量
+                done = StreamDone("aborted", metrics=done.metrics)
+
+            call_record = ModelCallCompleted(
+                run_id=run_id,
+                turn_index=turn_index,
+                stop_reason=done.stop_reason,
+                metrics=done.metrics,
+                elapsed_s=elapsed_s,
+            )
 
             assistant = AssistantMessage(
                 text=text,
@@ -111,6 +124,8 @@ class Agent:
             )
             session.append(assistant)
             self._emit(AssistantCompleted(run_id, assistant))
+            model_calls.append(call_record)
+            self._emit(call_record)
 
             if done.stop_reason == "error":
                 stop_reason, error = "error", done.error
@@ -149,7 +164,7 @@ class Agent:
             stop_reason, error = "error", f"max turns ({self._max_turns}) exceeded"
 
         self._emit(RunFinished(run_id, stop_reason, error))
-        return RunResult(run_id, stop_reason, error, session.messages)
+        return RunResult(run_id, stop_reason, error, session.messages, model_calls=tuple(model_calls))
 
     async def _collect_assistant(
         self, session: SessionState, cancel: CancelToken
