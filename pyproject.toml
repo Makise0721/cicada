@@ -23,3 +23,4 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "--basetemp=.pytest-tmp"
+markers = ["live: requires local Ollama with the configured model; skipped when unreachable"]
