@@ -97,7 +97,7 @@ class PluginRuntime:
             if outcome is not None:
                 errors.append(outcome)
         if errors:
-            raise ExceptionGroup("runtime stop failed", errors)
+            raise BaseExceptionGroup("runtime stop failed", errors)
 
     def capability(self, name: str) -> Any:
         if self._stopped:
@@ -121,12 +121,12 @@ class PluginRuntime:
             raise CapabilityError(f"capability {capability!r} is not available")
         return current[1]
 
-    async def _teardown(self, instance: PluginInstance) -> ExceptionGroup | None:
+    async def _teardown(self, instance: PluginInstance) -> BaseExceptionGroup | None:
         """清理实例 scope; 清理失败使实例 FAILED 并保留错误证据; 返回清理错误."""
         instance.state = InstanceState.STOPPING
         try:
             await instance.scope.aclose()
-        except ExceptionGroup as exc:
+        except BaseExceptionGroup as exc:
             if instance.error is None:
                 instance.error = exc
             instance.state = InstanceState.FAILED

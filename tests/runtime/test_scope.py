@@ -62,3 +62,17 @@ async def test_defer_after_close_raises():
     await scope.aclose()
     with pytest.raises(ScopeClosedError):
         scope.defer(lambda: None)
+
+
+async def test_base_exception_cleanup_aggregates_and_replays():
+    scope = ResourceScope("s")
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    scope.defer(interrupt)
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await scope.aclose()
+    assert isinstance(exc_info.value.exceptions[0], KeyboardInterrupt)
+    with pytest.raises(BaseExceptionGroup):
+        await scope.aclose()

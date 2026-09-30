@@ -18,7 +18,7 @@ class ResourceScope:
         self.name = name
         self._cleanups: list[Cleanup] = []
         self._closed = False
-        self._close_errors: ExceptionGroup | None = None
+        self._close_errors: BaseExceptionGroup | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -52,5 +52,7 @@ class ResourceScope:
                     errors.append(exc)
             self._cleanups.clear()
             if errors:
-                self._close_errors = ExceptionGroup(f"scope {self.name!r} cleanup failed", errors)
+                # BaseExceptionGroup 构造: 全部成员为 Exception 时自动得到 ExceptionGroup 实例,
+                # 成员含 BaseException (如 KeyboardInterrupt/CancelledError) 时不再抛 TypeError 掩盖原错误.
+                self._close_errors = BaseExceptionGroup(f"scope {self.name!r} cleanup failed", errors)
                 raise self._close_errors
