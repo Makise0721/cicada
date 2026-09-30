@@ -19,3 +19,4 @@ packages = ["src/cicada"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "--basetemp=.pytest-tmp"
