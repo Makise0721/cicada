@@ -56,13 +56,18 @@ class OllamaModel:
             nonlocal closed
             if not closed:
                 closed = True
-                await response.aclose()
+                try:
+                    await response.aclose()
+                except Exception:
+                    # 关闭是 best-effort: 关闭失败不改变已确定的终结事件语义 (审查 R1).
+                    # CancelledError 是 BaseException, 不在此列, 仍归内核处理.
+                    pass
 
         try:
             if not response.is_success:
                 try:
                     body = await response.aread()
-                except httpx.HTTPError as exc:
+                except Exception as exc:
                     yield StreamDone("error", f"ollama http {response.status_code}: {exc}")
                     return
                 yield StreamDone("error", f"ollama http {response.status_code}: {_error_text(body)}")
@@ -88,7 +93,10 @@ class OllamaModel:
                         await close()
                         yield StreamDone("error", "ollama stream ended without a done line")
                         return
-                    except (httpx.HTTPError, ValueError, TypeError) as exc:
+                    except Exception as exc:
+                        # 读取异常归一加宽 (审查 R2): 任何 Exception 均归 error.
+                        # StopAsyncIteration 已先行分流; CancelledError 是 BaseException,
+                        # 不被本分支捕获, 仍按原语义传播归内核.
                         await close()
                         yield StreamDone("error", f"ollama stream failed: {exc}")
                         return

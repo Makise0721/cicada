@@ -270,3 +270,102 @@ async def test_cancel_during_stream_closes_response_and_leaves_no_tasks():
     await gen.aclose()
     await model.client.aclose()
     assert [task for task in asyncio.all_tasks() if task is not asyncio.current_task()] == []
+
+
+class BoomCloseStream(httpx.AsyncByteStream):
+    """aclose 抛错的流 (审查 R1 探针): 连接拆卸已在故障中, 关闭再出错."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self):
+        yield self._body
+
+    async def aclose(self) -> None:
+        raise httpx.HTTPError("close boom")
+
+
+def boom_close_model(body: bytes) -> OllamaModel:
+    response = httpx.Response(
+        200, headers={"content-type": "application/x-ndjson"}, stream=BoomCloseStream(body)
+    )
+    return make_model(response, [])
+
+
+async def test_close_failure_on_done_path_does_not_bare_throw():
+    # R1①: 正常 done 路径上 response.aclose() 抛错不得顶掉 StreamDone("stop")
+    body = ndjson({"message": {"role": "assistant", "content": "hi"}, "done": True, "done_reason": "stop"})
+    events = await collect(boom_close_model(body))
+    assert events == [TextDelta("hi"), StreamDone("stop")]
+
+
+async def test_close_failure_on_cancel_path_still_yields_aborted():
+    # R1②: 流中取消路径上 response.aclose() 抛错不得顶掉 StreamDone("aborted")
+    gate = asyncio.Event()
+    line1 = b'{"model":"m","message":{"role":"assistant","content":"Hello"},"done":false}\n'
+
+    class GatedBoomCloseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield line1
+            await gate.wait()
+            yield b'{"model":"m","message":{"role":"assistant","content":" world"},"done":false}\n'
+
+        async def aclose(self) -> None:
+            raise httpx.HTTPError("close boom")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/x-ndjson"}, stream=GatedBoomCloseStream())
+
+    model = OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), CONFIG)
+    cancel = CancelToken()
+    gen = model.stream(ModelRequest((UserMessage(text="hi"),), ()), cancel)
+    assert await gen.__anext__() == TextDelta("Hello")
+    cancel.cancel()
+    assert await gen.__anext__() == StreamDone("aborted")
+    await gen.aclose()
+    await model.client.aclose()
+
+
+async def test_close_failure_on_error_path_does_not_replace_error_done():
+    # R1③: 坏行错误路径上 response.aclose() 抛错不得顶替 StreamDone("error")
+    body = ndjson({"message": {"role": "assistant", "content": "a"}, "done": False}, b"not-json")
+    events = await collect(boom_close_model(body))
+    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
+    assert events[-1].stop_reason == "error"
+    assert "protocol error" in events[-1].error
+
+
+async def test_midstream_connection_reset_is_normalized_to_error_done():
+    # R2: 读取路径的 OSError (Windows 连接重置 errno 10054) 不得裸抛, 归一 StreamDone("error")
+    line = b'{"message":{"role":"assistant","content":"Hello"},"done":false}\n'
+
+    class ResetStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield line
+            raise OSError(10054, "Connection reset by peer")
+
+    model = make_model(
+        httpx.Response(200, headers={"content-type": "application/x-ndjson"}, stream=ResetStream()), []
+    )
+    events = await collect(model)
+    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
+    assert events[0].text == "Hello"
+    assert events[-1].stop_reason == "error"
+    assert "stream failed" in events[-1].error
+
+
+async def test_http_error_body_read_failure_is_normalized_to_error_done():
+    # R2: 非 2xx 响应体 aread() 的 OSError 同样归一 StreamDone("error"), 不裸抛
+
+    class BrokenBodyStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise OSError(10054, "Connection reset by peer")
+            yield  # 使 __aiter__ 成为异步生成器, 首个迭代即抛错
+
+    model = make_model(
+        httpx.Response(500, headers={"content-type": "application/x-ndjson"}, stream=BrokenBodyStream()), []
+    )
+    events = await collect(model)
+    assert len(events) == 1
+    assert events[-1].stop_reason == "error"
+    assert "500" in events[-1].error
