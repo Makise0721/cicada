@@ -1,11 +1,13 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ToolContext
-from cicada.plugins.coding.tool_edit import EditTool
-from cicada.plugins.coding.workspace import Workspace
+from cicada.plugins.coding.tool_edit import MAX_CONTENT_BYTES, EditTool
+from cicada.plugins.coding.tool_read import ReadTool
+from cicada.plugins.coding.workspace import PathNotAllowedError, Workspace
 
 BOM = b"\xef\xbb\xbf"
 
@@ -52,9 +54,19 @@ async def test_single_replacement(tmp_path):
     assert not r.is_error
     assert f.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
     assert r.details["first_changed_line"] == 2
+    assert r.details["diff_truncated"] is False
+    assert "full_diff_path" not in r.details
     assert "-two" in r.details["diff"]
     assert "+TWO" in r.details["diff"]
     assert apply_hunks("one\ntwo\nthree\n", r.details["diff"]) == "one\nTWO\nthree\n"
+    # 模型可见 content: applied/路径/替换数/first_changed_line 在前, diff 在后
+    lines = r.content.split("\n")
+    assert lines[0] == "edit applied: a.txt, 1 replacement(s), first changed line 2"
+    assert lines[1].startswith("--- a/a.txt")
+    assert lines[2].startswith("+++ b/a.txt")
+    assert "@@" in lines[3]
+    assert "-two" in r.content and "+TWO" in r.content
+    assert len(r.content.encode("utf-8")) <= MAX_CONTENT_BYTES
 
 
 async def test_batch_non_overlapping(tmp_path):
@@ -182,3 +194,98 @@ async def test_concurrent_edits_no_lost_update(tmp_path):
     )
     assert all(not r.is_error for r in results)
     assert f.read_text(encoding="utf-8") == "l1\nL2\nl3\nL4\nl5\n"
+
+
+def big_edit_args(ws: Workspace, count: int = 4000):
+    f = ws.root / "big.txt"
+    original_lines = [f"line{i:04d}" for i in range(count)]
+    new_lines = [f"LINE{i:04d}" for i in range(count)]
+    f.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+    return f, [
+        {"old_text": "\n".join(original_lines), "new_text": "\n".join(new_lines)}
+    ], "\n".join(new_lines) + "\n"
+
+
+async def test_large_diff_spills_to_artifact_and_is_readable(tmp_path):
+    ws, tool = make(tmp_path)
+    f, edits, expected_text = big_edit_args(ws)
+    r = await run(tool, path="big.txt", edits=edits)
+    assert not r.is_error
+    # 文件已改
+    assert f.read_text(encoding="utf-8") == expected_text
+    # diff 超预算 → artifact 落盘
+    assert r.details["diff_truncated"] is True
+    diff_bytes = len(r.details["diff"].encode("utf-8"))
+    assert diff_bytes > MAX_CONTENT_BYTES
+    artifact = Path(r.details["full_diff_path"])
+    assert artifact.parent == ws.output_dir
+    assert artifact.exists()
+    full = artifact.read_text(encoding="utf-8")
+    assert full == r.details["diff"]  # 完整 diff 落盘
+    assert "-line0000" in full and "+LINE0000" in full
+    # content 有界, 带 diff_truncated=true 与可 read 路径
+    assert len(r.content.encode("utf-8")) <= MAX_CONTENT_BYTES
+    assert "diff_truncated=true" in r.content
+    display = str(artifact.relative_to(ws.root))
+    assert display in r.content
+    assert "read it with the read tool" in r.content
+    assert "--- a/big.txt" in r.content  # 预览含 diff 开头
+    # 给模型的路径确实能被 read 工具读回 (read 每页 2000 行, 首页覆盖 diff 的 - 半)
+    back = await ReadTool(ws).execute(
+        {"path": display}, ToolContext(call_id="c2", cancel=CancelToken())
+    )
+    assert not back.is_error
+    assert "@@ -1,4001 +1,4001 @@" in back.content
+    assert "-line0000" in back.content
+
+
+async def test_artifact_write_failure_still_reports_applied(tmp_path, monkeypatch):
+    """文件已改但 artifact 写失败 (junction 越界): 不回滚、不谎称未改."""
+    ws, tool = make(tmp_path)
+    f, edits, expected_text = big_edit_args(ws)
+    original_resolve = ws.resolve_for_write
+
+    def guarded(raw: str):
+        if ".cicada" in raw:
+            raise PathNotAllowedError(
+                f"path {raw!r} resolves outside workspace root (junction probe)"
+            )
+        return original_resolve(raw)
+
+    monkeypatch.setattr(ws, "resolve_for_write", guarded)
+    r = await run(tool, path="big.txt", edits=edits)
+    assert not r.is_error
+    # edit 已生效且未被回滚
+    assert f.read_text(encoding="utf-8") == expected_text
+    assert r.content.startswith("edit applied: big.txt, 1 replacement(s)")
+    assert "edit applied; full diff unavailable" in r.content
+    assert "re-read the edited file" in r.content
+    assert len(r.content.encode("utf-8")) <= MAX_CONTENT_BYTES
+    assert r.details["diff_truncated"] is True
+    assert "artifact_error" in r.details
+    assert "full_diff_path" not in r.details  # 不提供假路径
+    # 确实没有 artifact 残留
+    assert list(ws.output_dir.iterdir()) == []
+
+
+async def test_empty_diff_is_stated_explicitly(tmp_path, monkeypatch):
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    monkeypatch.setattr(tool, "_diff", lambda path, original, applied: ("", 1))
+    r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "two"}])
+    assert not r.is_error
+    assert r.content.startswith("edit applied: a.txt, 1 replacement(s)")
+    assert "no text differences" in r.content
+    assert r.details["diff_truncated"] is False
+
+
+async def test_spilled_artifact_paths_are_unique(tmp_path):
+    ws, tool = make(tmp_path)
+    f, edits, _ = big_edit_args(ws)
+    first = await run(tool, path="big.txt", edits=edits)
+    # 反向再改一次, 同样产生超大 diff
+    revert = [{"old_text": e["new_text"], "new_text": e["old_text"]} for e in edits]
+    second = await run(tool, path="big.txt", edits=revert)
+    assert first.details["full_diff_path"] != second.details["full_diff_path"]
+    assert len(list(ws.output_dir.iterdir())) == 2

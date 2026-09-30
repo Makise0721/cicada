@@ -1,8 +1,9 @@
-"""edit 工具: 批量精确替换, 任一编辑非法则整体不写盘; 经同文件队列串行."""
+"""edit 工具: 批量精确替换, 任一编辑非法则整体不写盘; 成功结果附有界 diff."""
 
 from __future__ import annotations
 
 import difflib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cicada.core.messages import ToolResult
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
     from cicada.runtime.plugin import PluginContext
 
 BOM = b"\xef\xbb\xbf"
+MAX_CONTENT_BYTES = 50 * 1024  # applied 头 + diff 的 UTF-8 总预算
 
 
 class _EditInvalid(Exception):
@@ -30,7 +32,10 @@ class EditTool:
             name="edit",
             description=(
                 "对文件做批量精确替换. 全部 old_text 在原始内容上匹配且必须唯一; "
-                "任一编辑非法则整体不写入."
+                "任一编辑非法则整体不写入. 成功结果先给出 applied/路径/替换数/"
+                "first_changed_line, 再附 unified diff; 总输出不超过 50 KiB UTF-8, "
+                "超限时完整 diff 写入 workspace 的 .cicada/outputs/ 唯一文件, "
+                "结果标 diff_truncated=true 并给出可 read 的路径."
             ),
             parameters={
                 "type": "object",
@@ -72,12 +77,89 @@ class EditTool:
             return self._error(ctx, str(exc))
         except UnicodeDecodeError:
             return self._error(ctx, f"file is not valid UTF-8 text: {path}")
+        header = (
+            f"edit applied: {self._display(path)}, {len(edits)} replacement(s), "
+            f"first changed line {first_changed_line}"
+        )
+        details = {"diff": diff, "first_changed_line": first_changed_line}
+        if diff == "":
+            # 语义上罕见 (new==old 已在校验拒绝), 仍明示而不是静默
+            return ToolResult(
+                call_id=ctx.call_id,
+                name="edit",
+                content=f"{header}\n(no text differences)",
+                details={**details, "diff_truncated": False},
+            )
+        if len(header.encode("utf-8")) + 1 + len(diff.encode("utf-8")) <= MAX_CONTENT_BYTES:
+            return ToolResult(
+                call_id=ctx.call_id,
+                name="edit",
+                content=f"{header}\n{diff}",
+                details={**details, "diff_truncated": False},
+            )
+        return self._spill_diff(ctx, path, header, diff, details)
+
+    def _spill_diff(
+        self, ctx: ToolContext, path: Path, header: str, diff: str, details: dict
+    ) -> ToolResult:
+        """diff 超预算: 完整 diff 落盘 .cicada/outputs, content 给有界预览."""
+        artifact: Path | None = None
+        artifact_error: str | None = None
+        try:
+            candidate = self._workspace.new_output_file(f"edit-diff-{self._display(path)}")
+            # 写入前再经 resolve_for_write 校验 canonical 目标, 防 .cicada/outputs
+            # 被 junction 指到工作区外 (P3 C2)
+            target = self._workspace.resolve_for_write(str(candidate))
+            target.write_bytes(diff.encode("utf-8"))
+            artifact = target
+        except Exception as exc:  # artifact 失败不回滚 edit; 取消 (BaseException) 仍传播
+            artifact_error = str(exc)
+        header_bytes = len(header.encode("utf-8"))
+        if artifact is not None:
+            display_path = self._display(artifact)
+            marker = (
+                f"[diff_truncated=true full diff of {len(diff.encode('utf-8'))} bytes "
+                f"written to {display_path}; read it with the read tool]"
+            )
+            preview = self._bounded_preview(
+                diff, MAX_CONTENT_BYTES - header_bytes - 2 - len(marker.encode("utf-8"))
+            )
+            parts = [header, preview, marker] if preview else [header, marker]
+            return ToolResult(
+                call_id=ctx.call_id,
+                name="edit",
+                content="\n".join(parts),
+                details={**details, "diff_truncated": True, "full_diff_path": str(artifact)},
+            )
+        # 文件已改但 artifact 写失败: 不回滚、不谎称未改, 明确告知 full diff 不可得
+        marker = (
+            f"[edit applied; full diff unavailable: {artifact_error}; "
+            f"re-read the edited file with the read tool to inspect the changes]"
+        )
+        preview = self._bounded_preview(
+            diff, MAX_CONTENT_BYTES - header_bytes - 2 - len(marker.encode("utf-8"))
+        )
+        parts = [header, preview, marker] if preview else [header, marker]
         return ToolResult(
             call_id=ctx.call_id,
             name="edit",
-            content=f"edited {self._display(path)}: {len(edits)} replacement(s), first changed line {first_changed_line}",
-            details={"diff": diff, "first_changed_line": first_changed_line},
+            content="\n".join(parts),
+            details={**details, "diff_truncated": True, "artifact_error": artifact_error},
         )
+
+    @staticmethod
+    def _bounded_preview(diff: str, budget: int) -> str:
+        if budget <= 0:
+            return ""
+        out: list[str] = []
+        used = 0
+        for line in diff.split("\n"):
+            need = len(line.encode("utf-8")) + 1
+            if used + need > budget:
+                break
+            out.append(line)
+            used += need
+        return "\n".join(out)
 
     async def _apply(self, path, edits: list[dict[str, str]]) -> tuple[str, int]:
         """读-验证-改-写 原子地跑在同文件队列内, 避免并发丢更新."""
