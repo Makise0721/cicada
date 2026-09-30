@@ -1,6 +1,9 @@
-"""非交互入口: uv run python -m cicada --workspace <dir> --script <script.json> "<prompt>".
+"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think] "<prompt>".
 
-真实模型适配器 (本地 Ollama qwen) 尚未接入; 无 --script 时明确报错并以退出码 2 结束.
+模型来源二选一:
+- --script: fake model 剧本 (见 parse_script), 用于确定性回归;
+- 缺省: 真实模型 (本地 Ollama /api/chat), preflight GET /api/version 不可达即退出码 2.
+--script 与真实模型旗标 (--model/--ollama-url/--think) 互斥, 混用退出码 2.
 剧本 JSON 为条目列表, 每条目是一轮模型响应:
   {"text": "...", "tool_calls": [{"id", "name", "arguments": {...}}],
    "stop": true | "error": "..." | "length": true}
@@ -14,6 +17,8 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+
+import httpx
 
 from cicada.boot import App, BootError, bootstrap
 from cicada.core.events import (
@@ -33,9 +38,11 @@ from cicada.plugins.coding.tool_read import read_plugin
 from cicada.plugins.coding.tool_write import write_plugin
 from cicada.plugins.coding.workspace import workspace_plugin
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.plugins.ollama import OllamaConfig, ollama_plugin
 from cicada.runtime.plugin import PluginDefinition
 
 TOOL_CAPABILITIES = ("tool.read", "tool.edit", "tool.write", "tool.powershell")
+DEFAULT_CONFIG = OllamaConfig()
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -80,7 +87,7 @@ def parse_script(raw: str) -> list[list[StreamEvent]]:
     return script
 
 
-def default_definitions(workspace: Path, model: FakeModel) -> list[PluginDefinition]:
+def default_definitions(workspace: Path, model_plugin: PluginDefinition) -> list[PluginDefinition]:
     return [
         workspace_plugin(workspace),
         process_plugin(),
@@ -88,7 +95,7 @@ def default_definitions(workspace: Path, model: FakeModel) -> list[PluginDefinit
         edit_plugin(),
         write_plugin(),
         powershell_plugin(),
-        fake_model_plugin(model),
+        model_plugin,
     ]
 
 
@@ -112,21 +119,45 @@ def print_event(event: Event) -> None:
         print(f"=== finished: {event.stop_reason}{suffix}")
 
 
-async def _run(args: argparse.Namespace) -> int:
-    if args.script is None:
-        print(
-            "真实模型适配器 (本地 Ollama qwen) 尚未接入; 请用 --script 提供 fake model 剧本",
-            file=sys.stderr,
-        )
-        return 2
+async def _ollama_reachable(base_url: str) -> bool:
+    """preflight: GET /api/version (2s 超时); 连接失败或非 2xx 均视为不可达."""
     try:
-        script = parse_script(Path(args.script).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        print(f"invalid script: {exc}", file=sys.stderr)
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.get(f"{base_url.rstrip('/')}/api/version")
+    except httpx.HTTPError:
+        return False
+    return response.is_success
+
+
+async def _run(args: argparse.Namespace) -> int:
+    if args.script is not None and (
+        args.model is not None or args.ollama_url is not None or args.think
+    ):
+        print("--script 与 --model/--ollama-url/--think 互斥, 请只选一种模型来源", file=sys.stderr)
         return 2
+    if args.script is not None:
+        try:
+            script = parse_script(Path(args.script).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"invalid script: {exc}", file=sys.stderr)
+            return 2
+        model_plugin = fake_model_plugin(FakeModel(script))
+    else:
+        config = OllamaConfig(
+            base_url=args.ollama_url or DEFAULT_CONFIG.base_url,
+            model=args.model or DEFAULT_CONFIG.model,
+            think=args.think,
+        )
+        if not await _ollama_reachable(config.base_url):
+            print(
+                f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
+                file=sys.stderr,
+            )
+            return 2
+        model_plugin = ollama_plugin(config)
     try:
         app: App = await bootstrap(
-            default_definitions(Path(args.workspace), FakeModel(script)),
+            default_definitions(Path(args.workspace), model_plugin),
             tool_capabilities=TOOL_CAPABILITIES,
         )
     except BootError as exc:
@@ -144,11 +175,12 @@ def main() -> int:
     # 与 powershell 工具一致: 入口输出统一 UTF-8, 不随控制台代码页变化
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(
-        prog="cicada", description="Cicada coding agent (scripted-model harness)"
-    )
+    parser = argparse.ArgumentParser(prog="cicada", description="Cicada coding agent")
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
-    parser.add_argument("--script", help="fake model 剧本 JSON 文件")
+    parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
+    parser.add_argument("--model", help=f"Ollama 模型名 (默认 {DEFAULT_CONFIG.model})")
+    parser.add_argument("--ollama-url", help=f"Ollama 服务地址 (默认 {DEFAULT_CONFIG.base_url})")
+    parser.add_argument("--think", action="store_true", help="开启模型思考 (思考增量不展示)")
     parser.add_argument("prompt", help="交给 agent 的 prompt")
     return asyncio.run(_run(parser.parse_args()))
 

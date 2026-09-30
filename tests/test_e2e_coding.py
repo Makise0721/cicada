@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -140,10 +141,30 @@ def test_cli_with_script_runs_tools(tmp_path):
     assert "finished: stop" in proc.stdout
 
 
-def test_cli_without_script_reports_real_model_pending(tmp_path):
-    proc = run_cli("--workspace", str(tmp_path), "测试")
+def _dead_port() -> int:
+    """取一个刚释放的本地端口, 用于指向不可达的 Ollama (确定性 preflight 失败)."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_cli_without_script_unreachable_ollama_exits_2(tmp_path):
+    proc = run_cli(
+        "--workspace", str(tmp_path),
+        "--ollama-url", f"http://127.0.0.1:{_dead_port()}",
+        "测试",
+    )
     assert proc.returncode == 2
-    assert "Ollama" in proc.stderr
+    assert "Ollama 不可达" in proc.stderr
+
+
+def test_cli_script_and_real_model_flags_are_mutually_exclusive(tmp_path):
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps([{"text": "hi", "stop": True}]), encoding="utf-8")
+    for extra in (["--model", "qwen3.5:9b"], ["--ollama-url", "http://127.0.0.1:11434"], ["--think"]):
+        proc = run_cli("--workspace", str(tmp_path), "--script", str(script), *extra, "测试")
+        assert proc.returncode == 2, extra
+        assert "互斥" in proc.stderr
 
 
 def test_parse_script_rejects_malformed_entries():
