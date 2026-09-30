@@ -31,7 +31,10 @@ async def bootstrap(
     *,
     tool_capabilities: tuple[str, ...],
     model_capability: str = "model",
+    system_prompt: str = "",
 ) -> App:
+    if not isinstance(system_prompt, str):
+        raise TypeError(f"system_prompt must be a str, got {type(system_prompt).__name__}")
     runtime = PluginRuntime()
     for definition in definitions:
         runtime.register(definition)
@@ -44,7 +47,11 @@ async def bootstrap(
         tools = {tool.spec.name: tool for name in tool_capabilities for tool in _as_tools(runtime.capability(name), name)}
     except CapabilityError as exc:
         raise BootError(f"required capability missing: {exc}") from exc
-    return App(runtime=runtime, agent=Agent(model=model, tools=tools), report=report)
+    return App(
+        runtime=runtime,
+        agent=Agent(model=model, tools=tools, system_prompt=system_prompt),
+        report=report,
+    )
 
 
 def _as_tools(value: object, capability: str) -> list:

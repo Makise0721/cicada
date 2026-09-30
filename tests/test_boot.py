@@ -82,3 +82,46 @@ async def test_bootstrap_accepts_single_tool_per_capability():
     result = await app.agent.run("x")
     assert result.stop_reason == "stop"
     await app.aclose()
+
+
+async def test_bootstrap_default_system_prompt_keeps_existing_behavior():
+    model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
+    app = await bootstrap(
+        [fake_model_plugin(model), fake_tools_plugin([EchoTool()])],
+        tool_capabilities=("tools",),
+    )
+    assert app.agent._system_prompt == ""
+    result = await app.agent.run("x")
+    assert result.stop_reason == "stop"
+    await app.aclose()
+
+
+async def test_bootstrap_passes_system_prompt_to_agent():
+    model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
+    app = await bootstrap(
+        [fake_model_plugin(model), fake_tools_plugin([EchoTool()])],
+        tool_capabilities=("tools",),
+        system_prompt="be terse",
+    )
+    # K1 落地前请求仍为空 system_prompt; 此处只断言组装行为, 与 K0 测试约定一致
+    assert app.agent._system_prompt == "be terse"
+    result = await app.agent.run("x")
+    assert result.stop_reason == "stop"
+    await app.aclose()
+
+
+@pytest.mark.parametrize("bad_prompt", [123, None, ["be terse"], b"bytes"])
+async def test_bootstrap_rejects_non_str_system_prompt_before_runtime_start(bad_prompt):
+    setup_calls = []
+
+    def setup(ctx):
+        setup_calls.append("ran")
+        ctx.provide("model", FakeModel([]))
+
+    with pytest.raises(TypeError, match="system_prompt"):
+        await bootstrap(
+            [PluginDefinition("fake-model", setup, provides=frozenset({"model"}))],
+            tool_capabilities=("tools",),
+            system_prompt=bad_prompt,
+        )
+    assert setup_calls == []
