@@ -21,7 +21,10 @@ async def test_bootstrap_runs_end_to_end():
         ]
     )
     echo = EchoTool()
-    app = await bootstrap([fake_model_plugin(model), fake_tools_plugin([echo, FailTool()])])
+    app = await bootstrap(
+        [fake_model_plugin(model), fake_tools_plugin([echo, FailTool()])],
+        tool_capabilities=("tools",),
+    )
     result = await app.agent.run("测试")
     assert result.stop_reason == "stop"
     assert echo.invocations == [{"text": "你好"}]
@@ -50,6 +53,32 @@ async def test_bootstrap_fails_when_plugin_fails():
             [
                 PluginDefinition("good", good_setup, provides=frozenset({"model"})),
                 PluginDefinition("bad", bad_setup, requires=frozenset({"model"})),
-            ]
+            ],
+            tool_capabilities=("tools",),
         )
     assert cleaned == ["good"]
+
+
+async def test_bootstrap_fails_when_required_capability_missing():
+    with pytest.raises(BootError, match="tools"):
+        await bootstrap(
+            [fake_model_plugin(FakeModel([]))],
+            tool_capabilities=("tools",),
+        )
+
+
+async def test_bootstrap_accepts_single_tool_per_capability():
+    def read_setup(ctx):
+        ctx.provide("tool.read", EchoTool())
+
+    echo = EchoTool()
+    app = await bootstrap(
+        [
+            fake_model_plugin(FakeModel([[StreamDone("stop")]])),
+            PluginDefinition("tool-read", read_setup, provides=frozenset({"tool.read"})),
+        ],
+        tool_capabilities=("tool.read",),
+    )
+    result = await app.agent.run("x")
+    assert result.stop_reason == "stop"
+    await app.aclose()
