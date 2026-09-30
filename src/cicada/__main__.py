@@ -39,8 +39,11 @@ TOOL_CAPABILITIES = ("tool.read", "tool.edit", "tool.write", "tool.powershell")
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
-    """把剧本 JSON 转换为 FakeModel 剧本; 非法输入抛 ValueError."""
-    entries = json.loads(raw)
+    """把剧本 JSON 转换为 FakeModel 剧本; 非法输入一律抛 ValueError."""
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"script is not valid JSON: {exc}") from exc
     if not isinstance(entries, list):
         raise ValueError("script must be a JSON list of entries")
     script: list[list[StreamEvent]] = []
@@ -51,15 +54,25 @@ def parse_script(raw: str) -> list[list[StreamEvent]]:
         text = entry.get("text")
         if text:
             events.append(TextDelta(str(text)))
-        for call in entry.get("tool_calls", []):
-            events.append(
-                ToolCallEvent(str(call["id"]), str(call["name"]), json.dumps(call["arguments"]))
-            )
+        tool_calls = entry.get("tool_calls", [])
+        if not isinstance(tool_calls, list):
+            raise ValueError(f"script entry {index}: tool_calls must be a list")
+        for call in tool_calls:
+            if not isinstance(call, dict) or "id" not in call or "name" not in call:
+                raise ValueError(
+                    f"script entry {index}: each tool call must be an object with id and name"
+                )
+            arguments = call.get("arguments", {})
+            if not isinstance(arguments, dict):
+                raise ValueError(
+                    f"script entry {index}: tool call arguments must be an object"
+                )
+            events.append(ToolCallEvent(str(call["id"]), str(call["name"]), json.dumps(arguments)))
         if "error" in entry:
             events.append(StreamDone("error", str(entry["error"])))
         elif entry.get("length"):
             events.append(StreamDone("length"))
-        elif entry.get("stop") or not entry.get("tool_calls"):
+        elif entry.get("stop") or not tool_calls:
             events.append(StreamDone("stop"))
         else:
             events.append(StreamDone("tool_use"))
@@ -108,7 +121,7 @@ async def _run(args: argparse.Namespace) -> int:
         return 2
     try:
         script = parse_script(Path(args.script).read_text(encoding="utf-8"))
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError) as exc:
         print(f"invalid script: {exc}", file=sys.stderr)
         return 2
     try:

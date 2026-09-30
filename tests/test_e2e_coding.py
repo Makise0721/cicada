@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from cicada.__main__ import parse_script
 from cicada.boot import bootstrap
 from cicada.core.messages import ToolResultMessage
 from cicada.core.ports import StreamDone, TextDelta, ToolCallEvent
@@ -143,3 +144,31 @@ def test_cli_without_script_reports_real_model_pending(tmp_path):
     proc = run_cli("--workspace", str(tmp_path), "测试")
     assert proc.returncode == 2
     assert "Ollama" in proc.stderr
+
+
+def test_parse_script_rejects_malformed_entries():
+    with pytest.raises(ValueError, match="list of entries"):
+        parse_script('{"text": "hi"}')
+    with pytest.raises(ValueError, match="entry 0"):
+        parse_script(json.dumps(["just-a-string"]))
+    with pytest.raises(ValueError, match="tool_calls must be a list"):
+        parse_script(json.dumps([{"tool_calls": "not-a-list"}]))
+    with pytest.raises(ValueError, match="id and name"):
+        parse_script(json.dumps([{"tool_calls": ["oops"]}]))
+    with pytest.raises(ValueError, match="arguments must be an object"):
+        parse_script(json.dumps([{"tool_calls": [{"id": "c1", "name": "read", "arguments": [1]}]}]))
+
+
+def test_parse_script_defaults_and_terminals():
+    (events,) = parse_script(json.dumps([{"tool_calls": [{"id": "c1", "name": "read"}]}]))
+    assert events == [ToolCallEvent("c1", "read", "{}"), StreamDone("tool_use")]
+    (events,) = parse_script(json.dumps([{"text": "hi"}]))
+    assert events == [TextDelta("hi"), StreamDone("stop")]
+
+
+def test_cli_malformed_script_exits_2(tmp_path):
+    script = tmp_path / "bad.json"
+    script.write_text(json.dumps([{"tool_calls": ["oops"]}]), encoding="utf-8")
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(script), "测试")
+    assert proc.returncode == 2
+    assert "invalid script" in proc.stderr
