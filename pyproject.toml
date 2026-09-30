@@ -3,7 +3,10 @@ name = "cicada"
 version = "0.1.0"
 description = "Cicada coding agent: kernel / plugin runtime / coding capabilities"
 requires-python = ">=3.12"
-dependencies = ["jsonschema>=4.23"]
+dependencies = [
+    "httpx>=0.28.1",
+    "jsonschema>=4.23",
+]
 
 [dependency-groups]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24"]

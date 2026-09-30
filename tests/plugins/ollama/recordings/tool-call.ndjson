@@ -1,0 +1,2 @@
+{"model":"qwen3.5:9b","created_at":"2026-09-30T12:00:02Z","message":{"role":"assistant","content":"","tool_calls":[{"id":"call_jiv93d1a","function":{"index":0,"name":"get_weather","arguments":{"city":"Paris"}}}]},"done":false}
+{"model":"qwen3.5:9b","created_at":"2026-09-30T12:00:02Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","total_duration":4320753500,"load_duration":3549404400,"prompt_eval_count":294,"prompt_eval_duration":147004200,"eval_count":26,"eval_duration":506688700}

@@ -1,0 +1,3 @@
+{"model":"qwen3.5:9b","created_at":"2026-09-30T12:00:04Z","message":{"role":"assistant","content":"once upon a time there was a little"},"done":false}
+{"model":"qwen3.5:9b","created_at":"2026-09-30T12:00:04Z","message":{"role":"assistant","content":" cicada that sang all summer long and"},"done":false}
+{"model":"qwen3.5:9b","created_at":"2026-09-30T12:00:04Z","message":{"role":"assistant","content":""},"done":true,"done_reason":"length","total_duration":4320753500,"load_duration":3549404400,"prompt_eval_count":15,"prompt_eval_duration":147004200,"eval_count":128,"eval_duration":506688700}
