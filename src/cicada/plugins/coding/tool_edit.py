@@ -88,11 +88,16 @@ class EditTool:
         except UnicodeDecodeError:
             raise
 
-        newline = "\n"
-        for candidate in ("\r\n", "\n", "\r"):
-            if candidate in text:
-                newline = candidate
-                break
+        # 恢复为文件首个换行风格: 取最早出现的换行字符, \r 后紧跟 \n 才算 CRLF;
+        # 混合换行文件整体归一为首个风格 (既定语义)
+        p_cr = text.find("\r")
+        p_lf = text.find("\n")
+        if p_cr == -1 and p_lf == -1:
+            newline = "\n"
+        elif p_lf == -1 or (p_cr != -1 and p_cr < p_lf):
+            newline = "\r\n" if text.startswith("\r\n", p_cr) else "\r"
+        else:
+            newline = "\n"
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
 
         spans: list[tuple[int, int, str]] = []

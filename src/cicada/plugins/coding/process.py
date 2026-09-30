@@ -155,8 +155,8 @@ class _ProcessWatcher:
     async def wait_once(self, seconds: float) -> bool:
         """等待至多 seconds 秒; 返回进程是否已退出."""
         if self._handle is None:
-            if sys.platform == "win32":
-                return True  # OpenProcess 失败视为进程已不存在
+            # 无句柄 (非 Windows 或 OpenProcess 失败): 退回 transport 的 returncode
+            # 轮询, 避免把正常退出误判为 exit_code=None
             await asyncio.sleep(seconds)
             if self._proc.returncode is not None:
                 self._code = self._proc.returncode
@@ -288,9 +288,13 @@ class PowerShellRunner:
             for task in still:
                 task.cancel()
             await asyncio.gather(*still, return_exceptions=True)
-            # 放弃等待 close 后显式关闭管道传输, 避免悬挂的 overlapped 读在 GC 时告警
+            # 放弃等待 close 后显式关闭管道传输, 避免悬挂的 overlapped 读在 GC 时告警;
+            # get_pipe_transport 是 asyncio 私有接口, 变动时放弃显式关闭, 依赖 GC 兜底
             for fd in (1, 2):
-                pipe = proc._transport.get_pipe_transport(fd)
+                try:
+                    pipe = proc._transport.get_pipe_transport(fd)
+                except AttributeError:
+                    continue
                 if pipe is not None:
                     pipe.close()
             return

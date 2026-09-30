@@ -122,6 +122,15 @@ async def test_binary_rejected(tmp_path):
     assert "binary" in r2.content
 
 
+async def test_text_starting_with_bm_is_not_binary(tmp_path):
+    """2 字节 BM 前缀不足以判定 BMP, 不得误伤以 BM 开头的文本 (审查 F2)."""
+    ws, tool = make(tmp_path)
+    (ws.root / "bm.txt").write_text("BMW is a car brand\n", encoding="utf-8")
+    r = await run(tool, path="bm.txt")
+    assert not r.is_error
+    assert r.content == "1\tBMW is a car brand"
+
+
 async def test_single_oversize_line_truncated_with_hint(tmp_path):
     ws, tool = make(tmp_path)
     (ws.root / "long.txt").write_text("y" * 60000, encoding="utf-8")

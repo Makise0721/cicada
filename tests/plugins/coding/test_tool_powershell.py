@@ -121,10 +121,12 @@ async def test_cancel_kills_tree_and_next_run_clean(tmp_path):
 
 async def test_grandchild_holding_pipe_returns_after_grace(tmp_path):
     ws, tool = make(tmp_path)
+    # 孙进程工作目录指向 basetemp 之外, 避免其存续期间锁住 pytest 的 tmp 目录清理
+    repo_root = Path(__file__).resolve().parents[2]
     command = (
         "Start-Process pwsh -ArgumentList '-NoProfile','-Command',"
-        "'Start-Sleep -Seconds 8' -NoNewWindow -PassThru | Out-Null; "
-        "Write-Output parent-exit"
+        f"'Start-Sleep -Seconds 8' -NoNewWindow -WorkingDirectory '{repo_root}' "
+        "-PassThru | Out-Null; Write-Output parent-exit"
     )
     t0 = time.monotonic()
     r = await run(tool, command=command)

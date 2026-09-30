@@ -20,11 +20,10 @@ _BINARY_MAGIC = (
     b"\xff\xd8\xff",
     b"GIF87a",
     b"GIF89a",
-    b"BM",
     b"%PDF",
     b"PK\x03\x04",
     b"RIFF",
-)
+)  # 不含 2 字节的 BMP "BM" 前缀: 不足以与以 BM 开头的文本区分
 
 
 class ReadTool:

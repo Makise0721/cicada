@@ -134,6 +134,22 @@ async def test_bom_preserved(tmp_path):
     assert f.read_bytes() == BOM + "x\nz\n".encode("utf-8")
 
 
+async def test_mixed_newline_normalized_to_first_style(tmp_path):
+    """混合换行文件按首个换行风格整体归一 (审查 F1 既定语义)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    # 首个换行是 LF: 全文件归一为 LF, 不因后文出现 CRLF 而整体改写为 CRLF
+    f.write_bytes(b"a\nb\r\nc\n")
+    r = await run(tool, path="a.txt", edits=[{"old_text": "c", "new_text": "C"}])
+    assert not r.is_error
+    assert f.read_bytes() == b"a\nb\nC\n"
+    # 首个换行是裸 CR: 全文件归一为 CR
+    f.write_bytes(b"a\rb\nc\r")
+    r2 = await run(tool, path="a.txt", edits=[{"old_text": "c", "new_text": "C"}])
+    assert not r2.is_error
+    assert f.read_bytes() == b"a\rb\rC\r"
+
+
 async def test_outside_root_rejected(tmp_path):
     ws, tool = make(tmp_path)
     outside = tmp_path / "outside.txt"
