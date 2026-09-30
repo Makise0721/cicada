@@ -3,6 +3,9 @@
 已知限制 (Part A.4): 取消延迟上界为一次行读取与取消事件的竞速裁决;
 服务端已生成的 token 不撤销 (与 CancelToken "取消是请求" 语义一致).
 所有失败路径 (请求构造/HTTP 非 2xx/连接失败/坏行/流中断) 均归一为 StreamDone("error"), 不裸抛.
+
+P3: terminal StreamDone 携带 done 行已解析的计量; 关闭响应的 await 被 Task 取消时
+产出 StreamDone("aborted", metrics=已知计量) 后再传播取消, 不丢计量.
 """
 
 from __future__ import annotations
@@ -120,8 +123,16 @@ class OllamaModel:
                             if chunk.done_reason == "length"
                             else "stop"
                         )
-                        await close()
-                        yield StreamDone(stop_reason)
+                        # P3: 合法 done 行解析完成后先保存计量, 再进入关闭响应步骤
+                        metrics = chunk.metrics
+                        try:
+                            await close()
+                        except asyncio.CancelledError:
+                            # 关闭响应的 await 被 Task 取消: 仍产出一次 aborted 并带上
+                            # 已知计量, 不裸抛丢计量, 也不提前产 stop 躲避取消
+                            yield StreamDone("aborted", metrics=metrics)
+                            raise
+                        yield StreamDone(stop_reason, metrics=metrics)
                         return
             finally:
                 cancel_wait.cancel()

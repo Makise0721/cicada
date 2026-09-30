@@ -7,12 +7,16 @@ import pytest
 
 from cicada.core.cancel import CancelToken
 from cicada.core.messages import UserMessage
-from cicada.core.ports import ModelRequest, StreamDone, ToolCallEvent, TextDelta
+from cicada.core.ports import ModelMetrics, ModelRequest, StreamDone, ToolCallEvent, TextDelta
 from cicada.plugins.ollama.model import OllamaModel
 from cicada.plugins.ollama.protocol import OllamaConfig
 
 CONFIG = OllamaConfig(base_url="http://ollama.test")
 RECORDINGS = Path(__file__).parent / "recordings"
+
+TEXT_STREAM_METRICS = ModelMetrics(
+    input_tokens=9, output_tokens=12, provider_duration_s=4320753500 / 1e9
+)
 
 
 def recording(name: str) -> bytes:
@@ -59,7 +63,7 @@ async def test_plain_text_stream_replays_recording():
     assert events == [
         TextDelta("The capital"),
         TextDelta(" of France is Paris."),
-        StreamDone("stop"),
+        StreamDone("stop", metrics=TEXT_STREAM_METRICS),
     ]
     assert seen[0].url == httpx.URL("http://ollama.test/api/chat")
     payload = json.loads(seen[0].content)
@@ -73,7 +77,15 @@ async def test_plain_text_stream_replays_recording():
 async def test_thinking_deltas_are_discarded():
     model = make_model(ndjson_response(recording("thinking-stream")), [])
     events = await collect(model)
-    assert events == [TextDelta("The answer is 42."), StreamDone("stop")]
+    assert events == [
+        TextDelta("The answer is 42."),
+        StreamDone(
+            "stop",
+            metrics=ModelMetrics(
+                input_tokens=12, output_tokens=20, provider_duration_s=5210753500 / 1e9
+            ),
+        ),
+    ]
 
 
 async def test_single_tool_call_yields_tool_use_despite_done_reason_stop():
@@ -82,7 +94,12 @@ async def test_single_tool_call_yields_tool_use_despite_done_reason_stop():
     events = await collect(model)
     assert events == [
         ToolCallEvent("call_jiv93d1a", "get_weather", json.dumps({"city": "Paris"})),
-        StreamDone("tool_use"),
+        StreamDone(
+            "tool_use",
+            metrics=ModelMetrics(
+                input_tokens=294, output_tokens=26, provider_duration_s=4320753500 / 1e9
+            ),
+        ),
     ]
 
 
@@ -92,7 +109,12 @@ async def test_mixed_content_and_tool_call():
     assert events == [
         TextDelta("Let me check the weather."),
         ToolCallEvent("call_abc123", "get_weather", json.dumps({"city": "Rome"})),
-        StreamDone("tool_use"),
+        StreamDone(
+            "tool_use",
+            metrics=ModelMetrics(
+                input_tokens=310, output_tokens=30, provider_duration_s=4320753500 / 1e9
+            ),
+        ),
     ]
 
 
@@ -102,7 +124,12 @@ async def test_done_reason_length_maps_to_length():
     assert events == [
         TextDelta("once upon a time there was a little"),
         TextDelta(" cicada that sang all summer long and"),
-        StreamDone("length"),
+        StreamDone(
+            "length",
+            metrics=ModelMetrics(
+                input_tokens=15, output_tokens=128, provider_duration_s=4320753500 / 1e9
+            ),
+        ),
     ]
 
 
@@ -369,3 +396,93 @@ async def test_http_error_body_read_failure_is_normalized_to_error_done():
     assert len(events) == 1
     assert events[-1].stop_reason == "error"
     assert "500" in events[-1].error
+
+
+async def test_done_line_without_metrics_fields_yields_none_metrics():
+    body = ndjson({"message": {"role": "assistant", "content": "hi"}, "done": True, "done_reason": "stop"})
+    events = await collect(make_model(ndjson_response(body), []))
+    assert events == [TextDelta("hi"), StreamDone("stop")]
+
+
+async def test_partial_terminal_metrics_are_forwarded():
+    body = ndjson(
+        {"message": {"role": "assistant", "content": "hi"}, "done": True, "eval_count": 3}
+    )
+    events = await collect(make_model(ndjson_response(body), []))
+    assert events == [
+        TextDelta("hi"),
+        StreamDone("stop", metrics=ModelMetrics(output_tokens=3)),
+    ]
+
+
+class SlowCloseStream(httpx.AsyncByteStream):
+    """aclose 挂起直到被取消: 探针关闭响应的 await 被 Task 取消的分支."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def __aiter__(self):
+        yield self._body
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(3600)
+
+
+async def test_done_metrics_survive_task_cancellation_during_close():
+    # P3: 合法 done 行已解析保存计量后, 关闭响应的 await 被 Task 取消 →
+    # 产出一次 StreamDone("aborted", metrics=已知计量), 不裸抛丢计量
+    body = ndjson(
+        {
+            "message": {"role": "assistant", "content": "hi"},
+            "done": True,
+            "done_reason": "stop",
+            "prompt_eval_count": 7,
+            "eval_count": 3,
+            "total_duration": 1_000_000_000,
+        }
+    )
+    response = httpx.Response(
+        200, headers={"content-type": "application/x-ndjson"}, stream=SlowCloseStream(body)
+    )
+    model = make_model(response, [])
+    gen = model.stream(ModelRequest((UserMessage(text="hi"),), ()), CancelToken())
+    assert await gen.__anext__() == TextDelta("hi")
+    pending = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0.2)  # 让关闭响应的 await 挂上
+    pending.cancel()
+    done = await pending
+    assert done == StreamDone(
+        "aborted", metrics=ModelMetrics(input_tokens=7, output_tokens=3, provider_duration_s=1.0)
+    )
+    await gen.aclose()
+    await model.client.aclose()
+
+
+async def test_cancel_winning_race_over_done_line_keeps_metrics_unknown():
+    # 取消抢先于终结行消费: 未消费的行不计入 metrics, aborted + metrics=None
+    gate = asyncio.Event()
+    done_line = (
+        b'{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",'
+        b'"prompt_eval_count":7,"eval_count":3,"total_duration":1000000000}\n'
+    )
+
+    class GatedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"message":{"role":"assistant","content":"Hello"},"done":false}\n'
+            await gate.wait()
+            yield done_line
+
+        async def aclose(self):
+            pass
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/x-ndjson"}, stream=GatedStream())
+
+    model = OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), CONFIG)
+    cancel = CancelToken()
+    gen = model.stream(ModelRequest((UserMessage(text="hi"),), ()), cancel)
+    assert await gen.__anext__() == TextDelta("Hello")
+    cancel.cancel()
+    assert await gen.__anext__() == StreamDone("aborted")
+    await gen.aclose()
+    await model.client.aclose()
