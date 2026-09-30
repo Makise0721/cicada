@@ -68,7 +68,10 @@ async def test_live_plain_text():
         events = [event async for event in gen]
         await gen.aclose()
     assert any(isinstance(event, TextDelta) for event in events)
-    assert events[-1] == StreamDone("stop")
+    done = events[-1]
+    assert isinstance(done, StreamDone) and done.stop_reason == "stop"
+    # P3 M2 起 terminal 携带真实计量
+    assert done.metrics is not None and done.metrics.input_tokens is not None
 
 
 async def test_live_tool_call():
@@ -86,7 +89,9 @@ async def test_live_tool_call():
     assert calls[0].id
     assert calls[0].name == "get_weather"
     json.loads(calls[0].arguments_json)  # arguments JSON 可解析
-    assert events[-1] == StreamDone("tool_use")
+    done = events[-1]
+    assert isinstance(done, StreamDone) and done.stop_reason == "tool_use"
+    assert done.metrics is not None and done.metrics.output_tokens is not None
 
 
 async def test_live_cancel_during_long_generation():
@@ -117,5 +122,6 @@ async def test_live_cancel_during_long_generation():
     events = await task
     elapsed = time.monotonic() - start
     assert events, "no events before cancellation"
-    assert events[-1] == StreamDone("aborted")
+    done = events[-1]
+    assert isinstance(done, StreamDone) and done.stop_reason == "aborted"
     assert elapsed < CANCEL_BUDGET
