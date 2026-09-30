@@ -9,7 +9,7 @@ from cicada.core.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from cicada.core.ports import ModelRequest, ToolSpec
+from cicada.core.ports import ModelMetrics, ModelRequest, ToolSpec
 from cicada.plugins.ollama.protocol import (
     OllamaConfig,
     ParsedChunk,
@@ -200,3 +200,122 @@ def test_invalid_utf8_line_reports_error():
     chunk = parse_line(b'{"message": {"content": "\xff\xfe"}, "done": false}')
     assert chunk.error is not None
     assert "UTF-8" in chunk.error
+
+
+def test_system_prompt_prepended_as_first_message():
+    request = ModelRequest(
+        (UserMessage(text="hi"),), (), system_prompt="You are a careful coding agent."
+    )
+    payload = build_request(request, CONFIG)
+    assert payload["messages"] == [
+        {"role": "system", "content": "You are a careful coding agent."},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_system_prompt_with_multiturn_history_stays_single_first_message():
+    messages = (
+        UserMessage(text="weather?"),
+        AssistantMessage(text="18C"),
+        UserMessage(text="thanks"),
+    )
+    request = ModelRequest(messages, (), system_prompt="sys")
+    payload = build_request(request, CONFIG)
+    assert [m["role"] for m in payload["messages"]] == ["system", "user", "assistant", "user"]
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+    assert payload["messages"][1] == {"role": "user", "content": "weather?"}
+
+
+def test_empty_system_prompt_keeps_legacy_message_json():
+    request = ModelRequest((UserMessage(text="hi"),), (), system_prompt="")
+    payload = build_request(request, CONFIG)
+    assert payload["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_parse_done_line_extracts_terminal_metrics():
+    raw = (
+        b'{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop",'
+        b'"prompt_eval_count":9,"eval_count":12,"total_duration":4320753500}'
+    )
+    chunk = parse_line(raw)
+    assert chunk.error is None
+    assert chunk.done is True
+    assert chunk.metrics == ModelMetrics(
+        input_tokens=9, output_tokens=12, provider_duration_s=4320753500 / 1e9
+    )
+
+
+def test_parse_done_line_without_metrics_fields_is_none():
+    raw = b'{"message":{"role":"assistant","content":""},"done":true,"done_reason":"stop"}'
+    chunk = parse_line(raw)
+    assert chunk.metrics is None
+
+
+def test_parse_partial_metrics_keeps_known_fields_only():
+    raw = b'{"message":{"role":"assistant","content":""},"done":true,"eval_count":3}'
+    chunk = parse_line(raw)
+    assert chunk.metrics == ModelMetrics(input_tokens=None, output_tokens=3, provider_duration_s=None)
+
+
+def test_parse_done_false_line_does_not_accumulate_metrics():
+    raw = (
+        b'{"message":{"role":"assistant","content":"a"},"done":false,'
+        b'"prompt_eval_count":9,"eval_count":12,"total_duration":4320753500}'
+    )
+    chunk = parse_line(raw)
+    assert chunk.done is False
+    assert chunk.metrics is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prompt_eval_count", True),
+        ("prompt_eval_count", False),
+        ("prompt_eval_count", -1),
+        ("prompt_eval_count", 1.5),
+        ("prompt_eval_count", "9"),
+        ("eval_count", True),
+        ("eval_count", -3),
+        ("total_duration", True),
+        ("total_duration", -1),
+        ("total_duration", 1.5),
+        ("total_duration", "4320753500"),
+    ],
+)
+def test_invalid_optional_metric_values_map_to_none(field, value):
+    line = {
+        "message": {"role": "assistant", "content": ""},
+        "done": True,
+        "prompt_eval_count": 5,
+        "eval_count": 6,
+        "total_duration": 7000,
+    }
+    line[field] = value
+    chunk = parse_line(json.dumps(line).encode("utf-8"))
+    assert chunk.error is None
+    metrics = chunk.metrics
+    assert metrics is not None
+    known = {
+        "prompt_eval_count": metrics.input_tokens,
+        "eval_count": metrics.output_tokens,
+        "total_duration": metrics.provider_duration_s,
+    }
+    assert known[field] is None
+    # 其余合法字段保留
+    for other, expected in (("prompt_eval_count", 5), ("eval_count", 6), ("total_duration", 7000 / 1e9)):
+        if other != field:
+            assert known[other] == expected
+
+
+def test_huge_total_duration_overflow_only_nulls_duration_field():
+    line = {
+        "message": {"role": "assistant", "content": ""},
+        "done": True,
+        "prompt_eval_count": 7,
+        "eval_count": 3,
+        "total_duration": 10**400,
+    }
+    chunk = parse_line(json.dumps(line).encode("utf-8"))
+    assert chunk.error is None
+    assert chunk.metrics == ModelMetrics(input_tokens=7, output_tokens=3, provider_duration_s=None)

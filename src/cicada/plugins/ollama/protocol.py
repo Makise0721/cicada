@@ -3,17 +3,23 @@
 契约 (docs/superpowers/plans/2026-09-30-parallel-p2-ollama.md Part A):
 - 请求构造失败 (如历史消息 arguments_json 非法) 以 ValueError 表达, 由 model 层归一为 StreamDone("error").
 - 行级解析错误一律以 ParsedChunk.error 返回值表达, 不抛异常.
+
+P3 增补 (docs/superpowers/plans/2026-09-30-parallel-p3-context-observability.md §5):
+- request.system_prompt 非空时在最前加一条 system 消息; 空串保持旧请求 JSON 不变.
+- 仅有效 done:true 行提取 optional 计量 (prompt_eval_count/eval_count/total_duration);
+  非法/缺失映射为 None, 不改变文本/工具/stop 的协议严格性.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from cicada.core.messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
-from cicada.core.ports import ModelRequest, ToolSpec
+from cicada.core.ports import ModelMetrics, ModelRequest, ToolSpec
 
 if TYPE_CHECKING:
     import httpx
@@ -41,7 +47,10 @@ class ToolCallChunk:
 
 @dataclass(frozen=True)
 class ParsedChunk:
-    """一行 NDJSON 的结构化结果; error 非 None 时为行级协议错误, 其余字段无效."""
+    """一行 NDJSON 的结构化结果; error 非 None 时为行级协议错误, 其余字段无效.
+
+    metrics 仅来自有效 done:true 行; done:false 行与其他行恒为 None (不累计).
+    """
 
     text: str = ""
     thinking: str = ""  # 既定语义: model 层丢弃, 不进会话
@@ -49,13 +58,18 @@ class ParsedChunk:
     done: bool = False
     done_reason: str | None = None
     error: str | None = None
+    metrics: ModelMetrics | None = None
 
 
 def build_request(request: ModelRequest, config: OllamaConfig) -> dict[str, Any]:
     """把 ModelRequest 映射为 /api/chat 请求体; 构造失败抛 ValueError."""
+    messages = [_encode_message(message) for message in request.messages]
+    if request.system_prompt:
+        # P3: 每轮至多一条首位 system 消息; 空串省略, 旧请求 JSON 不变
+        messages.insert(0, {"role": "system", "content": request.system_prompt})
     payload: dict[str, Any] = {
         "model": config.model,
-        "messages": [_encode_message(message) for message in request.messages],
+        "messages": messages,
         "stream": True,
         "think": config.think,
         "options": dict(config.options),
@@ -106,7 +120,44 @@ def parse_line(raw: bytes) -> ParsedChunk:
         tool_calls=tuple(tool_calls),
         done=done,
         done_reason=line.get("done_reason"),
+        metrics=_extract_metrics(line) if done else None,
     )
+
+
+def _extract_metrics(line: Mapping[str, Any]) -> ModelMetrics | None:
+    """仅从有效 done:true 行提取 optional 计量; 字段非法/缺失映射为 None.
+
+    total_duration 为纳秒, 换秒必须 finite; 巨大整数换秒的 OverflowError
+    只使该字段未知, 不破坏控制流. 全部不可得返回 None.
+    """
+    input_tokens = _metric_count(line.get("prompt_eval_count"))
+    output_tokens = _metric_count(line.get("eval_count"))
+    provider_duration_s = _metric_duration(line.get("total_duration"))
+    if input_tokens is None and output_tokens is None and provider_duration_s is None:
+        return None
+    return ModelMetrics(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        provider_duration_s=provider_duration_s,
+    )
+
+
+def _metric_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _metric_duration(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    try:
+        seconds = value / 1e9
+    except OverflowError:
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return seconds
 
 
 def _encode_message(message: Message) -> dict[str, Any]:
