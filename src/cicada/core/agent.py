@@ -14,6 +14,7 @@ from cicada.core.cancel import CancelToken
 from cicada.core.events import (
     AssistantCompleted,
     Event,
+    ModelCallCompleted,
     RunFinished,
     RunStarted,
     ToolCompleted,
@@ -47,13 +48,17 @@ class RunResult:
     stop_reason: StopReason
     error: str | None
     messages: tuple[Message, ...]
+    model_calls: tuple[ModelCallCompleted, ...] = ()
 
 
 class Agent:
-    def __init__(self, *, model: ModelPort, tools: Mapping[str, Tool], max_turns: int = 50) -> None:
+    def __init__(
+        self, *, model: ModelPort, tools: Mapping[str, Tool], max_turns: int = 50, system_prompt: str = ""
+    ) -> None:
         self._model = model
         self._tools = dict(tools)
         self._max_turns = max_turns
+        self._system_prompt = system_prompt
         self._subscribers: list[Callable[[Event], None]] = []
         self.subscriber_errors: list[BaseException] = []
         self._run_ids = itertools.count(1)

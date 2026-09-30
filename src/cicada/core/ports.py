@@ -19,9 +19,19 @@ class ToolSpec:
 
 
 @dataclass(frozen=True)
+class ModelMetrics:
+    """provider 报告的计量; None 表示不可得, 不是 0."""
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    provider_duration_s: float | None = None
+
+
+@dataclass(frozen=True)
 class ModelRequest:
     messages: tuple[Message, ...]
     tools: tuple[ToolSpec, ...]
+    system_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,6 +54,7 @@ class StreamDone:
 
     stop_reason: StopReason
     error: str | None = None
+    metrics: ModelMetrics | None = None
 
 
 StreamEvent: TypeAlias = TextDelta | ToolCallEvent | StreamDone

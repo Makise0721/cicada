@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TypeAlias
 
 from cicada.core.messages import AssistantMessage, StopReason, ToolResult
+from cicada.core.ports import ModelMetrics
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,17 @@ class TurnStarted:
 class AssistantCompleted:
     run_id: str
     message: AssistantMessage
+
+
+@dataclass(frozen=True)
+class ModelCallCompleted:
+    """一次模型调用的计量记录; 取消/错误路径同样产生记录."""
+
+    run_id: str
+    turn_index: int
+    stop_reason: StopReason
+    metrics: ModelMetrics | None
+    elapsed_s: float
 
 
 @dataclass(frozen=True)
@@ -46,5 +58,11 @@ class RunFinished:
 
 
 Event: TypeAlias = (
-    RunStarted | TurnStarted | AssistantCompleted | ToolStarted | ToolCompleted | RunFinished
+    RunStarted
+    | TurnStarted
+    | AssistantCompleted
+    | ModelCallCompleted
+    | ToolStarted
+    | ToolCompleted
+    | RunFinished
 )
