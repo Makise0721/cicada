@@ -55,6 +55,8 @@ class Agent:
     def __init__(
         self, *, model: ModelPort, tools: Mapping[str, Tool], max_turns: int = 50, system_prompt: str = ""
     ) -> None:
+        if not isinstance(system_prompt, str):
+            raise TypeError(f"system_prompt must be str, got {type(system_prompt).__name__}")
         self._model = model
         self._tools = dict(tools)
         self._max_turns = max_turns
@@ -155,6 +157,7 @@ class Agent:
         request = ModelRequest(
             messages=session.messages,
             tools=tuple(tool.spec for tool in self._tools.values()),
+            system_prompt=self._system_prompt,
         )
         text_parts: list[str] = []
         calls: list[ToolCall] = []

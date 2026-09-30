@@ -221,7 +221,7 @@ async def test_agent_accepts_system_prompt_and_stores_it():
     assert prompted._system_prompt == "be terse"
 
 
-async def test_run_with_system_prompt_keeps_default_behavior():
+async def test_run_with_system_prompt_reaches_request():
     model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
     agent = Agent(model=model, tools={"echo": EchoTool()}, system_prompt="be terse")
     events = []
@@ -230,5 +230,41 @@ async def test_run_with_system_prompt_keeps_default_behavior():
     assert result.stop_reason == "stop"
     assert result.model_calls == ()
     assert [type(e) for e in events] == [RunStarted, TurnStarted, AssistantCompleted, RunFinished]
-    # K0 只接受并存储参数; 传递进请求是 K1 的事, 现状请求保持空 system_prompt
+    assert model.requests[0].system_prompt == "be terse"
+
+
+async def test_empty_system_prompt_keeps_old_request_shape():
+    model, agent = make_agent([[TextDelta("ok"), StreamDone("stop")]])
+    result = await agent.run("x")
+    assert result.stop_reason == "stop"
     assert model.requests[0].system_prompt == ""
+    assert model.requests[0].messages[0].text == "x"
+
+
+async def test_system_prompt_carried_in_every_turn_request():
+    model = FakeModel(
+        [
+            [ToolCallEvent("c1", "echo", '{"text": "hi"}'), StreamDone("tool_use")],
+            [TextDelta("done"), StreamDone("stop")],
+        ]
+    )
+    agent = Agent(model=model, tools={"echo": EchoTool()}, system_prompt="be terse")
+    result = await agent.run("调用工具")
+    assert result.stop_reason == "stop"
+    assert len(model.requests) == 2
+    assert all(request.system_prompt == "be terse" for request in model.requests)
+
+
+async def test_system_prompt_not_in_session_history():
+    model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
+    agent = Agent(model=model, tools={"echo": EchoTool()}, system_prompt="be terse")
+    result = await agent.run("x")
+    for message in result.messages:
+        if isinstance(message, (UserMessage, AssistantMessage)):
+            assert "be terse" not in message.text
+
+
+async def test_system_prompt_rejects_non_str():
+    model = FakeModel([[StreamDone("stop")]])
+    with pytest.raises(TypeError, match="system_prompt"):
+        Agent(model=model, tools={}, system_prompt=123)  # type: ignore[arg-type]
