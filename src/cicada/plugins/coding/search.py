@@ -76,8 +76,8 @@ class Rendered:
 def parse_glob(pattern: str, *, field: str = "pattern") -> tuple[re.Pattern[str], ...]:
     """逐段 `*`/`?` 与独立段 `**`; 比较用 Unicode casefold.
 
-    返回匹配器变体。`**` 至少要吃掉一个路径段, 因此含 `**` 的模式给出两个变体:
-    常规形式, 以及首个 `**` 恰好吃掉一段 (使相邻 `/` 之一消失) 的形式。
+    每个独立 `**` 匹配零个或多个完整路径段: `src/**/**/*.py` 与 `src/**/*.py` 一样
+    包含 `src/alpha.py`; 末段 `**` 覆盖其后的全部剩余文件路径。
     """
     if not isinstance(pattern, str) or not pattern:
         raise SearchError("invalid_pattern", f"{field} must be a nonempty string")
@@ -98,25 +98,35 @@ def parse_glob(pattern: str, *, field: str = "pattern") -> tuple[re.Pattern[str]
             "invalid_pattern",
             f"{field} must not contain empty, '.' or '..' path segments",
         )
-    segments: list[str] = []
-    for part in parts:
+    return (re.compile("^" + _glob_regex(parts, field) + "$", re.IGNORECASE),)
+
+
+def _glob_regex(parts: list[str], field: str) -> str:
+    """把已验证的段列表编译成整串正则; `**` 段按零/多段语义拼接.
+
+    段间分隔符按前一段决定: 前一段是 `**` 时它已经包含每个被吃掉段的 `/`,
+    零段时后缀直接接在前一个 `/` 之后, 因此不再另写分隔符。
+    """
+    pieces: list[str] = []
+    for index, part in enumerate(parts):
         if part == "**":
-            # `**` 匹配 1 个或多个完整段
-            segments.append(r"[^/]+(?:/[^/]+)*")
+            # 非末段: 吃掉零个或多个完整段 (每个段自带其后分隔符)
+            # 末段: 剩余文件路径, 至少要有一个文件名段
+            pieces.append(
+                "[^/]+(?:/[^/]+)*" if index == len(parts) - 1 else "(?:[^/]+/)*"
+            )
             continue
         if "**" in part:
             raise SearchError(
                 "invalid_pattern",
                 f"{field} allows '**' only as a standalone path segment",
             )
-        segments.append(_segment_regex(part.casefold()))
-    matchers = [re.compile("^" + "/".join(segments) + "$", re.IGNORECASE)]
-    if "**" in parts:
-        index = parts.index("**")
-        collapsed = segments[:index] + segments[index + 1 :]
-        if collapsed:
-            matchers.append(re.compile("^" + "/".join(collapsed) + "$", re.IGNORECASE))
-    return tuple(matchers)
+        pieces.append(_segment_regex(part.casefold()))
+    regex = pieces[0]
+    for index in range(1, len(pieces)):
+        separator = "" if parts[index - 1] == "**" else "/"
+        regex += separator + pieces[index]
+    return regex
 
 
 def _segment_regex(part: str) -> str:
@@ -202,22 +212,37 @@ def classify_candidate(root: Path, relative: str) -> str:
         raise SearchError("path_unreadable", f"cannot inspect {relative!r}: {exc}") from exc
 
 
-def read_text_file_chunked(path: Path) -> str | None:
-    """分块读取, 仍整文件校验编码; 候选已由调用方限制在 MAX_FILE_BYTES 内."""
+class FileTooLarge(Exception):
+    """读取途中确认超过单文件字节上限 (预 stat 之后文件仍可能增长)."""
+
+
+def read_text_file_chunked(
+    path: Path, *, cancel: CancelToken, started: float
+) -> str | None:
+    """分块读取并整文件校验编码; 实际读取不超过 MAX_FILE_BYTES+1 字节.
+
+    预 stat 只是廉价预筛: 读取时文件仍可能增长, 因此这里按实际消耗的字节收口,
+    超限抛 FileTooLarge 而不是把部分内容当完整文件。每块都检查取消与原查询
+    deadline, 增长/超大文件既不能无界累积也不能拖过整查询预算。
+    """
     decoder = codecs.getincrementaldecoder("utf-8")()
     chunks: list[str] = []
+    total = 0
     try:
         with open(path, "rb") as handle:
-            first = handle.read(READ_CHUNK_BYTES + 1)
-            if b"\x00" in first:
-                return None
-            if first.startswith(codecs.BOM_UTF8):
-                first = first[len(codecs.BOM_UTF8) :]
-            chunks.append(decoder.decode(first))
+            first = True
             while True:
-                chunk = handle.read(READ_CHUNK_BYTES)
+                _checkpoint(cancel, started)
+                chunk = handle.read(min(READ_CHUNK_BYTES, MAX_FILE_BYTES + 1 - total))
                 if not chunk:
                     break
+                total += len(chunk)
+                if total > MAX_FILE_BYTES:
+                    raise FileTooLarge(f"{path} exceeds {MAX_FILE_BYTES} bytes while reading")
+                if first:
+                    first = False
+                    if chunk.startswith(codecs.BOM_UTF8):
+                        chunk = chunk[len(codecs.BOM_UTF8) :]
                 if b"\x00" in chunk:
                     return None
                 chunks.append(decoder.decode(chunk))
@@ -307,8 +332,8 @@ async def run_glob(
     rows: list[str] = []
     total = 0
     skipped = {"missing": 0, "reparse": 0, "not_regular": 0}
-    for index, (match_path, relative) in enumerate(scope_files(scope)):
-        _checkpoint(cancel, started, index)
+    for match_path, relative in scope_files(scope):
+        _checkpoint(cancel, started)
         verdict = classify_candidate(workspace.root, relative)
         if verdict != "ok":
             skipped[verdict] = skipped.get(verdict, 0) + 1
@@ -320,6 +345,7 @@ async def run_glob(
             break
         rows.append(json.dumps(str(workspace.root / relative), ensure_ascii=False))
     truncated = total > limit
+    _checkpoint(cancel, started)  # 渲染前仍验证截止, 不把超时扫描当完整结果
     header = (
         f"[glob pattern={_json(pattern)} path={_json(raw_path)} limit={limit} "
         f"files={len(scope.files)} policy={record.policy_id} "
@@ -365,8 +391,8 @@ async def run_grep(
     shown = 0
     truncated = False
     reason: str | None = None
-    for index, (match_path, relative) in enumerate(scope_files(scope)):
-        _checkpoint(cancel, started, index)
+    for match_path, relative in scope_files(scope):
+        _checkpoint(cancel, started)
         if not matches_any(include_glob, match_path):
             continue
         verdict = classify_candidate(workspace.root, relative)
@@ -381,7 +407,11 @@ async def run_grep(
         except OSError as exc:
             raise SearchError("path_unreadable", f"cannot stat {relative!r}: {exc}") from exc
         try:
-            text = read_text_file_chunked(absolute)
+            text = read_text_file_chunked(absolute, cancel=cancel, started=started)
+        except FileTooLarge:
+            # 预 stat 之后文件增长: 事实上限以实际读取字节为准
+            skipped["too_large"] += 1
+            continue
         except OSError as exc:
             raise SearchError("path_unreadable", f"cannot read {relative!r}: {exc}") from exc
         if text is None:
@@ -402,6 +432,7 @@ async def run_grep(
             remaining -= taken
         if truncated:
             break
+    _checkpoint(cancel, started)  # 渲染前仍验证截止, 不把超时扫描当完整结果
     header = (
         f"[grep pattern={_json(pattern)} path={_json(raw_path)} include={_json(include)} "
         f"ignore_case={str(ignore_case).lower()} context={context} limit={limit} "
@@ -432,7 +463,8 @@ async def _list_inventory(
         raise SearchError(kind, str(exc)) from exc
 
 
-def _checkpoint(cancel: CancelToken, started: float, index: int) -> None:
+def _checkpoint(cancel: CancelToken, started: float) -> None:
+    """检查取消与原查询 deadline; 清单、扫描与读取都共用同一截止时间."""
     cancel.throw_if_cancelled()
     if time.monotonic() - started >= QUERY_TIMEOUT_S:
         raise SearchError("timeout", "search query deadline exceeded")
@@ -576,6 +608,13 @@ def _json_block(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _lines_bytes(lines: list[str]) -> int:
+    """`"\\n".join(lines)` 的 UTF-8 字节数."""
+    if not lines:
+        return 0
+    return sum(len(line.encode("utf-8")) for line in lines) + len(lines) - 1
+
+
 def _render(
     *,
     header: str,
@@ -586,43 +625,76 @@ def _render(
     skipped: dict[str, int],
     no_match_text: str,
 ) -> Rendered:
-    """把行装配进 8192 bytes 预算; 放不下就丢尾部行并标 truncated/bytes."""
-    budget = MAX_CONTENT_BYTES
-    kept: list[str] = []
-    used = len(header.encode("utf-8")) + 1
-    dropped = False
-    for row in rows:
-        size = len(row.encode("utf-8")) + 1
-        if used + size > budget:
-            dropped = True
-            break
-        kept.append(row)
-        used += size
-    if dropped:
-        truncated = True
-        reason = "bytes"
-    kept_shown = _shown_of(kept, shown, len(rows))
-    lines = [header]
-    if kept:
-        lines.extend(kept)
-    else:
-        kept_shown = 0
-        lines.append(no_match_text)
-    skipped_note = ", ".join(f"{name}={value}" for name, value in sorted(skipped.items()) if value)
-    if skipped_note:
-        lines.append(f"[skipped: {clipped(skipped_note, 256)}]")
-    lines.append(
-        f"[shown={kept_shown} truncated={str(truncated).lower()} "
-        f"complete={str(not truncated).lower()}"
-        + (f" reason={reason}" if truncated and reason else "")
-        + "]"
+    """先为完整 footer/收窄提示预留预算, 再把整条合法 JSON 行装进剩余空间.
+
+    行放不下时整条丢弃 (不裁 JSON 字段), 状态行始终保持
+    `truncated=true complete=false` 并给出原因与收窄提示; 命中放不下时不得复用
+    零命中文案。元信息本身放不下时返回有界 error。
+    """
+    fixed: list[str] = [header]
+    skipped_note = ", ".join(
+        f"{name}={value}" for name, value in sorted(skipped.items()) if value
     )
-    if truncated:
-        lines.append(_TRUNCATED_NOTE)
-    content = "\n".join(lines)
-    if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
-        content = clipped(content, MAX_CONTENT_BYTES)
-    return Rendered(content, kept_shown, truncated, reason)
+    if skipped_note:
+        fixed.append(f"[skipped: {clipped(skipped_note, 256)}]")
+    if not rows:
+        fixed.append(no_match_text)
+
+    def tail(shown_value: int, is_truncated: bool, cause: str | None) -> list[str]:
+        lines = [
+            f"[shown={shown_value} truncated={str(is_truncated).lower()} "
+            f"complete={str(not is_truncated).lower()}"
+            + (f" reason={cause}" if is_truncated and cause else "")
+            + "]"
+        ]
+        if is_truncated:
+            lines.append(_TRUNCATED_NOTE)
+        return lines
+
+    def fit(reserve: list[str]) -> tuple[list[str], int]:
+        room = MAX_CONTENT_BYTES - _lines_bytes(fixed + reserve)
+        kept: list[str] = []
+        used = 0
+        for row in rows:
+            size = len(row.encode("utf-8")) + 1
+            if size > room - used:
+                return kept, len(rows) - len(kept)
+            kept.append(row)
+            used += size
+        return kept, 0
+
+    # 元信息本身放不下就是有界 error, 不用裁字段或丢掉状态行来硬塞
+    if _lines_bytes(fixed + tail(shown, True, "bytes")) > MAX_CONTENT_BYTES:
+        raise SearchError(
+            "metadata_too_large",
+            "search header metadata does not fit the content budget; narrow path or pattern",
+        )
+    if not truncated:
+        # 未截断 footer 更短: 行全部容纳时就不必截断, 也不虚报 complete
+        kept, dropped = fit(tail(shown, False, None))
+        if not dropped:
+            content = "\n".join(fixed + kept + tail(shown, False, None))
+            return Rendered(content, shown, False, None)
+    # 预留最坏形态 (带 reason 的截断状态行 + 收窄提示) 再装行: shown 位数只会变少
+    cause = reason if truncated and reason else "bytes"
+    reserved = tail(shown, True, "bytes")
+    kept, dropped = fit(reserved)
+    if dropped:
+        cause = "bytes"
+    kept_shown = _shown_of(kept, shown, len(rows))
+    keep_tail = tail(kept_shown, True, cause)
+    if kept:
+        content = "\n".join(fixed + kept + keep_tail)
+    elif rows:
+        # 命中存在但一行也放不下: 用收窄提示做正文, 绝不输出零命中文案
+        content = "\n".join(fixed + [_TRUNCATED_NOTE, keep_tail[0]])
+    else:
+        content = "\n".join(fixed + keep_tail)
+    if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:  # pragma: no cover - 预留已覆盖
+        raise SearchError(
+            "metadata_too_large", "rendered search result exceeds the content budget"
+        )
+    return Rendered(content, kept_shown, True, cause)
 
 
 def _shown_of(kept: list[str], shown: int, total_rows: int) -> int:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -158,6 +160,51 @@ async def test_grep_many_matches_stay_within_budget(workspace):
     result = await run(tool_for(workspace), pattern="needle", include="many.txt", limit=500)
     assert len(result.content.encode("utf-8")) <= MAX_CONTENT_BYTES
     assert result.details["truncated"] is True
+
+
+async def test_grep_long_filenames_keep_footer_and_narrowing_hint(workspace):
+    """F08: 报告反例 (60 个长文件名) 的公共 GrepTool 结果不再裁断 footer 字段.
+
+    文件名长度取到"旧实现填满行后剩余空间小于截断 footer": 旧实现必然把 footer 裁断。
+    """
+    count, padding = 60, 80
+    for _attempt in range(400):
+        for existing in workspace.root.glob("f*-*.txt"):
+            existing.unlink()
+        for index in range(count):
+            (workspace.root / f"f{index:03d}-{'x' * padding}.txt").write_text(
+                "needle\n", encoding="utf-8"
+            )
+        git(workspace.root, "add", "-A", ".")
+        record = await GitInventory(workspace).list_files(CancelToken())
+        header_size = len(
+            (
+                '[grep pattern="needle" path="." include="**/*" ignore_case=false '
+                f"context=0 limit=100 files={len(record.paths)} "
+                'policy=cicada-git-files-v1 excluded=0]'
+            ).encode("utf-8")
+        )
+        sample = str(workspace.root / f"f000-{'x' * padding}.txt")
+        row_size = (
+            len(json.dumps({"path": sample, "line": 1, "text": "needle"}).encode("utf-8")) + 1
+        )
+        if (8192 - header_size - 1) % row_size < 100:
+            break
+        padding += 1
+    result = await run(tool_for(workspace), pattern="needle")
+    content = result.content
+    assert len(content.encode("utf-8")) <= MAX_CONTENT_BYTES
+    assert result.details["shown"] > 0
+    assert result.details["truncated"] is True
+    assert result.details["complete"] is False
+    lines = content.splitlines()
+    assert re.fullmatch(
+        r"\[shown=\d+ truncated=true complete=false reason=(bytes|limit)\]", lines[-2]
+    )
+    assert lines[-1] == "[results truncated; narrow path, include or pattern and query again]"
+    for line in lines:
+        if line.startswith("{"):
+            json.loads(line)  # 整条合法 JSON: 字段与转义不被按字节裁断
 
 
 @pytest.mark.parametrize(
