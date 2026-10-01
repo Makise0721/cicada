@@ -50,11 +50,11 @@ def repo(tmp_path):
     return root
 
 
-async def service_for(repo, *checks):
+async def service_for(repo, *checks, runner=None):
     workspace = Workspace.create(repo)
     snapshotter = Snapshotter(workspace, GitInventory(workspace))
     plan = VerificationPlan("vrun-tool", workspace.root, tuple(checks))
-    verifier = Verifier(workspace, snapshotter, PowerShellRunner(), plan)
+    verifier = Verifier(workspace, snapshotter, runner or PowerShellRunner(), plan)
     capture = await verifier.initialize(CancelToken())
     assert capture.available, (capture.failure_kind, capture.error)
     return CheckTool(verifier)
@@ -183,6 +183,29 @@ async def test_cancellation_is_recorded_as_a_blocked_receipt_not_a_failure(repo)
     assert result.details["verification_status"] == "blocked"
     assert result.details["failure_kind"] == "cancelled"
     assert result.details["cancelled"] is True and result.details["exit_code"] is None
+
+
+async def test_runner_failure_after_start_is_the_latest_state_seen_by_status(repo):
+    """runner 已进入后异常: 服务的锁存与最近失败尝试经公开 status 可见, 旧 pass 不作候选."""
+
+    class ExplodingRunner:
+        def __init__(self):
+            self.entered = asyncio.Event()
+
+        async def run(self, **kwargs):
+            self.entered.set()
+            raise RuntimeError("simulated runner crash")
+
+    runner = ExplodingRunner()
+    tool = await service_for(repo, passing(), runner=runner)
+    with pytest.raises(RuntimeError, match="simulated runner crash"):
+        await call(tool, {"action": "run", "check_id": "check-1"})
+    status = await call(tool, {"action": "status"})
+    assert status.is_error is False
+    assert status.details["process_uncertain"] is True
+    assert status.details["checks"][0]["status"] == "blocked"
+    assert status.details["checks"][0]["failure_kind"] == "runner_error"
+    assert "process_uncertain" in status.content
 
 
 async def test_receipt_id_survives_the_kernel_tool_result_message(repo):

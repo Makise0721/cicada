@@ -50,7 +50,7 @@ def repo(tmp_path):
     return root
 
 
-def build(repo, *checks, snapshot_limits=None, **kwargs):
+def build(repo, *checks, snapshot_limits=None, runner=None, **kwargs):
     workspace = Workspace.create(repo)
     snapshotter = Snapshotter(workspace, GitInventory(workspace), **(snapshot_limits or {}))
     plan = VerificationPlan(
@@ -58,8 +58,20 @@ def build(repo, *checks, snapshot_limits=None, **kwargs):
         root=workspace.root,
         checks=tuple(checks),
     )
-    verifier = Verifier(workspace, snapshotter, PowerShellRunner(), plan, **kwargs)
+    verifier = Verifier(workspace, snapshotter, runner or PowerShellRunner(), plan, **kwargs)
     return workspace, verifier
+
+
+class SignallingRunner:
+    """真实 runner 的入口同步: 用例等 runner 已进入再取消, 不依赖固定 sleep 假设."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.entered = asyncio.Event()
+
+    async def run(self, **kwargs):
+        self.entered.set()
+        return await self.inner.run(**kwargs)
 
 
 def passing(command=f"& '{PY}' -m pytest test_sample.py -q") -> CheckDefinition:
@@ -147,24 +159,112 @@ async def test_timeout_latches_process_uncertain_and_a_later_pass_cannot_clear_i
 
 
 async def test_cancelled_check_is_blocked_latches_and_propagates_cancel(repo):
+    runner = SignallingRunner(PowerShellRunner())
     verifier = await initialized(
-        repo, CheckDefinition("check-1", "Start-Sleep -Seconds 20", timeout_s=30.0))
+        repo, CheckDefinition("check-1", "Start-Sleep -Seconds 20", timeout_s=30.0),
+        runner=runner)
     token = CancelToken()
     task = asyncio.create_task(verifier.run_check("check-1", token))
-    await asyncio.sleep(0.6)
+    # 等 runner 已进入再取消: 不再假设固定 sleep 后真实进程一定已经在跑。
+    await asyncio.wait_for(runner.entered.wait(), timeout=15)
     token.cancel()
     receipt = await asyncio.wait_for(task, timeout=15)
     assert receipt.verification_status == "blocked"
     assert receipt.failure_kind == "cancelled" and receipt.cancelled is True
     assert verifier.process_uncertain is True
+    view = await verifier.refresh(CancelToken())
+    assert view.checks[0].status == "blocked"
+    assert any("process_uncertain" in reason for reason in view.blocking_reasons)
 
-    other = await initialized(
-        repo, CheckDefinition("check-1", "Start-Sleep -Seconds 20", timeout_s=30.0))
-    pending = asyncio.create_task(other.run_check("check-1", CancelToken()))
-    await asyncio.sleep(0.6)
+
+async def test_task_cancel_after_the_runner_started_latches_and_keeps_the_attempt(repo):
+    runner = SignallingRunner(PowerShellRunner())
+    verifier = await initialized(
+        repo, CheckDefinition("check-1", "Start-Sleep -Seconds 20", timeout_s=30.0),
+        runner=runner)
+    pending = asyncio.create_task(verifier.run_check("check-1", CancelToken()))
+    await asyncio.wait_for(runner.entered.wait(), timeout=15)
     pending.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(pending, timeout=15)
+    # 服务先锁存并保留最近一次取消尝试, 然后才传播原取消。
+    assert verifier.process_uncertain is True
+    assert len(verifier.receipts) == 1
+    latest = verifier.receipts[-1]
+    assert latest.verification_status == "blocked"
+    assert latest.failure_kind == "cancelled" and latest.cancelled is True
+    assert latest.execution_status == "cancelled"
+    assert latest.exit_code is None and latest.snapshot_after is None
+    assert latest.snapshot_before == verifier.baseline_snapshot_ref
+    view = await verifier.refresh(CancelToken())
+    assert view.checks[0].status == "blocked"
+    assert view.checks[0].receipt.receipt_id == latest.receipt_id
+
+
+async def test_cancel_before_the_runner_starts_is_not_a_recorded_attempt(repo):
+    class GatedSnapshotter(Snapshotter):
+        """定位 seam: initialize 的快照正常, run_check 的前置快照停住等取消。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.captures = 0
+            self.entered = asyncio.Event()
+
+        async def capture(self, cancel):
+            self.captures += 1
+            if self.captures > 1:
+                self.entered.set()
+                await asyncio.Event().wait()
+            return await super().capture(cancel)
+
+    runner = SignallingRunner(PowerShellRunner())
+    workspace = Workspace.create(repo)
+    snapshotter = GatedSnapshotter(workspace, GitInventory(workspace))
+    plan = VerificationPlan("vrun-pre-cancel", workspace.root, (passing(),))
+    verifier = Verifier(workspace, snapshotter, runner, plan)
+    assert (await verifier.initialize(CancelToken())).available
+
+    pending = asyncio.create_task(verifier.run_check("check-1", CancelToken()))
+    await asyncio.wait_for(snapshotter.entered.wait(), timeout=15)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, timeout=15)
+    # 执行前取消: 进程从未进入, 不能记成一次尝试, 也不锁存不确定状态。
+    assert verifier.receipts == ()
+    assert verifier.process_uncertain is False
+    assert not runner.entered.is_set()
+
+
+async def test_runner_exception_after_start_replaces_a_pass_and_latches(repo):
+    class FailingAfterFirstRunner:
+        def __init__(self):
+            self.calls = 0
+            self.inner = PowerShellRunner()
+
+        async def run(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return await self.inner.run(**kwargs)
+            raise RuntimeError("simulated runner crash")
+
+    verifier = await initialized(repo, passing(), runner=FailingAfterFirstRunner())
+    first = await verifier.run_check("check-1", CancelToken())
+    assert first.verification_status == "passed"
+
+    with pytest.raises(RuntimeError, match="simulated runner crash"):
+        await verifier.run_check("check-1", CancelToken())
+    assert verifier.process_uncertain is True
+    latest = verifier.receipts[-1]
+    assert latest.verification_status == "blocked"
+    assert latest.failure_kind == "runner_error" and latest.execution_status == "error"
+    assert latest.output_complete is False and latest.snapshot_after is None
+    view = await verifier.refresh(CancelToken())
+    # 旧 pass 不能留作最新候选。
+    assert view.checks[0].status == "blocked"
+    assert view.checks[0].receipt.receipt_id == latest.receipt_id
+    assert any("process_uncertain" in reason for reason in view.blocking_reasons)
+    assert [receipt.receipt_id for receipt in view.receipts] == [
+        first.receipt_id, latest.receipt_id]
 
 
 async def test_latest_attempt_replaces_an_earlier_pass_in_state_but_history_remains(repo):

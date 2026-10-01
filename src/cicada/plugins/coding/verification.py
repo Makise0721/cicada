@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import difflib
 import hashlib
@@ -222,18 +223,38 @@ class Verifier:
                 definition, started, None, None, "snapshot_unavailable",
                 f"pre-run snapshot unavailable ({before.failure_kind}): {before.error}",
                 uncertain_before)
-        result = await self.runner.run(
-            command=definition.command,
-            cwd=self._plan.root,
-            timeout=definition.timeout_s,
-            cancel=cancel,
-            output_dir=self.workspace.output_dir,
-        )
-        bounded = result.output
-        artifact_path, artifact_sha256, artifact_error = self._artifact_facts(bounded)
-        # 取消后不能再要求协作取消的快照: 用不可用结果记录"没有后快照"这一事实。
-        after = None if cancel.cancelled else await self.snapshotter.capture(cancel)
         before_ref = before.snapshot.snapshot_ref
+        result = None
+        try:
+            result = await self.runner.run(
+                command=definition.command,
+                cwd=self._plan.root,
+                timeout=definition.timeout_s,
+                cancel=cancel,
+                output_dir=self.workspace.output_dir,
+            )
+            bounded = result.output
+            artifact_path, artifact_sha256, artifact_error = self._artifact_facts(bounded)
+            # 取消后不能再要求协作取消的快照: 用不可用结果记录"没有后快照"这一事实。
+            after = None if cancel.cancelled else await self.snapshotter.capture(cancel)
+        except asyncio.CancelledError:
+            # runner 已经进入: 先单调锁存并留下最近的取消尝试, 再传播原取消。
+            self._record_interrupted(
+                definition, started, before_ref, result, "cancelled",
+                "the check was cancelled after the runner started; "
+                "termination is not established")
+            raise
+        except Exception as exc:
+            if result is None:
+                kind = "runner_error"
+                message = f"the check runner raised {type(exc).__name__}: {exc}"
+            else:
+                kind = "snapshot_unavailable"
+                message = (
+                    "the post-run snapshot failed after the check returned "
+                    f"({type(exc).__name__}): {exc}")
+            self._record_interrupted(definition, started, before_ref, result, kind, message)
+            raise
         failure_kind, error = self._classify(result, before_ref, after, artifact_error)
         receipt = self._receipt(
             definition=definition,
@@ -543,6 +564,52 @@ class Verifier:
         )
         self._record(receipt, uncertain_before)
         # 快照不可用说明命令可能在未知状态下执行过: 与超时/取消同级锁存。
+        self._latch(error)
+        return receipt
+
+    def _record_interrupted(
+        self,
+        definition: CheckDefinition,
+        started: float,
+        before_ref: str,
+        result,
+        failure_kind: str,
+        error: str,
+    ) -> CheckReceipt:
+        """runner 已进入后的取消/异常: 先锁存并留下最近的失败尝试, 再让调用方传播异常.
+
+        执行事实优先取 runner 已返回的结果 (例如后快照失败时进程事实已知); 没有结果时
+        明确记录"进程没有可靠终结事实"。旧 pass 因此不再是最新候选。
+        """
+        bounded = result.output if result is not None else None
+        if bounded is None:
+            artifact_path, artifact_sha256, artifact_error = None, None, None
+        else:
+            artifact_path, artifact_sha256, artifact_error = self._artifact_facts(bounded)
+        receipt = self._receipt(
+            definition=definition,
+            elapsed_s=time.monotonic() - started,
+            execution_status=(
+                self._execution_status(result) if result is not None
+                else "cancelled" if failure_kind == "cancelled" else "error"),
+            exit_code=result.exit_code if result is not None else None,
+            timed_out=bool(result.timed_out) if result is not None else False,
+            cancelled=(failure_kind == "cancelled") or (
+                bool(result.cancelled) if result is not None else False),
+            output_complete=bool(result.output_complete) if result is not None else False,
+            snapshot_before=before_ref,
+            snapshot_after=None,
+            verification_status="blocked",
+            failure_kind=failure_kind,
+            output_truncated=bool(bounded.truncated) if bounded is not None else False,
+            artifact_truncated=(
+                bool(bounded.artifact_truncated) if bounded is not None else False),
+            output_artifact_path=artifact_path,
+            output_artifact_sha256=artifact_sha256,
+            artifact_error=artifact_error,
+            error=error,
+        )
+        self._receipts.append(receipt)
         self._latch(error)
         return receipt
 
