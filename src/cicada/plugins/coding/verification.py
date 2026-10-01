@@ -45,10 +45,11 @@ from cicada.runtime.plugin import PluginContext, PluginDefinition
 
 CONTENT_MAX_BYTES = 16 * 1024  # check 工具 content 的 UTF-8 总预算
 CONTROL_MAX_BYTES = 4 * 1024  # 头部控制字段 (状态/范围/回执身份) 预算
-COMMAND_PREVIEW_MAX_BYTES = 1024 - 3  # 命令预览编码后 ≤1024 bytes
+COMMAND_PREVIEW_MAX_BYTES = 1024  # command_preview JSON 编码后 ≤1024 bytes
+CWD_PREVIEW_MAX_BYTES = 1024  # cwd/path preview JSON 编码后 ≤1024 bytes
+OUTPUT_PREVIEW_MAX_BYTES = 8 * 1024  # 模型可见 stdout/stderr 预览上限 (总预算 16 KiB)
 DIFF_MAX_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
-_BASELINE_PATH_MAX_BYTES = 1024
 _REASON_MAX_BYTES = 512
 
 
@@ -73,6 +74,19 @@ def _clip(text: str, limit: int) -> str:
 
 def _one_line(text: str, limit: int) -> str:
     return _clip(" ".join(text.split()), limit)
+
+
+def _json_preview(text: str, limit: int) -> str:
+    """JSON 编码后的有界预览 (含引号): 控制字段里的命令/路径都用它, 结果始终是合法 JSON.
+
+    编码与转义膨胀都计入 limit, 所以长命令或大量引号不会挤掉 receipt/status/freshness。
+    """
+    budget = max(limit - 2, 1)  # 预留两个引号
+    raw = _clip(_one_line(text, limit), budget)
+    while raw and len(json.dumps(raw, ensure_ascii=False).encode("utf-8")) > limit:
+        budget = max(budget // 2, 1)  # 极端转义膨胀: 减半保证收敛
+        raw = _clip(_one_line(text, limit), budget)
+    return json.dumps(raw, ensure_ascii=False)
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -145,6 +159,9 @@ class Verifier:
         self._baseline_capture: SnapshotCapture | None = None
         self._receipts: list[CheckReceipt] = []
         self._uncertain_reasons: list[str] = []
+        # 模型可见的输出预览按程序 receipt_id 内部保存: 冻结 CheckReceipt 不新增字段,
+        # 完整输出仍在工件里 (工件才是证据, 预览只用于模型判断)。
+        self._previews: dict[str, str] = {}
 
     @property
     def plan(self) -> VerificationPlan:
@@ -279,8 +296,8 @@ class Verifier:
             error=error,
         )
         self._record(receipt, uncertain_before)
+        self._remember_output(receipt, bounded.text)
         return receipt
-
     async def refresh(self, cancel: CancelToken) -> VerificationView:
         """捕获当前快照并重新计算 freshness; 取不到时给 unknown view, 不抛到模型循环.
 
@@ -398,14 +415,25 @@ class Verifier:
 
     # --- check 工具的投影: 服务提供 content 拼装材料, 不自造第二份接口 ---
 
-    def render_receipt_content(self, receipt: CheckReceipt) -> str:
-        """回执的有界 content: 控制字段优先, 输出事实用剩余预算, 绝不产生半截字段."""
-        body = self._control_block(self._control_lines(receipt))
+    def render_receipt_content(
+        self,
+        receipt: CheckReceipt,
+        freshness: Freshness = "unknown",
+        view: VerificationView | None = None,
+    ) -> str:
+        """回执的有界 content: 控制/状态字段优先, 真实输出预览与工件事实用剩余预算.
+
+        content 必须能独立回答"这次检查发生了什么": 原始执行事实、freshness 与当前
+        范围身份、真实 stdout/stderr 预览、工件指针。完整输出仍在工件里。
+        """
+        body = self._control_block(self._control_lines(receipt, freshness, view))
+        footer = self._output_facts(receipt)
         remaining = self.content_max_bytes - len(body.encode("utf-8")) - 1
-        facts = self._output_facts(receipt, remaining)
-        if facts:
-            body = f"{body}\n{facts}"
-        return _clip(body, self.content_max_bytes)
+        if footer:
+            remaining -= len(footer.encode("utf-8")) + 1
+        preview = self._output_preview(receipt, remaining)
+        parts = [part for part in (body, preview, footer) if part]
+        return _clip("\n".join(parts), self.content_max_bytes)
 
     def render_status_content(
         self, view: VerificationView, freshness_reason: str | None = None
@@ -438,6 +466,7 @@ class Verifier:
             "command": receipt.command,
             "command_sha256": _sha256_text(receipt.command),
             "cwd": str(receipt.cwd),
+            "cwd_sha256": _sha256_text(str(receipt.cwd)),
             "timeout_s": receipt.timeout_s,
             "elapsed_s": receipt.elapsed_s,
             "execution_status": receipt.execution_status,
@@ -611,7 +640,13 @@ class Verifier:
         )
         self._receipts.append(receipt)
         self._latch(error)
+        self._remember_output(receipt, bounded.text if bounded is not None else None)
         return receipt
+
+    def _remember_output(self, receipt: CheckReceipt, text: str | None) -> None:
+        """内部保存模型可见的输出预览; 完整输出仍在工件, 冻结回执字段不变."""
+        if text:
+            self._previews[receipt.receipt_id] = _clip(text, OUTPUT_PREVIEW_MAX_BYTES)
 
     def _record(self, receipt: CheckReceipt, uncertain_before: bool) -> None:
         self._receipts.append(receipt)
@@ -806,9 +841,17 @@ class Verifier:
 
     # --- content 拼装 ---
 
-    def _control_lines(self, receipt: CheckReceipt) -> list[str]:
+    def _control_lines(
+        self,
+        receipt: CheckReceipt,
+        freshness: Freshness = "unknown",
+        view: VerificationView | None = None,
+    ) -> list[str]:
+        # 顺序即优先级: 状态/receipt/终止事实/freshness 与范围身份先占控制预算,
+        # 放不下时最后被 metadata_truncated 截掉的是较长的 path preview 与 blocking 文本。
         lines = [
-            f"[check {receipt.check_id} status={receipt.verification_status}]",
+            f"[check {receipt.check_id} status={receipt.verification_status} "
+            f"freshness={freshness}]",
             f"[receipt_id={receipt.receipt_id} "
             f"verification_run_id={receipt.verification_run_id}]",
             f"[execution_status={receipt.execution_status} exit_code={receipt.exit_code} "
@@ -816,12 +859,22 @@ class Verifier:
             f"cancelled={str(receipt.cancelled).lower()} "
             f"output_complete={str(receipt.output_complete).lower()} "
             f"elapsed_s={receipt.elapsed_s:.3f} timeout_s={receipt.timeout_s}]",
+        ]
+        if view is not None:
+            lines.append(
+                f"[scope_id={view.scope_id} snapshot_ref={view.snapshot_ref}]")
+            lines.append(f"[process_uncertain={str(view.process_uncertain).lower()}]")
+            lines.extend(
+                f"[blocking: {_one_line(reason, _REASON_MAX_BYTES)}]"
+                for reason in view.blocking_reasons)
+        lines.extend([
             f"[command_sha256={_sha256_text(receipt.command)} "
-            f"command_preview={_one_line(receipt.command, COMMAND_PREVIEW_MAX_BYTES)}]",
-            f"[cwd={_one_line(str(receipt.cwd), _BASELINE_PATH_MAX_BYTES)}]",
+            f"command_preview={_json_preview(receipt.command, COMMAND_PREVIEW_MAX_BYTES)}]",
+            f"[cwd_sha256={_sha256_text(str(receipt.cwd))} "
+            f"cwd={_json_preview(str(receipt.cwd), CWD_PREVIEW_MAX_BYTES)}]",
             f"[snapshot_before={receipt.snapshot_before} "
             f"snapshot_after={receipt.snapshot_after}]",
-        ]
+        ])
         if receipt.failure_kind:
             lines.append(f"[failure_kind={receipt.failure_kind}]")
         return lines
@@ -838,25 +891,32 @@ class Verifier:
             out = f"{out}{line}\n"
         return out.rstrip("\n")
 
-    def _output_facts(self, receipt: CheckReceipt, budget: int) -> str:
-        """输出/工件事实在剩余预算内; 工件缺失或损坏时明说不完整."""
-        if budget <= 0:
+    def _output_preview(self, receipt: CheckReceipt, budget: int) -> str:
+        """真实 stdout/stderr 有界预览; 完整输出仍在工件, 这里只给尾部事实."""
+        text = self._previews.get(receipt.receipt_id)
+        if not text or budget <= 0:
             return ""
+        header = "[output preview]"
+        room = budget - len(header.encode("utf-8")) - 1
+        if room <= 0:
+            return ""
+        return f"{header}\n{_clip(text, room)}"
+
+    def _output_facts(self, receipt: CheckReceipt) -> str:
+        """输出/工件事实: 每条字段自身有界, 因此不会在文末被截成半截字段."""
         lines = [
             f"[output_truncated={str(receipt.output_truncated).lower()} "
             f"artifact_truncated={str(receipt.artifact_truncated).lower()} "
             f"artifact_error={receipt.artifact_error}]",
-            f"[output artifact: {receipt.output_artifact_path}]"
+            "[output artifact: "
+            f"{_one_line(str(receipt.output_artifact_path), CWD_PREVIEW_MAX_BYTES)}]"
             if receipt.output_artifact_path else "[output artifact: unavailable]",
         ]
         if receipt.output_artifact_sha256:
             lines.append(f"[output artifact sha256: {receipt.output_artifact_sha256}]")
         if receipt.error:
             lines.append(f"[error: {_one_line(receipt.error, _REASON_MAX_BYTES)}]")
-        body = "\n".join(lines)
-        if len(body.encode("utf-8")) > budget:
-            return _clip(body, budget)
-        return body
+        return "\n".join(lines)
 
     def _state_line(self, state: CheckState) -> str:
         receipt = state.receipt

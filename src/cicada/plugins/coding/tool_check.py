@@ -68,13 +68,14 @@ class CheckTool:
         freshness = state.freshness if state is not None else "unknown"
         details = self._service.receipt_details(receipt, freshness)
         details["snapshot_ref"] = view.snapshot_ref
+        details["scope_id"] = view.scope_id
         details["baseline_snapshot_ref"] = self._service.baseline_snapshot_ref
         details["process_uncertain"] = view.process_uncertain
         details["blocking_reasons"] = list(view.blocking_reasons)
         return ToolResult(
             call_id=ctx.call_id,
             name=TOOL_NAME,
-            content=self._service.render_receipt_content(receipt),
+            content=self._service.render_receipt_content(receipt, freshness, view),
             is_error=False,
             details=details,
         )

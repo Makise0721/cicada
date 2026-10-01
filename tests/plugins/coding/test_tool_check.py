@@ -185,6 +185,30 @@ async def test_cancellation_is_recorded_as_a_blocked_receipt_not_a_failure(repo)
     assert result.details["cancelled"] is True and result.details["exit_code"] is None
 
 
+async def test_nonzero_check_diagnostics_are_visible_in_public_tool_content(repo):
+    # 诊断只出现在真实 stdout (char 码拼出 DIAG), 命令本身不含它。
+    command = "Write-Output ([string][char]68+[char]73+[char]65+[char]71); exit 3"
+    tool = await service_for(repo, CheckDefinition("check-1", command))
+    result = await call(tool, {"action": "run", "check_id": "check-1"})
+    assert result.is_error is False
+    assert result.details["verification_status"] == "failed"
+    assert result.details["exit_code"] == 3
+    assert len(result.content.encode("utf-8")) <= CONTENT_MAX_BYTES
+    # 公开工具的 content: 真实输出预览 + freshness + 当前范围 + 工件提示都在。
+    assert "DIAG" not in command and "DIAG" in result.content
+    assert "[output preview]" in result.content
+    assert "freshness=current" in result.content
+    assert f"scope_id={result.details['scope_id']}" in result.content
+    assert f"snapshot_ref={result.details['snapshot_ref']}" in result.content
+    assert "[output artifact:" in result.content
+    assert 'command_preview="' in result.content and "cwd_sha256=" in result.content
+    # 完整输出仍在工件里, 预览只是模型可见副本。
+    artifact = Path(result.details["output_artifact_path"]).read_text(encoding="utf-8")
+    assert "DIAG" in artifact
+    assert result.details["cwd_sha256"] == hashlib.sha256(
+        str(result.details["cwd"]).encode()).hexdigest()
+
+
 async def test_runner_failure_after_start_is_the_latest_state_seen_by_status(repo):
     """runner 已进入后异常: 服务的锁存与最近失败尝试经公开 status 可见, 旧 pass 不作候选."""
 

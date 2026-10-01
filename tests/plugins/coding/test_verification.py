@@ -6,6 +6,7 @@
 
 import asyncio
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -563,6 +564,34 @@ async def test_receipt_content_is_bounded_and_keeps_control_and_artifact_facts(r
     assert str(receipt.output_artifact_path) in content
     assert receipt.output_artifact_sha256 in content
     assert receipt.output_truncated is True  # 60 KiB 单行超 tail 预算
+    # 真实 stdout 预览在预算内进入 content (尾部 'done' 可见), 控制字段没有被挤掉。
+    assert "[output preview]" in content and "done" in content
+    assert "metadata_truncated" not in content
+
+
+async def test_receipt_content_shows_real_output_preview_freshness_and_current_scope(repo):
+    # 诊断文字只出现在真实 stdout (char 码拼出 DIAG), 命令本身不含它。
+    command = "Write-Output ([string][char]68+[char]73+[char]65+[char]71); exit 3"
+    verifier = await initialized(repo, CheckDefinition("check-1", command))
+    receipt = await verifier.run_check("check-1", CancelToken())
+    view = await verifier.refresh(CancelToken())
+    state = view.checks[0]
+    content = verifier.render_receipt_content(receipt, state.freshness, view)
+    assert len(content.encode("utf-8")) <= CONTENT_MAX_BYTES
+    assert "DIAG" not in command and "DIAG" in content  # 只能来自真实输出预览
+    assert "[output preview]" in content
+    # freshness 与当前范围身份同样在模型可见 content 里。
+    assert f"freshness={state.freshness}" in content
+    assert f"scope_id={view.scope_id}" in content
+    assert f"snapshot_ref={view.snapshot_ref}" in content
+    assert "process_uncertain=false" in content
+    # 非零诊断: 失败原因与退出码可见, 模型不必先读工件再定位。
+    assert "failure_kind=nonzero_exit" in content and "exit_code=3" in content
+    # 命令/路径是 JSON 转义的有界预览, 且完整命令仍在回执与 details。
+    command_line = next(line for line in content.splitlines() if "command_preview=" in line)
+    assert command_line.endswith("]")
+    preview = json.loads(command_line.split("command_preview=", 1)[1][:-1])
+    assert isinstance(preview, str) and command.startswith(preview.rstrip("."))
 
 
 async def test_long_command_keeps_full_text_in_receipt_and_bounded_preview(repo):
@@ -578,6 +607,18 @@ async def test_long_command_keeps_full_text_in_receipt_and_bounded_preview(repo)
     details = verifier.receipt_details(receipt, "current")
     assert details["command"] == long_command
     assert details["command_sha256"] == hashlib.sha256(long_command.encode()).hexdigest()
+
+    # 转义膨胀 (大量引号) 也不能靠 JSON 编码把控制字段挤出去。
+    quoted_command = 'Write-Output ok # ' + '"' * 3000
+    other = await initialized(repo, CheckDefinition("check-1", quoted_command))
+    quoted_receipt = await other.run_check("check-1", CancelToken())
+    quoted_content = other.render_receipt_content(quoted_receipt, "current")
+    assert len(quoted_content.encode("utf-8")) <= CONTENT_MAX_BYTES
+    assert f"receipt_id={quoted_receipt.receipt_id}" in quoted_content
+    assert "status=passed" in quoted_content and "freshness=current" in quoted_content
+    quoted_preview = quoted_content.split("command_preview=")[1].split("]")[0]
+    assert len(quoted_preview.encode("utf-8")) <= 1024
+    assert json.loads(quoted_preview).startswith("Write-Output ok #")
 
 
 async def test_generated_run_ids_are_unique_and_not_the_kernel_run_id():
