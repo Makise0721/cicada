@@ -8,6 +8,10 @@ P3 增补 (docs/superpowers/plans/2026-09-30-parallel-p3-context-observability.m
 - request.system_prompt 非空时在最前加一条 system 消息; 空串保持旧请求 JSON 不变.
 - 仅有效 done:true 行提取 optional 计量 (prompt_eval_count/eval_count/total_duration);
   非法/缺失映射为 None, 不改变文本/工具/stop 的协议严格性.
+
+P4 §8 增补:
+- OllamaConfig.max_request_bytes (默认 None) 声明真正 HTTP 请求体的字节上限;
+  None 保持旧路径. 上限的检查由 model 层在构造 httpx Request 后执行, 本模块只作配置校验.
 """
 
 from __future__ import annotations
@@ -34,6 +38,19 @@ class OllamaConfig:
     think: bool = False
     options: Mapping[str, Any] = field(default_factory=dict)  # 透传 Ollama options (temperature/num_ctx 等)
     timeout: httpx.Timeout | None = None
+    # P4 §8: 真正 HTTP 请求体的字节上限; None 保持原路径 (不额外构造 Request).
+    # 这不是 tokenizer/上下文预算, 只保证超限时不发出 POST.
+    max_request_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_request_bytes is None:
+            return
+        if (
+            isinstance(self.max_request_bytes, bool)
+            or not isinstance(self.max_request_bytes, int)
+            or self.max_request_bytes <= 0
+        ):
+            raise ValueError("max_request_bytes must be a positive integer or None")
 
 
 @dataclass(frozen=True)

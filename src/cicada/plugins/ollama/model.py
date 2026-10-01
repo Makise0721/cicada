@@ -6,6 +6,9 @@
 
 P3: terminal StreamDone 携带 done 行已解析的计量; 关闭响应的 await 被 Task 取消时
 产出 StreamDone("aborted", metrics=已知计量) 后再传播取消, 不丢计量.
+
+P4 §8: config.max_request_bytes 非 None 时, 在真正构造 httpx Request 之后、send 之前
+比较 len(request.content); 超限产出 StreamDone("error") 并不发 POST.
 """
 
 from __future__ import annotations
@@ -45,10 +48,22 @@ class OllamaModel:
         timeout = self.config.timeout if self.config.timeout is not None else DEFAULT_TIMEOUT
         url = f"{self.config.base_url.rstrip('/')}/api/chat"
         try:
-            response = await self.client.send(
-                self.client.build_request("POST", url, json=payload, timeout=timeout),
-                stream=True,
+            built = self.client.build_request("POST", url, json=payload, timeout=timeout)
+        except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
+            yield StreamDone("error", f"ollama request failed: {exc}")
+            return
+        limit = self.config.max_request_bytes
+        if limit is not None and len(built.content) > limit:
+            # P4 §8: 真正 wire 形态的 UTF-8 请求体超限 -> 不发 POST, 不依赖服务端裁剪.
+            # len(Request.content) 已含 system/messages/tools/options 与 JSON 转义.
+            yield StreamDone(
+                "error",
+                f"ollama request too large: {len(built.content)} bytes exceeds limit "
+                f"{limit} bytes; not sent",
             )
+            return
+        try:
+            response = await self.client.send(built, stream=True)
         except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
             yield StreamDone("error", f"ollama request failed: {exc}")
             return

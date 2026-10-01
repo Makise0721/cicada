@@ -1,15 +1,16 @@
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
 
 from cicada.core.cancel import CancelToken
-from cicada.core.messages import UserMessage
-from cicada.core.ports import ModelMetrics, ModelRequest, StreamDone, ToolCallEvent, TextDelta
+from cicada.core.messages import ToolResult, ToolResultMessage, UserMessage
+from cicada.core.ports import ModelMetrics, ModelRequest, StreamDone, ToolCallEvent, TextDelta, ToolSpec
 from cicada.plugins.ollama.model import OllamaModel
-from cicada.plugins.ollama.protocol import OllamaConfig
+from cicada.plugins.ollama.protocol import OllamaConfig, build_request
 
 CONFIG = OllamaConfig(base_url="http://ollama.test")
 RECORDINGS = Path(__file__).parent / "recordings"
@@ -31,6 +32,44 @@ def ndjson(*entries) -> bytes:
 
 def ndjson_response(body: bytes, status_code: int = 200) -> httpx.Response:
     return httpx.Response(status_code, content=body, headers={"content-type": "application/x-ndjson"})
+
+
+def ok_done() -> bytes:
+    return ndjson({"message": {"role": "assistant", "content": "hi"}, "done": True, "done_reason": "stop"})
+
+
+class CapturingTransport(httpx.MockTransport):
+    """记录实际 POST 次数的 MockTransport; 无命中回 200 合法终结流."""
+
+    def __init__(self) -> None:
+        self.seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.seen.append(request)
+            return ndjson_response(ok_done())
+
+        super().__init__(handler)
+
+
+def capped_model(limit: int, transport: CapturingTransport) -> OllamaModel:
+    config = replace(CONFIG, max_request_bytes=limit)
+    return OllamaModel(httpx.AsyncClient(transport=transport), config)
+
+
+def wire_size(model: OllamaModel, request: ModelRequest) -> int:
+    """用适配器自身的 serializer 测同一请求的 wire 字节数 (含 JSON 转义)."""
+    payload = build_request(request, model.config)
+    return len(model.client.build_request("POST", "http://ollama.test/api/chat", json=payload).content)
+
+
+def size_boundary_request(target: int) -> tuple[ModelRequest, int]:
+    """构造 wire 字节恰好等于 target 的请求 (正文长度取差值, 与 model 上限无关)."""
+    tools = (ToolSpec("t", "d" * 64, {"type": "object", "properties": {"a": {"type": "string"}}}),)
+    probe = OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(lambda request: ndjson_response(ok_done()))), CONFIG)
+    padding = target - wire_size(probe, ModelRequest((UserMessage(text=""),), tools, system_prompt="sys"))
+    assert padding > 0, "target 太小: 固定开销已超出目标字节数"
+    request = ModelRequest((UserMessage(text="q" * padding),), tools, system_prompt="sys")
+    return request, wire_size(probe, request)
 
 
 def make_model(response, seen: list) -> OllamaModel:
@@ -486,3 +525,115 @@ async def test_cancel_winning_race_over_done_line_keeps_metrics_unknown():
     assert await gen.__anext__() == StreamDone("aborted")
     await gen.aclose()
     await model.client.aclose()
+
+
+async def test_oversized_request_sends_no_post_and_reports_actual_bytes_and_limit():
+    transport = CapturingTransport()
+    model = capped_model(200, transport)
+    request = ModelRequest((UserMessage(text="x" * 500),), (), system_prompt="sys")
+    expected = wire_size(model, request)
+    assert expected > 200
+    events = await collect(model, request=request)
+    assert transport.seen == []  # 未发 POST
+    assert len(events) == 1
+    assert events[0].stop_reason == "error"
+    assert f"{expected} bytes" in events[0].error
+    assert "200 bytes" in events[0].error
+
+
+async def test_request_exactly_at_limit_is_sent_and_payload_matches_wire_bytes():
+    transport = CapturingTransport()
+    model = capped_model(4096, transport)
+    base = "中文" * 300
+    padding = 4096 - wire_size(model, ModelRequest((UserMessage(text=base),), (), system_prompt="规则"))
+    sized = ModelRequest((UserMessage(text=base + "x" * padding),), (), system_prompt="规则")
+    assert wire_size(model, sized) == 4096
+    events = await collect(model, request=sized)
+    assert [event.stop_reason for event in events if isinstance(event, StreamDone)] == ["stop"]
+    assert transport.seen != []
+    assert len(transport.seen[0].content) == 4096
+    payload = json.loads(transport.seen[0].content)
+    assert payload["messages"][0] == {"role": "system", "content": "规则"}
+    assert "中文" in payload["messages"][1]["content"]
+
+
+async def test_one_byte_over_limit_is_not_sent():
+    transport = CapturingTransport()
+    model = capped_model(3000, transport)
+    request, size = size_boundary_request(3000)
+    assert size == 3000
+    events = await collect(model, request=request)
+    assert [event.stop_reason for event in events if isinstance(event, StreamDone)] == ["stop"]
+    assert transport.seen != []
+
+    transport2 = CapturingTransport()
+    model2 = capped_model(2999, transport2)
+    assert wire_size(model2, request) == 3000
+    events2 = await collect(model2, request=request)
+    assert transport2.seen == []
+    assert [event.stop_reason for event in events2 if isinstance(event, StreamDone)] == ["error"]
+
+
+async def test_json_escaped_tool_result_counts_escaped_bytes():
+    # 转义膨胀: 同样字符数的正文, 含需要转义的字符时 wire 字节更大
+    transport = CapturingTransport()
+    model = capped_model(1024, transport)
+    plain = ModelRequest((ToolResultMessage(result=ToolResult("c1", "check", "a" * 460)),), ())
+    escaped = ModelRequest((ToolResultMessage(result=ToolResult("c1", "check", "\\" * 460)),), ())
+    assert wire_size(model, escaped) > wire_size(model, plain)
+    assert wire_size(model, escaped) > 1024
+    events = await collect(model, request=escaped)
+    assert transport.seen == []
+    dones = [event for event in events if isinstance(event, StreamDone)]
+    assert dones[0].stop_reason == "error"
+    assert f"{wire_size(model, escaped)} bytes" in dones[0].error
+
+
+async def test_tools_count_toward_request_limit():
+    transport = CapturingTransport()
+    tool = ToolSpec(
+        "glob",
+        "Find files",
+        {"type": "object", "properties": {"pattern": {"type": "string", "description": "p" * 400}}},
+    )
+    model = capped_model(300, transport)
+    request = ModelRequest((UserMessage(text="hi"),), (tool,), system_prompt="s")
+    events = await collect(model, request=request)
+    assert transport.seen == []
+    assert [event.stop_reason for event in events if isinstance(event, StreamDone)] == ["error"]
+
+    # 同一请求放宽上限后正常发出: 超限来自 tools 体积, 不是固定行为
+    relaxed = capped_model(4000, CapturingTransport())
+    assert wire_size(relaxed, request) < 4000
+    assert build_request(request, relaxed.config)["tools"][0]["function"]["name"] == "glob"
+
+
+async def test_max_request_bytes_none_keeps_legacy_path_without_cap():
+    transport = CapturingTransport()
+    model = OllamaModel(httpx.AsyncClient(transport=transport), CONFIG)
+    assert CONFIG.max_request_bytes is None
+    request = ModelRequest((UserMessage(text="y" * 20000),), ())
+    events = await collect(model, request=request)
+    assert [event.stop_reason for event in events if isinstance(event, StreamDone)] == ["stop"]
+    assert len(transport.seen[0].content) > 20000
+
+
+async def test_oversized_request_leaves_no_pending_tasks():
+    transport = CapturingTransport()
+    model = capped_model(100, transport)
+    events = await collect(model, request=ModelRequest((UserMessage(text="z" * 400),), ()))
+    assert [event.stop_reason for event in events if isinstance(event, StreamDone)] == ["error"]
+    assert [task for task in asyncio.all_tasks() if task is not asyncio.current_task()] == []
+
+
+async def test_cancelled_before_oversized_check_yields_aborted_without_post():
+    # 取消优先于体量判定: 进入时已取消 -> aborted, 不检查也不发送
+    transport = CapturingTransport()
+    model = capped_model(100, transport)
+    cancel = CancelToken()
+    cancel.cancel()
+    events = await collect(
+        model, cancel=cancel, request=ModelRequest((UserMessage(text="z" * 400),), ())
+    )
+    assert events == [StreamDone("aborted")]
+    assert transport.seen == []

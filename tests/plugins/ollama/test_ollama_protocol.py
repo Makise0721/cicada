@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -319,3 +320,23 @@ def test_huge_total_duration_overflow_only_nulls_duration_field():
     chunk = parse_line(json.dumps(line).encode("utf-8"))
     assert chunk.error is None
     assert chunk.metrics == ModelMetrics(input_tokens=7, output_tokens=3, provider_duration_s=None)
+
+
+def test_max_request_bytes_defaults_to_none_and_does_not_change_payload():
+    assert OllamaConfig().max_request_bytes is None
+    assert CONFIG.max_request_bytes is None
+    capped = OllamaConfig(max_request_bytes=65536)
+    request = ModelRequest((UserMessage(text="hi"),), (), system_prompt="sys")
+    # 配置字段本身不进请求体: 上限由 model 层在真实 Request 上执行
+    assert build_request(request, capped) == build_request(request, CONFIG)
+
+
+@pytest.mark.parametrize("value", [0, -1, -65536, True, False, 1.5, "65536"])
+def test_invalid_max_request_bytes_rejected(value):
+    with pytest.raises(ValueError, match="max_request_bytes"):
+        OllamaConfig(max_request_bytes=value)
+
+
+def test_valid_max_request_bytes_accepted():
+    assert OllamaConfig(max_request_bytes=1).max_request_bytes == 1
+    assert replace(CONFIG, max_request_bytes=65536).max_request_bytes == 65536
