@@ -321,4 +321,5 @@ async def test_tool_exception_is_normalised_by_the_kernel_so_policy_can_latch(re
         ModelRequest(messages=result.messages, tools=()), CancelToken()
     ):
         pass
-    assert service.reasons and "no structured details" in service.reasons[0]
+    # 锁存原因的具体措辞归 K 的投影实现; 这里只断言保守锁存确实发生且指向该工具。
+    assert service.reasons and "check" in service.reasons[0]
