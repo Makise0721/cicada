@@ -60,7 +60,7 @@ class ReadTool:
 
     async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         raw = arguments["path"]
-        path = self._workspace.resolve(raw)
+        path = self._workspace.resolve(raw).resolve()
         if not path.exists():
             return self._error(ctx, f"file not found: {path}")
         if path.is_dir():

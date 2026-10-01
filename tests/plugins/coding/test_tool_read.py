@@ -1,8 +1,13 @@
 import json
+import os
+import subprocess
+
+import pytest
 
 import cicada.plugins.coding.tool_read as tool_read_module
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ToolContext
+from cicada.plugins.coding.process import resolve_pwsh
 from cicada.plugins.coding.tool_read import MAX_CONTENT_BYTES, MAX_LINES, ReadTool
 from cicada.plugins.coding.workspace import Workspace
 
@@ -69,6 +74,51 @@ async def test_header_path_is_json_escaped_canonical_absolute(tmp_path):
     encoded = first_line[len("[file=") : first_line.index(" lines=")]
     assert json.loads(encoded) == str(f)
     assert "\\" in encoded  # 转义后的反斜杠
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive path alias")
+async def test_source_uses_actual_file_casing(tmp_path):
+    ws, tool = make(tmp_path)
+    target = ws.root / "MixedCase.TXT"
+    target.write_text("actual\n", encoding="utf-8")
+    result = await run(tool, path="mixedcase.txt")
+    assert not result.is_error
+    assert result.details["path"] == str(target.resolve())
+    assert result.content == expected_content(
+        target.resolve(), 1, 1, 1, ["1\tactual"], "[truncated=false next_offset=none]"
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction")
+async def test_junction_source_is_actual_target_and_remains_readable(tmp_path):
+    ws, tool = make(tmp_path)
+    target_dir = tmp_path / "actual"
+    target_dir.mkdir()
+    target = target_dir / "a.txt"
+    target.write_text("junction target\n", encoding="utf-8")
+    alias = ws.root / "alias"
+    subprocess.run(
+        [
+            str(resolve_pwsh()), "-NoProfile", "-NonInteractive", "-Command",
+            "New-Item -ItemType Junction -Path $env:CICADA_TEST_ALIAS "
+            "-Target $env:CICADA_TEST_TARGET -ErrorAction Stop | Out-Null",
+        ],
+        env={**os.environ, "CICADA_TEST_ALIAS": str(alias), "CICADA_TEST_TARGET": str(target_dir)},
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    try:
+        result = await run(tool, path="alias/a.txt")
+        assert not result.is_error
+        assert result.details["path"] == str(target.resolve())
+        assert result.content == expected_content(
+            target.resolve(), 1, 1, 1, ["1\tjunction target"],
+            "[truncated=false next_offset=none]",
+        )
+    finally:
+        alias.rmdir()  # Remove only the junction, never its target directory.
 
 
 async def test_absolute_path_outside_root_is_readable(tmp_path):

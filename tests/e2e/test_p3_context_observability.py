@@ -10,11 +10,12 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from cicada.boot import bootstrap
 from cicada.core.events import AssistantCompleted, Event, ModelCallCompleted
 from cicada.plugins.coding.process import process_plugin
-from cicada.plugins.coding.tool_edit import edit_plugin
+from cicada.plugins.coding.tool_edit import MAX_CONTENT_BYTES, edit_plugin
 from cicada.plugins.coding.tool_powershell import powershell_plugin
 from cicada.plugins.coding.tool_read import read_plugin
 from cicada.plugins.coding.tool_write import write_plugin
@@ -58,7 +59,8 @@ def _mock_ollama_plugin(model: OllamaModel) -> PluginDefinition:
     return PluginDefinition(name="mock-ollama", setup=setup, provides=frozenset({"model"}))
 
 
-async def test_p3_context_flows_end_to_end(tmp_path):
+@pytest.mark.parametrize("oversize_metadata", [False, True])
+async def test_p3_context_flows_end_to_end(tmp_path, monkeypatch, oversize_metadata):
     (tmp_path / "a.txt").write_text("alpha\nbeta\n", encoding="utf-8")
     prompt_text, _ = compose_system_prompt(tmp_path)
     requests: list[dict] = []
@@ -69,7 +71,7 @@ async def test_p3_context_flows_end_to_end(tmp_path):
         turn = len(requests) - 1
         if turn == 0:
             body = _ndjson(
-                _chunk(tool_calls=[{"id": "call_1", "function": {"name": "read", "arguments": {"path": "a.txt"}}}]),
+                _chunk(tool_calls=[{"id": "call_1", "function": {"name": "read", "arguments": {"path": "A.TXT"}}}]),
                 _done(100, 10, 500_000_000),
             )
         elif turn == 1:
@@ -97,6 +99,9 @@ async def test_p3_context_flows_end_to_end(tmp_path):
         tool_capabilities=TOOL_CAPABILITIES,
         system_prompt=prompt_text,
     )
+    if oversize_metadata:
+        tool = app.runtime.capability("tool.edit")
+        monkeypatch.setattr(tool, "_display", lambda path: "宽🎉" * 10000)
     events: list[Event] = []
     app.agent.subscribe(events.append)
     try:
@@ -123,6 +128,8 @@ async def test_p3_context_flows_end_to_end(tmp_path):
     assert tool_msg_1["role"] == "tool" and tool_msg_1["tool_call_id"] == "call_1"
     assert tool_msg_1["content"].startswith('[file="')
     assert "a.txt" in tool_msg_1["content"]
+    source = tool_msg_1["content"].split(" lines=", 1)[0][len("[file="):]
+    assert json.loads(source) == str((tmp_path / "a.txt").resolve())
     assert "lines=1-2 total_lines=2" in tool_msg_1["content"]
     assert "[truncated=false next_offset=none]" in tool_msg_1["content"]
 
@@ -130,7 +137,12 @@ async def test_p3_context_flows_end_to_end(tmp_path):
     tool_msg_2 = requests[2]["messages"][-1]
     assert tool_msg_2["tool_call_id"] == "call_2"
     assert "edit applied" in tool_msg_2["content"]
-    assert "-beta" in tool_msg_2["content"] and "+BETA" in tool_msg_2["content"]
+    assert len(tool_msg_2["content"].encode("utf-8")) <= MAX_CONTENT_BYTES
+    if oversize_metadata:
+        assert "metadata_truncated=true" in tool_msg_2["content"]
+        assert "diff_truncated=true" in tool_msg_2["content"]
+    else:
+        assert "-beta" in tool_msg_2["content"] and "+BETA" in tool_msg_2["content"]
 
     # 真实工具副作用落地
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "alpha\nBETA\n"

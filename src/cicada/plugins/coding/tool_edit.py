@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,18 +85,13 @@ class EditTool:
         details = {"diff": diff, "first_changed_line": first_changed_line}
         if diff == "":
             # 语义上罕见 (new==old 已在校验拒绝), 仍明示而不是静默
-            return ToolResult(
-                call_id=ctx.call_id,
-                name="edit",
-                content=f"{header}\n(no text differences)",
-                details={**details, "diff_truncated": False},
+            return self._success_result(
+                ctx, f"{header}\n(no text differences)",
+                {**details, "diff_truncated": False},
             )
         if len(header.encode("utf-8")) + 1 + len(diff.encode("utf-8")) <= MAX_CONTENT_BYTES:
-            return ToolResult(
-                call_id=ctx.call_id,
-                name="edit",
-                content=f"{header}\n{diff}",
-                details={**details, "diff_truncated": False},
+            return self._success_result(
+                ctx, f"{header}\n{diff}", {**details, "diff_truncated": False},
             )
         return self._spill_diff(ctx, path, header, diff, details)
 
@@ -125,11 +121,9 @@ class EditTool:
                 diff, MAX_CONTENT_BYTES - header_bytes - 2 - len(marker.encode("utf-8"))
             )
             parts = [header, preview, marker] if preview else [header, marker]
-            return ToolResult(
-                call_id=ctx.call_id,
-                name="edit",
-                content="\n".join(parts),
-                details={**details, "diff_truncated": True, "full_diff_path": str(artifact)},
+            return self._success_result(
+                ctx, "\n".join(parts),
+                {**details, "diff_truncated": True, "full_diff_path": str(artifact)},
             )
         # 文件已改但 artifact 写失败: 不回滚、不谎称未改, 明确告知 full diff 不可得
         marker = (
@@ -140,12 +134,42 @@ class EditTool:
             diff, MAX_CONTENT_BYTES - header_bytes - 2 - len(marker.encode("utf-8"))
         )
         parts = [header, preview, marker] if preview else [header, marker]
-        return ToolResult(
-            call_id=ctx.call_id,
-            name="edit",
-            content="\n".join(parts),
-            details={**details, "diff_truncated": True, "artifact_error": artifact_error},
+        return self._success_result(
+            ctx, "\n".join(parts),
+            {**details, "diff_truncated": True, "artifact_error": artifact_error},
         )
+
+    @staticmethod
+    def _success_result(ctx: ToolContext, content: str, details: dict) -> ToolResult:
+        """元信息也计入最终预算; 已写入的编辑不能因反馈超限变成错误."""
+        if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
+            details = {**details, "metadata_truncated": True, "full_result_content": content}
+            parts = ["edit applied; metadata_truncated=true; full metadata retained in details."]
+            if details.get("full_diff_path") is not None:
+                artifact_path = json.dumps(details["full_diff_path"], ensure_ascii=False)
+                marker = f"[diff_truncated=true full_diff_path={artifact_path}; read it with the read tool]"
+                if len((parts[0] + "\n" + marker).encode("utf-8")) <= MAX_CONTENT_BYTES:
+                    parts.append(marker)
+                else:
+                    parts.append(
+                        "[diff_truncated=true; full diff saved; artifact path omitted to fit the cap; "
+                        "re-read the edited file using the original edit path]"
+                    )
+            elif "artifact_error" in details:
+                parts.append(
+                    "[diff_truncated=true; full diff unavailable; "
+                    "re-read the edited file using the original edit path]"
+                )
+            elif details["diff"] == "":
+                parts.append("(no text differences)")
+            else:
+                details["diff_truncated"] = True
+                parts.append(
+                    "[diff_truncated=true; re-read the edited file using the original edit path]"
+                )
+            # 不截断成半个可回读路径; marker 已整体核对预算。短说明亦遵守总界。
+            content = "\n".join(parts).encode("utf-8")[:MAX_CONTENT_BYTES].decode("utf-8", errors="ignore")
+        return ToolResult(call_id=ctx.call_id, name="edit", content=content, details=details)
 
     @staticmethod
     def _bounded_preview(diff: str, budget: int) -> str:
