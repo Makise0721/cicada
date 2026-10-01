@@ -63,6 +63,20 @@ def test_resolve_for_write_rejects_outside(tmp_path):
         ws.resolve_for_write("..\\no_such_dir\\new.txt")
 
 
+def test_resolve_within_root_is_read_only_and_shares_write_boundary(tmp_path):
+    ws = make_workspace(tmp_path)
+    (ws.root / "sub").mkdir()
+    existing = ws.root / "sub" / "File.txt"
+    existing.write_text("unchanged", encoding="utf-8")
+    assert ws.resolve_within_root("SUB\\file.TXT") == existing
+    missing = ws.resolve_within_root("sub\\missing\\new.txt")
+    assert missing == ws.resolve_for_write("sub\\missing\\new.txt")
+    assert not missing.parent.exists()
+    assert existing.read_text(encoding="utf-8") == "unchanged"
+    with pytest.raises(PathNotAllowedError):
+        ws.resolve_within_root("..\\outside.txt")
+
+
 def test_junction_escape_rejected(tmp_path):
     ws = make_workspace(tmp_path)
     target = tmp_path / "real-target"

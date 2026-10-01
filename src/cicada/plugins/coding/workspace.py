@@ -53,8 +53,8 @@ class Workspace:
             candidate = self.root / candidate
         return Path(os.path.normpath(candidate))
 
-    def resolve_for_write(self, raw: str) -> Path:
-        """写入路径: canonical(realpath 解 junction/symlink, 不存在文件解析最近存在祖先)
+    def resolve_within_root(self, raw: str) -> Path:
+        """只读边界解析: canonical(realpath 解 junction/symlink, 不存在文件解析最近存在祖先)
         后以大小写不敏感的路径段比较判定必须在 root 内; 越界抛 PathNotAllowedError."""
         target = Path(os.path.realpath(self.resolve(raw)))
         if not self._within_root(target):
@@ -62,6 +62,10 @@ class Workspace:
                 f"path {raw!r} resolves to {target} outside workspace root {self.root}"
             )
         return target
+
+    def resolve_for_write(self, raw: str) -> Path:
+        """写入沿用同一 canonical 边界；此方法本身不创建文件."""
+        return self.resolve_within_root(raw)
 
     async def mutate(self, path: Path, op: Callable[[], Awaitable[T]]) -> T:
         """同 canonical 路径串行执行 op, 不同路径并行.

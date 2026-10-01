@@ -1,3 +1,6 @@
+import asyncio
+from dataclasses import replace
+
 import pytest
 
 from cicada.boot import BootError, bootstrap
@@ -126,3 +129,90 @@ async def test_bootstrap_rejects_non_str_system_prompt_before_runtime_start(bad_
             system_prompt=bad_prompt,
         )
     assert setup_calls == []
+
+
+async def test_bootstrap_policy_uses_runtime_and_wraps_actual_requests_with_turn_limit():
+    model = FakeModel([
+        [ToolCallEvent("c1", "echo", '{"text":"x"}'), StreamDone("tool_use")],
+        [TextDelta("must not run"), StreamDone("stop")],
+    ])
+    seen_runtime = []
+
+    def policy(original, runtime):
+        assert runtime.capability("model") is original
+        seen_runtime.append(runtime)
+
+        class Policy:
+            def stream(self, request, cancel):
+                return original.stream(replace(request, system_prompt=request.system_prompt + " / policy"), cancel)
+
+        return Policy()
+
+    app = await bootstrap(
+        [fake_model_plugin(model), fake_tools_plugin([EchoTool()])],
+        tool_capabilities=("tools",), system_prompt="rules", model_policy=policy, max_turns=1,
+    )
+    result = await app.agent.run("task")
+    assert result.stop_reason == "error"
+    assert result.error == "max turns (1) exceeded"
+    assert len(model.requests) == 1
+    assert model.requests[0].system_prompt == "rules / policy"
+    assert model.requests[0].tools[0].name == "echo"
+    assert result.messages[0].text == "task"
+    await app.aclose()
+    with pytest.raises(CapabilityError):
+        seen_runtime[0].capability("model")
+
+
+async def test_bootstrap_policy_failure_closes_started_runtime():
+    cleaned = []
+    seen_runtime = []
+
+    def setup(ctx):
+        ctx.provide("model", FakeModel([]))
+        ctx.defer(lambda: cleaned.append("closed"))
+
+    def policy(model, runtime):
+        seen_runtime.append(runtime)
+        raise ValueError("policy failed")
+
+    with pytest.raises(BootError, match="policy failed"):
+        await bootstrap([PluginDefinition("model", setup, provides=frozenset({"model"}))],
+                        tool_capabilities=(), model_policy=policy)
+    assert cleaned == ["closed"]
+    with pytest.raises(CapabilityError):
+        seen_runtime[0].capability("model")
+
+
+@pytest.mark.parametrize("mode", ["invalid", "async", "cancelled"])
+async def test_bootstrap_bad_policy_result_or_cancellation_still_cleans_runtime(mode):
+    cleaned = []
+
+    def setup(ctx):
+        ctx.provide("model", FakeModel([]))
+        ctx.defer(lambda: cleaned.append(True))
+
+    async def async_policy(model, runtime):
+        return model
+
+    def policy(model, runtime):
+        if mode == "cancelled":
+            raise asyncio.CancelledError
+        return None
+
+    with pytest.raises(asyncio.CancelledError if mode == "cancelled" else BootError):
+        await bootstrap([PluginDefinition("model", setup, provides=frozenset({"model"}))],
+                        tool_capabilities=(), model_policy=async_policy if mode == "async" else policy)
+    assert cleaned == [True]
+
+
+@pytest.mark.parametrize("turns", [0, -1, True, 1.5])
+async def test_bootstrap_invalid_turn_limit_does_not_start_plugins(turns):
+    setups = []
+
+    def setup(ctx):
+        setups.append(True)
+
+    with pytest.raises(ValueError, match="max_turns"):
+        await bootstrap([PluginDefinition("unused", setup)], tool_capabilities=(), max_turns=turns)
+    assert setups == []

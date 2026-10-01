@@ -5,15 +5,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 
 from cicada.core.agent import Agent
+from cicada.core.ports import ModelPort
 from cicada.runtime.plugin import PluginDefinition
 from cicada.runtime.runtime import CapabilityError, PluginRuntime, StartupReport
 
 
 class BootError(RuntimeError):
     """插件启动失败或必需能力缺失."""
+
+
+ModelPolicy = Callable[[ModelPort, PluginRuntime], ModelPort]
 
 
 @dataclass
@@ -32,9 +38,15 @@ async def bootstrap(
     tool_capabilities: tuple[str, ...],
     model_capability: str = "model",
     system_prompt: str = "",
+    model_policy: ModelPolicy | None = None,
+    max_turns: int = 50,
 ) -> App:
     if not isinstance(system_prompt, str):
         raise TypeError(f"system_prompt must be a str, got {type(system_prompt).__name__}")
+    if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns <= 0:
+        raise ValueError("max_turns must be a positive integer")
+    if model_policy is not None and not callable(model_policy):
+        raise TypeError("model_policy must be a synchronous callable or None")
     runtime = PluginRuntime()
     for definition in definitions:
         runtime.register(definition)
@@ -45,13 +57,29 @@ async def bootstrap(
     try:
         model = runtime.capability(model_capability)
         tools = {tool.spec.name: tool for name in tool_capabilities for tool in _as_tools(runtime.capability(name), name)}
-    except CapabilityError as exc:
-        raise BootError(f"required capability missing: {exc}") from exc
-    return App(
-        runtime=runtime,
-        agent=Agent(model=model, tools=tools, system_prompt=system_prompt),
-        report=report,
-    )
+        if model_policy is not None:
+            model = model_policy(model, runtime)
+            if inspect.isawaitable(model):
+                if inspect.iscoroutine(model):
+                    model.close()
+                raise BootError("model_policy must return a ModelPort synchronously")
+            if not callable(getattr(model, "stream", None)):
+                raise BootError("model_policy did not return a ModelPort")
+        return App(
+            runtime=runtime,
+            agent=Agent(model=model, tools=tools, system_prompt=system_prompt, max_turns=max_turns),
+            report=report,
+        )
+    except BaseException as exc:
+        # 策略和工具组装都发生在 start 之后；失败必须回收已发布能力。
+        try:
+            await runtime.stop()
+        except BaseException as cleanup_error:
+            exc.add_note(f"runtime cleanup failed: {cleanup_error}")
+        if not isinstance(exc, Exception) or isinstance(exc, BootError):
+            raise
+        prefix = "required capability missing" if isinstance(exc, CapabilityError) else "application assembly failed"
+        raise BootError(f"{prefix}: {exc}") from exc
 
 
 def _as_tools(value: object, capability: str) -> list:
