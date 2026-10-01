@@ -1,6 +1,8 @@
 """P4 05 应用层投影策略测试: 共享 VerificationService fake + 真实 ModelPort/MockTransport."""
 
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,7 +18,12 @@ from cicada.core.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from cicada.core.ports import ModelRequest, StreamDone, TextDelta, ToolSpec
+from cicada.core.ports import ModelRequest, StreamDone, TextDelta, ToolContext, ToolSpec
+from cicada.plugins.coding.inventory import GitInventory
+from cicada.plugins.coding.process import BoundedText, PowerShellRunner, ProcessResult
+from cicada.plugins.coding.snapshot import Snapshotter
+from cicada.plugins.coding.tool_check import CheckTool
+from cicada.plugins.coding.verification import Verifier, generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
     CheckDefinition,
     CheckReceipt,
@@ -24,6 +31,7 @@ from cicada.plugins.coding.verification_contracts import (
     VerificationPlan,
     VerificationView,
 )
+from cicada.plugins.coding.workspace import Workspace
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.fake_tools import EchoTool, fake_tools_plugin
 from cicada.plugins.ollama.model import OllamaModel
@@ -870,3 +878,159 @@ async def test_bootstrap_policy_wires_service_into_model_port():
     )
     assert "cicada-verification-state" not in repr(result.messages)
     await app.aclose()
+
+
+# --- 真实 Verifier 服务 + ModelPort 聚焦集成 ------------------------------------
+
+
+def _git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(root), *args], input=input_bytes, capture_output=True, check=True
+    ).stdout
+
+
+def _real_repo(tmp_path: Path) -> Workspace:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (root / "test_sample.py").write_text(
+        "import sample\n\n\ndef test_value():\n    assert sample.VALUE == 1\n", encoding="utf-8"
+    )
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "baseline")
+    return Workspace.create(root)
+
+
+def _real_verifier(workspace: Workspace, *checks: CheckDefinition, runner=None) -> Verifier:
+    snapshotter = Snapshotter(workspace, GitInventory(workspace))
+    plan = VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=workspace.root,
+        checks=tuple(checks),
+    )
+    return Verifier(workspace, snapshotter, runner or PowerShellRunner(), plan)
+
+
+def _scripted_result(exit_code: int, output_complete: bool) -> ProcessResult:
+    return ProcessResult(
+        exit_code=exit_code,
+        timed_out=False,
+        cancelled=False,
+        output=BoundedText(
+            text="out\n", truncated=False, total_bytes=4, total_lines=1, full_output_path=None
+        ),
+        output_complete=output_complete,
+    )
+
+
+class _ScriptedRunner:
+    """受控 runner: 只替代低层采集结果, 检查分类/回执/账本仍由真实服务计算."""
+
+    def __init__(self, result: ProcessResult | None = None, raises: bool = False) -> None:
+        self._result = result
+        self._raises = raises
+
+    async def run(self, *, command, cwd, timeout, cancel, output_dir) -> ProcessResult:
+        if self._raises:
+            raise KeyboardInterrupt
+        assert self._result is not None
+        return self._result
+
+
+async def _real_check_result(workspace: Workspace, verifier: Verifier, check_id: str) -> ToolResult:
+    capture = await verifier.initialize(CancelToken())
+    assert capture.available, (capture.failure_kind, capture.error)
+    return await CheckTool(verifier).execute(
+        {"action": "run", "check_id": check_id}, ToolContext(call_id="c1", cancel=CancelToken())
+    )
+
+
+async def _stream_with(policy: RunPolicy, model: RecordingModel, messages) -> tuple[str, list]:
+    events = [event async for event in policy.stream(ModelRequest(messages, ()), CancelToken())]
+    return model.requests[0].system_prompt, events
+
+
+async def test_real_service_receipt_survives_projection_without_latching(tmp_path):
+    """真实服务回执 id 经公开 ModelPort 投影: 账本核对通过, 不锁存且 marker 为 current."""
+    workspace = _real_repo(tmp_path)
+    verifier = _real_verifier(workspace, CheckDefinition("check-1", "exit 0"))
+    result = await _real_check_result(workspace, verifier, "check-1")
+    assert result.details["output_complete"] is True
+    assert result.details["execution_status"] == "exited"
+    assert verifier.receipts[-1].verification_status == "passed"
+
+    model = RecordingModel()
+    section, _ = await _stream_with(
+        RunPolicy(model, verifier), model, (ToolResultMessage(result=result),)
+    )
+    assert verifier.process_uncertain is False
+    assert "process_uncertain: true" not in section
+    assert f"verification_run_id: {verifier.plan.verification_run_id}" in section
+    assert f"check check-1: status=passed freshness=current" in section
+    projected = model.requests[0].messages[0].result
+    assert result.details["receipt_id"] in projected.content
+    assert "freshness=current" in projected.content
+
+
+async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path):
+    """真实服务低层 non-EOF 且 exit_code=0: 回执 blocked, 服务与投影都锁存且下一轮仍在."""
+    workspace = _real_repo(tmp_path)
+    non_eof = _ScriptedRunner(_scripted_result(exit_code=0, output_complete=False))
+    verifier = _real_verifier(workspace, CheckDefinition("check-1", "exit 0"), runner=non_eof)
+    result = await _real_check_result(workspace, verifier, "check-1")
+    receipt = verifier.receipts[-1]
+    assert receipt.verification_status == "blocked"
+    assert receipt.failure_kind == "output_incomplete"
+    assert receipt.exit_code == 0 and receipt.output_complete is False
+    # 服务先锁存 (spec §5); 投影仍独立从原始 details 得到同一保守事实 (spec §6)
+    assert verifier.process_uncertain is True
+
+    first_model = RecordingModel()
+    first_section, _ = await _stream_with(
+        RunPolicy(first_model, verifier), first_model, (ToolResultMessage(result=result),)
+    )
+    # 投影按账本核对回执: 回执自身 output_complete=False, 因此保守锁存 (与服务的锁存并存)
+    assert any("does not record a trustworthy terminal fact" in reason for reason in verifier._uncertain_reasons)
+    assert first_section.count("process_uncertain: true") == 1
+
+    # 下一轮同一历史: 锁存仍在, 不会因为已记录过而消失
+    second_model = RecordingModel()
+    second_section, _ = await _stream_with(
+        RunPolicy(second_model, verifier), second_model, (ToolResultMessage(result=result),)
+    )
+    assert "process_uncertain: true" in second_section
+    assert sum(
+        "does not record a trustworthy terminal fact" in reason for reason in verifier._uncertain_reasons
+    ) == 1
+    # 未在账本里的回执身份保守锁存, 不会被当成终结证明
+    ghost = ToolResultMessage(
+        result=ToolResult("c9", "check", "PASS", details={"receipt_id": "chk-ghost"})
+    )
+    third_model = RecordingModel()
+    await _stream_with(RunPolicy(third_model, verifier), third_model, (ghost,))
+    assert any("not in the verification ledger" in reason for reason in verifier._uncertain_reasons)
+
+
+async def test_real_service_execution_cancel_propagates_and_projection_latches(tmp_path):
+    """执行阶段取消: 服务传播取消 (不加回执), 投影对内核归一结果保守锁存."""
+    workspace = _real_repo(tmp_path)
+    verifier = _real_verifier(
+        workspace,
+        CheckDefinition("check-1", "exit 0"),
+        runner=_ScriptedRunner(raises=True),
+    )
+    capture = await verifier.initialize(CancelToken())
+    assert capture.available, (capture.failure_kind, capture.error)
+    with pytest.raises(KeyboardInterrupt):
+        await verifier.run_check("check-1", CancelToken())  # 取消仍协作传播
+    assert verifier.receipts == ()  # 取消收尾没有回执事实
+
+    # core 把 CancelledError 归一为无 details 的 error 结果 (agent.py: "cancelled during execution")
+    normalized = ToolResultMessage(
+        result=ToolResult("c1", "powershell", "cancelled during execution", is_error=True, details=None)
+    )
+    model = RecordingModel()
+    section, _ = await _stream_with(RunPolicy(model, verifier), model, (normalized,))
+    assert "process_uncertain: true" in section
+    assert any("termination failure" in reason for reason in verifier._uncertain_reasons)
