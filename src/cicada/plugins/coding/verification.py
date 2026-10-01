@@ -298,6 +298,7 @@ class Verifier:
         self._record(receipt, uncertain_before)
         self._remember_output(receipt, bounded.text)
         return receipt
+
     async def refresh(self, cancel: CancelToken) -> VerificationView:
         """捕获当前快照并重新计算 freshness; 取不到时给 unknown view, 不抛到模型循环.
 
