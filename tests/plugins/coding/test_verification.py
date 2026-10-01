@@ -194,6 +194,62 @@ async def test_code_change_after_a_pass_makes_it_stale(repo):
     assert any("stale" in reason for reason in view.blocking_reasons)
 
 
+async def test_new_path_makes_old_pass_stale_and_rechecking_current_range_recovers_it(repo):
+    verifier = await initialized(repo, passing())
+    first = await verifier.run_check("check-1", CancelToken())
+    assert first.verification_status == "passed"
+    baseline_ref = verifier.baseline_snapshot_ref
+    baseline_bytes = verifier._baseline.files["sample.py"].data
+
+    # 新增 nonignored 文件: 累计范围扩大, 旧 pass 对当前代码不再成立。
+    (repo / "brand-new.txt").write_text("new\n", encoding="utf-8")
+    stale = await verifier.refresh(CancelToken())
+    assert stale.checks[0].receipt.receipt_id == first.receipt_id
+    assert stale.checks[0].freshness == "stale"
+    assert stale.scope_id != verifier._baseline.scope_id  # 范围身份已扩大
+    assert stale.snapshot_ref != baseline_ref
+
+    # 对扩大后的**同一当前范围**重新检查通过: 必须恢复 current, 不用初始范围硬比较。
+    second = await verifier.run_check("check-1", CancelToken())
+    assert second.verification_status == "passed"
+    current = await verifier.refresh(CancelToken())
+    assert current.checks[0].receipt.receipt_id == second.receipt_id
+    assert current.checks[0].freshness == "current"
+    assert not [reason for reason in current.blocking_reasons if "check-1" in reason]
+    assert current.snapshot_ref == second.snapshot_after
+
+    # 基线仍然是启动时真实 bytes; 新路径在基线里 missing, 因此算 added 而不是改写起点。
+    assert verifier._baseline.files["sample.py"].data == baseline_bytes
+    assert "brand-new.txt" not in verifier._baseline.files
+    evidence = await verifier.finalize(CancelToken())
+    assert evidence.complete is True, evidence.error
+    by_path = {change.relative_path: change for change in evidence.changes}
+    assert by_path["brand-new.txt"].kind == "added"
+    assert by_path["brand-new.txt"].before_sha256 is None
+    assert by_path["brand-new.txt"].after_sha256
+
+
+async def test_every_check_is_compared_against_the_same_final_snapshot(repo):
+    verifier = await initialized(
+        repo, CheckDefinition("check-1", "exit 0"), CheckDefinition("check-2", "exit 0"))
+    await verifier.run_check("check-1", CancelToken())
+    (repo / "added.txt").write_text("new\n", encoding="utf-8")
+    await verifier.run_check("check-2", CancelToken())
+    grown = await verifier.refresh(CancelToken())
+    # 只有在新范围上跑过的回执才是 current; 旧回执必须 stale。
+    assert [state.freshness for state in grown.checks] == ["stale", "current"]
+
+    await verifier.run_check("check-1", CancelToken())
+    view = await verifier.refresh(CancelToken())
+    assert [state.freshness for state in view.checks] == ["current", "current"]
+    assert {state.receipt.snapshot_after for state in view.checks} == {view.snapshot_ref}
+    assert view.snapshot_ref not in (None, verifier.baseline_snapshot_ref)
+    evidence = await verifier.finalize(CancelToken())
+    assert evidence.complete is True, evidence.error
+    assert evidence.snapshot_ref == view.snapshot_ref
+    assert [change.relative_path for change in evidence.changes] == ["added.txt"]
+
+
 async def test_initialize_failure_has_no_baseline_and_leaves_checks_not_run(repo):
     (repo / "huge.bin").write_bytes(b"x" * 2048)
     _, verifier = build(repo, passing(), snapshot_limits={"max_file_bytes": 1024})

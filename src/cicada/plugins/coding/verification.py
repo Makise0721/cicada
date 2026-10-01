@@ -560,13 +560,12 @@ class Verifier:
             # 捕获失败: 报出最近已知快照身份但没有 current 回执; 这是 unknown, 不是过时事实。
             snapshot_ref = self._current_snapshot_ref
             scope_id = None
-        current_scope = scope_id or (self._baseline.scope_id if self._baseline else None)
         reasons: list[str] = []
         states: list[CheckState] = []
         for definition in self._plan.checks:
             receipt = next(
                 (r for r in reversed(self._receipts) if r.check_id == definition.check_id), None)
-            freshness = self._freshness(receipt, snapshot_ref, current_scope, capture.available)
+            freshness = self._freshness(receipt, snapshot_ref, capture.available)
             states.append(CheckState(definition.check_id, receipt, freshness))
             if receipt is None:
                 reasons.append(
@@ -602,15 +601,18 @@ class Verifier:
         self,
         receipt: CheckReceipt | None,
         snapshot_ref: str | None,
-        scope_id: str | None,
         captured: bool,
     ) -> Freshness:
-        if receipt is None or snapshot_ref is None or scope_id is None or not captured:
+        """回执对当前代码是否成立: 只比较回执自身的快照身份与当前快照.
+
+        当前快照身份已经绑定范围政策与累计范围, 因此不能拿初始 baseline 范围硬比较:
+        范围扩大后对同一当前范围重新检查通过必须能恢复 current。历史回执在内容或
+        范围变化后自然失效, 因为它的 `snapshot_after` 不再等于当前 `snapshot_ref`。
+        """
+        if receipt is None or snapshot_ref is None or not captured:
             # 无法确认当前快照时只能是 unknown: 不能把上一次已知快照当成现状。
             return "unknown"
         if receipt.snapshot_before is None or receipt.snapshot_after != snapshot_ref:
-            return "stale"
-        if self._baseline is None or scope_id != self._baseline.scope_id:
             return "stale"
         return "current"
 
