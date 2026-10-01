@@ -345,7 +345,7 @@ class Verifier:
                 error="the code changed while the change artifact was being produced",
             )
         try:
-            artifact_sha256 = _sha256_file(artifact_path)
+            observed_sha256 = _sha256_file(artifact_path)
         except OSError as exc:
             return ChangeEvidence(
                 baseline_snapshot_ref=baseline.snapshot_ref,
@@ -353,6 +353,17 @@ class Verifier:
                 changes=changes, artifact_path=artifact_path, artifact_sha256=None,
                 complete=False, failure_kind="artifact_corrupt",
                 error=f"the change artifact could not be re-read: {exc}",
+            )
+        if observed_sha256 != artifact_sha256:
+            # 保留生成时身份: 重读不一致说明工件被改写, 不能重认领新 hash 当作完整证据。
+            return ChangeEvidence(
+                baseline_snapshot_ref=baseline.snapshot_ref,
+                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
+                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
+                complete=False, failure_kind="artifact_corrupt",
+                error=(
+                    "the change artifact no longer matches the hash recorded when it was "
+                    f"written: recorded {artifact_sha256}, observed {observed_sha256}"),
             )
         return ChangeEvidence(
             baseline_snapshot_ref=baseline.snapshot_ref,
@@ -705,8 +716,8 @@ class Verifier:
     ) -> tuple[Path, str]:
         path = self._artifact_path("changes")
         written = 0
-        with open(path, "w", encoding="utf-8", newline="\n",
-                  errors="surrogateescape") as handle:
+        # 严格 UTF-8 写出: 文本 diff 只由可解码内容组成, 不会把原非法字节写成 surrogate。
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
             header = (
                 "# cicada change evidence\n"
                 f"# baseline_snapshot_ref: {baseline.snapshot_ref}\n"
@@ -718,7 +729,7 @@ class Verifier:
             written += len(header.encode("utf-8"))
             for change in changes:
                 block = _diff_block(change, baseline.files, final_bytes)
-                size = len(block.encode("utf-8", "surrogateescape"))
+                size = len(block.encode("utf-8"))
                 if written + size > DIFF_MAX_BYTES:
                     raise ValueError(
                         f"the complete change artifact would exceed {DIFF_MAX_BYTES} bytes")
@@ -881,10 +892,8 @@ def _diff_block(
         lines.append("--- textual diff not produced (binary content)")
         return "\n".join(lines) + "\n"
     before = files.get(change.relative_path)
-    before_text = (before.data if before is not None else b"").decode(
-        "utf-8-sig", "surrogateescape")
-    after_text = final_bytes.get(change.relative_path, b"").decode(
-        "utf-8-sig", "surrogateescape")
+    before_text = (before.data if before is not None else b"").decode("utf-8-sig")
+    after_text = final_bytes.get(change.relative_path, b"").decode("utf-8-sig")
     lines.extend(difflib.unified_diff(
         before_text.splitlines(keepends=False),
         after_text.splitlines(keepends=False),
@@ -896,7 +905,14 @@ def _diff_block(
 
 
 def _is_binary(data: bytes) -> bool:
-    return b"\x00" in data
+    """二进制判定: 含 NUL, 或不是合法 UTF-8(-sig); 非 UTF-8 不给伪造的文本 diff."""
+    if b"\x00" in data:
+        return True
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return True
+    return False
 
 
 def _has_bom(data: bytes) -> bool:

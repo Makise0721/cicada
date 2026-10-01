@@ -302,6 +302,52 @@ async def test_corrupted_baseline_artifact_blocks_evidence(repo):
     assert "no longer match" in evidence.error
 
 
+async def test_tampered_change_artifact_keeps_the_generation_hash_and_blocks(repo):
+    verifier = await initialized(repo, passing())
+    (repo / "sample.py").write_text("VALUE = 9\n", encoding="utf-8")
+    original = verifier._write_diff
+    generated: dict[str, object] = {}
+
+    def tampering(*args):
+        path, digest = original(*args)
+        generated["path"], generated["sha256"] = path, digest
+        path.write_bytes(b"forged artifact, no actual diff\n")
+        return path, digest
+
+    verifier._write_diff = tampering
+    evidence = await verifier.finalize(CancelToken())
+    assert evidence.complete is False
+    assert evidence.failure_kind == "artifact_corrupt"
+    # 生成时身份保留: 不把篡改后的 hash 重认领成完整证据。
+    assert evidence.artifact_sha256 is None
+    assert str(generated["sha256"]) in evidence.error
+    assert evidence.artifact_path == generated["path"]
+    assert [change.relative_path for change in evidence.changes] == ["sample.py"]
+
+    # 故障只属于这一次生成: 下一轮重新生成并通过重验才算完整证据。
+    verifier._write_diff = original
+    again = await verifier.finalize(CancelToken())
+    assert again.complete is True, again.error
+    assert again.artifact_sha256 == hashlib.sha256(
+        again.artifact_path.read_bytes()).hexdigest()
+
+
+async def test_invalid_utf8_without_nul_is_binary_and_never_a_fake_text_diff(repo):
+    verifier = await initialized(repo, passing())
+    (repo / "sample.py").write_bytes(b"\xff\xfe hello\n")
+    evidence = await verifier.finalize(CancelToken())
+    assert evidence.complete is True, evidence.error
+    change = next(c for c in evidence.changes if c.relative_path == "sample.py")
+    assert change.kind == "modified" and change.binary is True
+    assert change.before_sha256 and change.after_sha256 != change.before_sha256
+    raw = evidence.artifact_path.read_bytes()
+    # 工件本身是合法 UTF-8, 不含原非法字节, 也不含 surrogate 伪文本。
+    assert b"\xff\xfe" not in raw
+    body = raw.decode("utf-8")
+    assert "textual diff not produced (binary content)" in body
+    assert "hello" not in body
+
+
 async def test_binary_and_encoding_changes_are_reported_without_fake_text_diff(repo):
     (repo / "blob.bin").write_bytes(b"\x00\x01\x02")
     (repo / "windows.txt").write_bytes(b"line one\r\nline two\r\n")
