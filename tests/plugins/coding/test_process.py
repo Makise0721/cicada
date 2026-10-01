@@ -47,6 +47,15 @@ async def wait_pid_gone(pid: int, attempts: int = 30) -> bool:
     return not pid_alive(pid)
 
 
+async def wait_until(predicate, attempts: int = 200, interval: float = 0.05) -> bool:
+    """等条件成立, 避免与 pwsh 启动/首段输出竞态 (负载高时启动会明显变慢)."""
+    for _ in range(attempts):
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return bool(predicate())
+
+
 # --- 采集器单元行为 (不启动真实进程) ---
 
 
@@ -479,7 +488,9 @@ async def test_task_cancel_flushes_and_closes_the_artifact_handle(tmp_path, monk
             timeout=60.0,
         )
     )
-    await asyncio.sleep(1.0)
+    # 等 pwsh 真正产出首段输出再取消: 否则只测到"尚未创建工件", 不是取消收尾
+    fed = await wait_until(lambda: bool(captured) and captured[-1]._artifact_bytes > 0)
+    assert fed, "pwsh did not produce collectable output in time"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
