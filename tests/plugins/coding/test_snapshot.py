@@ -237,6 +237,92 @@ async def test_ledger_identity_is_stable_and_order_independent():
     assert PathScopeLedger(policy_id="other-policy").scope_id != PathScopeLedger().scope_id
 
 
+class _MutatingSnapshotter(Snapshotter):
+    """定位 seam: 在两次扫描之间改动 fixture, 模拟并发外部写入."""
+
+    def __init__(self, *args, mutate, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mutate = mutate
+        self.scan_count = 0
+
+    async def _scan(self, cancel, deadline):
+        result = await super()._scan(cancel, deadline)
+        self.scan_count += 1
+        if self.scan_count == 1:
+            self.mutate(self.workspace.root)
+        return result
+
+
+async def _capture_with_mutation(repo, mutate):
+    workspace = Workspace.create(repo)
+    snap = _MutatingSnapshotter(workspace, GitInventory(workspace), mutate=mutate)
+    return await snap.capture(CancelToken())
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda root: (root / "a.txt").unlink(), id="deleted"),
+        # 同长度不同内容: 只有 hash 变化也必须拒绝。
+        pytest.param(lambda root: (root / "a.txt").write_text("two"), id="hash_only"),
+        pytest.param(lambda root: (root / "a.txt").write_text("much longer"), id="length"),
+    ],
+)
+async def test_any_two_scan_difference_is_unavailable(repo, mutate):
+    (repo / "a.txt").write_text("one", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    capture = await _capture_with_mutation(repo, mutate)
+    assert not capture.available
+    assert capture.failure_kind == "unstable"
+    assert capture.snapshot is None
+
+
+async def test_observed_paths_survive_a_failed_capture_and_later_ignore(repo):
+    (repo / "small.txt").write_text("x", encoding="utf-8")
+    git(repo, "add", "small.txt")
+    (repo / "big.txt").write_bytes(b"y" * 21)
+    snap = make(repo, max_file_bytes=20)
+    failed = await snap.capture(CancelToken())
+    assert not failed.available and failed.failure_kind == "file_limit"
+    # 清单已经可靠看到 big.txt: 内容读取失败不回滚这一观察, 失败捕获不给半份快照。
+    assert snap.ledger.paths == ("big.txt", "small.txt")
+
+    # 后续把它改成 ignored 也不能让已观察路径退出检查范围。
+    (repo / ".gitignore").write_text("big.txt\n", encoding="utf-8")
+    still_failing = await snap.capture(CancelToken())
+    assert not still_failing.available and still_failing.failure_kind == "file_limit"
+    assert "big.txt" in snap.ledger.paths
+
+    # 文件真的不再超限 (删除) 才能重新建立可用快照: 路径仍以 tombstone 参与比较。
+    (repo / "big.txt").unlink()
+    recovered = await snap.capture(CancelToken())
+    entries = entries_of(recovered)
+    assert entries["big.txt"].exists is False
+    assert entries["big.txt"].sha256 is None and entries["big.txt"].size_bytes is None
+    assert snap.ledger.paths == (".gitignore", "big.txt", "small.txt")
+
+
+async def test_snapshot_ref_binds_policy_and_accumulated_range_identity(repo):
+    (repo / "a.txt").write_text("one", encoding="utf-8")
+    git(repo, "add", "a.txt")
+    default = await make(repo).capture(CancelToken())
+    other_policy = await make(
+        repo, ledger=PathScopeLedger(policy_id="other-policy")).capture(CancelToken())
+    assert default.available and other_policy.available
+    # 相同文件内容、不同范围政策不是同一个快照身份。
+    assert default.snapshot.entries == other_policy.snapshot.entries
+    assert default.snapshot.scope_id != other_policy.snapshot.scope_id
+    assert default.snapshot.snapshot_ref != other_policy.snapshot.snapshot_ref
+
+    # 排除名单同样进入身份: 相同 entries、不同政策范围不是同一个 ref。
+    other_exclusions = await make(
+        repo, ledger=PathScopeLedger(exclusions=("custom/",))).capture(CancelToken())
+    assert other_exclusions.available
+    assert other_exclusions.snapshot.entries == default.snapshot.entries
+    assert other_exclusions.snapshot.scope_id != default.snapshot.scope_id
+    assert other_exclusions.snapshot.snapshot_ref != default.snapshot.snapshot_ref
+
+
 async def test_snapshot_plugin_resolves_at_real_bootstrap(repo):
     from cicada.boot import bootstrap
     from cicada.core.ports import StreamDone

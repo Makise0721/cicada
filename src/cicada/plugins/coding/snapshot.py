@@ -1,10 +1,12 @@
 """P4 §4 有界代码快照: 单调累计路径账本、两次独立全量扫描、内容 SHA-256 身份.
 
 账本记录**本 run 曾观察到**的全部 Git 可见路径: 已见路径后来被删除或改为 ignored
-仍留在账本并按 tombstone/missing 比较, 所以路径不能靠改 ignore 规则消失。
+仍留在账本并按 tombstone/missing 比较, 所以路径不能靠改 ignore 规则消失。清单一旦
+可靠返回, 已验证路径立即进入账本; 后续内容读取失败不回滚这一观察, 与"本次捕获是否
+产生可用快照"分开记录。
 一次捕获做两次独立全量扫描并用同一账本比较: 只有两次观察到的路径集合相同、
-候选原始路径上没有 reparse 祖先/gitlink、每个文件内容前后一致、且总预算未超,
-才给出不可变 `Snapshot`; 否则 `available=False`, 不回退到半份快照。
+候选原始路径上没有 reparse 祖先/gitlink、每个文件的存在状态与内容前后一致、且
+总预算未超, 才给出不可变 `Snapshot`; 否则 `available=False`, 不回退到半份快照。
 
 这是 checkpoint 一致性检查, 不是操作系统原子快照, 也不能证明检查期间没有发生
 "短暂修改后还原"; 它面向单 Agent、无并发修改的验收工作区。
@@ -146,20 +148,26 @@ class Snapshotter:
         if len(first.observed_paths) > self.max_paths:
             return _unavailable(
                 "path_limit", f"snapshot exceeds {self.max_paths} ledger paths")
+        for path in first.observed_paths:
+            # 存在状态、长度、内容 hash 任意一项不一致都说明本次捕获不稳定:
+            # 不接受"以第二次为准"的半份替代, 也不回退到其中一次扫描。
+            if first.observations[path] != second.observations[path]:
+                return _unavailable(
+                    "unstable",
+                    "the two full scans disagree on the existence, length or content "
+                    f"of {path}")
         entries = tuple(
             first.observations[path]
-            if first.observations[path] == second.observations[path]
-            # 内容/存在状态两次不一致: 读取前后已 stat 校验, 这里再以第二次为准并标记
-            else _unstable_entry(first.observations[path], second.observations[path])
             for path in sorted(first.observations, key=lambda path: (path.casefold(), path))
         )
-        if any(entry.sha256 is None and entry.exists for entry in entries):
-            return _unavailable("unstable", "file content changed between the two snapshot scans")
-        # 只有两次扫描一致才提交账本, 失败捕获不留下半份范围。
-        self.ledger.observe(first.observed_paths)
         return SnapshotCapture(
             snapshot=Snapshot(
-                snapshot_ref=snapshot_ref(entries),
+                snapshot_ref=snapshot_ref(
+                    entries,
+                    policy_id=self.ledger.policy_id,
+                    exclusions=self.ledger.exclusions,
+                    scope_id=self.ledger.scope_id,
+                ),
                 scope_id=self.ledger.scope_id,
                 root=first.root,
                 entries=entries,
@@ -172,19 +180,25 @@ class Snapshotter:
         self._checkpoint(cancel, deadline)
         inventory = await self._inventory(cancel)
         observed: set[str] = set()
-        for index, entry in enumerate(inventory.files):
-            if index % _CHECKPOINT_EVERY == 0:
-                await asyncio.sleep(0)
-                self._checkpoint(cancel, deadline)
-            if entry.is_submodule:
-                raise _CaptureError("submodule", f"scope contains a submodule: {entry.relative_path}")
-            if entry.is_reparse:
-                raise _CaptureError(
-                    "reparse",
-                    f"scope path crosses a reparse point: {entry.reparse_paths[0] if entry.reparse_paths else entry.relative_path}",
-                )
-            _validate_relative_path(entry.relative_path)
-            observed.add(entry.relative_path)
+        try:
+            for index, entry in enumerate(inventory.files):
+                if index % _CHECKPOINT_EVERY == 0:
+                    await asyncio.sleep(0)
+                    self._checkpoint(cancel, deadline)
+                if entry.is_submodule:
+                    raise _CaptureError("submodule", f"scope contains a submodule: {entry.relative_path}")
+                if entry.is_reparse:
+                    raise _CaptureError(
+                        "reparse",
+                        f"scope path crosses a reparse point: {entry.reparse_paths[0] if entry.reparse_paths else entry.relative_path}",
+                    )
+                _validate_relative_path(entry.relative_path)
+                observed.add(entry.relative_path)
+        finally:
+            # 清单一旦可靠返回, 已验证路径立即单调进入账本: 后续内容读取失败或被改
+            # ignored 都不能让"本 run 曾观察到"的路径退出范围。账本累计与"本次捕获
+            # 是否产生可用证据"是两件事, 失败捕获不再回滚范围观察。
+            self.ledger.observe(frozenset(observed))
         observed |= set(self.ledger.paths)
         observations: dict[str, SnapshotEntry] = {}
         total_bytes = 0
@@ -295,11 +309,6 @@ def _unavailable(kind: str, message: str) -> SnapshotCapture:
     return SnapshotCapture(snapshot=None, failure_kind=kind, error=message)
 
 
-def _unstable_entry(first: SnapshotEntry, second: SnapshotEntry) -> SnapshotEntry:
-    """两次扫描不一致的记录: 内容身份作废, 只保留第二次的存在状态与长度."""
-    return SnapshotEntry(first.relative_path, second.exists, second.size_bytes, None)
-
-
 def _is_reparse(info) -> bool:
     return stat.S_ISLNK(info.st_mode) or bool(
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
@@ -334,10 +343,20 @@ def _feed(digest: "hashlib._Hash", *fields: object) -> None:
         digest.update(payload)
 
 
-def snapshot_ref(entries: tuple[SnapshotEntry, ...]) -> str:
-    """schema 版本分隔后的记录序列 SHA-256; 稳定排序, 与扫描顺序无关."""
+def snapshot_ref(
+    entries: tuple[SnapshotEntry, ...],
+    *,
+    policy_id: str,
+    exclusions: tuple[str, ...],
+    scope_id: str,
+) -> str:
+    """schema 版本分隔后的记录序列 SHA-256; 稳定排序, 与扫描顺序无关.
+
+    身份同时绑定策略、排除名单与累计范围 (scope_id): 同一份文件内容在不同范围政策
+    或不同累计路径集合下不是同一个快照, 所以 `snapshot_ref` 不能只由 entries 决定。
+    """
     digest = hashlib.sha256()
-    _feed(digest, "cicada-snapshot", SCHEMA_VERSION)
+    _feed(digest, "cicada-snapshot", SCHEMA_VERSION, policy_id, exclusions, scope_id)
     for entry in entries:
         _feed(
             digest,
