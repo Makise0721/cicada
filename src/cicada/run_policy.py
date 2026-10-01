@@ -3,14 +3,20 @@
 只构造发给模型的投影, 不修改内核会话记录, 不从输出文字推断成功或进程终结:
 
 - 每轮先按 check/powershell 的**终结点事实** (details/receipt) 扫描原始历史, 超时/取消/
-  非 EOF/缺少可靠 details 的异常结果保守调用 `mark_process_uncertain`, 单调锁存.
+  非 EOF/缺少可靠终结事实的异常结果保守调用 `mark_process_uncertain`, 单调锁存.
+  可靠的 `output_complete=False` (非 EOF drain) 独立锁存, 不因 exit_code=0 放行.
 - 再 `refresh` 取得不可变 `VerificationView`, 构造 ≤4096 UTF-8 bytes 的系统状态段,
   追加在原有 system prompt 之后 (不改原提示词).
-- 历史 check 结果按程序唯一 `receipt_id` 关联 `view.receipts` (不按模型 call_id),
-  原文一字不改, 只在末尾追加一行有界 freshness 标记; 缺失可靠身份的保守标 `unknown`.
-  工具调用的 id/name/配对顺序和消息对象本身都不重写.
+- 历史 check 结果的回执身份只在 `refresh` 之后按程序唯一 `receipt_id` 核对
+  `view.receipts` (不按模型 call_id): 账本里找不到, 或回执自身没有可靠终结事实,
+  都保守锁存; 存在 receipt_id 字符串不是跳过核对的理由.
+- 原文一字不改, 只按账本在末尾追加一行有界 freshness 标记; 缺失可靠身份的保守标
+  `unknown`. 工具调用的 id/name/配对顺序和消息对象本身都不重写.
 
-未从模型可见文字解析任何“通过/完成”信号; 这是 bytes 保护, 不是 token 预算或 compaction.
+未从模型可见文字解析任何“通过/完成”信号。文字只用于识别程序自己写的
+**执行前/启动失败**哨兵 (内核在调用工具之前就拒绝, 或命令根本没起来), 这些结果与进程
+终结无关, 不锁存; 其余无可靠终结事实的异常一律保守锁存。这是 bytes 保护, 不是 token
+预算或 compaction.
 """
 
 from __future__ import annotations
@@ -37,6 +43,20 @@ CHECK_TOOL_NAME = "check"
 PROCESS_TOOL_NAME = "powershell"
 FRESHNESS_TOOLS = frozenset({CHECK_TOOL_NAME, PROCESS_TOOL_NAME})
 
+# 程序自己写的哨兵: 内核在调用工具**之前**就拒绝, 进程不可能起来.
+PRE_EXECUTION_MARKERS = (
+    "cancelled before execution",
+    "unknown tool:",
+    "invalid arguments JSON:",
+    "arguments must be a JSON object",
+    "arguments failed validation:",
+    "model output truncated; tool call not executed",
+)
+# 命令根本没起来 (明确的启动失败), 与"进程终止未证"是不同事实.
+LAUNCH_FAILURE_MARKERS = ("pwsh executable not found on PATH",)
+# 工具执行阶段抛错/被取消: 进程可能已经起来且没有可靠的终结事实.
+_EXECUTION_FAILURE_MARKERS = ("tool raised:", "cancelled during execution")
+
 
 @dataclass(frozen=True)
 class RunPolicyConfig:
@@ -58,6 +78,7 @@ class _ToolFacts:
     """一条 check/powershell 工具结果里可用于判定的结构化事实."""
 
     tool: str
+    is_error: bool
     has_details: bool
     receipt_id: str | None
     output_complete: bool | None
@@ -65,12 +86,37 @@ class _ToolFacts:
     cancelled: bool
     exit_code: int | None
     error_text: str
-    process_started: bool
 
     @property
     def termination_known(self) -> bool:
-        """是否有可靠的终结事实: 明确记录过退出码且未超时/取消."""
-        return self.exit_code is not None and not self.timed_out and not self.cancelled
+        """是否有可靠的终结事实: 记录了退出码且采集到 EOF, 未超时/取消."""
+        return (
+            self.output_complete is True
+            and not self.timed_out
+            and not self.cancelled
+            and self.exit_code is not None
+        )
+
+    @property
+    def process_not_started(self) -> bool:
+        """是否有程序自证的执行前/启动失败事实: 与进程终结无关, 不锁存."""
+        text = self.error_text
+        return _starts_with_any(text, PRE_EXECUTION_MARKERS) or _starts_with_any(
+            text, LAUNCH_FAILURE_MARKERS
+        )
+
+    @property
+    def execution_failure(self) -> bool:
+        return _starts_with_any(self.error_text, _EXECUTION_FAILURE_MARKERS)
+
+
+@dataclass(frozen=True)
+class _TerminalScan:
+    """一次历史扫描的结果: 立即锁存的原因 + 留待账本核对的回执身份."""
+
+    reasons: tuple[str, ...]
+    deferred_receipts: tuple[tuple[str, str], ...]  # (tool, receipt_id)
+
 
 
 def verification_policy(
@@ -104,8 +150,13 @@ class RunPolicy:
         if cancel.cancelled:
             yield StreamDone("aborted")
             return
-        self._scan_terminal_facts(request.messages)
+        scan = _scan_terminal_facts(request.messages)
+        for reason in scan.reasons:
+            self.service.mark_process_uncertain(reason)
         view = await self.service.refresh(cancel)
+        # 回执身份只能在 refresh 之后核对真实账本; 未知/不可信一律保守锁存
+        for reason in _reconcile_receipts(scan, view):
+            self.service.mark_process_uncertain(reason)
         projected = ModelRequest(
             messages=tuple(_project_message(message, view, self.config) for message in request.messages),
             tools=request.tools,
@@ -115,16 +166,67 @@ class RunPolicy:
             yield event
 
     def _scan_terminal_facts(self, messages: tuple[Message, ...]) -> None:
-        """按终结点事实保守锁存 process_uncertain; 只读结构化字段, 不解析输出文字."""
-        for message in messages:
-            if not isinstance(message, ToolResultMessage):
-                continue
-            facts = _tool_facts(message)
-            if facts is None:
-                continue
-            reason = _uncertain_reason(facts)
-            if reason is not None:
-                self.service.mark_process_uncertain(reason)
+        """按终结点事实保守锁存 process_uncertain (账本可核对的部分留给 refresh 之后)."""
+        scan = _scan_terminal_facts(messages)
+        for reason in scan.reasons:
+            self.service.mark_process_uncertain(reason)
+
+
+def _scan_terminal_facts(messages: tuple[Message, ...]) -> _TerminalScan:
+    """只读结构化字段, 逐条判定立即锁存或留待账本核对; 不解析任意输出文字."""
+    reasons: list[str] = []
+    deferred: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, ToolResultMessage):
+            continue
+        facts = _tool_facts(message)
+        if facts is None:
+            continue
+        deferred_receipt = _deferred_receipt_id(facts)
+        if deferred_receipt is not None:
+            deferred.append((facts.tool, deferred_receipt))
+            continue
+        reason = _uncertain_reason(facts)
+        if reason is not None:
+            reasons.append(reason)
+    return _TerminalScan(reasons=tuple(reasons), deferred_receipts=tuple(deferred))
+
+
+def _reconcile_receipts(scan: _TerminalScan, view: VerificationView) -> tuple[str, ...]:
+    """按账本核对回执身份: 找不到回执或回执自身终结不可信时保守锁存."""
+    if not scan.deferred_receipts:
+        return ()
+    index: dict[str, CheckReceipt] = {}
+    for receipt in view.receipts:
+        if not isinstance(receipt, CheckReceipt) or not isinstance(receipt.receipt_id, str):
+            continue
+        index[receipt.receipt_id] = receipt  # 重复身份无法分辨最近一次尝试
+    reasons: list[str] = []
+    for tool, receipt_id in scan.deferred_receipts:
+        receipt = index.get(receipt_id)
+        if receipt is None:
+            reasons.append(
+                f"{tool} result receipt_id is not in the verification ledger; termination unproven"
+            )
+        elif not _receipt_terminates(receipt):
+            reasons.append(
+                f"{tool} result receipt {receipt_id} does not record a trustworthy terminal fact "
+                "in the verification ledger"
+            )
+    return tuple(reasons)
+
+
+def _receipt_terminates(receipt: CheckReceipt) -> bool:
+    """回执自身是否有可靠终结事实; 启动失败属于程序记录的明确事实, 与终结未知不同."""
+    if receipt.cancelled or receipt.timed_out:
+        return False
+    if receipt.execution_status == "launch_failed":
+        return receipt.exit_code is None
+    return (
+        receipt.execution_status == "exited"
+        and receipt.output_complete is True
+        and receipt.exit_code is not None
+    )
 
 
 def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
@@ -132,54 +234,72 @@ def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
     if result.name not in FRESHNESS_TOOLS:
         return None
     details = result.details if isinstance(result.details, dict) else None
+    error_text = result.content if result.is_error else ""
     if details is None:
         return _ToolFacts(
             tool=result.name,
+            is_error=result.is_error,
             has_details=False,
             receipt_id=None,
             output_complete=None,
             timed_out=False,
             cancelled=False,
             exit_code=None,
-            error_text=result.content if result.is_error else "",
-            process_started=False,
+            error_text=error_text,
         )
     receipt_id = details.get("receipt_id")
-    pid = details.get("pid")
+    output_complete = details.get("output_complete")
+    exit_code = details.get("exit_code")
     return _ToolFacts(
         tool=result.name,
+        is_error=result.is_error,
         has_details=True,
         receipt_id=receipt_id if isinstance(receipt_id, str) and receipt_id else None,
-        output_complete=details.get("output_complete"),
+        output_complete=output_complete if isinstance(output_complete, bool) else None,
         timed_out=details.get("timed_out") is True,
         cancelled=details.get("cancelled") is True,
-        exit_code=details.get("exit_code"),
-        error_text=result.content if result.is_error else "",
-        process_started=details.get("process_started") is True
-        or (isinstance(pid, int) and not isinstance(pid, bool)),
+        exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+        error_text=error_text,
     )
 
 
+def _deferred_receipt_id(facts: _ToolFacts) -> str | None:
+    """该结果只能用真实账本核对终结事实时, 返回它的回执身份.
+
+    已经由 runner 直接记录的未终结事实 (超时/取消/执行异常) 不需要账本, 立即锁存;
+    程序自证的执行前/启动失败与进程终结无关, 也不锁存。
+    """
+    if facts.receipt_id is None:
+        return None
+    if facts.timed_out or facts.cancelled or facts.execution_failure:
+        return None
+    return None if facts.process_not_started else facts.receipt_id
+
+
 def _uncertain_reason(facts: _ToolFacts) -> str | None:
-    """返回需要锁存的保守原因; 无可靠终结事实的异常结果才锁存."""
+    """返回需要立即锁存的保守原因; 无可靠终结事实且进程可能已启动才锁存."""
     if facts.timed_out:
         return f"{facts.tool} timed out before EOF"
     if facts.cancelled:
         return f"{facts.tool} was cancelled; process termination unproven"
-    if facts.receipt_id is not None:
-        return None  # 程序通过 check 工具给出回执身份: 事实由回执账本承载
-    if not facts.has_details:
-        return f"{facts.tool} result has no structured details; termination unproven"
-    if _kill_marker(facts.error_text):
+    if facts.process_not_started:
+        return None  # 程序自证的执行前/启动失败: 与进程终结无关
+    if facts.execution_failure:
         return f"{facts.tool} result reports a termination failure"
-    if not facts.termination_known and facts.output_complete is False:
-        return f"{facts.tool} ended without a complete terminal fact"
+    if not facts.has_details:
+        if facts.is_error:
+            return f"{facts.tool} result has no structured details; termination unproven"
+        return None
+    # 非 EOF drain 的事实独立于退出码: exit_code=0 不能抵消 output_complete=false
+    if facts.output_complete is False:
+        return f"{facts.tool} ended without reaching EOF; termination unproven"
+    if not facts.termination_known and facts.is_error:
+        return f"{facts.tool} error carries no trustworthy terminal fact"
     return None
 
 
-def _kill_marker(text: str) -> bool:
-    """终结点哨兵: 只认程序自己写的结构化前缀, 不做任意文字猜测."""
-    return text.startswith("tool raised:") or text.startswith("cancelled during execution")
+def _starts_with_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(text.startswith(marker) for marker in markers)
 
 
 def _project_message(message: Message, view: VerificationView | None, config: RunPolicyConfig) -> Message:

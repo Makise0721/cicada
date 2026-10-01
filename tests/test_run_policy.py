@@ -64,17 +64,20 @@ class FakeVerificationService:
         self.run_check_calls.append(check_id)
         raise AssertionError("投影不执行检查")
 
-    async def refresh(self, cancel: CancelToken) -> VerificationView:
-        self.refresh_calls.append(cancel)
-        return self.view
-
     def mark_process_uncertain(self, reason: str) -> None:
+        if reason in self.uncertain_reasons:  # 真实服务同样按 reason 去重 (单调)
+            return
         self.uncertain_reasons.append(reason)
+        # 真实服务由 mark 后的 refresh 反映锁存; fake 同样在 refresh 时重建 view
         self.view = replace(
             self.view,
             process_uncertain=True,
             blocking_reasons=self.view.blocking_reasons + (reason,),
         )
+
+    async def refresh(self, cancel: CancelToken) -> VerificationView:
+        self.refresh_calls.append(cancel)
+        return self.view
 
     async def finalize(self, cancel: CancelToken):
         raise AssertionError("投影不生成交付证据")
@@ -390,6 +393,55 @@ async def test_original_message_objects_are_not_rewritten():
     assert request.system_prompt == "sys"
 
 
+async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
+    """锁存路径同样不得改写原消息: id/name/顺序/正文一字不改, 只追加投影 marker."""
+    view = make_view()  # 空账本: 所有 check 回执都是 unknown
+    messages = (
+        UserMessage(text="task"),
+        AssistantMessage(text="", tool_calls=(ToolCall("c1", "powershell", '{"command":"x"}'),)),
+        ToolResultMessage(
+            result=ToolResult(
+                "c1",
+                "powershell",
+                "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]",
+                details={"exit_code": 0, "timed_out": False, "cancelled": False, "output_complete": False},
+            )
+        ),
+        check_result("c2", "check body", receipt_id="ghost"),
+    )
+    service = FakeVerificationService(view)
+    model = RecordingModel()
+    policy = RunPolicy(model, service)
+    request = ModelRequest(messages=messages, tools=(), system_prompt="rules")
+    async for _ in policy.stream(request, CancelToken()):
+        pass
+    assert len(service.uncertain_reasons) == 2  # 两条都保守锁存
+
+    projected = model.requests[0]
+    bodies = [m.result for m in projected.messages if isinstance(m, ToolResultMessage)]
+    assert [r.call_id for r in bodies] == ["c1", "c2"]
+    assert [r.name for r in bodies] == ["powershell", "check"]
+    assert bodies[0].content.startswith(
+        "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]"
+        "\nCicada freshness: stale=true freshness=unknown tool=powershell"
+    )
+    assert bodies[1].content.startswith(
+        "check body\nCicada freshness: stale=true freshness=unknown tool=check"
+    )
+    assert bodies[1].details == {"receipt_id": "ghost"}
+    # 原消息对象与传入请求都不被重写
+    assert messages[2].result.content == "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]"
+    assert messages[2].result.details == {
+        "exit_code": 0,
+        "timed_out": False,
+        "cancelled": False,
+        "output_complete": False,
+    }
+    assert messages[3].result.content == "check body"
+    assert request.messages[2].result.content == messages[2].result.content
+    assert request.system_prompt == "rules"
+
+
 async def test_missing_structured_receipt_is_unknown_and_latched_conservatively():
     view = make_view()
     detail_less = ToolResultMessage(
@@ -477,7 +529,169 @@ async def test_non_eof_and_missing_details_errors_latch_but_plain_errors_do_not(
     assert len(service.uncertain_reasons) == 3
     assert "no structured details" in service.uncertain_reasons[0]
     assert "termination failure" in service.uncertain_reasons[1]
-    assert "complete terminal fact" in service.uncertain_reasons[2]
+    assert "without reaching EOF" in service.uncertain_reasons[2]
+
+
+async def test_reliable_non_eof_latches_even_with_exit_code_zero():
+    """S3 反例: exit_code=0 不能抵消可靠的 output_complete=false."""
+    service = FakeVerificationService(make_view())
+    result = ToolResultMessage(
+        result=ToolResult(
+            "c1",
+            "powershell",
+            "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]",
+            details={"exit_code": 0, "timed_out": False, "cancelled": False, "output_complete": False},
+        )
+    )
+    request, _ = await projected_request(service, (result,))
+    assert service.uncertain_reasons == [
+        "powershell ended without reaching EOF; termination unproven"
+    ]
+    # 锁存发生在 refresh 之前, 同一轮系统状态段已含 process_uncertain
+    assert "process_uncertain: true" in request.system_prompt
+
+
+async def test_unknown_receipt_id_never_skips_ledger_check():
+    """S3 反例: 只要 details 里有 receipt_id 字符串就跳过终结核对是不成立的."""
+    ghost = ToolResultMessage(
+        result=ToolResult(
+            "c1",
+            "check",
+            "check output",
+            is_error=True,
+            details={"receipt_id": "ghost", "timed_out": False, "output_complete": False},
+        )
+    )
+    service = FakeVerificationService(make_view())
+    request, _ = await projected_request(service, (ghost,))
+    assert service.uncertain_reasons == [
+        "check result receipt_id is not in the verification ledger; termination unproven"
+    ]
+    # 账本核对在 refresh 之后: 锁存从下一轮投影起可见, 且不可被后续 PASS 清除
+    next_request, _ = await projected_request(service, (ghost,))
+    assert "process_uncertain: true" in next_request.system_prompt
+    assert service.uncertain_reasons == [
+        "check result receipt_id is not in the verification ledger; termination unproven"
+    ]
+
+
+async def test_structured_generic_error_without_terminal_fields_latches_conservatively():
+    """F13 反例: 存在 details 字典不是终结证明; 缺可靠字段的 error 保守锁存."""
+    service = FakeVerificationService(make_view())
+    messages = tuple(
+        ToolResultMessage(result=ToolResult(f"c{i}", "powershell", "boom", is_error=True, details=details))
+        for i, details in enumerate(
+            (
+                {},
+                {"exit_code": None},
+                {"exit_code": True, "output_complete": True},
+                {"exit_code": "0", "output_complete": True},
+                {"exit_code": 0},
+            ),
+            start=1,
+        )
+    ) + (
+        ToolResultMessage(
+            result=ToolResult("c6", "check", "blocked", is_error=True, details={"receipt_id": "ghost"})
+        ),
+    )
+    await projected_request(service, messages)
+    # 每条都锁存; 服务按 reason 去重, 因此同一原因在账本里只留一条
+    assert service.uncertain_reasons == [
+        "powershell error carries no trustworthy terminal fact",
+        "check result receipt_id is not in the verification ledger; termination unproven",
+    ]
+
+
+async def test_trustworthy_terminal_facts_stay_clean():
+    """保留既定行为: 正常0/正常非零完整/合法启动失败/执行前拒绝都不锁存."""
+    service = FakeVerificationService(make_view())
+    messages = (
+        ToolResultMessage(
+            result=ToolResult(
+                "c1", "powershell", "ok", details={"exit_code": 0, "timed_out": False, "cancelled": False, "output_complete": True}
+            )
+        ),
+        ToolResultMessage(
+            result=ToolResult(
+                "c2", "powershell", "exit 1", is_error=True, details={"exit_code": 1, "timed_out": False, "cancelled": False, "output_complete": True}
+            )
+        ),
+        ToolResultMessage(
+            result=ToolResult("c3", "powershell", "pwsh executable not found on PATH", is_error=True, details=None)
+        ),
+        ToolResultMessage(result=ToolResult("c4", "powershell", "unknown tool: powershell", is_error=True, details=None)),
+        ToolResultMessage(result=ToolResult("c5", "powershell", "cancelled before execution", is_error=True, details=None)),
+        ToolResultMessage(result=ToolResult("c6", "powershell", "arguments failed validation: nope", is_error=True, details=None)),
+    )
+    request, _ = await projected_request(service, messages)
+    assert service.uncertain_reasons == []
+    assert "process_uncertain: true" not in request.system_prompt
+
+
+async def test_known_receipt_in_ledger_resolves_check_identity():
+    """正例: 账本里能找到且自身终结可信的回执不需要锁存."""
+    passed = make_receipt("r-1")
+    view = make_view(states=(CheckState("check-1", receipt=passed, freshness="current"),), receipts=(passed,))
+    service = FakeVerificationService(view)
+    result = check_result("c1", "PASS", receipt_id="r-1")
+    request, _ = await projected_request(service, (result,))
+    assert service.uncertain_reasons == []
+    assert "freshness=current" in check_messages(request)[0].result.content
+
+
+async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
+    """通用 powershell 结果同样按账本核对回执身份, 不因工具名不同而跳过."""
+    passed = make_receipt("r-1")
+    view = make_view(states=(CheckState("check-1", receipt=passed, freshness="current"),), receipts=(passed,))
+    service = FakeVerificationService(view)
+    known = ToolResultMessage(
+        result=ToolResult("c1", "powershell", "out", details={"receipt_id": "r-1"})
+    )
+    request, _ = await projected_request(service, (known,))
+    assert service.uncertain_reasons == []
+    assert check_messages(request)[0].result.content.startswith("out\nCicada freshness: stale=false freshness=current")
+
+    ghost = ToolResultMessage(
+        result=ToolResult("c2", "powershell", "out", details={"receipt_id": "ghost"})
+    )
+    service_ghost = FakeVerificationService(make_view())
+    ghost_request, _ = await projected_request(service_ghost, (ghost,))
+    assert len(service_ghost.uncertain_reasons) == 1
+    assert "not in the verification ledger" in service_ghost.uncertain_reasons[0]
+    assert "freshness=unknown" in check_messages(ghost_request)[0].result.content
+
+
+async def test_receipt_in_ledger_without_terminal_fact_still_latches():
+    """账本里有回执, 但回执自身记录非 EOF: 仍然锁存, 不被 receipt_id 抵消."""
+    incomplete = replace(
+        make_receipt("r-1"),
+        output_complete=False,
+        verification_status="blocked",
+        failure_kind="output_incomplete",
+    )
+    view = make_view(states=(CheckState("check-1", receipt=incomplete, freshness="current"),), receipts=(incomplete,))
+    service = FakeVerificationService(view)
+    result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True)
+    await projected_request(service, (result,))
+    assert len(service.uncertain_reasons) == 1
+    assert "trustworthy terminal fact" in service.uncertain_reasons[0]
+
+
+async def test_launch_failed_receipt_is_a_known_failure_not_unknown_termination():
+    """合法启动失败由程序记录, 不属于"进程终结未知"."""
+    launched = replace(
+        make_receipt("r-1", status="blocked"),
+        execution_status="launch_failed",
+        exit_code=None,
+        output_complete=False,
+        failure_kind="launch_failed",
+    )
+    view = make_view(states=(CheckState("check-1", receipt=launched, freshness="current"),), receipts=(launched,))
+    service = FakeVerificationService(view)
+    result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True)
+    await projected_request(service, (result,))
+    assert service.uncertain_reasons == []
 
 
 async def test_success_text_does_not_clear_latched_uncertainty_and_successes_are_not_latched():
@@ -494,11 +708,13 @@ async def test_success_text_does_not_clear_latched_uncertainty_and_successes_are
     assert "process_uncertain: true" in request.system_prompt
 
 
-async def test_check_receipt_identity_is_not_treated_as_unknown_termination():
+async def test_check_receipt_identity_alone_does_not_decide_termination():
+    """receipt_id 只是待核对身份: 账本里没有它就不能跳过终结核对."""
     service = FakeVerificationService(make_view())
     result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True, extra={"output_complete": False})
     await projected_request(service, (result,))
-    assert service.uncertain_reasons == []  # 事实由回执账本承载
+    assert len(service.uncertain_reasons) == 1
+    assert "not in the verification ledger" in service.uncertain_reasons[0]
 
 
 async def test_policy_scans_before_refresh_and_uses_one_view_per_stream():
