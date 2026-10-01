@@ -275,6 +275,41 @@ async def test_k_projection_marks_the_receipt_current_and_stale_by_program_ledge
     assert "freshness=stale" in inner.requests[2].system_prompt
 
 
+async def test_k_projection_marks_a_recheck_current_after_the_range_grows(repo):
+    """跨层 (V 修复 + 05 发布后): 新增范围让投影转 stale, 在新范围重检通过又转回 current."""
+    from cicada.core.ports import ModelRequest
+    from cicada.plugins.fake_model import FakeModel
+    from cicada.run_policy import RunPolicy
+
+    workspace = Workspace.create(repo)
+    snapshotter = Snapshotter(workspace, GitInventory(workspace))
+    plan = VerificationPlan("vrun-k2", workspace.root, (passing(),))
+    verifier = Verifier(workspace, snapshotter, PowerShellRunner(), plan)
+    assert (await verifier.initialize(CancelToken())).available
+    tool = CheckTool(verifier)
+    inner = FakeModel([[StreamDone("stop")] for _ in range(3)])
+    policy = RunPolicy(inner, verifier)
+
+    async def projected(result):
+        request = ModelRequest(messages=(ToolResultMessage(result=result),), tools=())
+        async for _event in policy.stream(request, CancelToken()):
+            pass
+        return inner.requests[-1].messages[0].result.content
+
+    first = await call(tool, {"action": "run", "check_id": "check-1"})
+    assert "freshness=current" in await projected(first)
+
+    (repo / "added.txt").write_text("new\n", encoding="utf-8")
+    assert "freshness=stale" in await projected(first)
+
+    second = await call(tool, {"action": "run", "check_id": "check-1"})
+    assert second.details["freshness"] == "current"
+    # 投影按程序账本重新形成 freshness: 同一当前范围重检通过能恢复 current。
+    assert "freshness=current" in await projected(second)
+    assert second.details["snapshot_ref"] != first.details["snapshot_ref"]
+    assert second.details["snapshot_ref"] == second.details["snapshot_after"]
+
+
 async def test_check_tool_runs_through_bootstrap_agent_loop_without_model_text_evidence(repo):
     from cicada.boot import bootstrap
     from cicada.plugins.coding.inventory import inventory_plugin
