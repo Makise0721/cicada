@@ -72,7 +72,10 @@ def _output_footer(
     if not bounded.truncated:
         if output_complete:
             return ""
-        return "[output_complete=false; the output pipe did not reach EOF before the deadline]"
+        return (
+            "[output_complete=false; the output pipe did not reach EOF, "
+            "so termination is not established]"
+        )
     return _shorten_footer(bounded, artifact, notes, budget)
 
 

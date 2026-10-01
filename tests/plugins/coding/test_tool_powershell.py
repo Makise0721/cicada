@@ -307,3 +307,66 @@ def test_tool_drops_entire_tail_when_status_block_consumes_budget():
     )
     assert len(content.encode("utf-8")) <= MAX_CONTENT_BYTES
     assert "artifact_truncated" in content or "truncated" in content
+
+
+# --- 03 修复回归: 采集失败经真实 runner + 工具发布 ---
+
+
+class _FailingStream:
+    async def read(self, size):
+        raise OSError("simulated pipe read failure")
+
+
+class _PipeTransport:
+    def get_pipe_transport(self, fd):
+        return None
+
+
+class _ExitZeroProcess:
+    """命令已正常退出(0)但输出管道读取失败: 采集事实必须压过退出码."""
+
+    pid = 999999
+    returncode = 0
+    stdout = _FailingStream()
+    stderr = _FailingStream()
+    _transport = _PipeTransport()
+
+    async def wait(self):
+        return 0
+
+
+class _ExitZeroWatcher:
+    def __init__(self, pid, proc):
+        self._proc = proc
+
+    async def wait_once(self, seconds):
+        await asyncio.sleep(min(seconds, 0.02))
+        return True
+
+    @property
+    def exit_code(self):
+        return self._proc.returncode
+
+    async def close(self):
+        pass
+
+
+async def test_pipe_read_failure_is_published_as_incomplete(tmp_path, monkeypatch):
+    from cicada.plugins.coding import process as process_module
+    from cicada.plugins.coding.process import PowerShellRunner
+
+    ws, _ = make(tmp_path)
+
+    async def create(*args, **kwargs):
+        return _ExitZeroProcess()
+
+    monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(process_module, "_ProcessWatcher", _ExitZeroWatcher)
+    tool = PowerShellTool(ws, PowerShellRunner())
+    r = await run(tool, command="ignored")
+    assert r.is_error is True
+    assert r.details["exit_code"] == 0
+    assert r.details["output_complete"] is False
+    assert r.details["timed_out"] is True
+    assert "output_complete=false" in r.content
+    assert "did not reach EOF" in r.content

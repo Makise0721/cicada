@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import cicada.plugins.coding.process as process_module
 from cicada.core.cancel import CancelToken
 from cicada.plugins.coding.process import (
     ARTIFACT_MAX_BYTES,
@@ -303,3 +304,239 @@ async def test_nonzero_exit_code_is_preserved(tmp_path):
     assert result.cancelled is False
     assert result.output_complete is True
     assert result.output.text.strip() == "hi"
+
+
+# --- 03 修复回归: reader 完成事实 / 清理总预算 / 取消时工件句柄 ---
+#
+# 受控替身只替换 runner 的子进程与进程句柄 seam, 生产代码路径保持不变;
+# 真实 Windows runner 的用例仍走上面的真实 pwsh。
+
+
+class _FakeStream:
+    """受控管道替身: 可先给数据再抛错, 或永远不返回 (不结束的 read)."""
+
+    def __init__(self, chunks=(), error=None, hang=False):
+        self._chunks = list(chunks)
+        self._error = error
+        self._hang = hang
+
+    async def read(self, size):
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._error is not None:
+            raise self._error
+        if self._hang:
+            await asyncio.Event().wait()
+        return b""
+
+
+class _FakeTransport:
+    def get_pipe_transport(self, fd):
+        return None
+
+
+class _FakeProcess:
+    def __init__(self, stdout, stderr, returncode, pid=999999):
+        self.pid = pid
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self._transport = _FakeTransport()
+
+    async def wait(self):
+        return self.returncode
+
+
+class _FakeWatcher:
+    def __init__(self, pid, proc):
+        self._proc = proc
+        self.closed = False
+
+    async def wait_once(self, seconds):
+        await asyncio.sleep(min(seconds, 0.02))
+        return self._proc.returncode is not None
+
+    @property
+    def exit_code(self):
+        return self._proc.returncode
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_os(monkeypatch):
+    """把 runner 的子进程/进程句柄 seam 换成受控替身, 由用例填入 proc."""
+    state: dict = {}
+
+    async def create(*args, **kwargs):
+        return state["proc"]
+
+    monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(process_module, "_ProcessWatcher", _FakeWatcher)
+    return state
+
+
+async def test_reader_read_error_never_reports_output_complete(tmp_path, fake_os):
+    """S2: 管道读失败必须归为采集不完整, 命令 exit0 不能覆盖它."""
+    ws = make(tmp_path)
+    fake_os["proc"] = _FakeProcess(
+        stdout=_FakeStream([b"before-error\n"], error=OSError("simulated pipe read failure")),
+        stderr=_FakeStream(),
+        returncode=0,
+    )
+    result = await run_runner(PowerShellRunner(), ws, command="ignored", timeout=5.0)
+    assert result.exit_code == 0
+    assert result.output_complete is False
+    assert result.timed_out is True
+    assert result.cancelled is False
+    assert result.output.text == "before-error"  # 已到达输出仍然保留
+
+
+async def test_reader_without_eof_is_not_output_complete(tmp_path, fake_os):
+    """S2: 读者没有读到 EOF (随后被收尾取消) 同样不是完整采集."""
+    ws = make(tmp_path)
+    fake_os["proc"] = _FakeProcess(
+        stdout=_FakeStream([b"partial\n"], hang=True),
+        stderr=_FakeStream(),
+        returncode=0,
+    )
+    result = await run_runner(
+        PowerShellRunner(eof_grace_s=0.05), ws, command="ignored", timeout=5.0
+    )
+    assert result.exit_code == 0
+    assert result.output_complete is False
+    assert result.timed_out is True
+    assert result.output.text == "partial"
+
+
+async def test_cleanup_budget_bounds_hanging_kill_and_readers(tmp_path, monkeypatch):
+    """S1/F06: 不返回的 kill 与不结束的 read 都不能突破清理总预算."""
+    ws = make(tmp_path)
+    runner = PowerShellRunner(cleanup_budget_s=0.05)
+
+    async def hanging_kill(pid, stop):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_kill_tree", hanging_kill)
+    proc = _FakeProcess(_FakeStream(hang=True), _FakeStream(hang=True), returncode=None)
+    collector = _OutputCollector(ws.output_dir)
+    readers = [
+        asyncio.ensure_future(runner._pump(proc.stdout, collector)),
+        asyncio.ensure_future(runner._pump(proc.stderr, collector)),
+    ]
+    await asyncio.sleep(0)
+    watcher = _FakeWatcher(proc.pid, proc)
+    started = time.monotonic()
+    await runner._finish_resource_cleanup(proc, readers, collector, watcher, None)
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0
+    assert all(task.done() for task in readers)
+    assert collector.eof is False
+    assert watcher.closed is True
+
+
+async def test_kill_tree_abandons_taskkill_that_overruns_the_budget(monkeypatch):
+    """S1/F06: taskkill 自身的等待也受预算约束, 超预算时终止它而不是无限等待."""
+    killed: list[bool] = []
+
+    class _Killer:
+        async def wait(self):
+            await asyncio.Event().wait()
+
+        def kill(self):
+            killed.append(True)
+
+    async def create(*args, **kwargs):
+        return _Killer()
+
+    monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", create)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await PowerShellRunner._kill_tree(1234, started + 0.05)
+    assert loop.time() - started < 1.0
+    assert killed == [True]
+
+
+async def test_task_cancel_flushes_and_closes_the_artifact_handle(tmp_path, monkeypatch):
+    """S4: Task.cancel 后 finally 必须 flush/close 已创建的流式工件句柄."""
+    ws = make(tmp_path)
+    captured: list[_OutputCollector] = []
+    base_collector = _OutputCollector
+
+    class Capturing(base_collector):
+        def __init__(self, output_dir):
+            super().__init__(output_dir)
+            captured.append(self)
+
+    monkeypatch.setattr(process_module, "_OutputCollector", Capturing)
+    runner = PowerShellRunner()
+    task = asyncio.create_task(
+        run_runner(
+            runner,
+            ws,
+            command="Write-Output started; Start-Sleep -Seconds 60",
+            timeout=60.0,
+        )
+    )
+    await asyncio.sleep(1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    collector = captured[-1]
+    assert collector._artifact_file is None  # 句柄已关闭, 不是只丢引用
+    assert collector.artifact_error is None
+    assert collector.artifact_path is not None
+    assert b"started" in collector.artifact_path.read_bytes()  # flush 后内容可读
+
+
+async def test_timeout_cannot_be_extended_by_a_hanging_taskkill(tmp_path, monkeypatch):
+    """S1/F06: 公开 run() 在 taskkill 不返回时仍按预算返回并保守终结."""
+    ws = make(tmp_path)
+    runner = PowerShellRunner(cleanup_budget_s=0.1)
+    attempted: list[int] = []
+
+    async def hanging_kill(pid, stop):
+        attempted.append(pid)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_kill_tree", hanging_kill)
+    started = time.monotonic()
+    try:
+        result = await run_runner(runner, ws, command="Start-Sleep -Seconds 20", timeout=0.8)
+    finally:
+        # kill 被替换为不返回: 用真实 taskkill 清掉遗留 pwsh, 不留孤儿进程
+        for pid in set(attempted):
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True
+            )
+    elapsed = time.monotonic() - started
+    assert attempted, "超时路径必须尝试终止已知进程树"
+    assert result.timed_out is True
+    assert result.output_complete is False
+    assert elapsed < 3.0
+    for pid in set(attempted):
+        assert await wait_pid_gone(pid)
+
+
+async def test_eof_grace_cannot_extend_past_the_original_deadline(tmp_path):
+    """F06: 父进程退出后的 EOF 宽限不超过原命令 deadline."""
+    ws = make(tmp_path)
+    repo_root = Path(__file__).resolve().parents[3]
+    command = (
+        "Start-Process pwsh -ArgumentList '-NoProfile','-Command',"
+        "'Start-Sleep -Seconds 8' -NoNewWindow "
+        f"-WorkingDirectory '{repo_root}' -PassThru | Out-Null; Write-Output parent-exit"
+    )
+    started = time.monotonic()
+    result = await run_runner(
+        PowerShellRunner(eof_grace_s=5.0), ws, command=command, timeout=3.0
+    )
+    elapsed = time.monotonic() - started
+    if result.exit_code is None:
+        pytest.skip("pwsh startup slower than the 3s deadline on this host")
+    assert result.exit_code == 0
+    assert result.output_complete is False
+    assert result.timed_out is True
+    # 5s 的 EOF 宽限不得把收尾拖过原 deadline (修复前该路径实测约 7s)
+    assert elapsed < 5.0
