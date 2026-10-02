@@ -138,7 +138,14 @@ class PowerShellTool:
         if artifact is not None:
             parts.append(f"[full output: {artifact}]")
         content = self._assemble(parts, bounded, artifact, result.output_complete, incomplete_notes)
-        is_error = result.exit_code != 0 or result.timed_out or result.cancelled
+        # 采集失败 (含 reader 异常: 此时 timed_out 仍是 false) 也是工具错误, 不能把不完整
+        # 输出当成功结果交给模型; Verifier/Policy 另按 output_complete 保守阻断。
+        is_error = (
+            result.exit_code != 0
+            or result.timed_out
+            or result.cancelled
+            or not result.output_complete
+        )
         return ToolResult(
             call_id=ctx.call_id,
             name="powershell",

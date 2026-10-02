@@ -364,10 +364,10 @@ async def test_pipe_read_failure_is_published_as_incomplete(tmp_path, monkeypatc
     monkeypatch.setattr(process_module, "_ProcessWatcher", _ExitZeroWatcher)
     tool = PowerShellTool(ws, PowerShellRunner())
     r = await run(tool, command="ignored")
-    assert r.is_error is True
+    assert r.is_error is True  # 采集失败本身是工具错误, 不靠 timed_out 冒充
     assert r.details["exit_code"] == 0
     assert r.details["output_complete"] is False
-    assert r.details["timed_out"] is True
+    assert r.details["timed_out"] is False
     assert "output_complete=false" in r.content
     assert "did not reach EOF" in r.content
 

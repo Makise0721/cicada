@@ -1,6 +1,7 @@
 """coding.process 运行器与有界采集的聚焦验证 (03: 严格有界、流式工件、收尾与取消)."""
 
 import asyncio
+import gc
 import subprocess
 import time
 from pathlib import Path
@@ -396,19 +397,100 @@ class _FakeWatcher:
 
 @pytest.fixture
 def fake_os(monkeypatch):
-    """把 runner 的子进程/进程句柄 seam 换成受控替身, 由用例填入 proc."""
+    """把 runner 的子进程/进程句柄 seam 换成受控替身, 由用例填入 proc/watcher_cls."""
     state: dict = {}
 
     async def create(*args, **kwargs):
         return state["proc"]
 
     monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", create)
-    monkeypatch.setattr(process_module, "_ProcessWatcher", _FakeWatcher)
+    monkeypatch.setattr(
+        process_module,
+        "_ProcessWatcher",
+        lambda pid, proc: state.get("watcher_cls", _FakeWatcher)(pid, proc),
+    )
     return state
 
 
+class _LaggingStream:
+    """取消后迟延 0.15s 才交付末段的管道替身 (受控边界, 非本机真实挂死)."""
+
+    def __init__(self, lag_s: float = 0.15, first: bytes = b"first\n",
+                 late: bytes = b"late\n") -> None:
+        self.lag_s = lag_s
+        self.first = first
+        self.late = late
+        self.reads = 0
+
+    async def read(self, size):
+        self.reads += 1
+        if self.reads == 1:
+            return self.first
+        if self.reads >= 3:
+            return b""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(self.lag_s)
+            return self.late
+
+
+class _GatedStream:
+    """取消后等外部 gate 放行才交付末段的管道替身: 迟到时刻由用例确定控制."""
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self.gate = gate
+        self.reads = 0
+
+    async def read(self, size):
+        self.reads += 1
+        if self.reads == 1:
+            return b"first\n"
+        if self.reads >= 3:
+            return b""
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await self.gate.wait()
+            return b"late\n"
+
+
+class _LaggingWatcher(_FakeWatcher):
+    """关闭进程句柄的取消收尾迟滞 0.15s."""
+
+    async def close(self):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.15)
+        finally:
+            self.closed = True
+
+
+class _FailingFlush:
+    """真实文件句柄的透明包装: 只让 flush 失败, 记录 close 是否真的发生."""
+
+    def __init__(self, wrapped) -> None:
+        self.wrapped = wrapped
+        self.close_calls = 0
+
+    def write(self, data):
+        return self.wrapped.write(data)
+
+    def flush(self):
+        raise OSError("simulated flush failure")
+
+    def close(self):
+        self.close_calls += 1
+        self.wrapped.close()
+
+    @property
+    def closed(self) -> bool:
+        return self.wrapped.closed
+
+
 async def test_reader_read_error_never_reports_output_complete(tmp_path, fake_os):
-    """S2: 管道读失败必须归为采集不完整, 命令 exit0 不能覆盖它."""
+    """S2+R2: 管道读失败归为采集不完整, 但不伪造成执行超时, exit0 也不能覆盖."""
     ws = make(tmp_path)
     fake_os["proc"] = _FakeProcess(
         stdout=_FakeStream([b"before-error\n"], error=OSError("simulated pipe read failure")),
@@ -418,7 +500,7 @@ async def test_reader_read_error_never_reports_output_complete(tmp_path, fake_os
     result = await run_runner(PowerShellRunner(), ws, command="ignored", timeout=5.0)
     assert result.exit_code == 0
     assert result.output_complete is False
-    assert result.timed_out is True
+    assert result.timed_out is False  # 立即读失败不是等待期限耗尽
     assert result.cancelled is False
     assert result.output.text == "before-error"  # 已到达输出仍然保留
 
@@ -572,3 +654,146 @@ async def test_eof_grace_cannot_extend_past_the_original_deadline(tmp_path):
     assert result.timed_out is True
     # 5s 的 EOF 宽限不得把收尾拖过原 deadline (修复前该路径实测约 7s)
     assert elapsed < 5.0
+
+
+# --- 第二轮回归: 绝对截止点 / 迟到数据 / 工件句柄 ---
+
+
+async def test_drain_does_not_wait_for_a_lagging_reader(tmp_path, fake_os):
+    """R1: 宽限到点即收口, 不等待取消收尾迟滞的读者; 迟到 EOF 不改写事实."""
+    ws = make(tmp_path)
+    fake_os["proc"] = _FakeProcess(
+        stdout=_LaggingStream(lag_s=0.15), stderr=_FakeStream(), returncode=0
+    )
+    runner = PowerShellRunner(eof_grace_s=0.01, cleanup_budget_s=0.01)
+    started = time.monotonic()
+    result = await run_runner(runner, ws, command="ignored", timeout=0.02)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.12  # 修复前 ~0.172s: 等满了 0.15s 的取消迟滞
+    assert result.exit_code == 0
+    assert result.output_complete is False  # 迟到的 EOF 不得把截止点事实改成完整
+    assert result.timed_out is True  # 等待期限确实耗尽
+    assert result.output.text == "first"
+
+
+async def test_cleanup_budget_abandons_a_lagging_watcher_close(tmp_path, fake_os):
+    """R1: watcher 关闭的取消收尾同样受绝对预算限制."""
+    ws = make(tmp_path)
+    fake_os["proc"] = _FakeProcess(_FakeStream([b"out\n"]), _FakeStream(), returncode=0)
+    fake_os["watcher_cls"] = _LaggingWatcher
+    runner = PowerShellRunner(eof_grace_s=0.01, cleanup_budget_s=0.01)
+    started = time.monotonic()
+    result = await run_runner(runner, ws, command="ignored", timeout=0.02)
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.12  # 修复前 ~0.171s
+    assert result.output_complete is True  # 输出正常 EOF: 采集事实不受关闭迟滞影响
+
+
+async def test_abandoned_reader_exception_is_retrieved(tmp_path, fake_os):
+    """R1: 被放弃的读者异常必须取回, 不能留下 never-retrieved 噪声."""
+    ws = make(tmp_path)
+    loop = asyncio.get_running_loop()
+    seen: list[dict] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: seen.append(context))
+    try:
+        fake_os["proc"] = _FakeProcess(
+            stdout=_FakeStream([b"before\n"], error=OSError("pipe broke")),
+            stderr=_FakeStream(),
+            returncode=0,
+        )
+        result = await run_runner(PowerShellRunner(), ws, command="ignored", timeout=5.0)
+        assert result.output_complete is False
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(previous)
+    assert seen == []
+
+
+async def test_late_reader_cannot_reopen_a_finished_artifact(tmp_path, monkeypatch):
+    """R4: 取消预算耗尽后迟返数据不得再计数, 也不得重开已关闭的工件句柄."""
+    ws = make(tmp_path)
+    captured: list[_OutputCollector] = []
+    base_collector = _OutputCollector
+
+    class Capturing(base_collector):
+        def __init__(self, output_dir):
+            super().__init__(output_dir)
+            captured.append(self)
+
+    monkeypatch.setattr(process_module, "_OutputCollector", Capturing)
+    gate = asyncio.Event()
+    stream = _GatedStream(gate)
+    proc = _FakeProcess(stream, _FakeStream(), returncode=None)
+
+    async def create(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(process_module, "_ProcessWatcher", _FakeWatcher)
+    runner = PowerShellRunner(cleanup_budget_s=0.01)
+
+    async def no_kill(pid, stop):
+        return None
+
+    monkeypatch.setattr(runner, "_kill_tree", no_kill)
+    # 长 timeout: 取消发生在 runner 仍在等待时, 保证测到取消路径而不是正常返回
+    task = asyncio.create_task(run_runner(runner, ws, command="ignored", timeout=5.0))
+    fed = await wait_until(
+        lambda: bool(captured) and captured[-1]._artifact_bytes > 0, interval=0.01
+    )
+    assert fed, "受控读者没有产出可采集的输出"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    collector = captured[-1]
+    assert collector._artifact_file is None  # 收尾时已关闭
+    bytes_at_cancel = collector.total_bytes
+    gate.set()  # 放行迟返读者: 它确实会交付数据, 但必须被拒绝
+    assert await wait_until(lambda: stream.reads >= 3)
+    assert collector.total_bytes == bytes_at_cancel  # 迟返数据不计数
+    assert collector._artifact_file is None  # 不重开工件句柄
+
+
+async def test_flush_failure_still_closes_the_real_handle(tmp_path, monkeypatch):
+    """R4: flush 失败仍独立 close 真实句柄, 并保留 flush 失败事实."""
+    ws = make(tmp_path)
+    handles: list[_FailingFlush] = []
+    base_collector = _OutputCollector
+
+    class FlushCollector(base_collector):
+        def _ensure_artifact(self):
+            ok = super()._ensure_artifact()
+            if ok and not isinstance(self._artifact_file, _FailingFlush):
+                handle = _FailingFlush(self._artifact_file)
+                handles.append(handle)
+                self._artifact_file = handle
+            return ok
+
+    monkeypatch.setattr(process_module, "_OutputCollector", FlushCollector)
+    result = await run_runner(
+        PowerShellRunner(), ws, command="Write-Output hi", timeout=30.0
+    )
+    handle = handles[-1]
+    assert handle.close_calls == 1
+    assert handle.closed is True  # 真实句柄已关闭, 不是只丢引用
+    assert result.exit_code == 0
+    assert result.output.artifact_error is not None
+    assert "flush" in result.output.artifact_error
+    assert result.output_complete is True  # 工件收尾失败不冒充采集不完整
+
+
+def test_finished_collector_refuses_late_feeds(tmp_path):
+    """R4: finished collector 拒绝后续 feed 与工件创建."""
+    collector = _OutputCollector(tmp_path / "out")
+    collector.feed(b"first\n")
+    collector.finish()
+    assert collector.artifact_path is not None
+    bytes_after_finish = collector.total_bytes
+    path_after_finish = collector.artifact_path
+    collector.feed(b"late\n")
+    assert collector.total_bytes == bytes_after_finish
+    assert collector.text == "first"
+    assert collector.artifact_path == path_after_finish
+    assert collector._artifact_file is None

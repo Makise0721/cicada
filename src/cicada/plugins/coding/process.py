@@ -107,6 +107,9 @@ class _OutputCollector:
         self.output_dir = output_dir
 
     def feed(self, data: bytes) -> None:
+        if self._finished:
+            # 已收尾 (含取消/异常兜底): 迟到的读者数据不得再计数、写工件或重开句柄
+            return
         self.total_bytes += len(data)
         self._append(self._decoder.decode(data))
 
@@ -245,15 +248,25 @@ class _OutputCollector:
         return True
 
     def _close_artifact(self) -> None:
-        if self._artifact_file is None:
+        """flush 与 close 各自独立尝试: flush 失败也必须继续 close, 保留两者的事实.
+
+        句柄引用在任何情况下都释放, 但绝不能因为 flush 抛错就跳过 close 而泄漏真实句柄。
+        """
+        handle, self._artifact_file = self._artifact_file, None
+        if handle is None:
             return
         try:
-            self._artifact_file.flush()
-            self._artifact_file.close()
+            handle.flush()
         except OSError as exc:
-            self.artifact_error = self.artifact_error or f"cannot finalize output artifact: {exc}"
-        finally:
-            self._artifact_file = None
+            self.artifact_error = (
+                self.artifact_error or f"cannot flush output artifact: {exc}"
+            )
+        try:
+            handle.close()
+        except OSError as exc:
+            self.artifact_error = (
+                self.artifact_error or f"cannot finalize output artifact: {exc}"
+            )
 
 
 def _utf8_prefix(text: str, max_bytes: int) -> str:
@@ -293,6 +306,20 @@ def _consume_task_result(task: asyncio.Task) -> None:
         task.exception()
     except Exception:  # pragma: no cover - 只在任务状态异常时兜底
         pass
+
+
+def _abandon(awaitable) -> None:
+    """放弃一个 awaitable: 协程直接关闭, Future/Task 取消并取回异常.
+
+    预算已经耗尽时使用: 不再等待它的取消收尾, 也不让它的结果影响已固定的事实。
+    """
+    if isinstance(awaitable, asyncio.Future):
+        awaitable.cancel()
+        awaitable.add_done_callback(_consume_task_result)
+        return
+    close = getattr(awaitable, "close", None)
+    if close is not None:
+        close()
 
 
 if sys.platform == "win32":
@@ -448,10 +475,11 @@ class PowerShellRunner:
                     self._kill_tree(proc.pid, cleanup_deadline), cleanup_deadline
                 )
             # 注意: 本体被外部 cancel 时这里以上都不会执行, 由 finally 兜底清理。
-            drained = await self._drain_readers(proc, readers, exited, deadline)
+            drained, expired = await self._drain_readers(proc, readers, exited, deadline)
             collector.finish()
-            if exited and not drained:
-                # 命令已退出但输出管道没采到 EOF: 属于未能在 deadline 内收尾
+            if exited and not drained and expired:
+                # 命令已退出但输出管道没在 deadline/宽限内 EOF: 属实在的收尾超时。
+                # reader 自身失败不是超时, 只固定 output_complete=false, 不伪造 timed_out。
                 timed_out = True
             return ProcessResult(
                 exit_code=exit_code,
@@ -489,34 +517,40 @@ class PowerShellRunner:
         readers: list[asyncio.Task],
         exited: bool,
         deadline: float,
-    ) -> bool:
-        """收集已到达输出; 返回两个读者是否都正常读到 EOF。
+    ) -> tuple[bool, bool]:
+        """收集已到达输出; 返回 (两个读者是否都正常 EOF, 是否耗尽了等待期限)。
 
         父进程已确证退出时只再给有限宽限, 且**不超过原命令 deadline**; 未退出
-        (超时/取消)时按原 deadline 立即收口。reader 异常或被取消都不是 EOF:
-        必须取回 task 结果并归一为不完整, 退出码 0 不能覆盖采集失败。
+        (超时/取消)时按原 deadline 立即收口。到点后取消读者, 并且只在同一绝对截止点内
+        等它们收尾: 迟到的取消收尾与迟到的 EOF 都不能改写截止点已固定的事实 (若在
+        截止点后补上 EOF, 也不得把采集认领为完整)。只有等待期限真正耗尽才算 expired,
+        reader 自身失败固定为不完整但不冒充超时。
         """
         loop = asyncio.get_running_loop()
         drain_deadline = min(deadline, loop.time() + self.eof_grace_s) if exited else deadline
+        expired = False
+        complete = False
         while True:
             pending = [task for task in readers if not task.done()]
             if not pending:
+                # 截止点内全部结束: 只有两个正常 EOF 才算采集完整
+                complete = not any(_reader_incomplete(task) for task in readers)
                 break
             if any(_reader_incomplete(task) for task in readers if task.done()):
-                break  # 已有读者失败: 不必再等另一个
+                break  # 已有读者失败: 采集不完整, 不必再等另一个
             remaining = drain_deadline - loop.time()
             if remaining <= 0:
+                expired = True
                 break
             await asyncio.wait(pending, timeout=min(GRACE_SECONDS, remaining))
-        for task in readers:
-            if not task.done():
-                task.cancel()
-        # 取回全部 task 结果: 只有两个正常 EOF 才算采集完整
-        await asyncio.gather(*readers, return_exceptions=True)
-        complete = not any(_reader_incomplete(task) for task in readers)
         if not complete:
+            for task in readers:
+                if not task.done():
+                    task.cancel()
+            # 取消收尾同样只在截止点内等待; 用尽即放弃迟滞的取消处理
+            await self._wait_readers(readers, drain_deadline)
             self._close_pipes(proc)
-        return complete
+        return complete, expired
 
     @staticmethod
     def _close_pipes(proc: asyncio.subprocess.Process) -> None:
@@ -567,28 +601,36 @@ class PowerShellRunner:
 
     @staticmethod
     async def _wait_readers(readers: list[asyncio.Task], stop: float) -> None:
-        """在预算内等读者收尾; 预算用尽就放弃等待, 但仍取回其异常."""
+        """在预算内等读者收尾; 预算用尽就放弃等待, 但仍取回(或挂回调取回)其异常."""
         loop = asyncio.get_running_loop()
         pending = [task for task in readers if not task.done()]
-        if not pending:
-            return
-        await asyncio.wait(pending, timeout=max(stop - loop.time(), 0.0))
+        if pending:
+            await asyncio.wait(pending, timeout=max(stop - loop.time(), 0.0))
         for task in readers:
-            if not task.done():
+            if task.done():
+                _consume_task_result(task)
+            else:
                 task.add_done_callback(_consume_task_result)
 
     @staticmethod
     async def _bounded(awaitable, stop: float) -> None:
-        """在清理总预算内等待一个协程; 预算用尽就放弃等待, 由调用方保守处理终结事实.
+        """在绝对截止时间内等待一个 awaitable; 预算用尽就放弃等待, 不等取消收尾.
 
-        这是清理路径上每个 await 的硬上限: 未返回的 taskkill / proc.wait / 句柄关闭
-        都不能把取消或异常拖过预算; 本地管道与工件句柄已在调用它之前同步关闭。
+        `asyncio.wait_for` 超时后仍会等待被取消对象完成取消收尾, 因此不能兑现
+        "每个 await 的硬上限"; 这里用 `asyncio.wait` 到点后直接放弃任务并只取回其异常。
+        本地管道与工件句柄已在调用它之前同步关闭。
         """
         loop = asyncio.get_running_loop()
-        try:
-            await asyncio.wait_for(awaitable, max(stop - loop.time(), 0.001))
-        except (TimeoutError, OSError):
-            pass
+        remaining = stop - loop.time()
+        if remaining <= 0:
+            _abandon(awaitable)
+            return
+        task = asyncio.ensure_future(awaitable)
+        done, _pending = await asyncio.wait({task}, timeout=remaining)
+        if done:
+            _consume_task_result(task)  # 取回 close/wait 的异常, 不让它泄漏
+        else:
+            _abandon(task)
 
     @staticmethod
     async def _kill_tree(pid: int, stop: float) -> None:
