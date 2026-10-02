@@ -422,6 +422,14 @@ class ApplicationSession:
                     blocking_reasons=(reason,),
                 ),
             )
+        except BaseException:
+            # 外层取消/异常: 收尾任务不得成为无人持有的后台任务
+            token.cancel()
+            task.cancel()
+            done, pending = await asyncio.wait([task], timeout=_UNDEAD_GRACE_S)
+            if pending:
+                self._undead_tasks.append(task)
+            raise
 
     # --- 取消 / 清空 ---------------------------------------------------------------
 
