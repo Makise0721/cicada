@@ -7,8 +7,10 @@ import hashlib
 import pytest
 
 from cicada.prompting import (
+    DEFAULT_TOOLS,
     MAX_INSTRUCTIONS_BYTES,
     PROMPT_VERSION,
+    CheckPrompt,
     InstructionsError,
     build_builtin_prompt,
     compose_system_prompt,
@@ -121,3 +123,49 @@ def test_hash_stability_across_calls(tmp_path):
     _, info2 = compose_system_prompt(tmp_path, "a.md")
     assert info1.prompt_sha256 == info2.prompt_sha256
     assert info1.instructions_sha256 == info2.instructions_sha256
+
+
+# --- P4 §1/§6: 实际工具名单与指定检查声明 -----------------------------------------------
+
+
+def test_default_prompt_lists_glob_and_grep(tmp_path):
+    prompt = build_builtin_prompt(tmp_path)
+    for tool in ("read", "edit", "write", "powershell", "glob", "grep"):
+        assert f"- {tool}\n" in prompt
+    assert "- check" not in prompt  # 普通模式没有 check
+    assert prompt == build_builtin_prompt(tmp_path)  # 无时间/动态状态
+
+
+def test_default_tools_tuple_matches_prompt():
+    assert DEFAULT_TOOLS == ("read", "edit", "write", "powershell", "glob", "grep")
+
+
+def test_check_mode_prompt_declares_launcher_checks(tmp_path):
+    checks = (
+        CheckPrompt("check-1", "pytest -q", 120.0),
+        CheckPrompt("check-2", "Write-Output 'line one\nline two'", 30.0),
+    )
+    prompt = build_builtin_prompt(tmp_path, DEFAULT_TOOLS + ("check",), checks)
+    assert "- check\n" in prompt
+    assert "Required checks (declared by the launcher; you cannot change them):" in prompt
+    assert "- check-1: command=pytest -q timeout=120s" in prompt
+    # 多行命令压平为一行, 不破坏提示结构
+    assert "command=Write-Output 'line one line two' timeout=30s" in prompt
+    assert "Delivery is judged by the program" in prompt
+    assert "stale" in prompt
+
+
+def test_compose_passes_tools_and_checks(tmp_path):
+    checks = (CheckPrompt("check-1", "exit 0", 120.0),)
+    prompt, info = compose_system_prompt(
+        tmp_path, None, tools=DEFAULT_TOOLS + ("check",), checks=checks
+    )
+    assert "- check\n" in prompt
+    assert "- check-1: command=exit 0 timeout=120s" in prompt
+    assert info.version == PROMPT_VERSION
+    # 指令追加语义不变: 检查声明在指令之前 (内置提示部分)
+    (tmp_path / "TEAM.md").write_text("先跑测试。", encoding="utf-8")
+    prompt2, _ = compose_system_prompt(
+        tmp_path, "TEAM.md", tools=DEFAULT_TOOLS + ("check",), checks=checks
+    )
+    assert prompt2.index("- check-1: command=exit 0") < prompt2.index("--- Project instructions")

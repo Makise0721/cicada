@@ -1,4 +1,4 @@
-"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] "<prompt>".
+"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>".
 
 模型来源二选一:
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
@@ -6,7 +6,15 @@
 --script 与真实模型旗标 (--model/--ollama-url/--think/--num-ctx) 互斥, 混用退出码 2.
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
-退出码: 0=模型正常 stop; 1=error/aborted/length; 2=CLI 输入/预检/启动错误.
+
+P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
+是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
+profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes. 运行结束后
+程序独立扫描终结事实、刷新检查视图、生成变更证据并判定交付 (不读模型文字):
+- 0: 模型 stop 且全部指定检查的最近回执 passed/current 且证据完整;
+- 3: 模型 stop 但检查或证据条件不满足;
+- 1: 模型 error/aborted/length; 2: 输入/启动错误 (普通模式保持 0=stop, 1/2 同上).
+
 剧本 JSON 为条目列表, 每条目是一轮模型响应:
   {"text": "...", "tool_calls": [{"id", "name", "arguments": {...}}],
    "stop": true | "error": "..." | "length": true}
@@ -17,13 +25,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
 import httpx
 
 from cicada.boot import App, BootError, bootstrap
+from cicada.core.cancel import CancelToken
 from cicada.core.events import (
     AssistantCompleted,
     Event,
@@ -34,21 +45,62 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
+from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.process import process_plugin
+from cicada.plugins.coding.tool_check import check_plugin
 from cicada.plugins.coding.tool_edit import edit_plugin
+from cicada.plugins.coding.tool_glob import glob_plugin
+from cicada.plugins.coding.tool_grep import grep_plugin
 from cicada.plugins.coding.tool_powershell import powershell_plugin
 from cicada.plugins.coding.tool_read import read_plugin
 from cicada.plugins.coding.tool_write import write_plugin
+from cicada.plugins.coding.verification import (
+    Verifier,
+    generate_verification_run_id,
+    verification_plugin,
+)
+from cicada.plugins.coding.verification_contracts import (
+    VERIFICATION_CAPABILITY,
+    CheckDefinition,
+    VerificationPlan,
+    VerificationView,
+)
 from cicada.plugins.coding.workspace import workspace_plugin
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
-from cicada.prompting import InstructionsError, PromptInfo, compose_system_prompt
-from cicada.reporting import build_run_summary
+from cicada.prompting import (
+    CheckPrompt,
+    DEFAULT_TOOLS,
+    InstructionsError,
+    PromptInfo,
+    compose_system_prompt,
+)
+from cicada.reporting import (
+    DeliveryDecision,
+    build_delivery_section,
+    build_run_summary,
+    decide_delivery,
+)
+from cicada.run_policy import RunPolicy, verification_policy
 from cicada.runtime.plugin import PluginDefinition
 
-TOOL_CAPABILITIES = ("tool.read", "tool.edit", "tool.write", "tool.powershell")
+TOOL_CAPABILITIES = (
+    "tool.read", "tool.edit", "tool.write", "tool.powershell", "tool.glob", "tool.grep",
+)
+CHECK_TOOL_CAPABILITIES = TOOL_CAPABILITIES + ("tool.check",)
 DEFAULT_CONFIG = OllamaConfig()
 DEFAULT_NUM_CTX = 32768  # CLI 请求级默认值; 消除服务端默认 4K 依赖. 仅是请求值, 非实际分配保证
+
+# P4 §5/§8 检查模式的固定 profile 与输入边界
+MAX_CHECK_COMMANDS = 8
+CHECK_COMMAND_MAX_BYTES = 4096
+CHECK_TIMEOUT_DEFAULT_S = 120.0
+CHECK_TIMEOUT_MIN_S = 0.0
+CHECK_TIMEOUT_MAX_S = 300.0
+CHECK_MODE_MIN_NUM_CTX = 32768
+CHECK_MODE_NUM_PREDICT = 2048
+CHECK_MODE_MAX_TURNS = 25
+CHECK_MODE_MAX_REQUEST_BYTES = 65536
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -93,16 +145,60 @@ def parse_script(raw: str) -> list[list[StreamEvent]]:
     return script
 
 
-def default_definitions(workspace: Path, model_plugin: PluginDefinition) -> list[PluginDefinition]:
-    return [
+def parse_check_commands(
+    commands: list[str] | None, timeout: float | None
+) -> tuple[tuple[CheckDefinition, ...], str | None]:
+    """解析 --check-command/--check-timeout; 返回 (检查定义, 错误消息).
+
+    全部输入边界在此给出明确错误: 条数、空命令、命令字节上限、timeout 范围、
+    无检查时使用 --check-timeout。
+    """
+    commands = list(commands or [])
+    if not commands and timeout is not None:
+        return (), "--check-timeout 只能与 --check-command 一起使用"
+    if not commands:
+        return (), None
+    if len(commands) > MAX_CHECK_COMMANDS:
+        return (), f"--check-command 最多 {MAX_CHECK_COMMANDS} 条, 收到 {len(commands)} 条"
+    timeout_s = timeout if timeout is not None else CHECK_TIMEOUT_DEFAULT_S
+    if not CHECK_TIMEOUT_MIN_S < timeout_s <= CHECK_TIMEOUT_MAX_S:
+        return (), (
+            f"--check-timeout 必须在 ({CHECK_TIMEOUT_MIN_S:g}, {CHECK_TIMEOUT_MAX_S:g}] 秒内, "
+            f"收到 {timeout_s:g}"
+        )
+    definitions: list[CheckDefinition] = []
+    for index, command in enumerate(commands, start=1):
+        if not command or not command.strip():
+            return (), f"--check-command 第 {index} 条为空命令"
+        size = len(command.encode("utf-8"))
+        if size > CHECK_COMMAND_MAX_BYTES:
+            return (), (
+                f"--check-command 第 {index} 条超过 {CHECK_COMMAND_MAX_BYTES} UTF-8 bytes "
+                f"(收到 {size} bytes)"
+            )
+        definitions.append(CheckDefinition(check_id=f"check-{index}", command=command, timeout_s=timeout_s))
+    return tuple(definitions), None
+
+
+def default_definitions(
+    workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None
+) -> list[PluginDefinition]:
+    definitions: list[PluginDefinition] = [
         workspace_plugin(workspace),
+        inventory_plugin(),
         process_plugin(),
         read_plugin(),
         edit_plugin(),
         write_plugin(),
         powershell_plugin(),
-        model_plugin,
+        glob_plugin(),
+        grep_plugin(),
     ]
+    if plan is not None:
+        definitions.append(verification_plugin(plan))
+        definitions.append(check_plugin())
+    definitions.append(model_plugin)
+    return definitions
 
 
 def print_event(event: Event) -> None:
@@ -144,6 +240,38 @@ async def _ollama_reachable(base_url: str) -> bool:
     return response.is_success
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(256 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_receipt_artifacts(view: VerificationView) -> tuple[str, ...]:
+    """核对最近回执引用的输出工件与写入时记录的 hash; 缺失/篡改都是阻断原因.
+
+    只核对交付判定实际依赖的最近回执; 被取代的历史回执工件是历史证据, 不阻断。
+    """
+    problems: list[str] = []
+    for state in view.checks:
+        receipt = state.receipt
+        if receipt is None or receipt.output_artifact_path is None:
+            continue
+        path = receipt.output_artifact_path
+        try:
+            observed = _sha256_file(path)
+        except OSError as exc:
+            problems.append(
+                f"check {state.check_id} output artifact is missing or unreadable ({path}): {exc}")
+            continue
+        if receipt.output_artifact_sha256 is not None and observed != receipt.output_artifact_sha256:
+            problems.append(
+                f"check {state.check_id} output artifact no longer matches the hash recorded "
+                f"when it was written ({path})")
+    return tuple(problems)
+
+
 async def _run(args: argparse.Namespace) -> int:
     if args.script is not None and (
         args.model is not None
@@ -159,14 +287,45 @@ async def _run(args: argparse.Namespace) -> int:
     if args.num_ctx is not None and args.num_ctx <= 0:
         print(f"--num-ctx 必须是正整数, 收到 {args.num_ctx}", file=sys.stderr)
         return 2
+    checks, check_error = parse_check_commands(args.check_command, args.check_timeout)
+    if check_error is not None:
+        print(check_error, file=sys.stderr)
+        return 2
+    if checks and args.num_ctx is not None and args.num_ctx < CHECK_MODE_MIN_NUM_CTX:
+        print(
+            f"检查模式要求 --num-ctx >= {CHECK_MODE_MIN_NUM_CTX}, 收到 {args.num_ctx}",
+            file=sys.stderr,
+        )
+        return 2
     workspace = Path(args.workspace)
     # 指令文件错误先于 preflight/bootstrap (P3 §4.2)
+    check_prompts = tuple(
+        CheckPrompt(check.check_id, check.command, check.timeout_s) for check in checks
+    )
     try:
-        prompt, prompt_info = compose_system_prompt(workspace, args.instructions_file)
+        prompt, prompt_info = compose_system_prompt(
+            workspace,
+            args.instructions_file,
+            tools=DEFAULT_TOOLS + ("check",) if checks else DEFAULT_TOOLS,
+            checks=check_prompts,
+        )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
         return 2
     _print_prompt_info(prompt_info)
+    plan: VerificationPlan | None = None
+    if checks:
+        root = Path(os.path.realpath(Path(workspace).expanduser()))
+        plan = VerificationPlan(
+            verification_run_id=generate_verification_run_id(), root=root, checks=checks
+        )
+        timeout_s = checks[0].timeout_s
+        print(
+            f"[check_mode checks={len(checks)} "
+            f"ids={','.join(check.check_id for check in checks)} "
+            f"timeout={timeout_s:g}s verification_run_id={plan.verification_run_id} "
+            f"max_turns={CHECK_MODE_MAX_TURNS}]"
+        )
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -177,15 +336,25 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         num_ctx = args.num_ctx if args.num_ctx is not None else DEFAULT_NUM_CTX
         source = "cli" if args.num_ctx is not None else "default"
+        options: dict[str, object] = {"num_ctx": num_ctx}
+        request_limit: int | None = None
+        if checks:
+            options["num_predict"] = CHECK_MODE_NUM_PREDICT
+            request_limit = CHECK_MODE_MAX_REQUEST_BYTES
         config = OllamaConfig(
             base_url=args.ollama_url or DEFAULT_CONFIG.base_url,
             model=args.model or DEFAULT_CONFIG.model,
             think=args.think,
-            options={"num_ctx": num_ctx},
+            options=options,
+            max_request_bytes=request_limit,
+        )
+        policy_line = (
+            f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
+            if checks else ""
         )
         print(
             f"[config model={config.model} context_requested={num_ctx} source={source} "
-            f"think={str(config.think).lower()} workspace={prompt_info.workspace}]"
+            f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
         )
         if not await _ollama_reachable(config.base_url):
             print(
@@ -194,21 +363,62 @@ async def _run(args: argparse.Namespace) -> int:
             )
             return 2
         model_plugin = ollama_plugin(config)
+
+    # 检查模式: bootstrap 里同步工厂取得验证服务并包装 ModelPort; CLI 保留策略引用,
+    # 运行结束后用同一套扫描逻辑消费末次工具结果。
+    policy_state: dict[str, object] = {}
+
+    def _model_policy(model, runtime):
+        service = runtime.capability(VERIFICATION_CAPABILITY)
+        wrapped = verification_policy(model, service)
+        policy_state["policy"] = wrapped
+        policy_state["service"] = service
+        return wrapped
+
     try:
         app: App = await bootstrap(
-            default_definitions(workspace, model_plugin),
-            tool_capabilities=TOOL_CAPABILITIES,
+            default_definitions(workspace, model_plugin, plan),
+            tool_capabilities=CHECK_TOOL_CAPABILITIES if checks else TOOL_CAPABILITIES,
             system_prompt=prompt,
+            model_policy=_model_policy if checks else None,
+            max_turns=CHECK_MODE_MAX_TURNS if checks else 50,
         )
     except BootError as exc:
         print(f"boot failed: {exc}", file=sys.stderr)
         return 2
     app.agent.subscribe(print_event)
+    delivery: tuple[DeliveryDecision, VerificationView, object, Verifier] | None = None
     try:
+        if checks:
+            service: Verifier = policy_state["service"]  # type: ignore[assignment]
+            capture = await service.initialize(CancelToken())
+            if not capture.available:
+                detail = f" ({capture.failure_kind}): {capture.error}" if capture.error else ""
+                print(f"verification initialize failed{detail}", file=sys.stderr)
+                return 2
         result = await app.agent.run(args.prompt)
+        if checks:
+            policy: RunPolicy = policy_state["policy"]  # type: ignore[assignment]
+            service = policy_state["service"]  # type: ignore[assignment]
+            # 末次工具结果 (含最后一轮的 check/powershell 错误) 先锁存, 再取最终视图与证据
+            policy._scan_terminal_facts(result.messages)
+            view = await service.refresh(CancelToken())
+            evidence = await service.finalize(CancelToken())
+            delivery = (
+                decide_delivery(result, view, evidence, _verify_receipt_artifacts(view)),
+                view,
+                evidence,
+                service,
+            )
     finally:
         await app.aclose()
     print(build_run_summary(result))
+    if delivery is not None:
+        decision, view, evidence, service = delivery
+        print(build_delivery_section(decision, view, evidence, service.plan))
+        if not decision.model_stopped:
+            return 1
+        return 0 if decision.can_deliver else 3
     return 0 if result.stop_reason == "stop" else 1
 
 
@@ -227,6 +437,20 @@ def main() -> int:
     )
     parser.add_argument(
         "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"
+    )
+    parser.add_argument(
+        "--check-command", action="append", default=None, metavar="POWERSHELL",
+        help=(
+            f"指定检查命令 (可重复, 最多 {MAX_CHECK_COMMANDS} 条, 每条 ≤{CHECK_COMMAND_MAX_BYTES} bytes); "
+            "给出即进入检查模式, 按顺序分配 check-1..check-N"
+        ),
+    )
+    parser.add_argument(
+        "--check-timeout", type=float, default=None, metavar="SECONDS",
+        help=(
+            f"检查命令超时秒数 (默认 {CHECK_TIMEOUT_DEFAULT_S:g}; 范围 "
+            f"({CHECK_TIMEOUT_MIN_S:g}, {CHECK_TIMEOUT_MAX_S:g}]; 仅检查模式)"
+        ),
     )
     parser.add_argument("prompt", help="交给 agent 的 prompt")
     return asyncio.run(_run(parser.parse_args()))
