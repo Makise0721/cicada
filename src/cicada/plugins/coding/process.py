@@ -357,6 +357,16 @@ class _ProcessWatcher:
             await loop.run_in_executor(None, _kernel32.CloseHandle, handle)
 
 
+class PowerShellLaunchError(FileNotFoundError):
+    """进程创建边界确认目标未启动的明确事实.
+
+    只在 ``create_subprocess_exec`` 自身抛 ``FileNotFoundError`` (可执行文件不存在/不可解析)
+    时归一, 保留原 cause 与错误文本; 继承 ``FileNotFoundError`` 以保持既有
+    PowerShell 工具对缺失 exe 的处理兼容。执行后的 reader/collector/watcher 错误、
+    进程创建阶段的取消等不确定状态都**不**属于这个类型, 不能被当成"未启动"。
+    """
+
+
 class PowerShellRunner:
     """argv = [pwsh, -NoProfile, -NonInteractive, -ExecutionPolicy, Bypass, -Command, <utf8 prefix + command>].
 
@@ -391,12 +401,17 @@ class PowerShellRunner:
             "-Command",
             UTF8_PREFIX + command,
         ]
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(cwd),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            # 创建边界可证目标未启动 (缺失/不可解析的 exe); 保留原 cause 供上层记录,
+            # 其余创建期不确定状态 (含 CancelledError) 照旧传播, 不冒充启动失败。
+            raise PowerShellLaunchError(str(exc)) from exc
         collector = _OutputCollector(output_dir)
         readers = [
             asyncio.ensure_future(self._pump(proc.stdout, collector)),

@@ -370,3 +370,20 @@ async def test_pipe_read_failure_is_published_as_incomplete(tmp_path, monkeypatc
     assert r.details["timed_out"] is True
     assert "output_complete=false" in r.content
     assert "did not reach EOF" in r.content
+
+
+async def test_missing_executable_keeps_the_existing_tool_behaviour(tmp_path, monkeypatch):
+    """新的启动失败类型继承 FileNotFoundError: 工具原有缺失 exe 结果不变."""
+    from cicada.plugins.coding import process as process_module
+    from cicada.plugins.coding.process import PowerShellLaunchError, PowerShellRunner
+
+    ws, _ = make(tmp_path)
+    missing = ws.root / "no-such-pwsh.exe"
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(missing))
+    # 类型可判别, 且仍是 FileNotFoundError (工具按后者处理)
+    assert issubclass(PowerShellLaunchError, FileNotFoundError)
+    tool = PowerShellTool(ws, PowerShellRunner())
+    r = await run(tool, command="Write-Output hi")
+    assert r.is_error is True
+    assert r.content == "pwsh executable not found on PATH"
+    assert r.details is None

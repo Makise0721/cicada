@@ -13,6 +13,7 @@ from cicada.plugins.coding.process import (
     ARTIFACT_MAX_BYTES,
     READ_CHUNK_BYTES,
     RESOURCE_CLEANUP_SECONDS,
+    PowerShellLaunchError,
     PowerShellRunner,
     _OutputCollector,
 )
@@ -313,6 +314,26 @@ async def test_nonzero_exit_code_is_preserved(tmp_path):
     assert result.cancelled is False
     assert result.output_complete is True
     assert result.output.text.strip() == "hi"
+
+
+# --- 第二轮: 明确启动失败边界 (供 V/04 消费) ---
+
+
+async def test_missing_executable_raises_powershell_launch_error(tmp_path, monkeypatch):
+    """真实指向缺失 exe 的进程创建边界给出可判别的未启动类型, 并保留 cause."""
+    ws = make(tmp_path)
+    missing = ws.root / "no-such-pwsh.exe"
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(missing))
+    runner = PowerShellRunner()
+    with pytest.raises(PowerShellLaunchError) as caught:
+        await run_runner(runner, ws, command="Write-Output hi", timeout=5.0)
+    assert isinstance(caught.value, FileNotFoundError)  # 既有缺失 exe 处理仍能捕获
+    cause = caught.value.__cause__
+    assert isinstance(cause, FileNotFoundError)
+    assert "WinError 2" in str(caught.value)
+    assert str(caught.value) == str(cause)  # 归一不改写原始错误文本
+    # 创建边界失败: 没有启动采集, 也没有产出工件
+    assert not list(ws.output_dir.glob("powershell-output-*.txt"))
 
 
 # --- 03 修复回归: reader 完成事实 / 清理总预算 / 取消时工件句柄 ---
