@@ -119,11 +119,13 @@ uv run --frozen python -m cicada --workspace .\sandbox --script .\demo-script.js
 
 ```powershell
 uv run --frozen python -m cicada --workspace .\sandbox `
-  --check-command "if (Select-String -Path app.py -Pattern 'tools_ok' -Quiet) { exit 0 } else { exit 1 }" `
-  '给 build_run_summary 增加 tools_ok 参数, 并通过指定检查'
+  --check-command '& python check_reporting.py' `
+  '给运行摘要增加成功工具调用计数 tools_ok, 并通过指定检查'
 ```
 
-程序独立维护验证事实：启动时建立基线快照并把范围内文件字节存入工件；每次检查前后各捕获一次快照，退出码 0 且输出完整终结、前后快照一致才算 `passed`；任何文件变化都会让旧回执变 `stale`，同一检查的最近一次尝试（即使失败）取代旧的通过；超时、取消、启动失败、输出未 EOF 或快照异常都会锁存为不可交付状态，后续新的 PASS 不能清除。运行结束后程序基于已校验字节生成基线→最终的完整变更清单与 unified diff 工件，输出独立的 delivery section（范围政策、各检查回执与有效性、真实变更文件与工件 hash、阻断原因），并以退出码给出判定：全部条件满足为 0，模型 `stop` 但条件不满足为 3。判定不依赖模型的自然语言汇报。
+示例假定启动者已在工作区提供 `check_reporting.py`，检查摘要的行为。
+
+程序独立维护验证事实：启动时建立基线快照并把范围内文件字节存入工件；每次检查前后各捕获一次快照，退出码 0 且输出完整终结、前后快照一致才算 `passed`；任何文件变化都会让旧回执变 `stale`，同一检查的最近一次尝试（即使失败）取代旧的通过。超时、取消、输出未 EOF 或启动后缺少可靠终结事实会永久锁存 `process_uncertain`，后续新的 PASS 不能清除。明确未启动的失败或单纯的快照不可用会阻断当前回执，后续正常重检可以替代；已有的 `process_uncertain` 锁存仍保留。运行结束后程序基于已校验字节生成基线→最终的完整变更清单与 unified diff 工件，输出独立的 delivery section（范围政策、各检查回执与有效性、真实变更文件与工件 hash、阻断原因），并以退出码给出判定：全部条件满足为 0，模型 `stop` 但条件不满足为 3。判定不依赖模型的自然语言汇报。
 
 ## CLI 参数
 

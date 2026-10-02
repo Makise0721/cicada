@@ -4,7 +4,7 @@
 让实施后的 Cicada CLI (真实 Ollama 模型) 完成"给 build_run_summary 增加 tools_ok"
 的小改动。全部证据写入项目内 `docs/reviews/p4-evidence/0607-I/live/<attempt>/`。
 
-- fixture: 复制主仓库当前 `src/` 的全部 .py 到独立 Git 仓库, 附 4 行 checker;
+- fixture: 复制主仓库当前 `src/` 的全部 .py 到独立 Git 仓库, 附四行为 checker;
   checker 用 sys.path.insert(0, <fixture>/src) 优先导入 fixture 源码。
 - 构建时证明: baseline 上 checker exit 1 且 stderr 为空 (唯一失败原因是缺
   tools_ok, import 未失败), 并用探针证明导入路径绑定 fixture/src。
@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -36,6 +37,7 @@ MODEL = "qwen3.5:9b"
 NUM_CTX = 32768
 NUM_PREDICT = 2048
 MAX_TURNS = 25
+ATTEMPT_BUDGET = 2
 EPISODE_TIMEOUT_S = 600.0
 PROMPT_EVAL_PEAK_LIMIT = 24576
 
@@ -43,19 +45,42 @@ EVIDENCE_ROOT = PROJECT / "docs" / "reviews" / "p4-evidence" / "0607-I" / "live"
 
 # 固定三件套; 跨尝试不变, hash 记入证据。
 CHECKER_NAME = "check_p4.py"
-CHECKER_SOURCE = (
-    "import inspect, sys\n"
-    'sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent / "src"))\n'
-    "from cicada.reporting import build_run_summary\n"
-    'sys.exit(0 if "tools_ok" in inspect.signature(build_run_summary).parameters else 1)\n'
-)
+CHECKER_SOURCE = r'''from pathlib import Path
+import re
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from cicada.core.agent import RunResult
+from cicada.core.messages import ToolResult, ToolResultMessage
+from cicada.reporting import build_run_summary
+cases = [("empty", [], 0), ("all_success", [False, False], 2),
+         ("mixed", [False, True, False], 2), ("all_error", [True, True], 0)]
+failures = []
+for name, errors, expected_ok in cases:
+    messages = tuple(ToolResultMessage(ToolResult(str(i), "read", "probe", is_error=e))
+                     for i, e in enumerate(errors))
+    summary = build_run_summary(RunResult("probe", "stop", None, messages))
+    first = summary.splitlines()[0]
+    required = {"tools_ok": expected_ok, "tools": len(errors), "tool_errors": sum(errors)}
+    missing = [f"{key}={value}" for key, value in required.items()
+               if not re.search(rf"(?: |\[){key}={value}(?: |\])", first)]
+    if missing:
+        failures.append((name, missing, first))
+    if len(summary.splitlines()) != 3 or "input_tokens_known=unknown" not in summary:
+        failures.append((name, "existing summary fields/shape changed", summary))
+if failures:
+    print("CHECK_FAIL", failures)
+    raise SystemExit(1)
+print("CHECK_PASS: 4 behavior cases; existing counters, shape and unknown metrics preserved")
+'''
 # 检查命令只引用相对路径; python 解释器由 harness 的 PATH 提供 (launcher 事实)。
 CHECK_COMMAND = "& python check_p4.py"
 TASK_PROMPT = (
     "这个工作区是 Cicada 项目的一份源码副本。请完成一个小改动: 给 build_run_summary 函数"
-    "增加一个名为 tools_ok 的布尔关键字参数(默认 False), 要求默认参数下函数行为与现在完全一致。"
+    "生成的摘要第一行增加 tools_ok=N, 表示 is_error=False 的工具结果数。"
+    "保留原有计数、三行结构和未知计量语义。"
     "请先用 grep 工具搜索 \"def build_run_summary\" 定位实现文件, 再用 read 读取相关源码, "
-    "完成最小修改。修改后用 check 工具运行指定检查 check-1 并确认通过, 最后简要汇报你改了什么。"
+    "先用 check 工具运行指定检查 check-1 确认初始失败, 再完成最小修改并重检通过。"
+    "不要修改检查器, 最后汇报实际 diff 和检查退出状态。"
 )
 
 
@@ -69,18 +94,6 @@ def sha256_file(path: Path) -> str:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _force_rmtree(path: Path) -> None:
-    """Windows: Git object 文件只读, 删除前先清只读位."""
-    import stat
-
-    def _onexc(func, target, exc_info):
-        os.chmod(target, stat.S_IWRITE)
-        func(target)
-
-    if path.exists():
-        shutil.rmtree(path, onexc=_onexc)
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -103,8 +116,7 @@ def build_fixture(dest: Path) -> dict:
 
     返回 fixture 事实 (commit/manifest/checker 反证/导入优先探针), 全部进入证据。
     """
-    _force_rmtree(dest)
-    dest.mkdir(parents=True)
+    dest.mkdir(parents=True, exist_ok=False)
     copied = 0
     for source in sorted(SRC.rglob("*.py")):
         if "__pycache__" in source.parts:
@@ -137,7 +149,15 @@ def build_fixture(dest: Path) -> dict:
         f"checker must fail on baseline, got {baseline_run.returncode}: {baseline_run.stderr}"
     )
     assert baseline_run.stderr == "", f"baseline failure must not be an import/traceback: {baseline_run.stderr}"
-    assert baseline_run.stdout == ""
+    assert baseline_run.stdout.startswith("CHECK_FAIL "), baseline_run.stdout
+    failures = ast.literal_eval(baseline_run.stdout.removeprefix("CHECK_FAIL ").strip())
+    expected_missing = {
+        "empty": ["tools_ok=0"], "all_success": ["tools_ok=2"],
+        "mixed": ["tools_ok=2"], "all_error": ["tools_ok=0"],
+    }
+    assert len(failures) == 4 and {item[0]: item[1] for item in failures} == expected_missing, (
+        f"baseline must fail only for missing tools_ok counts: {failures}"
+    )
     # baseline 反证 2: 导入优先绑定 fixture/src (相同 PYTHONPATH 环境下)
     probe = subprocess.run(
         [str(VENV_PYTHON), "-c",
@@ -155,6 +175,7 @@ def build_fixture(dest: Path) -> dict:
         "checker_sha256": sha256_text(CHECKER_SOURCE),
         "checker_baseline_exit": baseline_run.returncode,
         "checker_baseline_stderr_empty": baseline_run.stderr == "",
+        "checker_baseline_stdout": baseline_run.stdout,
         "import_probe": probe.stdout.strip(),
         "main_head": head,
         "baseline_manifest": baseline_manifest,
@@ -300,10 +321,13 @@ def loaded_state() -> dict:
 
 def run_attempt(attempt: int) -> dict:
     """执行一次完整 live 尝试并保存全部证据; 断言结果由调用方在证据落盘后判定."""
+    if type(attempt) is not int or not 1 <= attempt <= ATTEMPT_BUDGET:
+        raise ValueError(f"attempt must be an integer from 1 to {ATTEMPT_BUDGET}")
     attempt_dir = EVIDENCE_ROOT / f"attempt-{attempt}"
-    _force_rmtree(attempt_dir)
-    attempt_dir.mkdir(parents=True)
     fixture_root = PROJECT / ".scratch" / "p4-implementation" / "temp" / "I-0607-live" / f"attempt-{attempt}" / "fixture"
+    if fixture_root.exists():
+        raise FileExistsError(f"live fixture already exists; refusing to overwrite: {fixture_root}")
+    attempt_dir.mkdir(parents=True, exist_ok=False)
 
     identity = {
         "attempt": attempt,
@@ -330,6 +354,7 @@ def run_attempt(attempt: int) -> dict:
         "prompt_sha256": sha256_text(TASK_PROMPT),
         "checker_baseline_exit": facts["checker_baseline_exit"],
         "checker_baseline_stderr_empty": facts["checker_baseline_stderr_empty"],
+        "checker_baseline_stdout": facts["checker_baseline_stdout"],
         "fixture_import_probe": facts["import_probe"],
     })
     identity.update(ollama_digest())
