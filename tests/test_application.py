@@ -1,0 +1,636 @@
+"""T02/T03/T07/T08 基础/T09 基础/T11 应用部分: 共享 ApplicationSession 公开执行检查.
+
+真实内核 + 真实插件组装, 模型用确定性 fake; 检查模式用项目内隔离 Git 工作区、
+真实 PowerShell 与现有检查/快照/工件实现. 观察公开状态、事件与 RequestOutcome,
+不复述内部函数实现. 唯一可控 seam:
+- 替换 session._service 为慢速委托代理 (T07 收尾屏障 / T11 监督截止);
+- 手工 bootstrap + ApplicationSession 构造最小应用 (T11 关闭监督/清理失败,
+  使用公开 bootstrap 与 PluginDefinition.defer).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from cicada.application import (
+    ApplicationClosed,
+    ApplicationConfig,
+    ApplicationOpenError,
+    ApplicationSession,
+    RequestCompleted,
+    RequestPhaseChanged,
+    open_application,
+)
+from cicada.boot import bootstrap
+from cicada.core.cancel import CancelToken
+from cicada.core.ports import ToolContext, ToolSpec
+from cicada.plugins.coding.verification_contracts import (
+    CheckDefinition,
+    VerificationPlan,
+    VerificationView,
+)
+from cicada.plugins.coding.verification import generate_verification_run_id
+from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.prompting import PromptInfo
+from cicada.runtime.plugin import PluginDefinition
+
+CHECK_COMMAND = "exit 0"
+
+
+def _git(root: Path, *args: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, check=True
+    ).stdout
+
+
+def _repo(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(root, "add", ".")
+    _git(root, "commit", "-q", "-m", "baseline")
+    return root
+
+
+def _prompt_info(root: Path) -> PromptInfo:
+    return PromptInfo(
+        version="test",
+        workspace=root,
+        instructions_path=None,
+        instructions_sha256=None,
+        prompt_sha256=hashlib.sha256(b"test").hexdigest(),
+    )
+
+
+def _config(root: Path, *, script: list, plan: VerificationPlan | None = None) -> ApplicationConfig:
+    return ApplicationConfig(
+        workspace=root,
+        system_prompt="test system prompt",
+        prompt_info=_prompt_info(root),
+        model_plugin=fake_model_plugin(FakeModel(script)),
+        plan=plan,
+        max_turns=6,
+        model_label="fake",
+    )
+
+
+def _plan(root: Path, command: str = CHECK_COMMAND) -> VerificationPlan:
+    return VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=Path(os.path.realpath(root)),
+        checks=(CheckDefinition("check-1", command, timeout_s=30.0),),
+    )
+
+
+def _script(*entries: dict) -> list:
+    """经 parse_script 构建确定性 fake 剧本 (JSON dict -> StreamEvent 列表)."""
+    from cicada.__main__ import parse_script
+
+    return parse_script(json.dumps(list(entries)))
+
+
+class Collector:
+    """订阅 ApplicationUpdate; 记录顺序并支持等待."""
+
+    def __init__(self, session: ApplicationSession) -> None:
+        self.updates: list = []
+        self._unsubscribe = session.subscribe(self)
+
+    def __call__(self, update) -> None:
+        self.updates.append(update)
+
+    @property
+    def phases(self) -> list[tuple[str | None, str]]:
+        return [(u.run_id, u.phase) for u in self.updates if isinstance(u, RequestPhaseChanged)]
+
+    @property
+    def completed(self):
+        return [u.outcome for u in self.updates if isinstance(u, RequestCompleted)]
+
+    @property
+    def closed(self) -> ApplicationClosed | None:
+        return next((u for u in self.updates if isinstance(u, ApplicationClosed)), None)
+
+    async def wait_for(self, predicate, timeout: float = 10.0) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.01)
+        return False
+
+    def stop(self) -> None:
+        self._unsubscribe()
+
+
+class SlowRefreshService:
+    """把真实服务的 refresh 延迟化的可控收尾屏障; 其余全部委托."""
+
+    def __init__(self, inner, delay: float) -> None:
+        self._inner = inner
+        self._delay = delay
+
+    @property
+    def plan(self):
+        return self._inner.plan
+
+    def mark_process_uncertain(self, reason: str) -> None:
+        self._inner.mark_process_uncertain(reason)
+
+    async def initialize(self, cancel: CancelToken):
+        return await self._inner.initialize(cancel)
+
+    async def run_check(self, check_id: str, cancel: CancelToken):
+        return await self._inner.run_check(check_id, cancel)
+
+    async def refresh(self, cancel: CancelToken) -> VerificationView:
+        await asyncio.sleep(self._delay)
+        return await self._inner.refresh(cancel)
+
+    async def finalize(self, cancel: CancelToken):
+        return await self._inner.finalize(cancel)
+
+
+class IgnoreCancelTool:
+    """吞掉取消令牌并持续运行的工具: 关闭监督到点路径的可控资源."""
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.cancel_observed = asyncio.Event()
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="hang",
+            description="忽略取消",
+            parameters={"type": "object", "properties": {}},
+        )
+
+    async def execute(self, arguments: dict, ctx: ToolContext):
+        from cicada.core.messages import ToolResult
+
+        self.started.set()
+
+        async def watch() -> None:
+            await ctx.cancel.wait()
+            self.cancel_observed.set()
+            # 观察到取消但继续运行: 模拟吞取消的外部工作 (第一版不承诺强制终止)
+
+        watcher = asyncio.create_task(watch())
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            watcher.cancel()
+            raise
+
+
+# --- 启动与配置 ------------------------------------------------------------------------------
+
+
+async def test_config_rejects_invalid_max_turns(tmp_path):
+    with pytest.raises(ValueError, match="max_turns"):
+        ApplicationConfig(
+            workspace=tmp_path, system_prompt="", prompt_info=_prompt_info(tmp_path),
+            model_plugin=fake_model_plugin(FakeModel([])), max_turns=0,
+        )
+
+
+async def test_open_failure_maps_boot_error(tmp_path, monkeypatch):
+    import cicada.application as app_module
+    from cicada.boot import BootError
+
+    async def broken_bootstrap(*args, **kwargs):
+        raise BootError("plugin startup failed: boom")
+
+    monkeypatch.setattr(app_module, "bootstrap", broken_bootstrap)
+    with pytest.raises(ApplicationOpenError, match="boot failed: plugin startup failed: boom"):
+        await open_application(_config(tmp_path, script=[]))
+
+
+# --- T02: 连续两请求接续结构化历史 -----------------------------------------------------------
+
+
+async def test_second_request_carries_prior_history_once(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"text": "第一轮回答", "stop": True},
+        {"text": "第二轮回答", "stop": True},
+    )))
+    collector = Collector(session)
+    first = await session.execute("第一个问题")
+    assert first.exit_code == 0
+    second = await session.execute("第二个问题")
+    assert second.exit_code == 0
+    # 应用累计历史: 每轮后缀追加一次, 无重复增长
+    assert [m.text for m in session.history] == [
+        "第一个问题", "第一轮回答", "第二个问题", "第二轮回答",
+    ]
+    # 系统提示独立于普通历史: 以 system_prompt 字段单独携带
+    from cicada.plugins.fake_model import FakeModel
+
+    model = session._app.agent._model
+    assert isinstance(model, FakeModel)
+    assert model.requests[1].system_prompt == "test system prompt"
+    assert not any(m.text == "test system prompt" for m in model.requests[1].messages)
+    collector.stop()
+    await session.aclose()
+
+
+async def test_phase_events_follow_lifecycle(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script({"text": "回答", "stop": True})))
+    collector = Collector(session)
+    await session.execute("问题")
+    assert collector.phases == [
+        (None, "executing"),
+        ("run-1", "executing"),
+        ("run-1", "finalizing"),
+        ("run-1", "idle"),
+    ]
+    outcome = collector.completed[0]
+    assert outcome.result.run_id == "run-1"
+    assert outcome.decision is None and outcome.view is None  # 普通模式不产生检查权威
+    collector.stop()
+    await session.aclose()
+
+
+# --- T03: 错误路径闭合且可继续追问 ------------------------------------------------------------
+
+
+async def test_model_error_closes_calls_and_allows_followup(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
+         "error": "provider exploded"},
+        {"text": "恢复后回答", "stop": True},
+    )))
+    collector = Collector(session)
+    bad = await session.execute("第一问")
+    assert bad.exit_code == 1
+    assert bad.result.stop_reason == "error"
+    # 错误路径闭合工具调用: 历史以固定哨兵错误结果结尾, 不悬空
+    tail = session.history[-1].result
+    assert tail.call_id == "c1"
+    assert tail.content == "model stream failed; tool call not executed"
+    # 结构化历史闭合 -> 允许继续追问
+    followup = await session.execute("第二问")
+    assert followup.exit_code == 0 and followup.result.stop_reason == "stop"
+    collector.stop()
+    await session.aclose()
+
+
+# --- T07: 内核结束后保持 finalizing, 收尾前不接受新请求 ---------------------------------------
+
+
+async def test_execute_rejected_until_finalization_completes(tmp_path):
+    root = _repo(tmp_path)
+    plan = _plan(root)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "check",
+                         "arguments": {"action": "run", "check_id": "check-1"}}],
+         "stop": True},
+    ), plan=plan))
+    real_service = session._service
+    assert real_service is not None
+    session._service = SlowRefreshService(real_service, delay=0.4)
+    collector = Collector(session)
+
+    task = asyncio.create_task(session.execute("运行检查"))
+    assert await collector.wait_for(lambda: session.state == "finalizing"), collector.phases
+    # 内核已结束 (finalizing), 新请求在收尾完成前被拒绝
+    with pytest.raises(RuntimeError, match="finalizing"):
+        await session.execute("插队")
+    outcome = await asyncio.wait_for(task, timeout=10)
+    assert session.state == "idle"
+    assert outcome.exit_code == 0
+    assert outcome.decision is not None and outcome.decision.can_deliver
+    collector.stop()
+    await session.aclose()
+
+
+# --- T08 基础: 多请求共用一次 initialize 的基线和账本 ------------------------------------------
+
+
+async def test_multi_request_shared_baseline_and_cumulative_artifacts(tmp_path):
+    root = _repo(tmp_path)
+    plan = _plan(root)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [
+            {"id": "e1", "name": "edit", "arguments": {
+                "path": "sample.py",
+                "edits": [{"old_text": "VALUE = 1", "new_text": "VALUE = 2"}],
+            }},
+            {"id": "c1", "name": "check", "arguments": {"action": "run", "check_id": "check-1"}},
+        ], "tool_use": True},
+        {"text": "第一轮检查完成", "stop": True},
+        {"tool_calls": [{"id": "c2", "name": "check",
+                         "arguments": {"action": "run", "check_id": "check-1"}}],
+         "tool_use": True},
+        {"text": "第二轮检查完成", "stop": True},
+    ), plan=plan))
+    collector = Collector(session)
+    first = await session.execute("改一下再检查")
+    assert first.exit_code == 0, first.decision.blocking_reasons if first.decision else None
+    assert first.decision is not None and first.decision.can_deliver
+    assert first.evidence is not None and first.view is not None
+    baseline = first.evidence.baseline_snapshot_ref
+    artifact_1 = first.evidence.artifact_path
+    assert artifact_1 is not None and artifact_1.exists()
+    assert first.evidence.changes, "请求 1 应有累计变更记录"
+    assert len(first.view.receipts) == 1
+
+    second = await session.execute("再检查一次")
+    assert second.exit_code == 0
+    assert second.decision is not None and second.decision.can_deliver
+    # 基线/账本跨请求共享: 同一 baseline, 同一 verification_run_id, 回执累计
+    assert second.evidence.baseline_snapshot_ref == baseline
+    assert second.view.verification_run_id == plan.verification_run_id
+    assert len(second.view.receipts) == 2
+    # 每次请求独立的累计变更工件: 新文件, 不覆盖
+    assert second.evidence.artifact_path is not None
+    assert second.evidence.artifact_path != artifact_1
+    assert second.evidence.artifact_path.exists() and artifact_1.exists()
+    collector.stop()
+    await session.aclose()
+
+
+# --- T09 基础: process_uncertain 拒绝后续编码请求, 清空历史不解锁 -----------------------------
+
+
+async def test_process_uncertain_blocks_followup_and_survives_clear(tmp_path):
+    root = _repo(tmp_path)
+    plan = VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=Path(os.path.realpath(root)),
+        checks=(CheckDefinition("check-1", "Start-Sleep -Seconds 5", timeout_s=0.5),),
+    )
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "check",
+                         "arguments": {"action": "run", "check_id": "check-1"}}],
+         "stop": True},
+        {"text": "汇报超时", "stop": True},
+    ), plan=plan))
+    collector = Collector(session)
+    outcome = await session.execute("跑一个会超时的检查")
+    assert outcome.result.stop_reason == "stop"
+    assert outcome.view is not None and outcome.view.process_uncertain
+    # 后续用户编码请求被拒绝
+    with pytest.raises(RuntimeError, match="process_uncertain"):
+        await session.execute("继续改代码")
+    # 清空历史不解锁: 锁存单调保持
+    session.clear_history()
+    with pytest.raises(RuntimeError, match="process_uncertain"):
+        await session.execute("清空后再试")
+    # 关闭仍然可用
+    await session.aclose()
+    assert session.state == "closed"
+    collector.stop()
+
+
+# --- T11 应用部分: 取消 / 关闭重入 / 迟到完成 / 监督截止 / 清理失败 ---------------------------
+
+
+async def test_cancel_returns_outcome_and_session_reusable(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "powershell",
+                         "arguments": {"command": "Start-Sleep -Seconds 30", "timeout": 30}}],
+         "tool_use": True},
+        {"text": "取消后的新请求", "stop": True},
+    )))
+    collector = Collector(session)
+    task = asyncio.create_task(session.execute("会取消的请求"))
+    assert await collector.wait_for(lambda: session.state == "executing")
+    await asyncio.sleep(0.3)  # 等真实 PowerShell 进程起来
+    session.cancel()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.result.stop_reason == "aborted"
+    assert outcome.exit_code == 1
+    assert session.state == "idle"
+    # 取消后可继续请求
+    again = await session.execute("下一个请求")
+    assert again.exit_code == 0
+    collector.stop()
+    await session.aclose()
+
+
+async def test_close_reentry_shares_one_close_and_rejects_execute(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=[]))
+    results = await asyncio.gather(session.aclose(), session.aclose())
+    assert results == [None, None]
+    assert session.state == "closed"
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.execute("after close")
+
+
+async def test_late_completion_during_close_keeps_closing_state(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "powershell",
+                         "arguments": {"command": "Start-Sleep -Seconds 30", "timeout": 30}}],
+         "tool_use": True},
+        {"text": "done", "stop": True},
+    )))
+    collector = Collector(session)
+    execute_task = asyncio.create_task(session.execute("取消我"))
+    assert await collector.wait_for(lambda: session.state == "executing")
+    await asyncio.sleep(0.3)
+    close_task = asyncio.create_task(session.aclose())
+    # 关闭锁存后, 活动请求被取消并完成收尾; RequestCompleted 仍发出一次, 但状态保持 closing
+    assert await collector.wait_for(
+        lambda: session.state == "closing" and collector.completed, timeout=15
+    )
+    completed = collector.completed[-1]
+    assert completed.result.stop_reason == "aborted"
+    assert session.state == "closing"
+    await asyncio.wait_for(close_task, timeout=15)
+    assert session.state == "closed"
+    # ApplicationClosed 是最后一条通知; 正常关闭无清理错误
+    assert collector.closed is not None and collector.closed.error is None
+    assert collector.updates[-1] is collector.closed
+    # execute 正常返回 outcome (迟到完成不能转回 idle 也不悬挂调用方)
+    outcome = await asyncio.wait_for(execute_task, timeout=10)
+    assert outcome.result.stop_reason == "aborted"
+    collector.stop()
+
+
+async def test_close_supervision_deadline_records_problem(tmp_path, monkeypatch):
+    import cicada.application as app_module
+
+    monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.2)
+    root = _repo(tmp_path)
+
+    def hang_setup(ctx):
+        ctx.provide("tool.hang", IgnoreCancelTool())
+
+    definitions = [
+        PluginDefinition(name="hang", setup=hang_setup, provides=frozenset({"tool.hang"})),
+        fake_model_plugin(FakeModel(_script(
+            {"tool_calls": [{"id": "c1", "name": "hang", "arguments": {}}], "tool_use": True},
+        ))),
+    ]
+    app = await bootstrap(
+        definitions, tool_capabilities=("tool.hang",), system_prompt="t", max_turns=6,
+    )
+    session = ApplicationSession(app=app, config=_config(root, script=[]), service=None, policy=None)
+    hang = app.runtime.capability("tool.hang")
+    assert isinstance(hang, IgnoreCancelTool)
+    execute_task = asyncio.create_task(session.execute("挂住"))
+    await asyncio.wait_for(hang.started.wait(), timeout=5)
+    close_task = asyncio.create_task(session.aclose())
+    closed = await asyncio.wait_for(close_task, timeout=10)
+    assert closed is None  # aclose 正常返回
+    assert session.state == "closed"
+    # 监督到点: 记录问题且不再回 idle / 不再接收请求
+    assert "did not finalize" in (session._close_problems[0] if session._close_problems else "")
+    execute_task.cancel()
+    try:
+        await execute_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_cleanup_failure_surfaces_in_application_closed(tmp_path):
+    root = _repo(tmp_path)
+
+    def leaky_setup(ctx):
+        ctx.provide("leaky-cap", object())
+
+        def boom():
+            raise RuntimeError("cleanup exploded")
+
+        ctx.defer(boom)
+
+    definitions = [
+        PluginDefinition(name="leaky", setup=leaky_setup, provides=frozenset({"leaky-cap"})),
+        fake_model_plugin(FakeModel(_script({"text": "ok", "stop": True}))),
+    ]
+    app = await bootstrap(definitions, tool_capabilities=(), system_prompt="t", max_turns=6)
+    session = ApplicationSession(app=app, config=_config(root, script=[]), service=None, policy=None)
+    collector = Collector(session)
+    outcome = await session.execute("x")
+    assert outcome.exit_code == 0
+    await session.aclose()
+    assert collector.closed is not None
+    assert collector.closed.error is not None
+    assert "runtime stop failed" in collector.closed.error
+    collector.stop()
+
+
+# --- 隔离 / 清空 / 拒绝 ----------------------------------------------------------------------
+
+
+async def test_observer_mutation_does_not_touch_canonical_history(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
+         "stop": True},
+        {"text": "第二问回答", "stop": True},
+    )))
+    seen: list = []
+
+    def mutating_observer(update):
+        if isinstance(update, RequestCompleted):
+            seen.append(update.outcome)
+            for message in update.outcome.result.messages:
+                result = getattr(message, "result", None)
+                if result is not None and result.details:
+                    result.details["tampered"] = True
+
+    session.subscribe(mutating_observer)
+    await session.execute("调用一次工具")
+    # 观察者确实在自己的副本上改到了 details
+    assert seen
+    tampered_in_copy = any(
+        "tampered" in (getattr(m, "result", None).details or {})
+        for o in seen for m in o.result.messages
+        if getattr(m, "result", None) is not None
+    )
+    assert tampered_in_copy
+    # 规范历史未被展示副本的改动穿透
+    for message in session.history:
+        result = getattr(message, "result", None)
+        if result is not None and result.details:
+            assert "tampered" not in result.details
+    await session.execute("第二个问题")
+    await session.aclose()
+
+
+async def test_clear_history_keeps_session_usable_and_verification_state(tmp_path):
+    root = _repo(tmp_path)
+    plan = _plan(root)
+    session = await open_application(_config(root, script=_script(
+        {"text": "第一轮", "stop": True},
+        {"text": "第二轮", "stop": True},
+    ), plan=plan))
+    await session.execute("第一问")
+    assert len(session.history) == 2
+    session.clear_history()
+    assert session.history == ()
+    # 声明的检查从未运行: 模型 stop 但交付判定不通过 (exit 3), 视图仍绑定同一验证运行
+    second = await session.execute("第二问")
+    assert second.exit_code == 3
+    assert second.decision is not None and not second.decision.can_deliver
+    assert [m.text for m in session.history] == ["第二问", "第二轮"]
+    # 验证状态保留: 收尾仍使用同一 verification_run_id (基线/账本未随历史清空)
+    assert second.view is not None
+    assert second.view.verification_run_id == plan.verification_run_id
+    # 空闲时重复清空合法
+    session.clear_history()
+    assert session.history == ()
+    await session.aclose()
+
+
+async def test_busy_clear_and_busy_execute_rejected(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "powershell",
+                         "arguments": {"command": "Start-Sleep -Seconds 30", "timeout": 30}}],
+         "tool_use": True},
+        {"text": "done", "stop": True},
+    )))
+    task = asyncio.create_task(session.execute("忙碌请求"))
+    await asyncio.sleep(0.3)
+    assert session.state == "executing"
+    with pytest.raises(RuntimeError, match="idle"):
+        session.clear_history()
+    with pytest.raises(RuntimeError, match="finish before the next"):
+        await session.execute("插队")
+    session.cancel()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.result.stop_reason == "aborted"
+    await session.aclose()
+
+
+async def test_empty_prompt_rejected_before_state_change(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=[]))
+    with pytest.raises(ValueError, match="nonempty"):
+        await session.execute("   ")
+    assert session.state == "idle"
+    await session.aclose()
+
+
+async def test_subscribe_observer_errors_recorded_not_fatal(tmp_path):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script({"text": "ok", "stop": True})))
+
+    def bad(update):
+        raise RuntimeError("observer boom")
+
+    session.subscribe(bad)
+    outcome = await session.execute("x")
+    assert outcome.exit_code == 0
+    assert any(isinstance(e, RuntimeError) for e in session.observer_errors)
+    await session.aclose()

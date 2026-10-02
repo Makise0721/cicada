@@ -15,17 +15,15 @@ profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes. 
 - 3: 模型 stop 但检查或证据条件不满足;
 - 1: 模型 error/aborted/length; 2: 输入/启动错误 (普通模式保持 0=stop, 1/2 同上).
 
-剧本 JSON 为条目列表, 每条目是一轮模型响应:
-  {"text": "...", "tool_calls": [{"id", "name", "arguments": {...}}],
-   "stop": true | "error": "..." | "length": true}
-终结缺省: 有 tool_calls 视为 tool_use, 否则视为 stop.
+启动/执行/验证收尾/关闭编排统一走 cicada.application (单次 CLI 与 TUI 的共享
+seam); 本模块保留参数解析、fake JSON 转换、preflight 与打印适配, 不复制检查
+模式装配. 订阅适配忽略新增文本增量与阶段通知, 旧 CLI 打印语义保持.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -33,8 +31,14 @@ from pathlib import Path
 
 import httpx
 
-from cicada.boot import App, BootError, bootstrap
-from cicada.core.cancel import CancelToken
+from cicada.application import (
+    AgentEventReceived,
+    ApplicationConfig,
+    ApplicationOpenError,
+    RequestCompleted,
+    RequestPhaseChanged,
+    open_application,
+)
 from cicada.core.events import (
     AssistantCompleted,
     Event,
@@ -45,27 +49,11 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
-from cicada.plugins.coding.inventory import inventory_plugin
-from cicada.plugins.coding.process import process_plugin
-from cicada.plugins.coding.tool_check import check_plugin
-from cicada.plugins.coding.tool_edit import edit_plugin
-from cicada.plugins.coding.tool_glob import glob_plugin
-from cicada.plugins.coding.tool_grep import grep_plugin
-from cicada.plugins.coding.tool_powershell import powershell_plugin
-from cicada.plugins.coding.tool_read import read_plugin
-from cicada.plugins.coding.tool_write import write_plugin
-from cicada.plugins.coding.verification import (
-    Verifier,
-    generate_verification_run_id,
-    verification_plugin,
-)
+from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
-    VERIFICATION_CAPABILITY,
     CheckDefinition,
     VerificationPlan,
-    VerificationView,
 )
-from cicada.plugins.coding.workspace import workspace_plugin
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
 from cicada.prompting import (
@@ -75,19 +63,8 @@ from cicada.prompting import (
     PromptInfo,
     compose_system_prompt,
 )
-from cicada.reporting import (
-    DeliveryDecision,
-    build_delivery_section,
-    build_run_summary,
-    decide_delivery,
-)
-from cicada.run_policy import RunPolicy, verification_policy
-from cicada.runtime.plugin import PluginDefinition
+from cicada.reporting import build_delivery_section, build_run_summary
 
-TOOL_CAPABILITIES = (
-    "tool.read", "tool.edit", "tool.write", "tool.powershell", "tool.glob", "tool.grep",
-)
-CHECK_TOOL_CAPABILITIES = TOOL_CAPABILITIES + ("tool.check",)
 DEFAULT_CONFIG = OllamaConfig()
 DEFAULT_NUM_CTX = 32768  # CLI 请求级默认值; 消除服务端默认 4K 依赖. 仅是请求值, 非实际分配保证
 
@@ -101,6 +78,7 @@ CHECK_MODE_MIN_NUM_CTX = 32768
 CHECK_MODE_NUM_PREDICT = 2048
 CHECK_MODE_MAX_TURNS = 25
 CHECK_MODE_MAX_REQUEST_BYTES = 65536
+NORMAL_MODE_MAX_TURNS = 50
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -180,28 +158,8 @@ def parse_check_commands(
     return tuple(definitions), None
 
 
-def default_definitions(
-    workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None
-) -> list[PluginDefinition]:
-    definitions: list[PluginDefinition] = [
-        workspace_plugin(workspace),
-        inventory_plugin(),
-        process_plugin(),
-        read_plugin(),
-        edit_plugin(),
-        write_plugin(),
-        powershell_plugin(),
-        glob_plugin(),
-        grep_plugin(),
-    ]
-    if plan is not None:
-        definitions.append(verification_plugin(plan))
-        definitions.append(check_plugin())
-    definitions.append(model_plugin)
-    return definitions
-
-
 def print_event(event: Event) -> None:
+    """旧 CLI 的内核事件打印; 新增事件类型 (文本增量等) 自然静默."""
     if isinstance(event, RunStarted):
         print(f"=== {event.run_id}")
     elif isinstance(event, TurnStarted):
@@ -238,38 +196,6 @@ async def _ollama_reachable(base_url: str) -> bool:
     except httpx.HTTPError:
         return False
     return response.is_success
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(256 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _verify_receipt_artifacts(view: VerificationView) -> tuple[str, ...]:
-    """核对最近回执引用的输出工件与写入时记录的 hash; 缺失/篡改都是阻断原因.
-
-    只核对交付判定实际依赖的最近回执; 被取代的历史回执工件是历史证据, 不阻断。
-    """
-    problems: list[str] = []
-    for state in view.checks:
-        receipt = state.receipt
-        if receipt is None or receipt.output_artifact_path is None:
-            continue
-        path = receipt.output_artifact_path
-        try:
-            observed = _sha256_file(path)
-        except OSError as exc:
-            problems.append(
-                f"check {state.check_id} output artifact is missing or unreadable ({path}): {exc}")
-            continue
-        if receipt.output_artifact_sha256 is not None and observed != receipt.output_artifact_sha256:
-            problems.append(
-                f"check {state.check_id} output artifact no longer matches the hash recorded "
-                f"when it was written ({path})")
-    return tuple(problems)
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -333,6 +259,7 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"invalid script: {exc}", file=sys.stderr)
             return 2
         model_plugin = fake_model_plugin(FakeModel(script))
+        model_label = "fake"
     else:
         num_ctx = args.num_ctx if args.num_ctx is not None else DEFAULT_NUM_CTX
         source = "cli" if args.num_ctx is not None else "default"
@@ -363,63 +290,44 @@ async def _run(args: argparse.Namespace) -> int:
             )
             return 2
         model_plugin = ollama_plugin(config)
+        model_label = config.model
 
-    # 检查模式: bootstrap 里同步工厂取得验证服务并包装 ModelPort; CLI 保留策略引用,
-    # 运行结束后用同一套扫描逻辑消费末次工具结果。
-    policy_state: dict[str, object] = {}
-
-    def _model_policy(model, runtime):
-        service = runtime.capability(VERIFICATION_CAPABILITY)
-        wrapped = verification_policy(model, service)
-        policy_state["policy"] = wrapped
-        policy_state["service"] = service
-        return wrapped
-
+    app_config = ApplicationConfig(
+        workspace=workspace,
+        system_prompt=prompt,
+        prompt_info=prompt_info,
+        model_plugin=model_plugin,
+        plan=plan,
+        max_turns=CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS,
+        model_label=model_label,
+    )
     try:
-        app: App = await bootstrap(
-            default_definitions(workspace, model_plugin, plan),
-            tool_capabilities=CHECK_TOOL_CAPABILITIES if checks else TOOL_CAPABILITIES,
-            system_prompt=prompt,
-            model_policy=_model_policy if checks else None,
-            max_turns=CHECK_MODE_MAX_TURNS if checks else 50,
-        )
-    except BootError as exc:
-        print(f"boot failed: {exc}", file=sys.stderr)
+        session = await open_application(app_config)
+    except ApplicationOpenError as exc:
+        print(f"{exc}", file=sys.stderr)
         return 2
-    app.agent.subscribe(print_event)
-    delivery: tuple[DeliveryDecision, VerificationView, object, Verifier] | None = None
+
+    def on_update(update) -> None:
+        # 旧 CLI 打印适配: 只转发内核事件; 忽略文本增量与阶段/完成通知, 避免重复输出
+        if isinstance(update, AgentEventReceived):
+            print_event(update.event)
+        elif isinstance(update, (RequestPhaseChanged, RequestCompleted)):
+            return
+
+    unsubscribe = session.subscribe(on_update)
     try:
-        if checks:
-            service: Verifier = policy_state["service"]  # type: ignore[assignment]
-            capture = await service.initialize(CancelToken())
-            if not capture.available:
-                detail = f" ({capture.failure_kind}): {capture.error}" if capture.error else ""
-                print(f"verification initialize failed{detail}", file=sys.stderr)
-                return 2
-        result = await app.agent.run(args.prompt)
-        if checks:
-            policy: RunPolicy = policy_state["policy"]  # type: ignore[assignment]
-            service = policy_state["service"]  # type: ignore[assignment]
-            # 末次工具结果 (含最后一轮的 check/powershell 错误) 先锁存, 再取最终视图与证据
-            policy._scan_terminal_facts(result.messages)
-            view = await service.refresh(CancelToken())
-            evidence = await service.finalize(CancelToken())
-            delivery = (
-                decide_delivery(result, view, evidence, _verify_receipt_artifacts(view)),
-                view,
-                evidence,
-                service,
-            )
+        try:
+            outcome = await session.execute(args.prompt)
+        except ValueError as exc:
+            print(f"invalid prompt: {exc}", file=sys.stderr)
+            return 2
     finally:
-        await app.aclose()
-    print(build_run_summary(result))
-    if delivery is not None:
-        decision, view, evidence, service = delivery
-        print(build_delivery_section(decision, view, evidence, service.plan))
-        if not decision.model_stopped:
-            return 1
-        return 0 if decision.can_deliver else 3
-    return 0 if result.stop_reason == "stop" else 1
+        unsubscribe()
+        await session.aclose()
+    print(build_run_summary(outcome.result))
+    if outcome.decision is not None:
+        print(build_delivery_section(outcome.decision, outcome.view, outcome.evidence, plan))
+    return outcome.exit_code
 
 
 def main() -> int:

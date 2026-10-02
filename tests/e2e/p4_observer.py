@@ -89,10 +89,13 @@ def run_observed_cli(evidence_dir: Path, cli_args: list[str]) -> int:
         raise ValueError("evidence-dir must be an existing directory inside the project")
     import cicada
     import cicada.__main__ as cli
+    import cicada.application as application
     from cicada.plugins.coding.verification_contracts import VERIFICATION_CAPABILITY
 
     observer = Observer(evidence_dir)
-    original_bootstrap, original_decide = cli.bootstrap, cli.decide_delivery
+    # 02 共享编排迁移后, bootstrap/decide_delivery 的实际调用点在 cicada.application;
+    # patch 必须跟随真实调用路径, 观察语义不变。
+    original_bootstrap, original_decide = application.bootstrap, application.decide_delivery
     invocation_argv = list(sys.argv)
     original_argv = sys.argv
     restorations: list[tuple[Any, str, Any]] = []
@@ -136,7 +139,7 @@ def run_observed_cli(evidence_dir: Path, cli_args: list[str]) -> int:
     main_exception: dict[str, str] | None = None
     started = time.monotonic()
     try:
-        cli.bootstrap, cli.decide_delivery = observed_bootstrap, observed_decide
+        application.bootstrap, application.decide_delivery = observed_bootstrap, observed_decide
         sys.argv = [str(Path(cli.__file__).resolve()), *cli_args]
         main_exit_code = cli.main()
         return main_exit_code
@@ -147,7 +150,7 @@ def run_observed_cli(evidence_dir: Path, cli_args: list[str]) -> int:
         raise
     finally:
         elapsed = time.monotonic() - started
-        cli.bootstrap, cli.decide_delivery = original_bootstrap, original_decide
+        application.bootstrap, application.decide_delivery = original_bootstrap, original_decide
         sys.argv = original_argv
         for instance, attribute, original in reversed(restorations):
             setattr(instance, attribute, original)
