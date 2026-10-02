@@ -216,14 +216,15 @@ class FileTooLarge(Exception):
     """读取途中确认超过单文件字节上限 (预 stat 之后文件仍可能增长)."""
 
 
-def read_text_file_chunked(
+async def read_text_file_chunked(
     path: Path, *, cancel: CancelToken, started: float
 ) -> str | None:
     """分块读取并整文件校验编码; 实际读取不超过 MAX_FILE_BYTES+1 字节.
 
     预 stat 只是廉价预筛: 读取时文件仍可能增长, 因此这里按实际消耗的字节收口,
-    超限抛 FileTooLarge 而不是把部分内容当完整文件。每块都检查取消与原查询
-    deadline, 增长/超大文件既不能无界累积也不能拖过整查询预算。
+    超限抛 FileTooLarge 而不是把部分内容当完整文件。每块先协作让出 event loop
+    再核对取消与原查询 deadline: 同步 checks 只能看见已设置的 flag, 让出后同 loop
+    已排队的取消回调才真正执行; 增长/超大文件既不能无界累积也不能拖过整查询预算。
     """
     decoder = codecs.getincrementaldecoder("utf-8")()
     chunks: list[str] = []
@@ -232,7 +233,7 @@ def read_text_file_chunked(
         with open(path, "rb") as handle:
             first = True
             while True:
-                _checkpoint(cancel, started)
+                await _yield_and_check(cancel, started)
                 chunk = handle.read(min(READ_CHUNK_BYTES, MAX_FILE_BYTES + 1 - total))
                 if not chunk:
                     break
@@ -333,7 +334,7 @@ async def run_glob(
     total = 0
     skipped = {"missing": 0, "reparse": 0, "not_regular": 0}
     for match_path, relative in scope_files(scope):
-        _checkpoint(cancel, started)
+        await _yield_and_check(cancel, started)
         verdict = classify_candidate(workspace.root, relative)
         if verdict != "ok":
             skipped[verdict] = skipped.get(verdict, 0) + 1
@@ -392,7 +393,7 @@ async def run_grep(
     truncated = False
     reason: str | None = None
     for match_path, relative in scope_files(scope):
-        _checkpoint(cancel, started)
+        await _yield_and_check(cancel, started)
         if not matches_any(include_glob, match_path):
             continue
         verdict = classify_candidate(workspace.root, relative)
@@ -407,7 +408,7 @@ async def run_grep(
         except OSError as exc:
             raise SearchError("path_unreadable", f"cannot stat {relative!r}: {exc}") from exc
         try:
-            text = read_text_file_chunked(absolute, cancel=cancel, started=started)
+            text = await read_text_file_chunked(absolute, cancel=cancel, started=started)
         except FileTooLarge:
             # 预 stat 之后文件增长: 事实上限以实际读取字节为准
             skipped["too_large"] += 1
@@ -468,6 +469,16 @@ def _checkpoint(cancel: CancelToken, started: float) -> None:
     cancel.throw_if_cancelled()
     if time.monotonic() - started >= QUERY_TIMEOUT_S:
         raise SearchError("timeout", "search query deadline exceeded")
+
+
+async def _yield_and_check(cancel: CancelToken, started: float) -> None:
+    """协作点: 先让出 event loop, 再核对同一 token 与原查询 deadline.
+
+    同步 `_checkpoint` 只能看见已经设置的 flag; 同 event loop 里 `call_soon` 排队的
+    取消回调必须有机会运行, 因此在逐文件、每块读取前都先 `await asyncio.sleep(0)`。
+    """
+    await asyncio.sleep(0)
+    _checkpoint(cancel, started)
 
 
 def _json(value: str) -> str:

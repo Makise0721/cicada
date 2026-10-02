@@ -518,10 +518,10 @@ def test_reader_stops_on_cancellation_per_chunk(repo, monkeypatch):
         )
 
 
-def test_reader_stops_on_query_deadline_per_chunk(repo):
+async def test_reader_stops_on_query_deadline_per_chunk(repo):
     workspace, _ = repo
     with pytest.raises(SearchError) as caught:
-        read_text_file_chunked(
+        await read_text_file_chunked(
             workspace.root / "src" / "alpha.py",
             cancel=CancelToken(),
             started=time.monotonic() - QUERY_TIMEOUT_S - 1,
@@ -529,17 +529,17 @@ def test_reader_stops_on_query_deadline_per_chunk(repo):
     assert caught.value.kind == "timeout"
 
 
-def test_reader_reads_a_file_at_the_byte_limit(repo):
+async def test_reader_reads_a_file_at_the_byte_limit(repo):
     workspace, _ = repo
     exact = workspace.root / "exact.txt"
     exact.write_bytes(b"n" * MAX_FILE_BYTES)
-    assert read_text_file_chunked(
+    assert await read_text_file_chunked(
         exact, cancel=CancelToken(), started=time.monotonic()
     ) == "n" * MAX_FILE_BYTES
     over = workspace.root / "over.txt"
     over.write_bytes(b"n" * (MAX_FILE_BYTES + 1))
     with pytest.raises(search_module.FileTooLarge):
-        read_text_file_chunked(over, cancel=CancelToken(), started=time.monotonic())
+        await read_text_file_chunked(over, cancel=CancelToken(), started=time.monotonic())
 
 
 async def test_search_deadline_is_rechecked_before_rendering(repo, monkeypatch):
@@ -548,10 +548,10 @@ async def test_search_deadline_is_rechecked_before_rendering(repo, monkeypatch):
     real_read = search_module.read_text_file_chunked
     calls: list[int] = []
 
-    def slow_read(path, **kwargs):
+    async def slow_read(path, **kwargs):
         calls.append(1)
         time.sleep(1.2)
-        return real_read(path, **kwargs)
+        return await real_read(path, **kwargs)
 
     monkeypatch.setattr(search_module, "read_text_file_chunked", slow_read)
     monkeypatch.setattr(search_module, "QUERY_TIMEOUT_S", 1.0)
@@ -563,6 +563,41 @@ async def test_search_deadline_is_rechecked_before_rendering(repo, monkeypatch):
     # scope 只有这一个文件且已经读过: 超时只能来自读取之后的渲染前检查
     assert calls == [1]
     assert caught.value.kind == "timeout"
+
+
+async def test_queued_cancellation_runs_between_files(tmp_path, monkeypatch):
+    """Spec R2: 清单返回时排队的同 loop 取消必须在扫描中真正执行并传播."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = tmp_path / "repo"
+    root.mkdir()
+    git(root, "init", "-q")
+    for name in ("a.txt", "b.txt"):
+        (root / name).write_text(
+            ("ordinary line\n" * 5000) + "needle\n", encoding="utf-8"
+        )
+    git(root, "add", "a.txt", "b.txt")
+    workspace = Workspace.create(root)
+
+    class InventoryWithQueuedCancel(GitInventory):
+        def __init__(self, ws):
+            super().__init__(ws)
+            self.queued = False
+
+        async def list_files(self, cancel):
+            record = await super().list_files(cancel)
+            self.queued = True
+            asyncio.get_running_loop().call_soon(cancel.cancel)
+            return record
+
+    inventory = InventoryWithQueuedCancel(workspace)
+    token = CancelToken()
+    with pytest.raises(asyncio.CancelledError):
+        await run_grep(
+            workspace, inventory, pattern="needle", raw_path=".", include="**/*",
+            ignore_case=False, context=0, limit=100, cancel=token,
+        )
+    assert inventory.queued is True
+    assert token.cancelled is True  # 排队的取消回调确实得到了执行机会
 
 
 # --- 文件事实与失败路径 ---
