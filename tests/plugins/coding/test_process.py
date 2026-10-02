@@ -659,6 +659,47 @@ async def test_eof_grace_cannot_extend_past_the_original_deadline(tmp_path):
 # --- 第二轮回归: 绝对截止点 / 迟到数据 / 工件句柄 ---
 
 
+@pytest.mark.parametrize("kill_hangs", [False, True])
+async def test_token_cancel_uses_cleanup_deadline_for_drain(tmp_path, fake_os, monkeypatch, kill_hangs):
+    """取消发生在首段输出后: kill 和管道 drain 共用清理预算, 不等原命令期限."""
+    ws = make(tmp_path)
+    first_output = asyncio.Event()
+
+    class ReadyStream(_FakeStream):
+        async def read(self, size):
+            chunk = await super().read(size)
+            if chunk:
+                first_output.set()
+            return chunk
+
+    fake_os["proc"] = _FakeProcess(
+        ReadyStream([b"started\n"], hang=True), _FakeStream(hang=True), returncode=None
+    )
+    runner = PowerShellRunner(cleanup_budget_s=0.05)
+    kill_started = asyncio.Event()
+
+    async def kill(pid, stop):
+        kill_started.set()
+        if kill_hangs:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_kill_tree", kill)
+    cancel = CancelToken()
+    task = asyncio.create_task(run_runner(runner, ws, cancel=cancel, command="ignored", timeout=0.5))
+    await asyncio.wait_for(first_output.wait(), 1.0)
+    started = time.monotonic()
+    cancel.cancel()
+    result = await asyncio.wait_for(task, 1.0)
+    elapsed = time.monotonic() - started
+    assert kill_started.is_set()
+    assert elapsed < 0.25  # 旧路径等待原 timeout (约0.5s), 含Windows时钟/调度余量
+    assert result.cancelled is True
+    assert result.timed_out is False
+    assert result.exit_code is None
+    assert result.output_complete is False
+    assert result.output.text == "started"
+
+
 async def test_drain_does_not_wait_for_a_lagging_reader(tmp_path, fake_os):
     """R1: 宽限到点即收口, 不等待取消收尾迟滞的读者; 迟到 EOF 不改写事实."""
     ws = make(tmp_path)

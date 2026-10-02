@@ -475,7 +475,11 @@ class PowerShellRunner:
                     self._kill_tree(proc.pid, cleanup_deadline), cleanup_deadline
                 )
             # 注意: 本体被外部 cancel 时这里以上都不会执行, 由 finally 兜底清理。
-            drained, expired = await self._drain_readers(proc, readers, exited, deadline)
+            # 提前取消时原命令期限仍在未来; kill、drain、finally 共用清理截止点。
+            drain_deadline = (
+                deadline if cleanup_deadline is None else min(deadline, cleanup_deadline)
+            )
+            drained, expired = await self._drain_readers(proc, readers, exited, drain_deadline)
             collector.finish()
             if exited and not drained and expired:
                 # 命令已退出但输出管道没在 deadline/宽限内 EOF: 属实在的收尾超时。
@@ -521,7 +525,7 @@ class PowerShellRunner:
         """收集已到达输出; 返回 (两个读者是否都正常 EOF, 是否耗尽了等待期限)。
 
         父进程已确证退出时只再给有限宽限, 且**不超过原命令 deadline**; 未退出
-        (超时/取消)时按原 deadline 立即收口。到点后取消读者, 并且只在同一绝对截止点内
+        (超时/取消)时使用调用方传入的命令/清理截止点。到点后取消读者, 并且只在同一绝对截止点内
         等它们收尾: 迟到的取消收尾与迟到的 EOF 都不能改写截止点已固定的事实 (若在
         截止点后补上 EOF, 也不得把采集认领为完整)。只有等待期限真正耗尽才算 expired,
         reader 自身失败固定为不完整但不冒充超时。
