@@ -264,6 +264,8 @@ class ApplicationSession:
         self._closing = False
         self._closed = False
         self._close_task: asyncio.Task | None = None
+        self._close_deadline: float | None = None
+        self._close_latch = asyncio.Event()  # 锁存置位: 收尾等待据此收缩截止时间
         self._close_problems: list[str] = []
         self._undead_tasks: list[asyncio.Task] = []
         self._unsubscribe_core = app.agent.subscribe(self._on_core_event)
@@ -340,13 +342,16 @@ class ApplicationSession:
         self._notify(RequestPhaseChanged(None, "executing"))
         try:
             result = await self._app.agent.run(prompt, token, history=tuple(self._history))
-            # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07)
-            self._state = "finalizing"
+            # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07);
+            # closed 是终态, close 监督超时后的迟到完成不得改写它 (02-R-F1)
+            if self._state != "closed":
+                self._state = "finalizing"
             outcome = await self._finalize_request(result)
         except BaseException:
             # 异常路径也不得把应用留在"可执行"状态: 内核/UI 异常一律经关闭路径处理
-            self._state = "closing"
-            self._closing = True
+            if self._state != "closed":
+                self._state = "closing"
+                self._closing = True
             raise
         finally:
             if self._active_done is not None and not self._active_done.done():
@@ -356,7 +361,10 @@ class ApplicationSession:
         if outcome.view is not None and outcome.view.process_uncertain:
             self._process_uncertain = True
         if self._closing:
-            self._state = "closing"
+            # closing 是不可逆接收门; 关闭中仍发一次 RequestCompleted, 但状态不得
+            # 回 idle, 也不得把已到达的 closed 终态改回 closing (02-R-F1)
+            if self._state != "closed":
+                self._state = "closing"
         else:
             self._state = "idle"
             self._notify(RequestPhaseChanged(result.run_id, "idle"))
@@ -366,15 +374,17 @@ class ApplicationSession:
     async def _finalize_request(self, result: RunResult) -> RequestOutcome:
         """验证收尾: 扫描末次终结事实 -> refresh -> finalize -> 工件核对 -> 交付判定.
 
-        建立拟定 15 秒监督窗口; 超时取消收尾任务并返回明确不可交付结果.
+        建立拟定 15 秒监督窗口; 中途锁存 closing 时与 close 截止时间取较早值;
+        超时取消收尾任务并返回明确不可交付结果.
         """
         if self._config.plan is None or self._service is None or self._policy is None:
             decision = None
             view = None
             evidence = None
         else:
-            deadline = time.monotonic() + REQUEST_FINALIZE_SUPERVISION_S
-            view, evidence, decision = await self._run_finalization(result, deadline)
+            view, evidence, decision = await self._run_finalization(
+                result, time.monotonic() + REQUEST_FINALIZE_SUPERVISION_S
+            )
         return RequestOutcome(
             result=result,
             view=view,
@@ -383,8 +393,14 @@ class ApplicationSession:
             exit_code=_outcome_exit_code(result, decision),
         )
 
+    def _effective_deadline(self, base_deadline: float) -> float:
+        """closing 锁存后, 有效截止时间取请求窗口与 close 截止时间的较早值."""
+        if self._closing and self._close_deadline is not None:
+            return min(base_deadline, self._close_deadline)
+        return base_deadline
+
     async def _run_finalization(
-        self, result: RunResult, deadline: float
+        self, result: RunResult, base_deadline: float
     ) -> tuple[VerificationView, ChangeEvidence, DeliveryDecision]:
         assert self._service is not None and self._policy is not None
         service, policy = self._service, self._policy
@@ -398,38 +414,55 @@ class ApplicationSession:
             decision = decide_delivery(result, view, evidence, verify_receipt_artifacts(view))
             return view, evidence, decision
 
+        async def _quarantine() -> None:
+            """取消收尾工作; 到宽限期仍未终结的任务保留强引用与诊断."""
+            token.cancel()
+            task.cancel()
+            _done, pending = await asyncio.wait([task], timeout=_UNDEAD_GRACE_S)
+            if pending:
+                self._undead_tasks.append(task)
+
         task = asyncio.create_task(work())
-        remaining = max(0.0, deadline - time.monotonic())
-        try:
-            return await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
-        except asyncio.TimeoutError:
-            token.cancel()
-            task.cancel()
-            done, pending = await asyncio.wait([task], timeout=_UNDEAD_GRACE_S)
-            if pending:
-                # 监督到点仍未终结的任务保留强引用与诊断, 不丢给隐式全量取消
-                self._undead_tasks.append(task)
-            reason = (
-                "verification finalization did not complete within the "
-                f"{REQUEST_FINALIZE_SUPERVISION_S:g}s supervision window"
-            )
-            return (
-                _unavailable_view("finalization timed out"),
-                _incomplete_evidence("finalization timed out"),
-                DeliveryDecision(
-                    model_stopped=result.stop_reason == "stop",
-                    can_deliver=False,
-                    blocking_reasons=(reason,),
-                ),
-            )
-        except BaseException:
-            # 外层取消/异常: 收尾任务不得成为无人持有的后台任务
-            token.cancel()
-            task.cancel()
-            done, pending = await asyncio.wait([task], timeout=_UNDEAD_GRACE_S)
-            if pending:
-                self._undead_tasks.append(task)
-            raise
+        while True:
+            # close 可能在等待中途锁存并收缩截止时间: 用 FIRST_COMPLETED 重估
+            shielded = asyncio.ensure_future(asyncio.shield(task))
+            latch = asyncio.ensure_future(self._close_latch.wait())
+            try:
+                remaining = self._effective_deadline(base_deadline) - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                timed_out = False
+                done, _ = await asyncio.wait(
+                    {shielded, latch}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                latch.cancel()
+            if shielded.done():
+                try:
+                    return shielded.result()
+                except BaseException:
+                    # 外层取消/异常: 收尾任务不得成为无人持有的后台任务
+                    await _quarantine()
+                    raise
+            if latch.done():
+                continue  # close 刚锁存: 用较早的 close 截止时间重新评估
+            break  # remaining 到点: 超时路径
+        await _quarantine()
+        reason = (
+            "verification finalization did not complete before the effective "
+            "supervision deadline (request finalize window; bounded by the close "
+            "deadline once closing is latched)"
+        )
+        return (
+            _unavailable_view("finalization timed out"),
+            _incomplete_evidence("finalization timed out"),
+            DeliveryDecision(
+                model_stopped=result.stop_reason == "stop",
+                can_deliver=False,
+                blocking_reasons=(reason,),
+            ),
+        )
 
     # --- 取消 / 清空 ---------------------------------------------------------------
 
@@ -462,6 +495,8 @@ class ApplicationSession:
         if self._state == "idle":
             self._state = "closing"
         deadline = time.monotonic() + CLOSE_SUPERVISION_S
+        self._close_deadline = deadline
+        self._close_latch.set()
         # 取消活动请求并等待现有请求路径 (含 P4 收尾) 终结, 共享同一截止时间
         if self._active_done is not None and not self._active_done.done():
             if self._cancel_token is not None:

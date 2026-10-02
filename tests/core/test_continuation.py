@@ -161,6 +161,7 @@ async def test_multi_turn_tool_loop_history_roundtrip():
         [
             [ToolCallEvent("c1", "echo", '{"text": "hi"}'), StreamDone("tool_use")],
             [TextDelta("继续"), StreamDone("stop")],
+            [TextDelta("再问回答"), StreamDone("stop")],
         ],
         tools=[echo],
     )
@@ -178,10 +179,13 @@ async def test_multi_turn_tool_loop_history_roundtrip():
     request = model.requests[0]
     assert len(request.messages) == 4
     assert isinstance(request.messages[3], UserMessage)
-    # 本轮后缀完整闭合, 后续请求可继续消费
+    # 本轮后缀完整闭合, 且实际可再入 history 供下一请求消费 (自洽性)
     kinds = [type(m) for m in result.messages]
     assert kinds == [UserMessage, AssistantMessage, ToolResultMessage, AssistantMessage]
     assert result.messages[2].result.call_id == "c1"  # type: ignore[union-attr]
+    followup = await agent.run("再问", history=history + result.messages)
+    assert followup.stop_reason == "stop"
+    assert len(model.requests[-1].messages) == 8  # 3 历史 + 4 后缀 + 本次 user
 
 
 async def test_run_ids_stay_unique_across_history_runs():
@@ -294,6 +298,7 @@ async def test_invalid_call_group_rejected_whole_before_history_and_execution():
     model, agent = make_agent(
         [
             [
+                TextDelta("已收集的部分文本"),
                 ToolCallEvent("", "echo", '{"text": "hi"}'),
                 ToolCallEvent("c2", "echo", '{"text": "hi"}'),
                 StreamDone("tool_use"),
@@ -312,8 +317,8 @@ async def test_invalid_call_group_rejected_whole_before_history_and_execution():
     assistant = next(m for m in result.messages if isinstance(m, AssistantMessage))
     assert assistant.tool_calls == ()
     assert assistant.stop_reason == "error"
-    # 已收集文本保留
-    assert assistant.text == ""
+    # 已收集文本保留: 整组拒绝不丢弃同轮增量文本
+    assert assistant.text == "已收集的部分文本"
     # 不改写原身份: 原始调用不进入任何可续写历史
     assert not any(
         isinstance(m, AssistantMessage) and m.tool_calls for m in result.messages

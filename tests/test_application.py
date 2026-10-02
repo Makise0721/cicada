@@ -501,6 +501,98 @@ async def test_close_supervision_deadline_records_problem(tmp_path, monkeypatch)
         pass
 
 
+async def test_finalization_supervision_deadline_returns_nondeliverable(tmp_path, monkeypatch):
+    """T11 应用部分: 请求收尾监督到点 -> 不可交付 outcome, 任务已终结才回 idle."""
+    import cicada.application as app_module
+
+    monkeypatch.setattr(app_module, "REQUEST_FINALIZE_SUPERVISION_S", 0.1)
+    root = _repo(tmp_path)
+    plan = _plan(root)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "check",
+                         "arguments": {"action": "run", "check_id": "check-1"}}],
+         "tool_use": True},
+        {"text": "done", "stop": True},
+    ), plan=plan))
+    real_service = session._service
+    assert real_service is not None
+    session._service = SlowRefreshService(real_service, delay=1.0)
+    outcome = await asyncio.wait_for(session.execute("慢收尾"), timeout=5)
+    assert outcome.decision is not None and not outcome.decision.can_deliver
+    assert "supervision" in outcome.decision.blocking_reasons[0]
+    assert outcome.exit_code == 3  # 模型 stop 但收尾超时, 不可交付
+    assert outcome.view is not None and outcome.view.snapshot_ref is None
+    assert session.state == "idle"  # 收尾任务已终结才回 idle
+    assert session._undead_tasks == []  # 协作式取消下无僵尸任务
+    await session.aclose()
+
+
+async def test_late_completion_after_close_deadline_keeps_closed_terminal_state(
+    tmp_path, monkeypatch
+):
+    """02-R-F1 回归: close 监督超时后的迟到完成不得把 closed 终态改回 closing."""
+    import cicada.application as app_module
+
+    monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.2)
+    root = _repo(tmp_path)
+
+    def hang_setup(ctx):
+        ctx.provide("tool.hang", IgnoreCancelTool())
+
+    definitions = [
+        PluginDefinition(name="hang", setup=hang_setup, provides=frozenset({"tool.hang"})),
+        fake_model_plugin(FakeModel(_script(
+            {"tool_calls": [{"id": "c1", "name": "hang", "arguments": {}}], "tool_use": True},
+        ))),
+    ]
+    app = await bootstrap(
+        definitions, tool_capabilities=("tool.hang",), system_prompt="t", max_turns=6,
+    )
+    session = ApplicationSession(app=app, config=_config(root, script=[]), service=None, policy=None)
+    hang = app.runtime.capability("tool.hang")
+    assert isinstance(hang, IgnoreCancelTool)
+    execute_task = asyncio.create_task(session.execute("挂住"))
+    await asyncio.wait_for(hang.started.wait(), timeout=5)
+    close_task = asyncio.create_task(session.aclose())
+    await asyncio.wait_for(close_task, timeout=10)
+    assert session.state == "closed"
+    assert session._close_problems, "监督到点必须记录 did not finalize 问题"
+    # 迟到完成: 取消 execute 任务后内核捕获并闭合, execute 正常返回 outcome
+    execute_task.cancel()
+    outcome = await asyncio.wait_for(execute_task, timeout=10)
+    assert outcome.result.stop_reason == "aborted"
+    assert session.state == "closed"  # 终态不可逆: 不回 closing, 也不回 idle
+
+
+async def test_close_deadline_bounds_request_finalization(tmp_path, monkeypatch):
+    """02-R-F6: closing 锁存后, 请求收尾窗口与 close 截止时间取较早值."""
+    import cicada.application as app_module
+
+    monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.3)
+    root = _repo(tmp_path)
+    plan = _plan(root)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "c1", "name": "check",
+                         "arguments": {"action": "run", "check_id": "check-1"}}],
+         "tool_use": True},
+        {"text": "done", "stop": True},
+    ), plan=plan))
+    real_service = session._service
+    assert real_service is not None
+    session._service = SlowRefreshService(real_service, delay=5.0)
+    collector = Collector(session)
+    task = asyncio.create_task(session.execute("慢收尾"))
+    assert await collector.wait_for(lambda: session.state == "finalizing")
+    close_task = asyncio.create_task(session.aclose())
+    # 5 秒内返回 = 收尾被 close 截止时间 (0.3s) 截断, 而非等待 15s 请求窗口
+    outcome = await asyncio.wait_for(task, timeout=5)
+    assert outcome.decision is not None and not outcome.decision.can_deliver
+    assert "supervision" in outcome.decision.blocking_reasons[0]
+    await asyncio.wait_for(close_task, timeout=10)
+    assert session.state == "closed"
+    collector.stop()
+
+
 async def test_cleanup_failure_surfaces_in_application_closed(tmp_path):
     root = _repo(tmp_path)
 
@@ -563,7 +655,16 @@ async def test_observer_mutation_does_not_touch_canonical_history(tmp_path):
         result = getattr(message, "result", None)
         if result is not None and result.details:
             assert "tampered" not in result.details
+    # 且下一请求的模型输入不受影响: 继续一次带历史的请求并核对请求内 details
     await session.execute("第二个问题")
+    from cicada.plugins.fake_model import FakeModel
+
+    model = session._app.agent._model
+    assert isinstance(model, FakeModel)
+    for message in model.requests[-1].messages:
+        result = getattr(message, "result", None)
+        if result is not None and result.details:
+            assert "tampered" not in result.details
     await session.aclose()
 
 
