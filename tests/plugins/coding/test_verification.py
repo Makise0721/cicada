@@ -301,6 +301,32 @@ async def test_known_launch_failure_returns_a_blocked_receipt_without_latching(r
     assert not any("process_uncertain" in reason for reason in view.blocking_reasons)
 
 
+async def test_launch_failure_keeps_an_earlier_latch_without_adding_a_new_reason(repo, monkeypatch):
+    """已知未启动不新锁存, 但同 run 早先的锁存仍单调保持."""
+    from cicada.plugins.coding import process as process_module
+
+    verifier = await initialized(
+        repo,
+        CheckDefinition("check-1", "Start-Sleep -Seconds 20", timeout_s=1.0),
+        CheckDefinition("check-2", "exit 0"))
+    timed_out = await verifier.run_check("check-1", CancelToken())
+    assert timed_out.failure_kind == "timed_out"
+    assert verifier.process_uncertain is True
+    reasons_after_timeout = tuple(verifier._uncertain_reasons)
+
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(repo / "missing-pwsh.exe"))
+    failed = await verifier.run_check("check-2", CancelToken())
+    assert failed.failure_kind == "launch_failed"
+
+    # 既有锁存保持, 启动失败本身不追加不确定原因。
+    assert verifier.process_uncertain is True
+    assert tuple(verifier._uncertain_reasons) == reasons_after_timeout
+    view = await verifier.refresh(CancelToken())
+    assert view.process_uncertain is True
+    assert view.checks[1].status == "blocked"
+    assert any("process_uncertain" in reason for reason in view.blocking_reasons)
+
+
 async def test_launch_failure_replaces_a_pass_and_a_real_recheck_recovers_current(repo, monkeypatch):
     from cicada.plugins.coding import process as process_module
 
