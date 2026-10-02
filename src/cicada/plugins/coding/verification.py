@@ -23,7 +23,7 @@ from pathlib import Path
 
 from cicada.core.cancel import CancelToken
 from cicada.plugins.coding.inventory import GitInventory
-from cicada.plugins.coding.process import PowerShellRunner
+from cicada.plugins.coding.process import PowerShellLaunchError, PowerShellRunner
 from cicada.plugins.coding.snapshot import SNAPSHOT_CAPABILITY, Snapshotter
 from cicada.plugins.coding.verification_contracts import (
     VERIFICATION_CAPABILITY,
@@ -254,6 +254,13 @@ class Verifier:
             artifact_path, artifact_sha256, artifact_error = self._artifact_facts(bounded)
             # 取消后不能再要求协作取消的快照: 用不可用结果记录"没有后快照"这一事实。
             after = None if cancel.cancelled else await self.snapshotter.capture(cancel)
+        except PowerShellLaunchError as exc:
+            # 进程创建边界已确认目标未启动: 记录 blocked/launch_failed 最近尝试并返回回执。
+            # 没有已启动进程的未知终结, 因此不锁存 process_uncertain (已有锁存仍保持);
+            # 命令未运行也不能当作 PASS, 仍阻断交付, 之后正常重检可替代它。
+            return self._launch_failed(
+                definition, started, before_ref, await self._post_snapshot_ref(cancel),
+                exc, uncertain_before)
         except asyncio.CancelledError:
             # runner 已经进入: 先单调锁存并留下最近的取消尝试, 再传播原取消。
             self._record_interrupted(
@@ -596,6 +603,49 @@ class Verifier:
         # 快照不可用说明命令可能在未知状态下执行过: 与超时/取消同级锁存。
         self._latch(error)
         return receipt
+
+    def _launch_failed(
+        self,
+        definition: CheckDefinition,
+        started: float,
+        before_ref: str,
+        after_ref: str | None,
+        exc: BaseException,
+        uncertain_before: bool,
+    ) -> CheckReceipt:
+        """已知未启动: 明确 blocked/launch_failed 回执, 不锁存进程不确定状态.
+
+        进程从未创建, 没有终结未知可言; 同 run 早先的锁存 (如超时) 仍单调保持。
+        命令未运行不是 PASS, 回执继续阻断交付, 之后正常重检可替代它。
+        """
+        receipt = self._receipt(
+            definition=definition,
+            elapsed_s=time.monotonic() - started,
+            execution_status="launch_failed",
+            exit_code=None,
+            timed_out=False,
+            cancelled=False,
+            output_complete=False,
+            snapshot_before=before_ref,
+            snapshot_after=after_ref,
+            verification_status="blocked",
+            failure_kind="launch_failed",
+            output_truncated=False,
+            artifact_truncated=False,
+            output_artifact_path=None,
+            output_artifact_sha256=None,
+            artifact_error=None,
+            error=f"the check command could not be started: {exc}",
+        )
+        self._record(receipt, uncertain_before)
+        return receipt
+
+    async def _post_snapshot_ref(self, cancel: CancelToken) -> str | None:
+        """已知未启动时的后快照: 只用于记录"这次尝试没有改变代码", 取不到就不声称."""
+        if cancel.cancelled:
+            return None
+        capture = await self.snapshotter.capture(cancel)
+        return capture.snapshot.snapshot_ref if capture.available else None
 
     def _record_interrupted(
         self,

@@ -232,6 +232,65 @@ async def test_runner_failure_after_start_is_the_latest_state_seen_by_status(rep
     assert "process_uncertain" in status.content
 
 
+async def test_launch_failure_returns_a_blocked_receipt_through_the_public_tool(repo, monkeypatch):
+    """真实缺失 exe: 可预期启动故障返回 blocked 回执, receipt_id 与真实账本核对一致."""
+    from cicada.plugins.coding import process as process_module
+
+    tool = await service_for(repo, passing())
+    monkeypatch.setattr(
+        process_module, "resolve_pwsh", lambda: str(repo / "missing-pwsh.exe"))
+    result = await call(tool, {"action": "run", "check_id": "check-1"})
+    assert result.is_error is False
+    details = result.details
+    assert details["verification_status"] == "blocked"
+    assert details["execution_status"] == "launch_failed"
+    assert details["failure_kind"] == "launch_failed"
+    assert details["exit_code"] is None
+    assert details["output_artifact_path"] is None
+    assert details["freshness"] == "current"
+    assert details["process_uncertain"] is False
+    assert details["receipt_id"].startswith("chk-")
+    assert "launch_failed" in result.content
+    status = await call(tool, {"action": "status"})
+    assert status.details["process_uncertain"] is False
+    assert status.details["checks"][0]["status"] == "blocked"
+    assert status.details["checks"][0]["failure_kind"] == "launch_failed"
+    assert status.details["checks"][0]["receipt_id"] == details["receipt_id"]
+
+
+async def test_launch_failure_projection_names_launch_failed_without_latching(repo, monkeypatch):
+    """跨层: 已知未启动经 05 真实账本核对后不锁存, 同轮控制视图报 launch_failed."""
+    from cicada.core.ports import ModelRequest
+    from cicada.plugins.coding import process as process_module
+    from cicada.plugins.fake_model import FakeModel
+    from cicada.run_policy import RunPolicy
+
+    workspace = Workspace.create(repo)
+    snapshotter = Snapshotter(workspace, GitInventory(workspace))
+    plan = VerificationPlan("vrun-launch", workspace.root, (passing(),))
+    verifier = Verifier(workspace, snapshotter, PowerShellRunner(), plan)
+    assert (await verifier.initialize(CancelToken())).available
+    tool = CheckTool(verifier)
+    monkeypatch.setattr(
+        process_module, "resolve_pwsh", lambda: str(repo / "missing-pwsh.exe"))
+
+    result = await call(tool, {"action": "run", "check_id": "check-1"})
+    assert result.details["failure_kind"] == "launch_failed"
+
+    inner = FakeModel([[StreamDone("stop")]])
+    policy = RunPolicy(inner, verifier)
+    async for _event in policy.stream(
+        ModelRequest(messages=(ToolResultMessage(result=result),), tools=()), CancelToken()
+    ):
+        pass
+    section = inner.requests[0].system_prompt
+    assert verifier.process_uncertain is False
+    assert "process_uncertain: true" not in section
+    assert "check check-1: status=blocked freshness=current" in section
+    assert "failure_kind: launch_failed" in section
+    assert "<cicada-verification-state>" in section
+
+
 async def test_receipt_id_survives_the_kernel_tool_result_message(repo):
     """K/应用层按程序 receipt_id 关联: 它必须出现在原始 ToolResult.details 里."""
     tool = await service_for(repo, passing())

@@ -268,6 +268,68 @@ async def test_runner_exception_after_start_replaces_a_pass_and_latches(repo):
         first.receipt_id, latest.receipt_id]
 
 
+async def test_known_launch_failure_returns_a_blocked_receipt_without_latching(repo, monkeypatch):
+    """真实缺失 exe: 进程创建边界确认未启动, 记 blocked/launch_failed 且不锁存."""
+    from cicada.plugins.coding import process as process_module
+
+    verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    missing = repo / "missing-pwsh.exe"  # 项目内不存在: 真实缺失 exe
+    assert not missing.exists()
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(missing))
+
+    receipt = await verifier.run_check("check-1", CancelToken())
+    assert receipt.verification_status == "blocked"
+    assert receipt.execution_status == "launch_failed"
+    assert receipt.failure_kind == "launch_failed"
+    assert receipt.exit_code is None
+    assert receipt.timed_out is False and receipt.cancelled is False
+    assert receipt.output_complete is False
+    assert receipt.output_artifact_path is None
+    assert receipt.receipt_id.startswith("chk-")
+    assert "could not be started" in receipt.error
+    # 已知未启动不是"进程终结未知": 不新锁存, 但仍是阻断交付的最近尝试。
+    assert verifier.process_uncertain is False
+    assert len(verifier.receipts) == 1
+    view = await verifier.refresh(CancelToken())
+    state = view.checks[0]
+    assert state.status == "blocked"
+    assert state.receipt.receipt_id == receipt.receipt_id
+    assert state.freshness == "current"
+    assert view.process_uncertain is False
+    assert any("launch_failed" in reason for reason in view.blocking_reasons)
+    assert not any("process_uncertain" in reason for reason in view.blocking_reasons)
+
+
+async def test_launch_failure_replaces_a_pass_and_a_real_recheck_recovers_current(repo, monkeypatch):
+    from cicada.plugins.coding import process as process_module
+
+    real_resolve = process_module.resolve_pwsh
+    verifier = await initialized(repo, passing())
+    first = await verifier.run_check("check-1", CancelToken())
+    assert first.verification_status == "passed"
+
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(repo / "missing-pwsh.exe"))
+    failed = await verifier.run_check("check-1", CancelToken())
+    assert failed.failure_kind == "launch_failed"
+    view = await verifier.refresh(CancelToken())
+    # 旧 pass 不能留作最新候选; 启动失败仍阻断交付, 但没有进程不确定。
+    assert view.checks[0].status == "blocked"
+    assert view.checks[0].receipt.receipt_id == failed.receipt_id
+    assert view.process_uncertain is False
+    assert any("launch_failed" in reason for reason in view.blocking_reasons)
+
+    # 恢复合法 runner 后正常重检必须恢复 current, 不被上一轮启动失败永久卡住。
+    monkeypatch.setattr(process_module, "resolve_pwsh", real_resolve)
+    recovered = await verifier.run_check("check-1", CancelToken())
+    assert recovered.verification_status == "passed"
+    final = await verifier.refresh(CancelToken())
+    assert final.checks[0].freshness == "current"
+    assert final.process_uncertain is False
+    assert not [reason for reason in final.blocking_reasons if "check-1" in reason]
+    assert [receipt.receipt_id for receipt in final.receipts] == [
+        first.receipt_id, failed.receipt_id, recovered.receipt_id]
+
+
 async def test_latest_attempt_replaces_an_earlier_pass_in_state_but_history_remains(repo):
     verifier = await initialized(repo, passing())
     first = await verifier.run_check("check-1", CancelToken())
