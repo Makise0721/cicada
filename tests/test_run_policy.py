@@ -19,6 +19,7 @@ from cicada.core.messages import (
     UserMessage,
 )
 from cicada.core.ports import ModelRequest, StreamDone, TextDelta, ToolContext, ToolSpec
+from cicada.plugins.coding import process as coding_process
 from cicada.plugins.coding.inventory import GitInventory
 from cicada.plugins.coding.process import BoundedText, PowerShellRunner, ProcessResult
 from cicada.plugins.coding.snapshot import Snapshotter
@@ -1055,6 +1056,32 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
     assert any("not in the verification ledger" in reason for reason in verifier._uncertain_reasons)
     assert "process_uncertain: true" in third_section
     assert "- check result receipt_id is not in the verification ledger; termination unproven" in third_section
+
+
+async def test_real_service_launch_failure_projects_blocked_without_new_latch(tmp_path, monkeypatch):
+    """S/V 发布明确启动失败后: 真实服务给 blocked/launch_failed 回执, 投影不新增不确定锁存."""
+    workspace = _real_repo(tmp_path)
+    verifier = _real_verifier(workspace, CheckDefinition("check-1", "exit 0"))
+    missing = tmp_path / "missing-pwsh.exe"
+    monkeypatch.setattr(coding_process, "resolve_pwsh", lambda: str(missing))
+    result = await _real_check_result(workspace, verifier, "check-1")
+
+    receipt = verifier.receipts[-1]
+    assert receipt.execution_status == "launch_failed"
+    assert receipt.verification_status == "blocked"
+    assert receipt.failure_kind == "launch_failed"
+    assert receipt.exit_code is None and receipt.timed_out is False and receipt.cancelled is False
+    assert verifier.process_uncertain is False  # 已知未启动不是"进程终结未知"
+
+    model = RecordingModel()
+    section, _ = await _stream_with(
+        RunPolicy(model, verifier), model, (ToolResultMessage(result=result),)
+    )
+    assert verifier.process_uncertain is False
+    assert "process_uncertain: true" not in section
+    assert "check check-1: status=blocked" in section
+    assert "not in the verification ledger" not in section
+    assert "trustworthy terminal fact" not in section
 
 
 async def test_real_service_execution_cancel_propagates_and_projection_latches(tmp_path):
