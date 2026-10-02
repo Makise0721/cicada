@@ -357,6 +357,87 @@ async def test_launch_failure_replaces_a_pass_and_a_real_recheck_recovers_curren
         first.receipt_id, failed.receipt_id, recovered.receipt_id]
 
 
+@pytest.mark.parametrize("post_outcome", ["cancelled", "snapshot_error"])
+@pytest.mark.parametrize("prior_uncertainty", [False, True])
+async def test_launch_failure_keeps_its_attempt_when_post_snapshot_is_interrupted(
+    repo, monkeypatch, post_outcome, prior_uncertainty,
+):
+    """取消/异常发生于已知未启动后的快照: 不能让旧 PASS 继续作为最近尝试."""
+    from cicada.plugins.coding import process as process_module
+
+    verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    first = await verifier.run_check("check-1", CancelToken())
+    assert first.verification_status == "passed"
+    if prior_uncertainty:
+        verifier.mark_process_uncertain("prior unknown termination")
+    real_snapshotter = verifier.snapshotter
+    real_resolve = process_module.resolve_pwsh
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    class GatedPostSnapshot:
+        def __init__(self):
+            self.calls = 0
+
+        async def capture(self, cancel):
+            self.calls += 1
+            if self.calls == 2:
+                entered.set()
+                await released.wait()
+                raise RuntimeError("post-snapshot failed after known launch failure")
+            return await real_snapshotter.capture(cancel)
+
+    verifier.snapshotter = GatedPostSnapshot()
+    monkeypatch.setattr(process_module, "resolve_pwsh", lambda: str(repo / "missing-pwsh.exe"))
+    pending = asyncio.create_task(verifier.run_check("check-1", CancelToken()))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=15)
+        if post_outcome == "cancelled":
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=15)
+        else:
+            released.set()
+            with pytest.raises(RuntimeError, match="post-snapshot failed"):
+                await asyncio.wait_for(pending, timeout=15)
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        verifier.snapshotter = real_snapshotter
+        monkeypatch.setattr(process_module, "resolve_pwsh", real_resolve)
+
+    # 回执必须在后快照的可取消 await 前已经保存; 同一次尝试只有一个历史记录。
+    assert len(verifier.receipts) == 2
+    latest = verifier.receipts[-1]
+    assert latest.receipt_id != first.receipt_id
+    assert latest.verification_status == "blocked"
+    assert latest.execution_status == latest.failure_kind == "launch_failed"
+    assert latest.snapshot_before == first.snapshot_after
+    assert latest.snapshot_after is None
+    assert latest.exit_code is None and latest.output_complete is False
+    assert latest.cancelled is False and latest.timed_out is False
+    assert latest.output_artifact_path is None and latest.output_artifact_sha256 is None
+    view = await verifier.refresh(CancelToken())
+    assert view.checks[0].receipt.receipt_id == latest.receipt_id
+    assert view.checks[0].status == "blocked"
+    assert view.process_uncertain is prior_uncertainty
+    uncertain_reasons = [reason for reason in view.blocking_reasons
+                         if reason.startswith("process_uncertain:")]
+    assert uncertain_reasons == (
+        ["process_uncertain: prior unknown termination"] if prior_uncertainty else [])
+
+    # 恢复正常 runner 后可以重新检查; 仅此前已存在的不确定状态继续保持。
+    recovered = await verifier.run_check("check-1", CancelToken())
+    final = await verifier.refresh(CancelToken())
+    assert final.checks[0].receipt.receipt_id == recovered.receipt_id
+    assert final.checks[0].status == "passed" and final.checks[0].freshness == "current"
+    assert final.process_uncertain is prior_uncertainty
+    assert [receipt.receipt_id for receipt in final.receipts] == [
+        first.receipt_id, latest.receipt_id, recovered.receipt_id]
+    assert list(final.blocking_reasons) == uncertain_reasons
+
+
 async def test_latest_attempt_replaces_an_earlier_pass_in_state_but_history_remains(repo):
     verifier = await initialized(repo, passing())
     first = await verifier.run_check("check-1", CancelToken())

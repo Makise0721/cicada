@@ -18,7 +18,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cicada.core.cancel import CancelToken
@@ -258,9 +258,16 @@ class Verifier:
             # 进程创建边界已确认目标未启动: 记录 blocked/launch_failed 最近尝试并返回回执。
             # 没有已启动进程的未知终结, 因此不锁存 process_uncertain (已有锁存仍保持);
             # 命令未运行也不能当作 PASS, 仍阻断交付, 之后正常重检可替代它。
-            return self._launch_failed(
-                definition, started, before_ref, await self._post_snapshot_ref(cancel),
-                exc, uncertain_before)
+            # 先同步保存这次未启动的事实, 后快照的取消/失败不能使旧 PASS 继续有效。
+            # 后快照成功时只补同一回执的快照事实, 不新增一次检查尝试。
+            receipt = self._launch_failed(
+                definition, started, before_ref, None, exc, uncertain_before)
+            receipt_index = len(self._receipts) - 1
+            after_ref = await self._post_snapshot_ref(cancel)
+            receipt = replace(
+                receipt, snapshot_after=after_ref, elapsed_s=time.monotonic() - started)
+            self._receipts[receipt_index] = receipt
+            return receipt
         except asyncio.CancelledError:
             # runner 已经进入: 先单调锁存并留下最近的取消尝试, 再传播原取消。
             self._record_interrupted(
