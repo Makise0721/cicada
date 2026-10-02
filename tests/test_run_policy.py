@@ -572,15 +572,14 @@ async def test_unknown_receipt_id_never_skips_ledger_check():
     )
     service = FakeVerificationService(make_view())
     request, _ = await projected_request(service, (ghost,))
-    assert service.uncertain_reasons == [
-        "check result receipt_id is not in the verification ledger; termination unproven"
-    ]
-    # 账本核对在 refresh 之后: 锁存从下一轮投影起可见, 且不可被后续 PASS 清除
-    next_request, _ = await projected_request(service, (ghost,))
-    assert "process_uncertain: true" in next_request.system_prompt
-    assert service.uncertain_reasons == [
-        "check result receipt_id is not in the verification ledger; termination unproven"
-    ]
+    reason = "check result receipt_id is not in the verification ledger; termination unproven"
+    assert service.uncertain_reasons == [reason]
+    # 账本核对结果必须在**同一轮**发给模型的请求里可见, 不能只保证下一轮
+    assert "process_uncertain: true" in request.system_prompt
+    assert f"- {reason}" in request.system_prompt
+    assert "none reported by the verification view" not in request.system_prompt
+    # 不为此重复整仓快照: 每轮仍只有一次 refresh
+    assert len(service.refresh_calls) == 1
 
 
 async def test_structured_generic_error_without_terminal_fields_latches_conservatively():
@@ -603,12 +602,13 @@ async def test_structured_generic_error_without_terminal_fields_latches_conserva
             result=ToolResult("c6", "check", "blocked", is_error=True, details={"receipt_id": "ghost"})
         ),
     )
-    await projected_request(service, messages)
+    request, _ = await projected_request(service, messages)
     # 每条都锁存; 服务按 reason 去重, 因此同一原因在账本里只留一条
     assert service.uncertain_reasons == [
         "powershell error carries no trustworthy terminal fact",
         "check result receipt_id is not in the verification ledger; termination unproven",
     ]
+    assert "process_uncertain: true" in request.system_prompt
 
 
 async def test_trustworthy_terminal_facts_stay_clean():
@@ -645,7 +645,10 @@ async def test_known_receipt_in_ledger_resolves_check_identity():
     result = check_result("c1", "PASS", receipt_id="r-1")
     request, _ = await projected_request(service, (result,))
     assert service.uncertain_reasons == []
+    assert "process_uncertain: true" not in request.system_prompt
+    assert "- none reported by the verification view" in request.system_prompt
     assert "freshness=current" in check_messages(request)[0].result.content
+    assert len(service.refresh_calls) == 1
 
 
 async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
@@ -658,6 +661,7 @@ async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
     )
     request, _ = await projected_request(service, (known,))
     assert service.uncertain_reasons == []
+    assert "process_uncertain: true" not in request.system_prompt
     assert check_messages(request)[0].result.content.startswith("out\nCicada freshness: stale=false freshness=current")
 
     ghost = ToolResultMessage(
@@ -668,6 +672,9 @@ async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
     assert len(service_ghost.uncertain_reasons) == 1
     assert "not in the verification ledger" in service_ghost.uncertain_reasons[0]
     assert "freshness=unknown" in check_messages(ghost_request)[0].result.content
+    # 同一轮的 system/control 段也必须是锁存后的状态
+    assert "process_uncertain: true" in ghost_request.system_prompt
+    assert f"- {service_ghost.uncertain_reasons[0]}" in ghost_request.system_prompt
 
 
 async def test_receipt_in_ledger_without_terminal_fact_still_latches():
@@ -681,9 +688,16 @@ async def test_receipt_in_ledger_without_terminal_fact_still_latches():
     view = make_view(states=(CheckState("check-1", receipt=incomplete, freshness="current"),), receipts=(incomplete,))
     service = FakeVerificationService(view)
     result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True)
-    await projected_request(service, (result,))
+    request, _ = await projected_request(service, (result,))
     assert len(service.uncertain_reasons) == 1
     assert "trustworthy terminal fact" in service.uncertain_reasons[0]
+    # 同轮可见, 不推迟到下一轮
+    assert "process_uncertain: true" in request.system_prompt
+    assert f"- {service.uncertain_reasons[0]}" in request.system_prompt
+    assert len(service.refresh_calls) == 1
+    # 原始工具结果不被改写 (投影只加 freshness marker)
+    assert result.result.details == {"receipt_id": "r-1"}
+    assert check_messages(request)[0].result.call_id == "c1"
 
 
 async def test_launch_failed_receipt_is_a_known_failure_not_unknown_termination():
@@ -698,8 +712,30 @@ async def test_launch_failed_receipt_is_a_known_failure_not_unknown_termination(
     view = make_view(states=(CheckState("check-1", receipt=launched, freshness="current"),), receipts=(launched,))
     service = FakeVerificationService(view)
     result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True)
-    await projected_request(service, (result,))
+    request, _ = await projected_request(service, (result,))
     assert service.uncertain_reasons == []
+    assert "process_uncertain: true" not in request.system_prompt
+
+
+async def test_static_service_view_still_yields_same_round_latched_control_section():
+    """即使 refresh 的 view 未反映本轮锁存, 交给 inner 的控制段也必须带上已核对的锁存事实."""
+
+    class StaticViewService(FakeVerificationService):
+        def mark_process_uncertain(self, reason: str) -> None:
+            if reason not in self.uncertain_reasons:
+                self.uncertain_reasons.append(reason)  # 故意不更新 view: 只有 service state 变
+
+    ghost = ToolResultMessage(
+        result=ToolResult("c1", "check", "check output", is_error=True, details={"receipt_id": "ghost"})
+    )
+    service = StaticViewService(make_view())
+    request, _ = await projected_request(service, (ghost,))
+    reason = "check result receipt_id is not in the verification ledger; termination unproven"
+    assert service.uncertain_reasons == [reason]
+    assert "process_uncertain: true" in request.system_prompt
+    assert f"- {reason}" in request.system_prompt
+    assert "none reported by the verification view" not in request.system_prompt
+    assert len(service.refresh_calls) == 1
 
 
 async def test_success_text_does_not_clear_latched_uncertainty_and_successes_are_not_latched():
@@ -991,8 +1027,15 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
         RunPolicy(first_model, verifier), first_model, (ToolResultMessage(result=result),)
     )
     # 投影按账本核对回执: 回执自身 output_complete=False, 因此保守锁存 (与服务的锁存并存)
-    assert any("does not record a trustworthy terminal fact" in reason for reason in verifier._uncertain_reasons)
+    ledger_reason = next(
+        reason
+        for reason in verifier._uncertain_reasons
+        if "does not record a trustworthy terminal fact" in reason
+    )
     assert first_section.count("process_uncertain: true") == 1
+    # 账本核对产生的新锁存必须在同一轮可见, 不能只保证下一轮
+    assert f"- {ledger_reason}" in first_section
+    assert "none reported by the verification view" not in first_section
 
     # 下一轮同一历史: 锁存仍在, 不会因为已记录过而消失
     second_model = RecordingModel()
@@ -1008,8 +1051,10 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
         result=ToolResult("c9", "check", "PASS", details={"receipt_id": "chk-ghost"})
     )
     third_model = RecordingModel()
-    await _stream_with(RunPolicy(third_model, verifier), third_model, (ghost,))
+    third_section, _ = await _stream_with(RunPolicy(third_model, verifier), third_model, (ghost,))
     assert any("not in the verification ledger" in reason for reason in verifier._uncertain_reasons)
+    assert "process_uncertain: true" in third_section
+    assert "- check result receipt_id is not in the verification ledger; termination unproven" in third_section
 
 
 async def test_real_service_execution_cancel_propagates_and_projection_latches(tmp_path):

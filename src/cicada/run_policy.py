@@ -10,6 +10,9 @@
 - 历史 check 结果的回执身份只在 `refresh` 之后按程序唯一 `receipt_id` 核对
   `view.receipts` (不按模型 call_id): 账本里找不到, 或回执自身没有可靠终结事实,
   都保守锁存; 存在 receipt_id 字符串不是跳过核对的理由.
+- 账本核对产生的新锁存**同一轮**生效: 交给 inner 的控制 view 由已取得的不可变 view
+  并入本轮核对 reason 派生 (不重复 capture), 因此本轮请求就带 `process_uncertain`
+  与 blocking 原因, 不推迟到下一轮. 该派生只产生新的不可变 view, 不改服务对象.
 - 原文一字不改, 只按账本在末尾追加一行有界 freshness 标记; 缺失可靠身份的保守标
   `unknown`. 工具调用的 id/name/配对顺序和消息对象本身都不重写.
 
@@ -155,12 +158,16 @@ class RunPolicy:
             self.service.mark_process_uncertain(reason)
         view = await self.service.refresh(cancel)
         # 回执身份只能在 refresh 之后核对真实账本; 未知/不可信一律保守锁存
-        for reason in _reconcile_receipts(scan, view):
+        reconciled = _reconcile_receipts(scan, view)
+        for reason in reconciled:
             self.service.mark_process_uncertain(reason)
+        # 账本核对发生在本轮 refresh 之后: 交给 inner 的控制 view 必须已包含本轮新锁存
+        # 的不能交付原因, 不能推迟到下一轮 (否则本轮模型仍看见 "none reported")。
+        control = _control_view_with_latches(view, reconciled)
         projected = ModelRequest(
-            messages=tuple(_project_message(message, view, self.config) for message in request.messages),
+            messages=tuple(_project_message(message, control, self.config) for message in request.messages),
             tools=request.tools,
-            system_prompt=_with_control_section(request.system_prompt, view, self.config),
+            system_prompt=_with_control_section(request.system_prompt, control, self.config),
         )
         async for event in self.inner.stream(projected, cancel):
             yield event
@@ -170,6 +177,21 @@ class RunPolicy:
         scan = _scan_terminal_facts(messages)
         for reason in scan.reasons:
             self.service.mark_process_uncertain(reason)
+
+
+def _control_view_with_latches(
+    view: VerificationView, reconciled: tuple[str, ...]
+) -> VerificationView:
+    """把本轮账本核对产生的新锁存并入不可变控制 view; 不重复 capture, 不改服务对象.
+
+    `refresh` 之前锁存的原因按 Protocol 已由服务反映在 view 里 (服务可能用自己的措辞),
+    因此这里只追加 `refresh` 之后才产生的核对 reason; 只要本轮有新锁存, 控制段就必须报
+    `process_uncertain=true`, 不能把已成立的不确定事实推迟到下一轮。
+    """
+    if not reconciled:
+        return view
+    fresh = tuple(reason for reason in dict.fromkeys(reconciled) if reason not in view.blocking_reasons)
+    return replace(view, process_uncertain=True, blocking_reasons=view.blocking_reasons + fresh)
 
 
 def _scan_terminal_facts(messages: tuple[Message, ...]) -> _TerminalScan:
