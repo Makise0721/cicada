@@ -959,8 +959,9 @@ class Verifier:
             f"[output_truncated={str(receipt.output_truncated).lower()} "
             f"artifact_truncated={str(receipt.artifact_truncated).lower()} "
             f"artifact_error={receipt.artifact_error}]",
+            # 工件路径也走同一 JSON 编码器, 与 command/cwd 的路径口径一致。
             "[output artifact: "
-            f"{_one_line(str(receipt.output_artifact_path), CWD_PREVIEW_MAX_BYTES)}]"
+            f"{_json_preview(str(receipt.output_artifact_path), CWD_PREVIEW_MAX_BYTES)}]"
             if receipt.output_artifact_path else "[output artifact: unavailable]",
         ]
         if receipt.output_artifact_sha256:

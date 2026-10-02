@@ -18,6 +18,7 @@ from cicada.plugins.coding.process import PowerShellRunner
 from cicada.plugins.coding.snapshot import Snapshotter
 from cicada.plugins.coding.verification import (
     CONTENT_MAX_BYTES,
+    CWD_PREVIEW_MAX_BYTES,
     DIFF_MAX_BYTES,
     Verifier,
     VerificationError,
@@ -623,7 +624,12 @@ async def test_receipt_content_is_bounded_and_keeps_control_and_artifact_facts(r
     assert "status=passed" in content
     assert f"command_sha256={hashlib.sha256(receipt.command.encode()).hexdigest()}" in content
     assert receipt.output_artifact_path is not None
-    assert str(receipt.output_artifact_path) in content
+    # 工件路径与 command/cwd 用同一 JSON 编码器: 反解后等于真实路径, 不再裸文本拼接。
+    prefix = "[output artifact: "
+    artifact_line = next(line for line in content.splitlines() if line.startswith(prefix))
+    artifact_preview = json.loads(artifact_line[len(prefix):-1])
+    assert artifact_preview == str(receipt.output_artifact_path)
+    assert len(artifact_line.encode("utf-8")) <= CWD_PREVIEW_MAX_BYTES + len(prefix) + 1
     assert receipt.output_artifact_sha256 in content
     assert receipt.output_truncated is True  # 60 KiB 单行超 tail 预算
     # 真实 stdout 预览在预算内进入 content (尾部 'done' 可见), 控制字段没有被挤掉。
