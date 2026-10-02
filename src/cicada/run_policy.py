@@ -54,6 +54,7 @@ PRE_EXECUTION_MARKERS = (
     "arguments must be a JSON object",
     "arguments failed validation:",
     "model output truncated; tool call not executed",
+    "model stream failed; tool call not executed",
 )
 # 命令根本没起来 (明确的启动失败), 与"进程终止未证"是不同事实.
 LAUNCH_FAILURE_MARKERS = ("pwsh executable not found on PATH",)

@@ -7,6 +7,7 @@ from cicada.core.agent import Agent
 from cicada.core.cancel import CancelToken
 from cicada.core.events import (
     AssistantCompleted,
+    AssistantTextDelta,
     ModelCallCompleted,
     RunFinished,
     RunStarted,
@@ -43,10 +44,15 @@ async def test_text_only_run_completes():
     assert [type(e) for e in events] == [
         RunStarted,
         TurnStarted,
+        AssistantTextDelta,
+        AssistantTextDelta,
         AssistantCompleted,
         ModelCallCompleted,
         RunFinished,
     ]
+    deltas = [e for e in events if isinstance(e, AssistantTextDelta)]
+    assert deltas[0].run_id == result.run_id and deltas[0].turn_index == 0
+    assert [d.text for d in deltas] == ["你", "好"]
     user, assistant = result.messages
     assert isinstance(user, UserMessage) and user.text == "打招呼"
     assert isinstance(assistant, AssistantMessage) and assistant.text == "你好"
@@ -251,6 +257,7 @@ async def test_run_with_system_prompt_reaches_request():
     assert [type(e) for e in events] == [
         RunStarted,
         TurnStarted,
+        AssistantTextDelta,
         AssistantCompleted,
         ModelCallCompleted,
         RunFinished,
@@ -341,6 +348,7 @@ async def test_model_call_recorded_per_turn_in_event_order():
         ToolStarted,
         ToolCompleted,
         TurnStarted,
+        AssistantTextDelta,
         AssistantCompleted,
         ModelCallCompleted,
         RunFinished,
@@ -415,6 +423,7 @@ async def test_terminal_then_cancel_keeps_known_metrics():
     assert [type(e) for e in events] == [
         RunStarted,
         TurnStarted,
+        AssistantTextDelta,
         AssistantCompleted,
         ModelCallCompleted,
         RunFinished,

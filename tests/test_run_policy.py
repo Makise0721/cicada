@@ -718,6 +718,36 @@ async def test_launch_failed_receipt_is_a_known_failure_not_unknown_termination(
     assert "process_uncertain: true" not in request.system_prompt
 
 
+async def test_model_stream_failed_closure_is_pre_execution_sentinel_not_latch():
+    """T03: 模型错误后未执行调用的固定关闭文本是执行前哨兵, 不锁存进程不确定.
+
+    即使结果带 details 或错误形态 (通常会导致保守锁存), 进程根本未启动.
+    """
+    service = FakeVerificationService(make_view())
+    messages = (
+        ToolResultMessage(
+            result=ToolResult(
+                "c1",
+                "powershell",
+                "model stream failed; tool call not executed",
+                is_error=True,
+                details={"receipt_id": "r-1", "output_complete": False},
+            )
+        ),
+        ToolResultMessage(
+            result=ToolResult(
+                "c2",
+                "check",
+                "model stream failed; tool call not executed",
+                is_error=True,
+            )
+        ),
+    )
+    request, _ = await projected_request(service, messages)
+    assert service.uncertain_reasons == []
+    assert "process_uncertain: true" not in request.system_prompt
+
+
 async def test_static_service_view_still_yields_same_round_latched_control_section():
     """即使 refresh 的 view 未反映本轮锁存, 交给 inner 的控制段也必须带上已核对的锁存事实."""
 

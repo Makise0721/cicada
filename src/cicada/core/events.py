@@ -27,6 +27,19 @@ class AssistantCompleted:
 
 
 @dataclass(frozen=True)
+class AssistantTextDelta:
+    """只读文本增量: 供 UI 活动预览; thinking 与参数增量不发布.
+
+    完成事件 (AssistantCompleted) 仍是回答与工具调用的权威, 预览不是
+    可供模型续写的历史.
+    """
+
+    run_id: str
+    turn_index: int
+    text: str
+
+
+@dataclass(frozen=True)
 class ModelCallCompleted:
     """一次模型调用的计量记录; 取消/错误路径同样产生记录."""
 
@@ -60,6 +73,7 @@ class RunFinished:
 Event: TypeAlias = (
     RunStarted
     | TurnStarted
+    | AssistantTextDelta
     | AssistantCompleted
     | ModelCallCompleted
     | ToolStarted

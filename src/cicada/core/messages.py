@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 from typing import Any, Literal, TypeAlias
 
 StopReason: TypeAlias = Literal["stop", "tool_use", "length", "error", "aborted"]
@@ -50,3 +51,21 @@ class ToolResultMessage:
 
 
 Message: TypeAlias = UserMessage | AssistantMessage | ToolResultMessage
+
+
+def isolate_tool_result(result: ToolResult) -> ToolResult:
+    """复制嵌套可变 details, 其余字段本就不可变; 类型结构保持原记录.
+
+    frozen dataclass 只保护外层; 不隔离 details 会让订阅者/快照改动穿透
+    规范历史与 RunPolicy 判定.
+    """
+    if result.details is None:
+        return result
+    return replace(result, details=copy.deepcopy(result.details))
+
+
+def isolate_message(message: Message) -> Message:
+    """返回隔离嵌套可变数据后的等价消息; 其余类型直接返回原对象."""
+    if isinstance(message, ToolResultMessage):
+        return ToolResultMessage(result=isolate_tool_result(message.result))
+    return message
