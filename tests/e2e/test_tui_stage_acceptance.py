@@ -46,6 +46,9 @@ async def test_stage_acceptance_full_interaction(tmp_path):
             assert any("工具 check" in text for text in sink.rendered)
             assert any("来源=本次检查" in text for text in sink.rendered)
             assert any("可交付" in text for text in sink.rendered)
+            assert sink.rendered_count("第一轮修改完成并通过检查。") == 1, (
+                "最终回答经生产渲染且恰好一次"
+            )
             assert await wait_until(lambda: session.state == "idle")
             assert len(model_of(session).requests) == 2, "首问 = 工具轮 + 文本轮"
 
@@ -59,6 +62,7 @@ async def test_stage_acceptance_full_interaction(tmp_path):
             # 追问请求 = 完整历史 (首轮后缀) + 本次 UserMessage; 只携带一次
             assert len(second_request_messages) == history_after_first + 1
             assert any("此前检查，仍有效" in text for text in sink.rendered)
+            assert sink.rendered_count("这是追问的回答。") == 1
 
             # 3) 修改但不重检: 检查过期, 程序判定不可交付, 退出码 3 (T08/T10)
             pipe.send_text("再改一处但不重检\r")

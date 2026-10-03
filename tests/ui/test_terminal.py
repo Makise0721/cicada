@@ -860,3 +860,26 @@ async def test_render_failure_recorded_and_session_still_closes(tmp_path):
         assert any("render failed" in failure for failure in executor.ui_failures)
     with pytest.raises(RuntimeError, match="closed"):
         await session.execute("after close")
+
+
+async def test_idle_ctrl_c_clears_draft_instead_of_exiting(tmp_path):
+    """规格 §输入: 空闲 Ctrl+C 只清空草稿不退出; 退出走 /exit 或空草稿 Ctrl+D."""
+    session = await open_application(
+        _config(tmp_path, _script({"text": "回答", "stop": True}))
+    )
+    sink = RecordingSink()
+    with create_pipe_input() as pipe:
+        executor = _make_executor(session, pipe, sink)
+        runner = asyncio.ensure_future(executor.run_async())
+        try:
+            await _start(executor, runner)
+            pipe.send_text("草稿内容")
+            assert await wait_until(lambda: executor.buffer.text == "草稿内容")
+            pipe.send_text("\x03")
+            assert await wait_until(lambda: executor.buffer.text == "")
+            # 应用仍在运行: 清空后可正常提交新问题
+            pipe.send_text("新问题\r")
+            assert await wait_until(lambda: sink.count_prefix("[user]") == 1)
+            await _wait_request_done(sink, 1)
+        finally:
+            await _close_by_exit(executor, pipe, runner)

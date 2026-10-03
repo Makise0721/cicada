@@ -15,6 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
@@ -380,3 +381,18 @@ async def test_production_check_mode_delivery_rendered(tmp_path):
         finally:
             pipe.send_text("/exit\r")
             await asyncio.wait_for(runner, timeout=15)
+
+
+async def test_run_tui_session_fallback_closes_session_when_runner_fails(tmp_path, monkeypatch):
+    """run_tui_session 兜底分支: runner 在自身收尾前异常 → 异常上抛且 session 被关闭."""
+    from cicada.ui import ProductionTerminalExecutor
+
+    async def boom(self):
+        raise RuntimeError("runner exploded before cleanup")
+
+    monkeypatch.setattr(ProductionTerminalExecutor, "run_async", boom)
+    session = await open_app(_config(tmp_path, _script({"text": "答", "stop": True})))
+    with create_pipe_input() as pipe:
+        with pytest.raises(RuntimeError, match="runner exploded"):
+            await run_tui_session(session, input=pipe, output=DummyOutput())
+    assert session.state == "closed"

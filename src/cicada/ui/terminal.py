@@ -18,7 +18,7 @@
   忙碌拒绝不产生假用户消息; 最终回答只进入终端记录一次 (零增量也显示).
 - 关闭顺序 (T11): 先退出 Application 恢复终端输入/光标模式, 再退订, 停 mailbox
   消费, 最后 await session.aclose(); 关闭不可逆. 忙碌 Ctrl+C 只协作取消,
-  不伪造 idle.
+  不伪造 idle; 空闲 Ctrl+C 按规格只清空草稿 (退出走 /exit 或空草稿 Ctrl+D).
 """
 
 from __future__ import annotations
@@ -493,10 +493,12 @@ class TerminalExecutor:
 
         @kb.add("c-c")
         def _ctrl_c(event) -> None:  # noqa: ANN001
-            if executor._session.state not in _BUSY_STATES:
-                event.app.exit()  # 空闲 Ctrl+C: 进入关闭序列
-            else:
+            if executor._session.state in _BUSY_STATES:
                 executor._cancel_or_explain()
+            else:
+                # 规格 §输入: 空闲 Ctrl+C 只清空草稿, 不退出 (防误触丢失会话);
+                # 退出走 /exit 或空草稿 Ctrl+D
+                executor._buffer.reset()
 
         @kb.add("c-d")
         def _ctrl_d(event) -> None:  # noqa: ANN001
