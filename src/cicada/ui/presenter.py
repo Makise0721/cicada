@@ -55,6 +55,7 @@ CHECK_TOOL_NAME = "check"
 # presenter 产出的标注文案 (程序事实的中文标签; 不含 PASS/FAIL 之类自制判定)
 NORMAL_MODE_CHECK_LABEL = "未启用检查"
 HISTORICAL_PASS_LABEL = "此前检查，仍有效"
+HISTORICAL_NEUTRAL_LABEL = "此前检查"
 CURRENT_RUN_CHECK_LABEL = "本次检查"
 PROCESS_UNCERTAIN_LABEL = "进程终结未知（锁存）"
 NOT_RUN_CHECK_LABEL = "未运行"
@@ -98,8 +99,10 @@ def _bounded_body(text: str) -> tuple[str, ...]:
 
 
 def _sum_known(values: list[int | None]) -> int | None:
-    known = [value for value in values if value is not None]
-    return sum(known) if known else None
+    # None 表示不可得: 任一调用该计量不可得时, 该累计就是不可得, 不显示部分和
+    if not values or any(value is None for value in values):
+        return None
+    return sum(values)
 
 
 def _card_status_for(result_content: str, is_error: bool) -> str:
@@ -121,6 +124,8 @@ class _ToolCardState:
     result_content: str | None = None
     is_error: bool = False
     artifact_line: str | None = None
+    # 本轮注册过卡才有资格断言"未执行"; 订阅前开始的卡只能标"状态未知"
+    registered: bool = True
 
 
 class ProjectionPresenter:
@@ -252,9 +257,11 @@ class ProjectionPresenter:
         if message.text or message.error:
             key = f"{event.run_id}:{turn}:assistant"
             body_text = message.text + (f"\n错误: {message.error}" if message.error else "")
+            # 最终回答是完整规范文本 (契约: 完整文本以最终 AssistantCompleted 为准),
+            # 不套预览/卡片限额; 截断标注只属于活动预览与工具卡
             appended.append(self._upsert(PresentationRecord(
                 key=key, role="assistant", title="助手", status="done" if message.error is None else "failed",
-                body=_bounded_body(body_text),
+                body=tuple(body_text.split("\n")),
             )))
         for call in message.tool_calls:
             card_key = f"{event.run_id}:{turn}:{call.id}"
@@ -291,11 +298,12 @@ class ProjectionPresenter:
         result = event.result
         card_key = self._open_calls.pop((event.run_id, result.call_id), None)
         if card_key is None:
-            # 无注册卡的 ToolCompleted (订阅晚加入等): 仍按失败/未执行卡投影, 不丢事实
+            # 无注册卡的 ToolCompleted (订阅晚加入等): 仍投影, 不丢事实;
+            # 但没有本轮注册事实, 不能断言"未执行"
             card_key = f"{event.run_id}:unknown:{result.call_id}"
             self._cards[card_key] = _ToolCardState(
                 run_id=event.run_id, turn_index=-1, call_id=result.call_id,
-                name=result.name, arguments_json="", started=False,
+                name=result.name, arguments_json="", started=False, registered=False,
             )
         card = self._cards[card_key]
         self._cards[card_key] = replace(
@@ -330,7 +338,9 @@ class ProjectionPresenter:
         if card.turn_index >= 0:
             head.append(f"run={card.run_id} turn={card.turn_index}")
         if not card.started:
-            head.append("未执行（无 ToolStarted）")
+            head.append(
+                "执行状态未知（订阅前开始）" if not card.registered else "未执行（无 ToolStarted）"
+            )
         if card.artifact_line:
             head.append(card.artifact_line)
         # 参数与结果合并后整体受 32 行 / 8192 bytes 卡片限额约束
@@ -352,7 +362,10 @@ class ProjectionPresenter:
         appended: list[PresentationRecord] = []
         view = outcome.view
         if view is not None:
-            self._verification_run_id = view.verification_run_id
+            # 无快照的 view (收尾监督超时哨兵) 不携带真实 verification_run_id:
+            # 保持既有真实 id, 不让哨兵值覆盖状态栏
+            if view.snapshot_ref is not None:
+                self._verification_run_id = view.verification_run_id
             if view.process_uncertain:
                 self._process_uncertain = True
         # 运行结果记录: stop_reason / 错误 (普通模式与检查模式一致)
@@ -391,8 +404,12 @@ class ProjectionPresenter:
                     source = NOT_RUN_CHECK_LABEL
                 elif state.receipt.receipt_id in self._check_receipts_this_request:
                     source = CURRENT_RUN_CHECK_LABEL
-                else:
+                elif state.status == "passed" and state.freshness == "current":
+                    # "仍有效" 只属于快照没变且仍为最新尝试的旧 PASS
                     source = HISTORICAL_PASS_LABEL
+                else:
+                    # 失败/stale/未知 freshness 的历史回执不得宣称为仍有效
+                    source = HISTORICAL_NEUTRAL_LABEL
                 line = f"check {state.check_id}: status={state.status} freshness={state.freshness} 来源={source}"
                 if state.receipt is not None:
                     line += f" receipt_id={state.receipt.receipt_id} exit_code={state.receipt.exit_code}"

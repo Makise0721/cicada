@@ -36,6 +36,7 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.reporting import DeliveryDecision
 from cicada.ui.contracts import PresentationRecord
 from cicada.ui.presenter import (
+    HISTORICAL_NEUTRAL_LABEL,
     HISTORICAL_PASS_LABEL,
     NORMAL_MODE_CHECK_LABEL,
     PREVIEW_MAX_BYTES,
@@ -243,19 +244,18 @@ def test_final_completion_keeps_authoritative_text_after_merge():
     assert presenter.current_preview is None, "最终完成替换预览"
 
 
-def test_none_metrics_stay_none_and_cumulative_metrics_sum():
+def test_metrics_any_unknown_call_makes_that_cumulative_unknown():
     presenter = ProjectionPresenter()
-    update = presenter.accept(_event(ModelCallCompleted(RUN, 0, "stop", None, 0.1)))
-    assert update.status.input_tokens is None and update.status.output_tokens is None
     update = presenter.accept(_event(ModelCallCompleted(
-        RUN, 1, "stop", ModelMetrics(input_tokens=100, output_tokens=10), 0.1,
+        RUN, 0, "stop", ModelMetrics(input_tokens=100, output_tokens=10), 0.1,
     )))
     assert update.status.input_tokens == 100 and update.status.output_tokens == 10
     update = presenter.accept(_event(ModelCallCompleted(
-        RUN, 2, "stop", ModelMetrics(input_tokens=250, output_tokens=None), 0.1,
+        RUN, 1, "stop", ModelMetrics(input_tokens=250, output_tokens=None), 0.1,
     )))
-    # 累计口径: 跨调用求和 (100+250), 不是单次峰值; output 已知值累计
-    assert update.status.input_tokens == 350 and update.status.output_tokens == 10
+    # None 表示不可得: 任一调用该计量不可得, 该累计就是不可得 (不显示部分和);
+    # input 全部已知仍可累计 (跨调用求和, 不是单次峰值)
+    assert update.status.input_tokens == 350 and update.status.output_tokens is None
 
 
 def test_metrics_reset_between_requests():
@@ -431,6 +431,74 @@ def test_historical_pass_marked_by_source_without_this_run_check():
     body = _body_of(presenter, "run-2:delivery")
     assert HISTORICAL_PASS_LABEL in body
     assert "a2.diff" in body, "每请求结果绑定自己的工件"
+
+
+def test_historical_failed_or_stale_receipt_not_labeled_still_valid():
+    """历史回执只有 passed+current 才配"仍有效"; 失败/stale 用中性来源标注."""
+    presenter = ProjectionPresenter(verification_run_id="vrun")
+    outcome = _outcome(
+        run_id="run-2",
+        view=_view(checks=(
+            CheckState("check-1", _receipt("r-failed", status="failed"), "current"),
+            CheckState("check-2", _receipt("r-stale"), "stale"),
+        )),
+        decision=DeliveryDecision(model_stopped=True, can_deliver=False, blocking_reasons=("x",)),
+        exit_code=3,
+    )
+    presenter.accept(RequestCompleted(outcome))
+    body = _body_of(presenter, "run-2:delivery")
+    assert "来源=" + HISTORICAL_NEUTRAL_LABEL in body
+    assert "仍有效" not in body
+    assert "status=failed" in body and "freshness=stale" in body
+
+
+def test_finalize_timeout_sentinel_view_does_not_overwrite_real_run_id():
+    """收尾监督超时的哨兵 view (snapshot_ref=None) 不得把 'unavailable' 写进状态栏."""
+    presenter = ProjectionPresenter(verification_run_id="vrun-real")
+    sentinel = VerificationView(
+        verification_run_id="unavailable", snapshot_ref=None, scope_id=None,
+        checks=(), receipts=(), process_uncertain=False,
+        blocking_reasons=("finalization timed out",),
+    )
+    update = presenter.accept(RequestCompleted(
+        _outcome(run_id="run-2", view=sentinel, exit_code=3,
+                 decision=DeliveryDecision(model_stopped=False, can_deliver=False,
+                                           blocking_reasons=("finalization timed out",)))
+    ))
+    assert update.status.verification_run_id == "vrun-real"
+    presenter.accept(RequestCompleted(
+        _outcome(run_id="run-3", view=_view(), exit_code=0,
+                 decision=DeliveryDecision(model_stopped=True, can_deliver=True, blocking_reasons=()))
+    ))
+    assert presenter.status.verification_run_id == "vrun"  # 真实 view 照常更新
+
+
+def test_mid_subscribe_unknown_card_not_claimed_unexecuted():
+    """订阅前开始的工具: 完成仍投影, 但只标"状态未知", 不断言"未执行"."""
+    presenter = ProjectionPresenter()
+    presenter.accept(_event(ToolStarted(RUN, "call-late", "echo")))  # 无注册卡: 静默 (无事实可显示)
+    presenter.accept(_event(ToolCompleted(
+        RUN, ToolResult(call_id="call-late", name="echo", content="done"),
+    )))
+    card = presenter.records[-1]
+    assert card.key == f"{RUN}:unknown:call-late" and card.status == "done"
+    body = "\n".join(card.body)
+    assert "执行状态未知" in body
+    assert "未执行" not in body
+
+
+def test_final_assistant_record_not_bounded_by_preview_limits():
+    """最终回答是完整规范文本, 不套预览/工具卡的有界上限 (完整文本以完成事件为准)."""
+    presenter = ProjectionPresenter()
+    presenter.accept(_event(TurnStarted(RUN, 0)))
+    long_text = "\n".join(f"line-{i:03d}" for i in range(80))
+    presenter.accept(_event(AssistantCompleted(
+        RUN, AssistantMessage(text=long_text, stop_reason="stop"),
+    )))
+    record = next(r for r in presenter.records if r.key == f"{RUN}:0:assistant")
+    body = "\n".join(record.body)
+    assert "line-000" in body and "line-079" in body
+    assert not any("已截断" in line for line in record.body)
 
 
 # --- 关闭 / 清空 / 去重 -----------------------------------------------------------------------

@@ -27,9 +27,11 @@ from cicada.ui.contracts import (
 
 RENDER_WIDTH = 100
 
-# 显示清理: CSI 序列、OSC 序列、除 \n \t 外的 C0/C1 控制字符
+# 显示清理: CSI 序列、OSC 序列、未终结的截断段、除 \n \t 外的 C0/C1 控制字符
 _CSI_RE = re.compile(r"\x1b\[[0-9;:?<=>!]*[ -/]*[@-~]")
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_UNTERMINATED_OSC_RE = re.compile(r"\x1b\][^\x1b]*")
+_TRUNCATED_CSI_RE = re.compile(r"\x1b\[[0-9;:?<=>!]*[ -/]*$")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
 
 _ROLE_STYLES = {
@@ -49,9 +51,9 @@ _STATUS_STYLES = {
 
 
 def sanitize_display(text: str) -> str:
-    """显示副本清理: 移除 CSI/OSC 与控制字符 (保留 \n 与 \t); 只用于渲染输入."""
-    text = _CSI_RE.sub("", text)
-    text = _OSC_RE.sub("", text)
+    """显示副本清理: 移除 CSI/OSC/未终结截断段与控制字符 (保留 \n 与 \t); 只用于渲染输入."""
+    text = _UNTERMINATED_OSC_RE.sub("", _OSC_RE.sub("", text))
+    text = _TRUNCATED_CSI_RE.sub("", _CSI_RE.sub("", text))
     return _CONTROL_RE.sub("", text)
 
 

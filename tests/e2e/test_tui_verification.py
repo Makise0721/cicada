@@ -234,6 +234,9 @@ async def test_t08_stale_check_not_shown_as_deliverable(tmp_path):
     body = "\n".join(delivery.body)
     assert delivery.status == "failed"
     assert "stale" in body and "不可交付" in body
+    # stale 的历史 PASS 只标中性来源, 不得宣称为"仍有效"
+    assert "来源=此前检查" in body
+    assert "仍有效" not in body
     tap.close()
     await session.aclose()
 

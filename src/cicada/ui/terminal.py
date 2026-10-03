@@ -45,6 +45,7 @@ from cicada.application import (
     ApplicationSession,
     ApplicationUpdate,
     HistoryCleared,
+    REQUEST_FINALIZE_SUPERVISION_S,
     RequestCompleted,
     RequestPhaseChanged,
 )
@@ -73,16 +74,23 @@ _BUSY_STATES = frozenset({"executing", "cancelling", "finalizing"})
 
 _CSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*[@-~]")
 _OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-# 保留 \n (0x0a) 与 \t (0x09); 其余 C0 控制字符与 DEL 全部移除
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# 未终结 OSC: 良构序列移除后, 余下 \x1b] 到下一 ESC/串尾是截断段 payload
+_UNTERMINATED_OSC_RE = re.compile(r"\x1b\][^\x1b]*")
+# 尾部被截断的 CSI (中间不会出现: 参数后首个 [@-~] 字节即终结)
+_TRUNCATED_CSI_RE = re.compile(r"\x1b\[[0-9:;<=>?]*[ -/]*$")
+# 保留 \n (0x0a) 与 \t (0x09); 其余 C0、C1 控制字符与 DEL 全部移除
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def sanitize_external_text(text: str) -> str:
     """T13: 外部显示文本先移除 CSI/OSC 及除换行/制表外的控制字符.
 
+    先移除良构序列, 再移除未终结的截断段 (其 payload 不可与后续正文区分,
+    一并移除是截断的代价); 最后剥掉 C0/C1 控制字符, 孤立 ESC 不再构成执行通道.
     只作用于展示路径; 规范消息、会话历史与证据保持原始内容.
     """
-    text = _OSC_RE.sub("", _CSI_RE.sub("", text))
+    text = _UNTERMINATED_OSC_RE.sub("", _OSC_RE.sub("", text))
+    text = _TRUNCATED_CSI_RE.sub("", _CSI_RE.sub("", text))
     return _CONTROL_RE.sub("", text)
 
 
@@ -362,7 +370,11 @@ class TerminalExecutor:
             if wait > 0:
                 await asyncio.sleep(wait)
             last_render = loop.time()
-            self._render_batch(items)
+            try:
+                self._render_batch(items)
+            except Exception as exc:  # 渲染/输出异常不得杀死消费任务: 记录后走关闭序列
+                self._record_ui_failure(f"render failed: {exc!r}")
+                self._app.exit()
 
     def _render_batch(self, items: list[object]) -> None:
         updates: list[PresentationUpdate] = []
@@ -470,15 +482,14 @@ class TerminalExecutor:
         @kb.add("escape")
         def _escape(event) -> None:  # noqa: ANN001
             # 孤立 Escape 经 KeyProcessor timeoutlen 消歧后到达 (01 探针裁决)
-            if executor._session.state in _BUSY_STATES:
-                executor._session.cancel()
+            executor._cancel_or_explain()
 
         @kb.add("c-c")
         def _ctrl_c(event) -> None:  # noqa: ANN001
-            if executor._session.state in _BUSY_STATES:
-                executor._session.cancel()  # 协作取消, 不伪造 idle
-            else:
+            if executor._session.state not in _BUSY_STATES:
                 event.app.exit()  # 空闲 Ctrl+C: 进入关闭序列
+            else:
+                executor._cancel_or_explain()
 
         @kb.add("c-d")
         def _ctrl_d(event) -> None:  # noqa: ANN001
@@ -503,6 +514,24 @@ class TerminalExecutor:
             output=output,
             style=Style.from_dict({"reverse": "reverse"}),
         )
+
+    def _cancel_or_explain(self) -> None:
+        """忙碌时协作取消, 不伪造 idle; finalizing 的收尾不受公共取消接口影响.
+
+        ApplicationSession.cancel 只作用于执行中的请求 token (冻结契约:
+        executing -> cancelling 通知一次); 收尾由独立 token 驱动且受监督窗口
+        约束, 因此该阶段按键不做无声 no-op, 如实告知用户等待.
+        """
+        state = self._session.state
+        if state == "finalizing":
+            self._sink.print_line(
+                "[system] 验证收尾中: 取消无效, 等待本次收尾完成"
+                f" (监督窗口最长 {REQUEST_FINALIZE_SUPERVISION_S:.0f} 秒)"
+            )
+            self._app.invalidate()
+            return
+        if state in _BUSY_STATES:
+            self._session.cancel()
 
     def _accept_prompt(self, raw: str, event) -> None:  # noqa: ANN001
         state = self._session.state
@@ -596,6 +625,9 @@ class TerminalExecutor:
                     await consumer
                 except asyncio.CancelledError:
                     pass
+                except Exception as exc:
+                    # 消费任务因异常死亡也必须完成关闭收尾, 不能跳过 aclose
+                    self._record_ui_failure(f"mailbox consumer terminated: {exc!r}")
             await self._session.aclose()
 
     def run(self) -> None:

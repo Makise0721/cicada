@@ -313,6 +313,34 @@ async def test_display_sanitized_but_canonical_raw(tmp_path):
             await _close_by_exit(executor, pipe, runner)
 
 
+def test_sanitize_strips_c1_and_unterminated_escape_payloads():
+    """T13 加强: C1 控制字符与被截断的转义序列不残留执行通道."""
+    # C1 (U+0080-U+009F) 全部移除: legacy 8-bit 控制台下 \x9b 是 CSI 引导符
+    assert sanitize_external_text("a\x9b31mred") == "a31mred"
+    assert sanitize_external_text("x\x85y\x9cz") == "xyz"
+    # 未终结 OSC 的 payload 不残留 (良构部分先移除, 余下 ESC 起的截断段整段移除)
+    assert sanitize_external_text("\x1b]0;title\x1b[31mred\x1b[0m") == "red"
+    assert sanitize_external_text("看\x1b[31") == "看"
+    assert sanitize_external_text("孤\x1b立") == "孤立"
+    # 换行/制表保留; 良构序列行为不回归
+    assert sanitize_external_text("看\n好\t的") == "看\n好\t的"
+    assert sanitize_external_text("看见\x1b[31m红色\x1b[0m\x07了吗") == "看见红色了吗"
+
+
+def test_closing_state_rejects_prompt_and_keeps_draft():
+    """closing 下提交与 executing/finalizing 同路径拒绝; 草稿保留."""
+
+    class StubSession:
+        state = "closing"
+
+    sink = RecordingSink()
+    executor = _make_offline_executor(StubSession(), sink)  # type: ignore[arg-type]
+    executor.buffer.text = "草稿"
+    executor._accept_prompt("草稿", None)
+    assert any("closing" in line and "提交被拒绝" in line for line in sink.lines)
+    assert executor.buffer.text == "草稿"
+
+
 # --- T05: 忙碌提交拒绝不排队; finalizing 拒绝 --------------------------------------------------
 
 
@@ -400,6 +428,36 @@ async def test_finalizing_submit_rejected_and_draft_kept(tmp_path):
             assert session.state == "idle"
             assert len(_model_of(session).requests) == 1  # 插队请求未执行
             assert executor.buffer.text == "插队"  # 草稿保留
+        finally:
+            await _close_by_exit(executor, pipe, runner)
+
+
+async def test_finalizing_cancel_key_explains_instead_of_silent_noop(tmp_path):
+    """finalizing 期间 Ctrl+C: 公共 cancel 契约不覆盖收尾, 必须给出反馈而非无声无操作."""
+    root = _repo(tmp_path)
+    plan = VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=Path(os.path.realpath(root)),
+        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
+    )
+    session = await open_application(
+        _config(root, _script({"text": "直接回答", "stop": True}), plan=plan)
+    )
+    session._service = SlowService(session._service, delay=0.6)  # type: ignore[arg-type]
+    sink = RecordingSink()
+    with create_pipe_input() as pipe:
+        executor = _make_executor(session, pipe, sink)
+        runner = asyncio.ensure_future(executor.run_async())
+        try:
+            await _start(executor, runner)
+            pipe.send_text("第一问\r")
+            assert await wait_until(lambda: session.state == "finalizing", timeout=10)
+            pipe.send_text("\x03")  # Ctrl+C
+            assert await wait_until(lambda: "取消无效" in sink.joined(), timeout=5)
+            # 收尾未被取消: 请求正常完成, 没有 cancelling 阶段
+            await _wait_request_done(sink, 1)
+            assert session.state == "idle"
+            assert not any("cancelling" in line for line in sink.lines)
         finally:
             await _close_by_exit(executor, pipe, runner)
 
@@ -596,6 +654,63 @@ async def test_exit_closes_in_order_and_is_irreversible(tmp_path):
         await session.execute("after close")
 
 
+async def test_exit_closes_in_true_observed_order(tmp_path):
+    """T11 顺序用可观测 seam 验证: 主屏退出 -> 退订 -> 停消费 -> aclose."""
+    session = await open_application(
+        _config(tmp_path, _script({"text": "回答", "stop": True}))
+    )
+    sink = RecordingSink()
+    with create_pipe_input() as pipe:
+        executor = _make_executor(session, pipe, sink)
+        order: list[str] = []
+
+        real_run_async = executor._app.run_async
+
+        async def recording_run_async():
+            try:
+                await real_run_async()
+            finally:
+                order.append("app-exited")
+
+        executor._app.run_async = recording_run_async  # type: ignore[method-assign]
+
+        real_subscribe = session.subscribe
+
+        def recording_subscribe(handler):
+            unsubscribe = real_subscribe(handler)
+
+            def unsubscribe_once():
+                order.append("unsubscribe")
+                unsubscribe()
+
+            return unsubscribe_once
+
+        session.subscribe = recording_subscribe  # type: ignore[method-assign]
+
+        real_consume = executor._consume
+
+        async def recording_consume():
+            try:
+                await real_consume()
+            finally:
+                order.append("consumer-stopped")
+
+        executor._consume = recording_consume  # type: ignore[method-assign]
+
+        real_aclose = session.aclose
+
+        async def recording_aclose():
+            order.append("aclose")
+            await real_aclose()
+
+        session.aclose = recording_aclose  # type: ignore[method-assign]
+
+        runner = asyncio.ensure_future(executor.run_async())
+        await _close_by_exit(executor, pipe, runner)
+        assert order == ["app-exited", "unsubscribe", "consumer-stopped", "aclose"]
+        assert session.state == "closed"
+
+
 # --- 预览有界 ---------------------------------------------------------------------------------
 
 
@@ -715,3 +830,33 @@ async def test_structural_overflow_fails_explicitly_and_cancels(tmp_path):
     finally:
         unsubscribe()
         await session.aclose()
+
+
+class ExplodingSink:
+    """打印助手最终记录时抛错: 模拟渲染/输出层死亡."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def print_line(self, text: str = "") -> None:
+        if text.startswith("[assistant]"):
+            raise ValueError("sink render exploded")
+        self.lines.append(text)
+
+
+async def test_render_failure_recorded_and_session_still_closes(tmp_path):
+    """渲染异常不得杀死关闭收尾: 记录 UI failure, run_async 正常完成且 aclose 执行."""
+    session = await open_application(
+        _config(tmp_path, _script({"text": "回答", "stop": True}))
+    )
+    sink = ExplodingSink()
+    with create_pipe_input() as pipe:
+        executor = _make_executor(session, pipe, sink)
+        runner = asyncio.ensure_future(executor.run_async())
+        pipe.send_text("问题\r")
+        # 助手记录打印抛错 -> 消费任务记录 UI failure 并退出主屏 -> 关闭序列照常执行
+        await asyncio.wait_for(runner, timeout=15)
+        assert session.state == "closed"
+        assert any("render failed" in failure for failure in executor.ui_failures)
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.execute("after close")
