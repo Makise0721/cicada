@@ -46,6 +46,7 @@ class MainScreenFrontend:
         on_ctrl_o: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         escape_prefix_timeout: float = ESCAPE_PREFIX_TIMEOUT_S,
+        footer_lines: Callable[[int, int], list[str]] | None = None,
     ) -> None:
         self._terminal = terminal
         self._editor = editor
@@ -55,6 +56,7 @@ class MainScreenFrontend:
         self._on_ctrl_c = on_ctrl_c
         self._on_ctrl_o = on_ctrl_o
         self._on_exit = on_exit
+        self._footer_lines = footer_lines
         self.ui_failures: list[str] = []
         self.terminal_failed = False
         self._screen = MainScreen(self._render_frame_lines, terminal.write)
@@ -73,8 +75,11 @@ class MainScreenFrontend:
 
     def _render_frame_lines(self, width: int) -> list[str]:
         lines = list(self._document_lines(width))
-        max_rows = max(5, int(self._terminal.rows * 0.3))  # Pi 编辑器高度规则
+        # 设计 §4: 编辑器正文 1–5 行; 低高度 (8 行) 时 1–3 行, 剩余给对话
+        max_rows = min(5, max(3, int(self._terminal.rows * 0.3)))
         lines.extend(self._editor.render(width, max_rows))
+        if self._footer_lines is not None:
+            lines.extend(self._footer_lines(width, self._terminal.rows))
         return lines
 
     # --- 调度 (TuiBase.requestRender 移植) -----------------------------------------

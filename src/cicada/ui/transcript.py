@@ -20,10 +20,10 @@ from typing import Protocol
 
 from cicada.core.messages import AssistantMessage
 from cicada.core.ports import ModelMetrics
+from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
-USER_PREFIX = "> "
 ERROR_PREFIX = "错误: "
 CANCELLED_TEXT = "已取消: 本次请求在完成前被中止。"
 LENGTH_NOTE = "（回答因达到输出长度上限被截断）"
@@ -65,17 +65,21 @@ def _fit(lines: list[str], width: int) -> list[str]:
 
 
 class UserEntry:
-    """用户消息条目: 原文换行保留, 逐行加前缀辨识 (主题背景归票据 04)。"""
+    """用户消息条目: Pi 样式背景盒 (上下 1 行、左右 1 列), 原文换行保留。"""
 
     def __init__(self, text: str) -> None:
         self.text = text
 
     def render(self, width: int) -> list[str]:
-        return _wrap_with_prefix(USER_PREFIX, sanitize_display(self.text), width)
+        return theme.user_message_lines(self.text, width)
 
 
 class AssistantEntry:
-    """助手消息条目: 以 (run_id, turn_index) 定位, 流式累积, 完成校准。"""
+    """助手消息条目: 以 (run_id, turn_index) 定位, 流式累积, 完成校准。
+
+    渲染为离屏 Markdown (Pi 样式, 前置空行, 左右 1 列); 缓存按
+    (正文, 宽度) 复用, 流式增量未变化时不重复排版。
+    """
 
     def __init__(self, run_id: str, turn_index: int) -> None:
         self.run_id = run_id
@@ -84,17 +88,25 @@ class AssistantEntry:
         self.finalized = False
         self.stop_reason: str | None = None
         self.error: str | None = None
+        self._render_cache: tuple[str, int, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
         cleaned = sanitize_display(self.text)
+        lines: list[str]
         if cleaned:
-            lines = _wrap_lines(cleaned, width)
+            cached = self._render_cache
+            if cached is not None and cached[0] == cleaned and cached[1] == width:
+                lines = list(cached[2])
+            else:
+                lines = theme.assistant_markdown_lines(cleaned, width)
+                self._render_cache = (cleaned, width, list(lines))
+            lines = ["", *lines]  # Pi assistant 前置空行
         elif not self.finalized:
             lines = [STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量
         else:
             lines = []  # 完成但无正文 (如错误路径): 事实由错误/取消条目表达
         if self.finalized and self.stop_reason == "length":
-            lines.append(LENGTH_NOTE)
+            lines.append(theme.fg(theme.MUTED_GRAY, LENGTH_NOTE))
         return lines
 
 
@@ -242,6 +254,10 @@ class Transcript:
 
         return f"计量: 累计{fmt('输入', self._input_total, self._input_unknown)} · 累计{fmt('输出', self._output_total, self._output_unknown)}"
 
+    def metrics_fact(self) -> tuple[int | None, bool, int | None, bool]:
+        """底栏用计量事实: (输入累计, 输入含缺失, 输出累计, 输出含缺失)。"""
+        return (self._input_total, self._input_unknown, self._output_total, self._output_unknown)
+
     # --- 渲染 ----------------------------------------------------------------------
 
     def render(self, width: int) -> list[str]:
@@ -257,7 +273,6 @@ __all__ = [
     "ERROR_PREFIX",
     "LENGTH_NOTE",
     "STREAM_PLACEHOLDER",
-    "USER_PREFIX",
     "AssistantEntry",
     "CancelledEntry",
     "ErrorEntry",

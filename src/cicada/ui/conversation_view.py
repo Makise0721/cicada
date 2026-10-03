@@ -39,6 +39,8 @@ from cicada.core.events import (
 )
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
 from cicada.ui.editor import Editor
+from cicada.ui import theme
+from cicada.ui.theme import FooterComponent
 from cicada.ui.transcript import Transcript
 
 HELP_TEXT = "\n".join(
@@ -68,7 +70,7 @@ class ConversationView:
         diagnostics: Callable[[], list[str]] | None = None,
     ) -> None:
         self._session = session
-        self._editor = editor if editor is not None else Editor()
+        self._editor = editor if editor is not None else Editor(border_color=theme.editor_border())
         self._on_exit = on_exit
         self._on_update = on_update
         self._diagnostics = diagnostics
@@ -78,6 +80,12 @@ class ConversationView:
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
         self._unsubscribe = session.subscribe(self._on_application_update)
+        # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计
+        self.footer = FooterComponent(
+            str(session.config.workspace),
+            session.config.model_label,
+            self.transcript.metrics_fact,
+        )
 
     # --- 生命周期 -----------------------------------------------------------------
 
@@ -239,6 +247,7 @@ def build(
         "on_exit": view.handle_exit,
         "editor": view.editor,
         "view": view,
+        "footer_lines": view.footer.render,  # (width, rows) -> 底栏行
     }
 
 

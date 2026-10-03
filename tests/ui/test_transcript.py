@@ -40,8 +40,9 @@ def test_delta_accumulates_into_single_entry():
     assert isinstance(entries[0], AssistantEntry)
     assert entries[0].text == "第一段。第二段,第三段。"
     assert entries[0].finalized is False
-    # 渲染为无前缀正文
-    assert t.render(80) == ["第一段。第二段,第三段。"]
+    # 渲染为无前缀正文 (Pi 样式: 前置空行 + Markdown 排版, 样式剥离后文本不变)
+    rendered = [strip_terminal_sequences(line).strip() for line in t.render(80)]
+    assert [x for x in rendered if x] == ["第一段。第二段,第三段。"]
 
 
 def test_completed_calibrates_same_entry_without_duplicate():
@@ -98,22 +99,23 @@ def test_long_answer_stays_single_entry_and_keeps_full_text():
     assert len(entries) == 1
     assert entries[0].text == full  # 保存已收到的完整正文
     # 80 列下渲染远超 12 行且全文可回放 (无 12 行/64 行窗口裁剪):
-    # 忽略换行位置后逐字符等于原文 (换行只由排版宽度决定, 无内容丢失)
+    # Markdown 重排会移动空白与缩进 (Pi outputPad 1 列), 剥样式并
+    # 归一空白后逐字符等于原文 (无内容丢失)
     lines = t.render(80)
     assert len(lines) > 12
     replay = "".join(strip_terminal_sequences(line) for line in lines)
-    assert replay == full.replace("\n", "")
+    assert "".join(replay.split()) == "".join(full.split())
 
 
 def test_length_stop_reason_annotated_on_entry():
     t = Transcript()
     t.complete_assistant("run-1", 0, AssistantMessage(text="被截断的回答", stop_reason="length"))
-    lines = t.render(80)
-    assert lines[0] == "被截断的回答"
-    assert lines[-1] == LENGTH_NOTE
+    lines = [strip_terminal_sequences(line) for line in t.render(80)]
+    assert [x.strip() for x in lines if x.strip()][0] == "被截断的回答"
+    assert lines[-1].strip() == LENGTH_NOTE
     # 非 length 完成不带标注
     t.complete_assistant("run-1", 1, AssistantMessage(text="正常", stop_reason="stop"))
-    rendered = t.render(80)
+    rendered = [strip_terminal_sequences(line) for line in t.render(80)]
     assert rendered.count(LENGTH_NOTE) == 1
 
 
@@ -170,10 +172,17 @@ def test_metrics_accumulate_and_none_is_not_zero():
 
 
 def test_user_entry_keeps_lines_and_prefixes_each_row():
+    """04 主题化: 用户消息为 Pi 背景盒 (上下 1 行、左右 1 列), 原文换行保留。"""
     t = Transcript()
     t.append_user("第一行\n第二行")
     lines = t.render(80)
-    assert lines == ["> 第一行", "> 第二行"]
+    plain = [strip_terminal_sequences(line).rstrip() for line in lines]
+    assert plain == ["", " 第一行", " 第二行", ""]
+    # 背景色作用于整行 (含填充)
+    from cicada.ui.theme import USER_MESSAGE_BG, bg
+
+    assert lines[0] == bg(USER_MESSAGE_BG, " " * 80)
+    assert all(line.startswith("\x1b[48;2;52;53;65m") for line in lines)
 
 
 def test_user_and_assistant_entries_in_order():
@@ -182,7 +191,8 @@ def test_user_and_assistant_entries_in_order():
     t.stream_assistant_delta("run-1", 0, "回答")
     t.append_system("系统提示")
     assert [type(e) for e in t.entries()] == [UserEntry, AssistantEntry, SystemEntry]
-    assert t.render(80) == ["> 问题", "回答", "系统提示"]
+    rendered = [strip_terminal_sequences(line).strip() for line in t.render(80)]
+    assert [x for x in rendered if x] == ["问题", "回答", "系统提示"]
 
 
 @pytest.mark.parametrize("width", [20, 40, 80, 160])
