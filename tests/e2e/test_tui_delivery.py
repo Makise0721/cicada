@@ -19,7 +19,10 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from cicada.__main__ import parse_script
+from cicada.application import AgentEventReceived
 from cicada.core.cancel import CancelToken
+from cicada.core.events import AssistantCompleted, AssistantTextDelta, TurnStarted
+from cicada.core.messages import AssistantMessage
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
@@ -306,6 +309,40 @@ async def test_t11_run_tui_cancel_yields_aborted_exit_code_and_closes(tmp_path):
 
 
 # --- 检查模式组合渲染 (T08/T10 经生产管线) ------------------------------------------------------
+
+
+async def test_structural_events_before_text_flush_multi_turn(tmp_path):
+    """同批渲染: 结构事件先于文本 flush——后一轮的待渲染增量不得抢先改写轮号,
+    否则前一轮最终回答错标并与后一轮键碰撞而被去重静默丢失."""
+    from cicada.ui.terminal import _TEXT_DIRTY
+
+    session = await open_app(_config(tmp_path, _script({"text": "x", "stop": True})))
+    sink = RecordingRenderSink()
+    executor = build_production_executor(session, output=DummyOutput(), sink=sink)
+    try:
+        executor._on_update(AgentEventReceived(TurnStarted("run-1", 0)))
+        turn0 = executor._mailbox.get_nowait()
+        executor._render_batch([turn0])
+        # turn-1 的增量被 subscriber 合并 (脏信号入队), 随后 turn-0 的完成事件入队
+        executor._on_update(AgentEventReceived(AssistantTextDelta("run-1", 1, "第二轮开头")))
+        dirty = executor._mailbox.get_nowait()
+        assert dirty is _TEXT_DIRTY
+        executor._on_update(AgentEventReceived(AssistantCompleted(
+            "run-1", AssistantMessage(text="第一轮回答", stop_reason="stop"),
+        )))
+        completed0 = executor._mailbox.get_nowait()
+        executor._render_batch([completed0])  # 同一批: turn-1 增量尚在 pending
+        assert sink.rendered_count("第一轮回答") == 1
+        executor._render_batch([dirty])  # flush turn-1 增量: 只影响 turn-1 预览
+        executor._on_update(AgentEventReceived(AssistantCompleted(
+            "run-1", AssistantMessage(text="第二轮最终回答", stop_reason="stop"),
+        )))
+        completed1 = executor._mailbox.get_nowait()
+        executor._render_batch([completed1])
+        assert sink.rendered_count("第二轮最终回答") == 1, "轮 1 最终回答不被键碰撞吞掉"
+        assert sink.rendered_count("第一轮回答") == 1
+    finally:
+        await session.aclose()
 
 
 async def test_production_check_mode_delivery_rendered(tmp_path):

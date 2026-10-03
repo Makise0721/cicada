@@ -200,6 +200,9 @@ class BasicTextPresenter:
             self._turn_for_status = event.turn_index
             return PresentationUpdate(status=self._snapshot())
         if isinstance(event, AssistantTextDelta):
+            if assistant_key(event.run_id, event.turn_index) in self._final_keys:
+                # 该轮最终回答已落记录: 批次重排后迟到的合并增量不再重建预览
+                return PresentationUpdate()
             parts = self._turn_texts.setdefault((event.run_id, event.turn_index), [])
             parts.append(event.text)
             merged = sanitize_external_text("".join(parts))
@@ -378,6 +381,16 @@ class TerminalExecutor:
 
     def _render_batch(self, items: list[object]) -> None:
         updates: list[PresentationUpdate] = []
+        # 结构事件按 mailbox 到达序先处理, 文本增量最后统一 flush:
+        # 后一轮的待渲染增量不得先于同批中前一轮的 AssistantCompleted 到达
+        # presenter, 否则前一轮的最终回答/工具卡会错标轮号, 并与后一轮最终回答
+        # 发生记录键碰撞而被去重静默丢失
+        for item in items:
+            if item is _TEXT_DIRTY:
+                continue  # 文本统一在本批结构事件之后 flush
+            assert isinstance(item, (AgentEventReceived, RequestPhaseChanged, RequestCompleted,
+                                     HistoryCleared, ApplicationClosed))
+            updates.append(self._presenter.accept(item))  # type: ignore[arg-type]
         if self._text_dirty:
             for (run_id, turn_index), parts in self._pending_text.items():
                 merged = sanitize_external_text("".join(parts))
@@ -388,12 +401,6 @@ class TerminalExecutor:
                 )
             self._pending_text.clear()
             self._text_dirty = False
-        for item in items:
-            if item is _TEXT_DIRTY:
-                continue  # 已在上面统一 flush
-            assert isinstance(item, (AgentEventReceived, RequestPhaseChanged, RequestCompleted,
-                                     HistoryCleared, ApplicationClosed))
-            updates.append(self._presenter.accept(item))  # type: ignore[arg-type]
         for update in updates:
             self._apply(update)
         if any(isinstance(item, ApplicationClosed) for item in items):

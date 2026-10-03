@@ -248,10 +248,17 @@ def test_tui_missing_ui_dependency_exits_cleanly(tmp_path):
     assert "simulated missing prompt_toolkit" in proc.stderr
 
 
-def test_plain_mode_has_zero_ui_imports():
-    # T14: 普通单次模式不导入 UI 可选依赖 (prompt_toolkit / rich)
+def test_plain_mode_has_zero_ui_imports(tmp_path):
+    # T14: 普通单次模式全程不导入 UI 可选依赖 (prompt_toolkit / rich)。
+    # 运行完整 main() (fake 剧本, 零网络) 而非仅模块导入, 覆盖 _run 共享段。
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps([{"text": "hi", "stop": True}]), encoding="utf-8")
     code = (
-        "import cicada.__main__, sys; "
+        "import sys; "
+        f"sys.argv = ['cicada', '--workspace', r'{tmp_path}', '--script', r'{script}', '任务']; "
+        "import cicada.__main__ as m; "
+        "rc = m.main(); "
+        "assert rc == 0, f'exit {rc}'; "
         "assert 'prompt_toolkit' not in sys.modules, 'UI 依赖被普通模式导入'; "
         "assert 'rich' not in sys.modules, 'rich 被普通模式导入'"
     )

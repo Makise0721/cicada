@@ -83,9 +83,13 @@ class ProductionTerminalExecutor(TerminalExecutor):
 
         snapshot = self._display_status
         if snapshot is None:
+            # 首个请求前的回退快照取 session 只读事实, 口径与 /status 一致:
+            # 检查模式启动窗口不得把已有验证运行显示成"未启用检查"
             snapshot = StatusSnapshot(
                 model=self._session.config.model_label or None,
                 workspace=str(self._session.config.workspace),
+                phase=self._session.state,
+                verification_run_id=self._session.verification_run_id,
             )
         return status_fragments(snapshot)
 

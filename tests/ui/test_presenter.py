@@ -501,6 +501,20 @@ def test_final_assistant_record_not_bounded_by_preview_limits():
     assert not any("已截断" in line for line in record.body)
 
 
+def test_delta_after_final_answer_does_not_rebuild_preview():
+    """已终结轮的迟到增量不重建预览 (批次重排后 flush 的陈旧文本)."""
+    presenter = ProjectionPresenter()
+    presenter.accept(_event(TurnStarted(RUN, 0)))
+    presenter.accept(_event(AssistantCompleted(
+        RUN, AssistantMessage(text="最终回答", stop_reason="stop"),
+    )))
+    update = presenter.accept(_event(AssistantTextDelta(RUN, 0, "迟到增量")))
+    assert update.preview is None and presenter.current_preview is None
+    # 未终结轮的增量照常更新预览
+    update = presenter.accept(_event(AssistantTextDelta(RUN, 1, "新一轮")))
+    assert update.preview is not None and update.preview.turn_index == 1
+
+
 # --- 关闭 / 清空 / 去重 -----------------------------------------------------------------------
 
 

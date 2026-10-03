@@ -156,6 +156,8 @@ class ProjectionPresenter:
         self._check_receipts_this_request: set[str] = set()
         self._process_uncertain = False
         self._request_counter = 0
+        # 已收到最终回答的 (run_id, turn): 批次重排后迟到的增量不再重建该轮预览
+        self._finalized: set[tuple[str, int]] = set()
 
     # --- 只读快照 ------------------------------------------------------------------
 
@@ -239,6 +241,8 @@ class ProjectionPresenter:
         self._check_receipts_this_request = set()
 
     def _accept_delta(self, event: AssistantTextDelta) -> PresentationUpdate:
+        if (event.run_id, event.turn_index) in self._finalized:
+            return PresentationUpdate()  # 该轮最终回答已落记录, 不再重建预览
         key = (event.run_id, event.turn_index)
         merged = self._preview_buffers.get(key, "") + event.text
         self._preview_buffers[key] = merged
@@ -253,6 +257,7 @@ class ProjectionPresenter:
         message = event.message
         # AssistantCompleted 不携带 turn_index: 按 contracts 从当前 TurnStarted 取
         turn = self._current_turn
+        self._finalized.add((event.run_id, turn))
         appended: list[PresentationRecord] = []
         if message.text or message.error:
             key = f"{event.run_id}:{turn}:assistant"
