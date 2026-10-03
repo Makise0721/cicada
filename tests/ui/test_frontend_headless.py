@@ -409,3 +409,25 @@ def test_prompt_toolkit_start_failure_rolls_back_partial_modes():
     assert inp.raw.exited == 1  # raw 模式已回滚
     assert any("\x1b[?2004l" in w for w in out.written)  # 粘贴模式已关闭
     assert any("terminal start failed" in f for f in terminal.failures)
+
+
+@pytest.mark.asyncio
+async def test_shift_enter_is_primary_newline_key():
+    """用户 2026-10-03 裁决: Shift+Enter 换行不提交 (Windows Terminal 下
+    与 Enter 同为 \r, 靠适配器原生修饰键状态区分); 松开后 Enter 恢复提交。"""
+    h = Harness()
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("第一行"))
+        h.terminal.shift_pressed = True
+        h.terminal.emit([ENTER])  # \r + Shift 按下 -> 换行
+        h.terminal.emit(text_keys("第二行"))
+        h.terminal.shift_pressed = False
+        await h.settle()
+        assert h.submitted == []
+        assert h.editor.get_text() == "第一行\n第二行"
+        h.terminal.emit([ENTER])  # Shift 已松开 -> 提交
+        await h.settle()
+        assert h.submitted == ["第一行\n第二行"]
+    finally:
+        await h.stop()

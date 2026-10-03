@@ -199,6 +199,11 @@ class MainScreenFrontend:
             self._editor.insert_text(data)
             return
         if key.key in (Keys.ControlM,) or data == "\r":
+            if self._terminal.is_shift_pressed():
+                # Shift+Enter: 主换行键 (用户 2026-10-03 裁决; Windows
+                # Terminal 下与 Enter 同为 \r, 靠原生修饰键状态区分)
+                self._editor.insert_newline()
+                return
             self._handle_enter()
             return
         if data == "\n" or key.key is Keys.ControlJ:

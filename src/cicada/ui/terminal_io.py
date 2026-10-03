@@ -20,6 +20,7 @@ write/get_size/输入关闭故障注入。
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import Callable, Protocol
 
 from prompt_toolkit.key_binding.key_processor import KeyPress
@@ -48,6 +49,16 @@ class Terminal(Protocol):
     def rows(self) -> int: ...
 
     def flush_keys(self) -> list[KeyPress]: ...
+
+    def is_shift_pressed(self) -> bool:
+        """查询物理 Shift 修饰键 (Pi win32 原生修饰键方案)。
+
+        Windows Terminal 默认对 Shift+Enter 发送与 Enter 相同的 \\r,
+        只能在按键到达时查询修饰键状态区分 (用户 2026-10-03 裁决:
+        Alt+Enter 与 Windows 全屏冲突, 主换行键改 Shift+Enter)。
+        查询失败/非 Windows 返回 False (Enter 按提交处理, 保守)。
+        """
+        ...
 
 
 class PromptToolkitTerminal:
@@ -184,6 +195,20 @@ class PromptToolkitTerminal:
             self.failures.append(f"flush_keys failed: {exc!r}")
             return []
 
+    def is_shift_pressed(self) -> bool:
+        """GetAsyncKeyState(VK_SHIFT) 高位 (Pi native-modifiers 的 Python 适配)。"""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+
+            VK_SHIFT = 0x10
+            state = ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT)
+            return bool(state & 0x8000)
+        except Exception as exc:
+            self.failures.append(f"is_shift_pressed failed: {exc!r}")
+            return False
+
 
 class FakeTerminal:
     """headless 终端: 脚本化按键、可控尺寸、写捕获与故障注入。"""
@@ -193,6 +218,7 @@ class FakeTerminal:
         self.rows = rows
         self.written: list[str] = []
         self.feed_screen: Callable[[str], None] | None = None  # 写镜像 (VT 屏断言用)
+        self.shift_pressed = False  # 脚本化修饰键 (Shift+Enter 测试)
         self.input_closed = False
         self.fail_write = False
         self.fail_size = False
@@ -238,6 +264,9 @@ class FakeTerminal:
 
     def flush_keys(self) -> list[KeyPress]:
         return []
+
+    def is_shift_pressed(self) -> bool:
+        return self.shift_pressed
 
 
 __all__ = [
