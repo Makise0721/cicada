@@ -24,6 +24,7 @@ import sys
 from typing import Callable, Protocol
 
 from prompt_toolkit.key_binding.key_processor import KeyPress
+from prompt_toolkit.keys import Keys
 
 RESIZE_POLL_INTERVAL_S = 0.2
 
@@ -50,19 +51,35 @@ class Terminal(Protocol):
 
     def flush_keys(self) -> list[KeyPress]: ...
 
-    def is_shift_pressed(self) -> bool:
-        """查询物理 Shift 修饰键 (Pi win32 原生修饰键方案)。
 
-        Windows Terminal 默认对 Shift+Enter 发送与 Enter 相同的 \\r,
-        只能在按键到达时查询修饰键状态区分 (用户 2026-10-03 裁决:
-        Alt+Enter 与 Windows 全屏冲突, 主换行键改 Shift+Enter)。
-        查询失败/非 Windows 返回 False (Enter 按提交处理, 保守)。
+_ShiftEnterConsoleInputReader = None  # type: ignore[assignment]; POSIX 首版不在范围
+if sys.platform == "win32":
+    from prompt_toolkit.input.win32 import ConsoleInputReader
+
+    class _ShiftEnterConsoleInputReader(ConsoleInputReader):  # type: ignore[misc,valid-type]
+        """Shift+Enter 确定性编码 (2026-10-03 用户裁决: 主换行键)。
+
+        非 VT 记录读取器的每个 KEY_EVENT_RECORD 自带 ControlKeyState;
+        Enter 按下时 SHIFT_PRESSED 且无 Ctrl → 编码为 Keys.ControlJ (换行),
+        与 Textual/crossterm 等 Windows TUI 的记录级修饰键方案同源。
+        VT 字节流路径丢失记录级修饰键, 事后 GetAsyncKeyState 采样有竞态
+        (实测快速敲击/中文 IME 下不可靠), 已弃用。
         """
-        ...
+
+        def _event_to_key_presses(self, ev) -> list[KeyPress]:
+            keys = list(super()._event_to_key_presses(ev))
+            if (
+                len(keys) == 1
+                and keys[0].key is Keys.ControlM
+                and ev.ControlKeyState & self.SHIFT_PRESSED
+                and not ev.ControlKeyState & (self.LEFT_CTRL_PRESSED | self.RIGHT_CTRL_PRESSED)
+            ):
+                return [KeyPress(Keys.ControlJ, "\n")]
+            return keys
 
 
 class PromptToolkitTerminal:
-    """真实终端: prompt_toolkit create_input/create_output 低层组合。"""
+    """真实终端: prompt_toolkit 公开低层组合。"""
 
     def __init__(self, input=None, output=None) -> None:
         from prompt_toolkit.output.defaults import create_output as _create_output
@@ -78,9 +95,26 @@ class PromptToolkitTerminal:
 
     @staticmethod
     def _create_input():
+        if sys.platform == "win32":
+            # Windows Terminal 下默认走 VT 字节流路径 (修饰键信息丢失);
+            # 覆盖为非 VT 记录读取器, ControlKeyState 确定性区分 Shift+Enter。
+            from prompt_toolkit.input.win32 import Win32Input
+
+            inp = Win32Input()
+            inp.console_input_reader = _ShiftEnterConsoleInputReader()
+            return inp
         from prompt_toolkit.input.defaults import create_input
 
         return create_input()
+
+    def _enter_raw_mode(self):
+        """raw 模式; Windows 下不启用 ENABLE_VIRTUAL_TERMINAL_INPUT,
+        否则 conhost 改发 VT 字节流, 记录级修饰键 (Shift 位) 失效。"""
+        if sys.platform == "win32":
+            from prompt_toolkit.input.win32 import raw_mode as win32_raw_mode
+
+            return win32_raw_mode(use_win10_virtual_terminal_input=False)
+        return self._input.raw_mode()
 
     # --- 尺寸 -----------------------------------------------------------------
 
@@ -112,7 +146,7 @@ class PromptToolkitTerminal:
 
     def start(self, on_input: InputBatchCallback, on_resize: ResizeCallback) -> None:
         self._on_resize = on_resize
-        self._raw_mode = self._input.raw_mode()
+        self._raw_mode = self._enter_raw_mode()
         self._raw_mode.__enter__()
         try:
             # bracketed paste: 粘贴内容以单事件到达, 换行不会触发提交
@@ -195,20 +229,6 @@ class PromptToolkitTerminal:
             self.failures.append(f"flush_keys failed: {exc!r}")
             return []
 
-    def is_shift_pressed(self) -> bool:
-        """GetAsyncKeyState(VK_SHIFT) 高位 (Pi native-modifiers 的 Python 适配)。"""
-        if sys.platform != "win32":
-            return False
-        try:
-            import ctypes
-
-            VK_SHIFT = 0x10
-            state = ctypes.windll.user32.GetAsyncKeyState(VK_SHIFT)
-            return bool(state & 0x8000)
-        except Exception as exc:
-            self.failures.append(f"is_shift_pressed failed: {exc!r}")
-            return False
-
 
 class FakeTerminal:
     """headless 终端: 脚本化按键、可控尺寸、写捕获与故障注入。"""
@@ -218,7 +238,6 @@ class FakeTerminal:
         self.rows = rows
         self.written: list[str] = []
         self.feed_screen: Callable[[str], None] | None = None  # 写镜像 (VT 屏断言用)
-        self.shift_pressed = False  # 脚本化修饰键 (Shift+Enter 测试)
         self.input_closed = False
         self.fail_write = False
         self.fail_size = False
@@ -264,9 +283,6 @@ class FakeTerminal:
 
     def flush_keys(self) -> list[KeyPress]:
         return []
-
-    def is_shift_pressed(self) -> bool:
-        return self.shift_pressed
 
 
 __all__ = [

@@ -404,6 +404,7 @@ def test_prompt_toolkit_start_failure_rolls_back_partial_modes():
     inp = AttachFailingInput()
     out = RecordingOutput()
     terminal = PromptToolkitTerminal(input=inp, output=out)
+    terminal._enter_raw_mode = lambda: inp.raw()  # 隔离真实控制台 raw 模式
     with pytest.raises(RuntimeError, match="terminal start failed"):
         asyncio.run(terminal.start(lambda keys: None, lambda: None))
     assert inp.raw.exited == 1  # raw 模式已回滚
@@ -411,23 +412,135 @@ def test_prompt_toolkit_start_failure_rolls_back_partial_modes():
     assert any("terminal start failed" in f for f in terminal.failures)
 
 
+def test_record_reader_encodes_shift_enter_deterministically():
+    """非 VT 记录读取器: KEY_EVENT_RECORD 的 SHIFT_PRESSED 位确定性区分
+    Shift+Enter (Textual/crossterm 同款记录级方案; VT 字节流+GetAsyncKeyState
+    采样因竞态弃用)。"""
+    from prompt_toolkit.win32_types import KEY_EVENT_RECORD
+
+    from cicada.ui.terminal_io import _ShiftEnterConsoleInputReader
+
+    def make_event(u_char: str, control_state: int) -> KEY_EVENT_RECORD:
+        ev = KEY_EVENT_RECORD()
+        ev.KeyDown = 1
+        ev.RepeatCount = 1
+        ev.VirtualKeyCode = 13
+        ev.VirtualScanCode = 28
+        ev.uChar.UnicodeChar = u_char
+        ev.ControlKeyState = control_state
+        return ev
+
+    reader = _ShiftEnterConsoleInputReader()
+    shift, ctrl, alt = reader.SHIFT_PRESSED, reader.LEFT_CTRL_PRESSED, reader.LEFT_ALT_PRESSED
+    # Shift+Enter -> ControlJ (前端换行), 确定性无竞态
+    assert reader._event_to_key_presses(make_event("\r", shift)) == [KeyPress(Keys.ControlJ, "\n")]
+    # 无修饰 Enter -> ControlM (提交)
+    assert reader._event_to_key_presses(make_event("\r", 0)) == [KeyPress(Keys.ControlM, "\r")]
+    # Ctrl+Enter 保持 pt 既有: Escape + ControlJ (换行)
+    assert reader._event_to_key_presses(make_event("\n", ctrl)) == [
+        KeyPress(Keys.Escape, ""),
+        KeyPress(Keys.ControlJ, "\n"),
+    ]
+    # Alt+Enter -> Escape + ControlM (前端 Escape 前缀配对为换行, 兼容保留)
+    assert reader._event_to_key_presses(make_event("\r", alt)) == [
+        KeyPress(Keys.Escape, ""),
+        KeyPress(Keys.ControlM, "\r"),
+    ]
+
+
 @pytest.mark.asyncio
-async def test_shift_enter_is_primary_newline_key():
-    """用户 2026-10-03 裁决: Shift+Enter 换行不提交 (Windows Terminal 下
-    与 Enter 同为 \r, 靠适配器原生修饰键状态区分); 松开后 Enter 恢复提交。"""
+async def test_control_j_newline_no_submit():
+    """记录读取器把 Shift+Enter 编码为 ControlJ; 前端收到后换行不提交。"""
     h = Harness()
     try:
         await h.start()
         h.terminal.emit(text_keys("第一行"))
-        h.terminal.shift_pressed = True
-        h.terminal.emit([ENTER])  # \r + Shift 按下 -> 换行
+        h.terminal.emit([KeyPress(Keys.ControlJ, "\n")])
         h.terminal.emit(text_keys("第二行"))
-        h.terminal.shift_pressed = False
         await h.settle()
         assert h.submitted == []
         assert h.editor.get_text() == "第一行\n第二行"
-        h.terminal.emit([ENTER])  # Shift 已松开 -> 提交
+    finally:
+        await h.stop()
+
+
+def test_prompt_toolkit_size_failure_falls_back_to_last_good():
+    """适配层 get_size 失败: 记录失败并沿用上次良好值 (P10 故障矩阵)。"""
+    from prompt_toolkit.data_structures import Size
+
+    class FlakyOutput:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.size = Size(rows=30, columns=100)
+
+        def get_size(self) -> Size:
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("injected size failure")
+            return self.size
+
+        def write_raw(self, data: str) -> None:
+            pass
+
+        def flush(self) -> None:
+            pass
+
+    from cicada.ui.terminal_io import PromptToolkitTerminal
+
+    output = FlakyOutput()
+    terminal = PromptToolkitTerminal(input=object(), output=output)
+    assert terminal.columns == 80  # 无良好值时回退默认并记录失败
+    assert any("get_size failed" in f for f in terminal.failures)
+    assert terminal.rows == 30  # 第三次成功后获得真实尺寸
+    assert terminal.columns == 100
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_and_ctrl_d_semantics():
+    h = Harness()
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("草稿"))
+        h.terminal.emit([CTRL_C])
         await h.settle()
-        assert h.submitted == ["第一行\n第二行"]
+        assert h.ctrl_c_count == 1
+        h.terminal.emit([CTRL_D])  # 非空草稿: 不触发退出
+        await h.settle()
+        assert h.exit_requested is False
+        h.editor.clear()
+        await h.settle()
+        h.terminal.emit([CTRL_D])  # 空草稿: 退出
+        await h.settle()
+        assert h.exit_requested
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_backspace_and_undo_through_frontend():
+    h = Harness()
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("中文abc"))
+        h.terminal.emit([BACKSPACE])  # 删 c
+        await h.settle()
+        assert h.editor.get_text() == "中文ab"
+        h.terminal.emit([KeyPress("\x1f", "\x1f")])  # Ctrl+_ 撤销
+        await h.settle()
+        assert h.editor.get_text() == "中文abc"
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_plain_enter_after_paste_text_still_submits():
+    """换行键机制回归哨兵: 无 Shift 的 Enter 保持提交语义。"""
+    h = Harness()
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("普通提交"))
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["普通提交"]
     finally:
         await h.stop()
