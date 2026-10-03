@@ -35,16 +35,23 @@ class RenderingSink:
     def __init__(self) -> None:
         # 已渲染记录的可见纯文本 (供测试/诊断断言, 不含样式)
         self.rendered: list[str] = []
+        self._output: Any = None
+
+    def bind_output(self, output: Any) -> None:
+        """记录与活动布局共享 Application 的实际终端输出及当前尺寸."""
+        self._output = output
 
     def print_line(self, text: str = "") -> None:
-        print_formatted_text(text)
+        print_formatted_text(text, output=self._output)
 
     def print_record(self, record: PresentationRecord) -> None:
         from cicada.ui.rendering import record_fragments
+        from prompt_toolkit.application import get_app_session
 
-        fragments = record_fragments(record)
+        output = self._output or get_app_session().output
+        fragments = record_fragments(record, width=max(1, output.get_size().columns))
         self.rendered.append("".join(text for _, text in fragments))
-        print_formatted_text(fragments)
+        print_formatted_text(fragments, output=output)
 
 
 class ProductionTerminalExecutor(TerminalExecutor):
@@ -76,7 +83,7 @@ class ProductionTerminalExecutor(TerminalExecutor):
             return super()._get_preview_lines()
         from cicada.ui.rendering import preview_fragments
 
-        return preview_fragments(preview)
+        return preview_fragments(preview, width=max(1, self._app.output.get_size().columns))
 
     def _get_status_line(self) -> Any:
         from cicada.ui.rendering import status_fragments
@@ -91,7 +98,7 @@ class ProductionTerminalExecutor(TerminalExecutor):
                 phase=self._session.state,
                 verification_run_id=self._session.verification_run_id,
             )
-        return status_fragments(snapshot)
+        return status_fragments(snapshot, width=max(1, self._app.output.get_size().columns))
 
     def _status_summary(self) -> str:
         """/status 的纯文本摘要: 在基础字段上补检查事实 (口径与渲染一致)."""
@@ -126,14 +133,18 @@ def build_production_executor(
             config.plan.verification_run_id if config.plan is not None else None
         ),
     )
-    return ProductionTerminalExecutor(
+    rendering_sink = sink if sink is not None else RenderingSink()
+    executor = ProductionTerminalExecutor(
         session,
         presenter=presenter,
-        sink=sink if sink is not None else RenderingSink(),
+        sink=rendering_sink,
         input=input,
         output=output,
         use_patch_stdout=input is None and output is None,
     )
+    if isinstance(rendering_sink, RenderingSink):
+        rendering_sink.bind_output(executor.app.output)
+    return executor
 
 
 async def run_tui_session(

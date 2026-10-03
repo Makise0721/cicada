@@ -18,6 +18,7 @@ import io
 import re
 
 from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.utils import get_cwidth
 
 from cicada.ui.contracts import (
     ActivePreview,
@@ -62,7 +63,9 @@ def rich_to_ansi(renderable, width: int = RENDER_WIDTH) -> str:
     from rich.console import Console
 
     console = Console(
-        width=width, file=io.StringIO(), force_terminal=True,
+        # 离屏排版的几何尺寸由调用者决定. 同时给出 height, 避免 TERM=dumb
+        # 时 Rich.size 忽略单独给出的 width 而回退到 80 列.
+        width=max(1, width), height=25, file=io.StringIO(), force_terminal=True,
         color_system="standard", legacy_windows=False,
         markup=False, highlight=False, emoji=False,
     )
@@ -78,10 +81,17 @@ def ansi_fragments(ansi: str) -> FormattedText:
     return to_formatted_text(ANSI(ansi))
 
 
-def _markdown_fragments(text: str) -> FormattedText:
+def _markdown_fragments(text: str, width: int) -> FormattedText:
     from rich.markdown import Markdown
 
-    return ansi_fragments(rich_to_ansi(Markdown(sanitize_display(text))))
+    return ansi_fragments(rich_to_ansi(Markdown(sanitize_display(text)), width))
+
+
+def _text_fragments(text: str, width: int, style: str = "") -> FormattedText:
+    from rich.text import Text
+
+    fragments = ansi_fragments(rich_to_ansi(Text(sanitize_display(text)), width))
+    return FormattedText([(style, value) for _, value in fragments])
 
 
 _DIFF_LINE_RE = re.compile(r"^(?:diff --git |index [0-9a-f]{7,}|\+\+\+ |--- |@@ )")
@@ -95,7 +105,7 @@ def _looks_like_diff(text: str) -> bool:
     return hits / len(lines) >= 0.6
 
 
-def _tool_fragments(body: str) -> FormattedText:
+def _tool_fragments(body: str, width: int) -> FormattedText:
     from rich.syntax import Syntax
     from rich.text import Text
 
@@ -105,7 +115,7 @@ def _tool_fragments(body: str) -> FormattedText:
     else:
         # 外部纯文本: Text 不解释 markup, 不伪造样式
         renderable = Text(cleaned)
-    return ansi_fragments(rich_to_ansi(renderable))
+    return ansi_fragments(rich_to_ansi(renderable, width))
 
 
 def record_header(record: PresentationRecord) -> tuple[str, str]:
@@ -117,36 +127,32 @@ def record_header(record: PresentationRecord) -> tuple[str, str]:
     return header, style
 
 
-def record_fragments(record: PresentationRecord) -> FormattedText:
+def record_fragments(record: PresentationRecord, width: int = RENDER_WIDTH) -> FormattedText:
     """把一条记录排版为 styled fragments; 正文经显示清理, 不读工件文件."""
     from prompt_toolkit.formatted_text import FormattedText as _FT
 
     header, style = record_header(record)
-    fragments: FormattedText = _FT([(style, header), ("", "\n")])
+    fragments = _text_fragments(header, width, style)
     body = "\n".join(record.body)
     if not body.strip():
         return fragments
     if record.role == "assistant":
-        fragments.extend(_markdown_fragments(body))
+        fragments.extend(_markdown_fragments(body, width))
     elif record.role == "tool":
-        fragments.extend(_tool_fragments(body))
+        fragments.extend(_tool_fragments(body, width))
     else:
-        from rich.text import Text
-
-        fragments.extend(ansi_fragments(rich_to_ansi(Text(sanitize_display(body)))))
+        fragments.extend(_text_fragments(body, width))
     return _FT(fragments)
 
 
-def preview_fragments(preview: ActivePreview) -> FormattedText:
+def preview_fragments(preview: ActivePreview, width: int = RENDER_WIDTH) -> FormattedText:
     """活动预览: 有界文本 + 截断事实; 不含最终记录 (最终回答以完成事件为准)."""
     from prompt_toolkit.formatted_text import FormattedText as _FT
-    from rich.text import Text
-
     header = f"▌ 活动预览 ({preview.run_id} turn {preview.turn_index})"
-    fragments: FormattedText = _FT([("ansibrightblue", header), ("", "\n")])
-    fragments.extend(ansi_fragments(rich_to_ansi(Text(sanitize_display(preview.text)))))
+    fragments = _text_fragments(header, width, "ansibrightblue")
+    fragments.extend(_text_fragments(preview.text, width))
     if preview.truncated:
-        fragments.append(("ansiyellow", "…[预览已截断，完整文本以最终回答为准]"))
+        fragments.extend(_text_fragments("…[预览已截断，完整文本以最终回答为准]", width, "ansiyellow"))
     return _FT(fragments)
 
 
@@ -154,7 +160,52 @@ def _metric_text(value: int | None) -> str:
     return "不可得" if value is None else str(value)
 
 
-def status_fragments(status: StatusSnapshot) -> FormattedText:
+def _clip_cells(text: str, width: int) -> str:
+    """单行省略按显示列计算, 中文双列字符不会越过右边界."""
+    if width <= 0:
+        return ""
+    if get_cwidth(text) <= width:
+        return text
+    result = []
+    used = 0
+    for char in text:
+        cells = get_cwidth(char)
+        if used + cells > width - 1:
+            break
+        result.append(char)
+        used += cells
+    return "".join(result) + "…"
+
+
+def _bounded_status(parts: list[str], width: int) -> str:
+    # 窄窗优先保留 phase/check; 长工作区不会把关键状态挤到屏幕外.
+    phase, check = parts[2], parts[6]
+    separator = " | "
+    critical = separator.join((phase, check))
+    if get_cwidth(critical) > width:
+        available = width - get_cwidth(separator)
+        if available < 2:
+            return _clip_cells(critical, width)
+        phase_width = min(get_cwidth(phase), available // 2)
+        check_width = available - phase_width
+        # 检查摘要必须整体可见. 截断 passed/current 或多个检查的前缀会隐藏
+        # stale/failed 等后续事实; 放不下时只提示省略, 完整事实走 /status.
+        check_text = check if get_cwidth(check) <= check_width else "检查: 省略(/status)"
+        return separator.join((_clip_cells(phase, phase_width), _clip_cells(check_text, check_width)))
+    line = critical
+    for part in (parts[0], parts[3], parts[4], parts[5], parts[1], *parts[7:]):
+        available = width - get_cwidth(line) - get_cwidth(separator)
+        if available <= 0:
+            break
+        clipped = _clip_cells(part, available)
+        if clipped:
+            line += separator + clipped
+        if clipped != part:
+            break
+    return line
+
+
+def status_fragments(status: StatusSnapshot, width: int | None = None) -> FormattedText:
     """状态栏: None 显示不可得; 计量标注累计口径; 检查事实来自 presenter 投影."""
     model = status.model or "不可得"
     workspace = status.workspace or "不可得"
@@ -177,5 +228,6 @@ def status_fragments(status: StatusSnapshot) -> FormattedText:
         parts.append(f"验证运行: {status.verification_run_id}")
     if status.change_scope is not None:
         parts.append(status.change_scope)
-    line = " | ".join(parts)
+    parts = [sanitize_display(part).replace("\n", " ").replace("\t", " ") for part in parts]
+    line = " | ".join(parts) if width is None else _bounded_status(parts, max(1, width))
     return FormattedText([("reverse", line)])  # FormattedText 是 list 子类, 需实例化
