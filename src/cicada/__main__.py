@@ -1,4 +1,5 @@
-"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>".
+"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>"
+交互入口: uv run python -m cicada --tui --workspace <dir> [同上模型/检查旗标] [首问]
 
 模型来源二选一:
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
@@ -6,6 +7,11 @@
 --script 与真实模型旗标 (--model/--ollama-url/--think/--num-ctx) 互斥, 混用退出码 2.
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
+
+--tui 进入交互终端 (生产组合: 共享应用 + 正式展示投影 + prompt_toolkit inline
+主屏, 见 cicada.ui); UI 可选依赖缺失或 stdin/stdout 非 TTY 退出码 2; 位置
+prompt 可省略 (空启动), 给出则作为首问提交; 进程退出码为最后一条请求的
+退出码. 单次模式要求位置 prompt; 普通 UI 导入要求为零 (T14).
 
 P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
 是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
@@ -199,6 +205,26 @@ async def _ollama_reachable(base_url: str) -> bool:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if not args.tui and args.prompt is None:
+        print("缺少 prompt: 单次模式需要位置参数 prompt (交互入口用 --tui)", file=sys.stderr)
+        return 2
+    run_tui_session_fn = None
+    if args.tui:
+        # 依赖缺失先于 TTY 判断与配置组装, 给出明确退出 (T14)
+        try:
+            from cicada.ui import run_tui_session as run_tui_session_fn
+        except ImportError as exc:
+            print(
+                f"TUI 依赖未安装: {exc} (请安装 UI 可选组, 如 pip install -e .[tui])",
+                file=sys.stderr,
+            )
+            return 2
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print(
+                "TUI 需要交互式终端 (stdin/stdout 均为 TTY); 管道或重定向请用单次模式",
+                file=sys.stderr,
+            )
+            return 2
     if args.script is not None and (
         args.model is not None
         or args.ollama_url is not None
@@ -301,6 +327,9 @@ async def _run(args: argparse.Namespace) -> int:
         max_turns=CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS,
         model_label=model_label,
     )
+    if args.tui:
+        assert run_tui_session_fn is not None
+        return await _run_tui(run_tui_session_fn, app_config, initial_prompt=args.prompt)
     try:
         session = await open_application(app_config)
     except ApplicationOpenError as exc:
@@ -330,6 +359,18 @@ async def _run(args: argparse.Namespace) -> int:
     return outcome.exit_code
 
 
+async def _run_tui(
+    run_tui_session_fn, app_config: ApplicationConfig, *, initial_prompt: str | None
+) -> int:
+    """--tui 分支: 依赖与 TTY 已在 _run 校验; 打开共享应用并运行生产组合."""
+    try:
+        session = await open_application(app_config)
+    except ApplicationOpenError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    return await run_tui_session_fn(session, initial_prompt=initial_prompt)
+
+
 def main() -> int:
     # 与 powershell 工具一致: 入口输出统一 UTF-8, 不随控制台代码页变化
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -354,13 +395,20 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--tui", action="store_true",
+        help="进入交互终端 (连续对话; 位置 prompt 可省略, 给出则作为首问)",
+    )
+    parser.add_argument(
         "--check-timeout", type=float, default=None, metavar="SECONDS",
         help=(
             f"检查命令超时秒数 (默认 {CHECK_TIMEOUT_DEFAULT_S:g}; 范围 "
             f"({CHECK_TIMEOUT_MIN_S:g}, {CHECK_TIMEOUT_MAX_S:g}]; 仅检查模式)"
         ),
     )
-    parser.add_argument("prompt", help="交给 agent 的 prompt")
+    parser.add_argument(
+        "prompt", nargs="?", default=None,
+        help="交给 agent 的 prompt (单次模式必填; --tui 可作首问)",
+    )
     return asyncio.run(_run(parser.parse_args()))
 
 

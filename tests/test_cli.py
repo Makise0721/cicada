@@ -199,3 +199,69 @@ def test_normal_mode_has_no_request_limit(tmp_path):
     proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead, "任务")
     assert proc.returncode == 2
     assert "request_bytes_limit" not in proc.stdout  # 普通模式保持原语义
+
+
+# --- T14: --tui 接线 (非 TTY / 缺 UI 依赖 / prompt 语义 / 零 UI 导入) ---------------------------
+
+
+def test_tui_non_tty_rejected_with_clear_exit(tmp_path):
+    # 子进程 stdin/stdout 均为管道: --tui 必须给出明确退出码 2
+    proc = run_cli("--tui", "--workspace", str(tmp_path))
+    assert proc.returncode == 2
+    assert "交互式终端" in proc.stderr
+
+
+def test_tui_non_tty_rejected_even_with_prompt(tmp_path):
+    proc = run_cli("--tui", "--workspace", str(tmp_path), "首问")
+    assert proc.returncode == 2
+    assert "交互式终端" in proc.stderr
+
+
+def test_single_mode_requires_prompt(tmp_path):
+    proc = run_cli("--workspace", str(tmp_path))
+    assert proc.returncode == 2
+    assert "缺少 prompt" in proc.stderr
+
+
+def test_tui_missing_ui_dependency_exits_cleanly(tmp_path):
+    # 用一个 raise ImportError 的假 prompt_toolkit 模块模拟未安装 UI 可选组
+    blocker = tmp_path / "blocker"
+    blocker.mkdir()
+    (blocker / "prompt_toolkit.py").write_text(
+        "raise ImportError('simulated missing prompt_toolkit')", encoding="utf-8"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{blocker}{os.pathsep}{SRC}",
+        "PYTHONIOENCODING": "utf-8",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-m", "cicada", "--tui", "--workspace", str(tmp_path), "首问"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 2
+    assert "TUI 依赖未安装" in proc.stderr
+    assert "simulated missing prompt_toolkit" in proc.stderr
+
+
+def test_plain_mode_has_zero_ui_imports():
+    # T14: 普通单次模式不导入 UI 可选依赖 (prompt_toolkit / rich)
+    code = (
+        "import cicada.__main__, sys; "
+        "assert 'prompt_toolkit' not in sys.modules, 'UI 依赖被普通模式导入'; "
+        "assert 'rich' not in sys.modules, 'rich 被普通模式导入'"
+    )
+    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=env,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
