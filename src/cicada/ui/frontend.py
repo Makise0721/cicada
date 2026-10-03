@@ -43,6 +43,7 @@ class MainScreenFrontend:
         on_submit: Callable[[str], object] | None = None,
         on_escape: Callable[[], None] | None = None,
         on_ctrl_c: Callable[[], None] | None = None,
+        on_ctrl_o: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         escape_prefix_timeout: float = ESCAPE_PREFIX_TIMEOUT_S,
     ) -> None:
@@ -52,6 +53,7 @@ class MainScreenFrontend:
         self._on_submit = on_submit
         self._on_escape = on_escape
         self._on_ctrl_c = on_ctrl_c
+        self._on_ctrl_o = on_ctrl_o
         self._on_exit = on_exit
         self.ui_failures: list[str] = []
         self.terminal_failed = False
@@ -184,6 +186,11 @@ class MainScreenFrontend:
         if data == "\x1f":
             self._editor.undo()
             return
+        # Ctrl+O: 工具输出展开切换 (03 工具卡; 01 阶段无宿主时为无动作)
+        if key.key is Keys.ControlO or data == "\x0f":
+            if self._on_ctrl_o is not None:
+                self._on_ctrl_o()
+            return
         # Escape 前缀状态机: Escape 后窗口内 Enter = Alt+Enter 换行
         if key.key is Keys.Escape or (data == "\x1b" and len(data) == 1):
             self._arm_escape_prefix()
@@ -233,11 +240,23 @@ class MainScreenFrontend:
             self._editor.insert_text(data)
 
     def _handle_enter(self) -> None:
-        text = self._editor.submit()
-        if text and self._on_submit is not None:
-            result = self._on_submit(text)
-            if asyncio.iscoroutine(result):
-                asyncio.ensure_future(result)
+        """受理制提交: on_submit 返回 False = 拒绝 (草稿保留, 02 准入语义);
+        True/None = 接受 (清空草稿)。空白草稿直接清空不派发。"""
+        text = self._editor.get_text()
+        if not text.strip():
+            if text:
+                self._editor.clear()
+            return
+        stripped = text.strip()
+        if self._on_submit is None:
+            self._editor.clear()
+            return
+        result = self._on_submit(stripped)
+        if result is False:
+            return  # 拒绝: 草稿保留 (实际接受前不伪造用户条目)
+        self._editor.clear()
+        if asyncio.iscoroutine(result):
+            asyncio.ensure_future(result)
 
     # --- Escape 前缀定时器 -----------------------------------------------------------
 

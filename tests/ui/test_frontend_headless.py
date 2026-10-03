@@ -544,3 +544,50 @@ async def test_plain_enter_after_paste_text_still_submits():
         assert h.submitted == ["普通提交"]
     finally:
         await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_submit_acceptance_contract():
+    """受理制提交: on_submit 返回 False = 拒绝, 草稿保留 (02 准入语义前提);
+    None/True = 接受, 草稿清空; 空白草稿直接清空不派发。"""
+    h = Harness()
+    results = [False, None]
+
+    def gate(text: str):
+        return results.pop(0)
+
+    try:
+        await h.start()
+        h.frontend._on_submit = gate
+        h.terminal.emit(text_keys("第一问"))
+        h.terminal.emit([ENTER])  # False: 拒绝
+        await h.settle()
+        assert h.submitted == []
+        assert h.editor.get_text() == "第一问"
+        h.terminal.emit([ENTER])  # None: 接受
+        await h.settle()
+        assert h.editor.is_empty()
+        h.terminal.emit(text_keys("   "))
+        h.terminal.emit([ENTER])  # 空白草稿: 清空不派发
+        await h.settle()
+        assert h.editor.is_empty()
+        assert h.submitted == []
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_ctrl_o_hook():
+    """Ctrl+O 钩子 (03 工具展开切换的接缝); 无宿主时无动作不崩溃。"""
+    h = Harness()
+    count = []
+    try:
+        await h.start()
+        h.frontend._on_ctrl_o = lambda: count.append(1)
+        h.terminal.emit([KeyPress(Keys.ControlO, "\x0f")])
+        h.terminal.emit(text_keys("草稿"))
+        await h.settle()
+        assert count == [1]
+        assert h.editor.get_text() == "草稿"  # Ctrl+O 不进草稿
+    finally:
+        await h.stop()
