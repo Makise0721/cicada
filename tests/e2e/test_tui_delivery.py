@@ -327,3 +327,90 @@ async def test_resize_reflows_visible_document(tmp_path):
     finally:
         if session.state != "closed":
             await session.aclose()
+
+
+# --- P12: /status 诊断注入与有界限额 (CLI 提供不可变诊断对象) ---------------------------
+
+
+async def test_status_diagnostics_injected_and_bounded(tmp_path):
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}), chunks=1)
+    )
+    stage = StageTerminal()
+
+    def diagnostics() -> list[str]:
+        return [
+            "prompt 版本: builtin:p4-v1",
+            "prompt sha256: " + "a" * 64,
+            "超长字段: " + "汉" * 400,  # > 512 bytes: 必须截断并给标记
+        ]
+
+    try:
+        task = asyncio.ensure_future(
+            run_tui_session(session, terminal=stage.terminal, diagnostics=diagnostics)
+        )
+        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+        stage.emit(text_keys("/status"))
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("状态: idle"))
+        flat = stage.flat()
+        assert "prompt 版本: builtin:p4-v1" in flat
+        assert "prompt sha256: " + "a" * 64 in flat
+        assert "…[已截断: 512/" in flat, "超长字段按 512 bytes 限额截断并标记"
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        code = await asyncio.wait_for(task, timeout=15)
+        assert code == 0
+        assert session.state == "closed"
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_run_tui_cli_assembles_diagnostics_from_config(tmp_path):
+    """__main__._run_tui: 诊断快照来自 ApplicationConfig 已发布字段 (P12 组装路径)."""
+    from cicada.__main__ import _run_tui
+    from cicada.plugins.coding.verification import generate_verification_run_id
+    from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
+    from cicada.ui import run_tui_session as run_fn
+
+    root = _repo(tmp_path)
+    plan = VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=Path(os.path.realpath(root)),
+        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
+    )
+    app_config = make_config(root, script_json({"text": "答", "stop": True}), chunks=1, plan=plan)
+    stage = StageTerminal()
+    captured: list[str] = []
+
+    async def runner(session, **kwargs):
+        assert kwargs.get("diagnostics") is not None, "CLI 必须注入诊断"
+        captured.extend(kwargs["diagnostics"]())
+
+        async def driver():
+            assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+            stage.emit(text_keys("/status"))
+            stage.emit([ENTER])
+            assert await wait_until(lambda: stage.contains("状态: idle"))
+            stage.emit(text_keys("/exit"))
+            stage.emit([ENTER])
+
+        driver_task = asyncio.ensure_future(driver())
+        code = await run_fn(session, terminal=stage.terminal, **kwargs)
+        await driver_task
+        return code
+
+    code = await asyncio.wait_for(
+        _run_tui(runner, app_config, initial_prompt=None), timeout=30
+    )
+    assert code == 0, "无请求完成: 正常关闭退出码 0"
+    # 诊断快照字段与 ApplicationConfig/prompt_info/plan 一致
+    assert f"工作区: {root}" in " ".join(captured) or any("工作区:" in line for line in captured)
+    assert any("prompt 版本: stage-acceptance" in line for line in captured)
+    assert any("prompt sha256: " for line in captured if line.startswith("prompt sha256"))
+    assert any("检查配置: ids=check-1" in line for line in captured)
+    assert any("检查超时: 30s" in line for line in captured)
+    assert any("轮次上限: 6" in line for line in captured)
+    # /status 实际显示包含注入诊断
+    assert stage.contains("prompt 版本: stage-acceptance")
