@@ -37,6 +37,7 @@ from cicada.core.messages import (
     UserMessage,
     isolate_message,
     isolate_tool_result,
+    validate_history_structure,
 )
 from cicada.core.ports import (
     ModelPort,
@@ -104,54 +105,9 @@ class Agent:
         """执行前校验结构化历史: 类型、组内身份、闭合与次序; 违规 ValueError.
 
         校验只读不复制; 零模型请求、零工具执行、零会话追加的拒绝在种子建立前完成.
-        文本序列不强制每个用户请求恰好一个 assistant, 以保留多轮工具循环.
+        结构规则与持久化恢复共用 validate_history_structure, 保持同样拒绝内容.
         """
-        if not isinstance(history, tuple):
-            raise ValueError(f"history must be a tuple of messages, got {type(history).__name__}")
-        for index, message in enumerate(history):
-            if not isinstance(message, (UserMessage, AssistantMessage, ToolResultMessage)):
-                raise ValueError(f"history[{index}] is not a supported message type")
-        index = 0
-        while index < len(history):
-            message = history[index]
-            index += 1
-            if isinstance(message, ToolResultMessage):
-                raise ValueError(f"history[{index - 1}] is a tool result without a preceding open tool call group")
-            if not isinstance(message, AssistantMessage) or not message.tool_calls:
-                continue
-            ids: set[str] = set()
-            for call in message.tool_calls:
-                if (
-                    not isinstance(call, ToolCall)
-                    or not isinstance(call.id, str)
-                    or not call.id
-                    or not isinstance(call.name, str)
-                    or not call.name
-                    or not isinstance(call.arguments_json, str)
-                ):
-                    raise ValueError(
-                        f"history[{index - 1}] contains a tool call with invalid identity; "
-                        "id/name must be nonempty strings and arguments_json a string"
-                    )
-                if call.id in ids:
-                    raise ValueError(
-                        f"history[{index - 1}] contains duplicate tool call id {call.id!r} within one group"
-                    )
-                ids.add(call.id)
-            if index + len(message.tool_calls) > len(history):
-                raise ValueError(f"history[{index - 1}] ends with unclosed tool calls")
-            for call in message.tool_calls:
-                follow = history[index]
-                if not isinstance(follow, ToolResultMessage):
-                    raise ValueError(
-                        f"history[{index}] does not close tool call {call.id!r} in declared order"
-                    )
-                if follow.result.call_id != call.id or follow.result.name != call.name:
-                    raise ValueError(
-                        f"history[{index}] does not match its declared tool call {call.id!r} "
-                        f"({call.name!r}) by call id and tool name"
-                    )
-                index += 1
+        validate_history_structure(history)
         return history
 
     async def _run(self, prompt: str, cancel: CancelToken, seed: tuple[Message, ...]) -> RunResult:
