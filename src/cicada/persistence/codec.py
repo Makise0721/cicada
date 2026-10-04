@@ -142,7 +142,7 @@ def _take_stop_reason(obj: dict[str, Any], key: str, where: str) -> StopReason:
     return value  # type: ignore[return-value]
 
 
-def _dumps(payload: object) -> str:
+def dumps_strict(payload: object) -> str:
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except ValueError as exc:
@@ -187,7 +187,7 @@ def encode_messages(messages: Any) -> str:
             })
         else:
             raise CodecError(f"{where} is not a supported message type")
-    return _dumps(payload)
+    return dumps_strict(payload)
 
 
 def decode_messages(raw: str) -> tuple[Message, ...]:
@@ -262,7 +262,7 @@ def encode_model_calls(calls: tuple[ModelCallCompleted, ...]) -> str:
         }
         for call in calls
     ]
-    return _dumps(payload)
+    return dumps_strict(payload)
 
 
 def decode_model_calls(raw: str) -> tuple[ModelCallCompleted, ...]:
@@ -319,7 +319,7 @@ def encode_outcome_facts(facts: RequestOutcomeFacts) -> str:
         "finalization_notes": list(facts.finalization_notes),
         "model_calls": json.loads(encode_model_calls(facts.model_calls)),
     }
-    return _dumps(payload)
+    return dumps_strict(payload)
 
 
 def decode_outcome_facts(raw: str) -> RequestOutcomeFacts:
@@ -341,7 +341,7 @@ def decode_outcome_facts(raw: str) -> RequestOutcomeFacts:
         exit_code=_take_int(parsed, "exit_code", where),
         finalized=_take_bool(parsed, "finalized", where),
         finalization_notes=tuple(notes),
-        model_calls=decode_model_calls(_dumps(parsed["model_calls"])),
+        model_calls=decode_model_calls(dumps_strict(parsed["model_calls"])),
     )
 
 
@@ -357,7 +357,7 @@ def encode_identity(identity: StoredIdentity) -> str:
     payload = launch.comparable_dict()
     payload["sources"] = dict(launch.sources)
     payload["tool_fingerprint"] = identity.tool_fingerprint
-    return _dumps(payload)
+    return dumps_strict(payload)
 
 
 def decode_identity(raw: str) -> StoredIdentity:
