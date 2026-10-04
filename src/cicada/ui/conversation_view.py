@@ -148,6 +148,8 @@ class ConversationView:
             and self.on_unrecoverable is not None
         ):
             self.on_unrecoverable()
+        if self._on_update is not None:
+            self._on_update()  # 错误条目不经应用事件, 必须显式触发渲染
 
     def _project_agent_event(self, event: Event) -> None:
         if isinstance(event, TurnStarted):

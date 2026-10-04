@@ -8,10 +8,11 @@
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
 
---tui 进入交互终端 (生产组合: 共享应用 + 正式展示投影 + prompt_toolkit inline
-主屏, 见 cicada.ui); UI 可选依赖缺失或 stdin/stdout 非 TTY 退出码 2; 位置
-prompt 可省略 (空启动), 给出则作为首问提交; 进程退出码为最后一条请求的
-退出码. 单次模式要求位置 prompt; 普通 UI 导入要求为零 (T14).
+--tui 进入交互终端 (生产组合: 共享应用 + Pi 主屏前端, 见 cicada.ui; 正常启动
+安静, /status 提供有界可追溯诊断, 检查事实由 RequestOutcome 投影); UI 可选依赖
+缺失或 stdin/stdout 非 TTY 退出码 2; 位置 prompt 可省略 (空启动), 给出则作为
+首问提交; 进程退出码: 启动失败 2, UI 不可恢复/关闭错误优先 1, 正常关闭取最后
+一条请求的退出码 (无请求 0). 单次模式要求位置 prompt; 普通 UI 导入要求为零 (T14).
 
 P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
 是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
@@ -368,7 +369,30 @@ async def _run_tui(
     except ApplicationOpenError as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
-    return await run_tui_session_fn(session, initial_prompt=initial_prompt)
+    # /status 的只读诊断: CLI 组装不可变快照后注入, UI 不读取 provider 闭包
+    from functools import partial
+
+    from cicada.ui.diagnostics import UIDiagnostics, diagnostics_lines
+
+    plan = app_config.plan
+    info = app_config.prompt_info
+    diagnostics = UIDiagnostics(
+        workspace=str(app_config.workspace),
+        model_label=app_config.model_label or None,
+        prompt_version=info.version,
+        prompt_sha256=info.prompt_sha256,
+        instructions_path=(
+            str(info.instructions_path) if info.instructions_path is not None else None
+        ),
+        instructions_sha256=info.instructions_sha256,
+        verification_run_id=plan.verification_run_id if plan is not None else None,
+        check_ids=tuple(check.check_id for check in plan.checks) if plan is not None else (),
+        check_timeout_s=plan.checks[0].timeout_s if plan is not None else None,
+        max_turns=app_config.max_turns,
+    )
+    return await run_tui_session_fn(
+        session, initial_prompt=initial_prompt, diagnostics=partial(diagnostics_lines, diagnostics)
+    )
 
 
 def main() -> int:

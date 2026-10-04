@@ -39,6 +39,7 @@ from cicada.core.events import (
     ToolStarted,
     TurnStarted,
 )
+from cicada.ui.checks import artifact_line as _artifact_line_from_details
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
@@ -121,6 +122,7 @@ class _ToolCard:
         "cancelled",
         "content",
         "terminal",
+        "artifact",
     )
 
     def __init__(self, *, run_id: str, turn_index: int, call_id: str, name: str, args_summary: str) -> None:
@@ -134,6 +136,8 @@ class _ToolCard:
         self.cancelled = False
         self.content = ""
         self.terminal = False
+        # 回执输出工件行 (路径 + hash, 只显示不读入; 同旧 presenter 卡头口径)
+        self.artifact: str | None = None
 
     def complete(self, content: str, is_error: bool) -> None:
         self.content = _clean_output(content)
@@ -203,10 +207,12 @@ class ToolDocument:
     def _on_tool_completed(self, event: ToolCompleted) -> None:
         result = event.result
         run_id = event.run_id
+        artifact = _artifact_line_from_details(result.details)
         # 1) 同 run 同 call 的未终结条目: 原位更新 (开始→终态同一条目)
         for card in reversed(self._cards):
             if card.run_id == run_id and card.call_id == result.call_id and not card.terminal:
                 card.complete(result.content, result.is_error)
+                card.artifact = artifact
                 self._touch()
                 return
         # 2) 缺少 ToolStarted 的闭合结果: 以当前轮建终态卡 (跨轮复用 call_id 不合并)
@@ -223,6 +229,7 @@ class ToolDocument:
             args_summary=self._summarize_args(run_id, result.call_id),
         )
         card.complete(result.content, result.is_error)
+        card.artifact = artifact
         self._append(card)
 
     # --- 只读视图 ---------------------------------------------------------------
@@ -303,6 +310,11 @@ class ToolDocument:
         for chunk in wrap_text_ansi(title_text, content_w):
             lines.append(row(self._bold_name_span(chunk, pos, card.name)))
             pos += len(chunk)
+
+        # 回执输出工件 (路径 + hash): 只显示来源事实, 不读入内容
+        if card.artifact:
+            for chunk in wrap_text_ansi(card.artifact, content_w):
+                lines.append(row(MUTED + chunk))
 
         if card.terminal and card.content:
             output_lines = card.content.split("\n")

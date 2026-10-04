@@ -1,197 +1,167 @@
-"""cicada.ui: 终端交互与展示投影 (TUI 第一版).
+"""cicada.ui: Pi 主屏前端生产组合 (票据 05).
 
-02 发布共享数据契约 (contracts); 终端执行器 (terminal, 03) 与展示投影
-(presenter/rendering, 04) 的实现进入子模块. 本模块是 05 生产组合:
-共享应用 + 正式 presenter + Rich 渲染 + 终端执行器, 只由 `--tui` 分支导入
-(普通单次模式无 UI 导入要求); 组合不新增接口语义, 只做三件事:
-- ProjectionPresenter (04) 作为 TuiPresenter 注入 TerminalExecutor (03);
-- RenderingSink 把 PresentationRecord 经 record_fragments 渲染为
-  prompt_toolkit styled fragments, ANSI 串不作普通文本 print;
-- ProductionTerminalExecutor 覆盖记录渲染 / 活动预览 / 状态栏投影, 并在
-  最终回答记录追加时收起活动预览 (正式 presenter 的记录键为 run:turn:assistant).
+--tui 公开入口的唯一前端: ConversationView (02 显示文档/准入/斜线命令) +
+ToolDocument (03 工具卡) + CheckProjection (05 检查事实) + FooterComponent
+(04 底栏) 注入 MainScreenFrontend (01 冻结: 唯一写屏 owner)。终端经 Terminal
+协议注入: 缺省 PromptToolkitTerminal (真实终端), headless 检查注入 FakeTerminal。
+
+组合层职责:
+- 编辑器聚焦 (硬件光标/IME 跟随) 与 Ctrl+O 工具展开接线 (toggle + 立即帧);
+- 生命周期: frontend 退出 (正常或不可恢复失败) 后 await session.aclose()
+  (本函数是唯一 close owner); 关闭结果观察者与 ConversationView 订阅保留到
+  ApplicationClosed 送达 (session 收尾清空观察者) 再退订;
+- 退出码: 启动失败 2 (CLI 层); frontend 不可恢复失败/关闭抛错/
+  ApplicationClosed.error 非空优先 1; 正常关闭取最近请求退出码, 无请求 0;
+- renderer 停止后由同一终端适配独占写一次晚到关闭短错误 (不重启 renderer,
+  不存在同时写屏的两个 owner)。
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Callable
 
-from prompt_toolkit.shortcuts import print_formatted_text
-
-from cicada.ui.contracts import (
-    PresentationRecord,
-    PresentationUpdate,
-    StatusSnapshot,
-)
-from cicada.ui.terminal import TerminalExecutor
+from cicada.ui.conversation_view import ConversationView
+from cicada.ui.frontend import MainScreenFrontend
+from cicada.ui.terminal_io import PromptToolkitTerminal, Terminal
 
 if TYPE_CHECKING:
     from cicada.application import ApplicationSession, ApplicationUpdate
 
-
-class RenderingSink:
-    """生产输出 seam: 记录经渲染管线输出, 行文本原样; 全部经 prompt_toolkit 协调."""
-
-    def __init__(self) -> None:
-        # 已渲染记录的可见纯文本 (供测试/诊断断言, 不含样式)
-        self.rendered: list[str] = []
-        self._output: Any = None
-
-    def bind_output(self, output: Any) -> None:
-        """记录与活动布局共享 Application 的实际终端输出及当前尺寸."""
-        self._output = output
-
-    def print_line(self, text: str = "") -> None:
-        print_formatted_text(text, output=self._output)
-
-    def print_record(self, record: PresentationRecord) -> None:
-        from cicada.ui.rendering import record_fragments
-        from prompt_toolkit.application import get_app_session
-
-        output = self._output or get_app_session().output
-        fragments = record_fragments(record, width=max(1, output.get_size().columns))
-        self.rendered.append("".join(text for _, text in fragments))
-        print_formatted_text(fragments, output=output)
-
-
-class ProductionTerminalExecutor(TerminalExecutor):
-    """正式 presenter 组合: 记录键/状态字段与 03 基础 presenter 不同, 覆盖投影."""
-
-    def _apply(self, update: PresentationUpdate) -> None:
-        # 正式 presenter 的最终回答记录 (键 run:turn:assistant) 追加时收起活动预览;
-        # 基础 presenter 的键 assistant:run:turn 由父类自身的收起逻辑处理
-        for record in update.appended:
-            if (
-                record.role == "assistant"
-                and self._display_preview is not None
-                and record.key.startswith(f"{self._display_preview.run_id}:")
-            ):
-                self._display_preview = None
-        for record in update.appended:
-            if record.key in self._printed_keys:
-                continue
-            self._printed_keys.add(record.key)
-            self._sink.print_record(record)  # type: ignore[attr-defined]
-        if update.preview is not None:
-            self._display_preview = update.preview
-        if update.status is not None:
-            self._display_status = update.status
-
-    def _get_preview_lines(self) -> Any:
-        preview = self._display_preview
-        if preview is None:
-            return super()._get_preview_lines()
-        from cicada.ui.rendering import preview_fragments
-
-        return preview_fragments(preview, width=max(1, self._app.output.get_size().columns))
-
-    def _get_status_line(self) -> Any:
-        from cicada.ui.rendering import status_fragments
-
-        snapshot = self._display_status
-        if snapshot is None:
-            # 首个请求前的回退快照取 session 只读事实, 口径与 /status 一致:
-            # 检查模式启动窗口不得把已有验证运行显示成"未启用检查"
-            snapshot = StatusSnapshot(
-                model=self._session.config.model_label or None,
-                workspace=str(self._session.config.workspace),
-                phase=self._session.state,
-                verification_run_id=self._session.verification_run_id,
-            )
-        return status_fragments(snapshot, width=max(1, self._app.output.get_size().columns))
-
-    def _status_summary(self) -> str:
-        """/status 的纯文本摘要: 在基础字段上补检查事实 (口径与渲染一致)."""
-        base = super()._status_summary()
-        snapshot = self._display_status
-        if snapshot is None:
-            return base
-        check = snapshot.check_status
-        if check is None:
-            check = "未启用检查" if snapshot.verification_run_id is None else "不可得"
-        extras = [f"check={check}"]
-        if snapshot.change_scope is not None:
-            extras.append(snapshot.change_scope)
-        return f"{base} {' '.join(extras)}"
-
-
-def build_production_executor(
-    session: "ApplicationSession",
-    *,
-    input: Any = None,
-    output: Any = None,
-    sink: RenderingSink | None = None,
-) -> ProductionTerminalExecutor:
-    """按生产组合构建执行器: 正式 presenter + RenderingSink (input/output/sink 可注入)."""
-    from cicada.ui.presenter import ProjectionPresenter
-
-    config = session.config
-    presenter = ProjectionPresenter(
-        model=config.model_label or None,
-        workspace=str(config.workspace),
-        verification_run_id=(
-            config.plan.verification_run_id if config.plan is not None else None
-        ),
-    )
-    rendering_sink = sink if sink is not None else RenderingSink()
-    executor = ProductionTerminalExecutor(
-        session,
-        presenter=presenter,
-        sink=rendering_sink,
-        input=input,
-        output=output,
-        use_patch_stdout=input is None and output is None,
-    )
-    if isinstance(rendering_sink, RenderingSink):
-        rendering_sink.bind_output(executor.app.output)
-    return executor
+_LATE_ERROR_MAX_CHARS = 200
 
 
 async def run_tui_session(
     session: "ApplicationSession",
     *,
     initial_prompt: str | None = None,
-    input: Any = None,
-    output: Any = None,
-    sink: RenderingSink | None = None,
+    terminal: Terminal | None = None,
+    diagnostics: Callable[[], list[str]] | None = None,
 ) -> int:
-    """运行生产组合 TUI 直至退出并完成关闭收尾; 返回最后一条请求的退出码.
+    """运行 Pi 主屏前端直至退出并完成应用关闭收尾; 返回进程退出码。
 
-    session 由调用方 open; 关闭顺序由 TerminalExecutor.run_async 负责
-    (恢复终端模式 -> 退订 -> 停 mailbox 消费 -> session.aclose), 本函数不重复关闭.
-    input/output 注入时 (headless 测试) 不启用 patch_stdout.
+    session 由调用方 open; 关闭顺序: frontend 停止 (恢复终端模式) ->
+    await session.aclose() (关闭监督) -> 退订观察者。diagnostics 为 /status
+    注入的只读诊断行 (CLI 提供的不可变对象行化, 限额归 /status 组装层)。
     """
-    executor = build_production_executor(session, input=input, output=output, sink=sink)
-    last_exit_codes: list[int] = []
+    if terminal is None:
+        terminal = PromptToolkitTerminal()
 
-    def track(update: "ApplicationUpdate") -> None:
-        from cicada.application import RequestCompleted
+    refs: dict[str, MainScreenFrontend] = {}
+
+    def _request_render() -> None:
+        frontend = refs.get("frontend")
+        if frontend is not None:
+            frontend.request_render()
+
+    view = ConversationView(
+        session,
+        on_exit=lambda: _request_exit(refs),
+        on_update=_request_render,
+        diagnostics=diagnostics,
+    )
+    view.editor.focused = True  # 硬件光标标记: IME 候选窗跟随编辑光标
+    view.on_unrecoverable = lambda: _request_exit(refs)
+
+    def _toggle_tools() -> None:
+        view.handle_ctrl_o()
+        refs["frontend"].request_render_now()
+
+    frontend = MainScreenFrontend(
+        terminal,
+        document_lines=view.document_lines,
+        editor=view.editor,
+        on_submit=view.on_submit,
+        on_escape=view.handle_escape,
+        on_ctrl_c=view.handle_ctrl_c,
+        on_ctrl_o=_toggle_tools,
+        on_exit=view.handle_exit,
+        footer_lines=view.footer.render,
+    )
+    refs["frontend"] = frontend
+
+    # 关闭结果观察者: 独立于前端, 保留订阅直到 ApplicationClosed 送达
+    close_state = _CloseState()
+
+    def observe_close(update: "ApplicationUpdate") -> None:
+        from cicada.application import ApplicationClosed, RequestCompleted
 
         if isinstance(update, RequestCompleted):
-            last_exit_codes.append(update.outcome.exit_code)
+            close_state.last_exit_code = update.outcome.exit_code
+        elif isinstance(update, ApplicationClosed):
+            close_state.closed_error = update.error
 
-    unsubscribe = session.subscribe(track)
+    unsubscribe_close = session.subscribe(observe_close)
     try:
-        runner = asyncio.ensure_future(executor.run_async())
-        if initial_prompt:
-            # 等订阅与消费任务就绪后再提交首问 (executor 在 run_async 内订阅)
-            while executor._consumer_task is None:
-                await asyncio.sleep(0.01)
-            executor._accept_prompt(initial_prompt, None)
+        runner = asyncio.ensure_future(frontend.run_async())
+        if initial_prompt is not None and initial_prompt.strip():
+            await asyncio.sleep(0)  # 让 run_async 先行: terminal.start + 首帧
+            view.on_submit(initial_prompt.strip())
         try:
             await runner
-        except BaseException:
-            # run_async 收尾未完成的异常路径兜底; aclose 幂等
-            await session.aclose()
+        except asyncio.CancelledError:
+            await _close_application(session)
             raise
+        except Exception:
+            # frontend 自身异常: 终端恢复由 frontend 收尾尽力而为, 应用关闭监督收尾
+            await _close_application(session)
+            view.close()
+            return 1
+        if frontend.terminal_failed:
+            await _close_application(session)
+            view.close()
+            return 1
+        # frontend 正常退出: 应用关闭监督收尾; 晚到关闭错误优先退出 1
+        close_failure = await _close_application(session)
+        view.close()
+        if close_state.closed_error is None:
+            close_state.closed_error = close_failure
     finally:
-        unsubscribe()
-    return last_exit_codes[-1] if last_exit_codes else 0
+        unsubscribe_close()
+
+    if close_state.closed_error is not None:
+        _write_late_close_error(terminal, close_state.closed_error)
+        return 1
+    return close_state.last_exit_code if close_state.last_exit_code is not None else 0
 
 
-__all__ = [
-    "ProductionTerminalExecutor",
-    "RenderingSink",
-    "build_production_executor",
-    "run_tui_session",
-]
+class _CloseState:
+    """关闭观察者的可变状态 (RequestCompleted 退出码 / ApplicationClosed 错误)。"""
+
+    def __init__(self) -> None:
+        self.last_exit_code: int | None = None
+        self.closed_error: str | None = None
+
+
+def _request_exit(refs: dict[str, MainScreenFrontend]) -> None:
+    frontend = refs.get("frontend")
+    if frontend is not None:
+        frontend.request_exit()
+
+
+async def _close_application(session: "ApplicationSession") -> str | None:
+    """应用关闭监督收尾; 返回关闭抛错文本 (无则 None)。
+
+    aclose 返回/抛错都不代表资源必然全部释放: 监督超时由 ApplicationClosed.error
+    与本返回值如实呈现, 不当作资源已释放。
+    """
+    try:
+        await session.aclose()
+    except Exception as exc:
+        return f"close failed: {exc!r}"
+    return None
+
+
+def _write_late_close_error(terminal: Terminal, message: str) -> None:
+    """renderer 停止后的唯一晚到错误出口: 同一终端适配独占写一次短错误。
+
+    输出永久失效时不再启用 renderer (尽力而为, 不伪称屏幕已恢复)。
+    """
+    short = message if len(message) <= _LATE_ERROR_MAX_CHARS else message[:_LATE_ERROR_MAX_CHARS - 3] + "..."
+    try:
+        terminal.write(f"\n[cicada] 关闭错误: {short}\n")
+    except Exception:
+        pass
+
+
+__all__ = ["run_tui_session"]
