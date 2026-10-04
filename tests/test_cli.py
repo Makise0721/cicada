@@ -311,3 +311,134 @@ def test_tui_startup_is_quiet_no_prompt_or_config_lines(tmp_path, monkeypatch, c
     assert "prompt version=" not in out, "TUI 启动不打印 prompt 身份行"
     assert "[config model=" not in out, "TUI 启动不打印 config 行"
     assert "[check_mode" not in out
+
+
+# --- 会话保存恢复 v1 (01): --save-session / --resume 全子进程路径 -----------------------------
+
+
+def test_save_and_resume_roundtrip_via_separate_processes(tmp_path):
+    """A01 的 CLI 级证明: 保存->关闭->新进程恢复->新请求, 旧工具不重放。"""
+    work = tmp_path / "ws"
+    work.mkdir()
+    first_script = tmp_path / "first.json"
+    first_script.write_text(json.dumps([
+        {"tool_calls": [{"id": "c1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
+         "tool_use": True},
+        {"text": "第一轮回答", "stop": True},
+    ]), encoding="utf-8")
+    second_script = tmp_path / "second.json"
+    second_script.write_text(json.dumps([{"text": "恢复后的回答", "stop": True}]), encoding="utf-8")
+
+    first = run_cli("--workspace", str(work), "--script", str(first_script),
+                    "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    assert "[session id=" in first.stdout and "mode=save restored_requests=0" in first.stdout
+    assert "[session saved request_id=" in first.stdout and "seq=" in first.stdout
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    assert len(session_id) == 36
+
+    second = run_cli("--workspace", str(work), "--script", str(second_script),
+                     "--resume", session_id, "第二问")
+    assert second.returncode == 0, second.stderr
+    assert f"[session id={session_id} mode=resume restored_requests=1]" in second.stdout
+    assert "[session saved request_id=" in second.stdout
+    # 旧工具只在第一次进程执行: 恢复进程不重放
+    assert first.stdout.count(">> glob") == 1
+    assert second.stdout.count(">> glob") == 0
+    assert "<< glob" in first.stdout and "<< glob" not in second.stdout
+
+
+def test_resume_unknown_id_reports_not_found_before_preflight(tmp_path):
+    dead = f"http://127.0.0.1:{_dead_port()}"
+    proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead,
+                   "--resume", "123e4567-e89b-42d3-a456-426614174000", "任务")
+    assert proc.returncode == 2
+    assert "session store open failed" in proc.stderr
+    assert "no session archive" in proc.stderr
+    assert "Ollama 不可达" not in proc.stderr, "可达性探测不得先于存档预检"
+
+
+def test_resume_malformed_id_rejected(tmp_path):
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
+                   "--resume", "not-a-uuid", "任务")
+    assert proc.returncode == 2
+    assert "UUIDv4" in proc.stderr
+
+
+def test_save_session_and_resume_are_mutually_exclusive(tmp_path):
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
+                   "--save-session", "--resume", "123e4567-e89b-42d3-a456-426614174000", "任务")
+    assert proc.returncode == 2
+    assert "互斥" in proc.stderr
+
+
+def test_save_session_with_check_mode_rejected(tmp_path):
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
+                   "--save-session", "--check-command", "exit 0", "任务")
+    assert proc.returncode == 2
+    assert "检查模式暂不支持持久会话" in proc.stderr
+
+
+def test_resume_with_check_mode_rejected(tmp_path):
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
+                   "--resume", "123e4567-e89b-42d3-a456-426614174000",
+                   "--check-command", "exit 0", "任务")
+    assert proc.returncode == 2
+    assert "检查模式暂不支持持久会话" in proc.stderr
+
+
+def test_persistence_with_tui_rejected(tmp_path):
+    script = _script(tmp_path)
+    proc = run_cli("--tui", "--workspace", str(tmp_path), "--script", str(script),
+                   "--save-session", "任务")
+    assert proc.returncode == 2
+    assert "阶段 05" in proc.stderr
+
+
+def test_resume_config_conflict_names_field(tmp_path):
+    """同配置恢复之外的变化在副作用前拒绝, 且不先做模型可达性探测。
+
+    存档由 fake 会话写入 (provider=fake); 恢复时改用真实模型旗标 ->
+    provider/base_url 冲突先于 Ollama preflight 报出。
+    """
+    work = tmp_path / "ws2"
+    work.mkdir()
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+    first = run_cli("--workspace", str(work), "--script", str(script),
+                    "--save-session", "问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    dead = f"http://127.0.0.1:{_dead_port()}"
+    proc = run_cli("--workspace", str(work), "--ollama-url", dead,
+                   "--resume", session_id, "任务")
+    assert proc.returncode == 2
+    assert "config conflicts" in proc.stderr
+    assert "provider" in proc.stderr
+    assert "Ollama 不可达" not in proc.stderr
+
+
+def test_resume_after_workspace_move_rejected(tmp_path):
+    """存档绑定解析后的真实路径: 整个工作区 (含 .cicada) 移动后拒绝恢复。"""
+    import shutil
+
+    work = tmp_path / "ws3"
+    work.mkdir()
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+    first = run_cli("--workspace", str(work), "--script", str(script), "--save-session", "问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    moved = tmp_path / "moved-workspace"
+    shutil.move(str(work), str(moved))
+    moved_script = moved.parent / "s2.json"
+    moved_script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+    proc = run_cli("--workspace", str(moved), "--script", str(moved_script),
+                   "--resume", session_id, "问")
+    assert proc.returncode == 2
+    assert "session store open failed" in proc.stderr
+    assert "workspace" in proc.stderr

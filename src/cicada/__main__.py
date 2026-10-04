@@ -42,6 +42,7 @@ from cicada.application import (
     AgentEventReceived,
     ApplicationConfig,
     ApplicationOpenError,
+    PersistenceConfig,
     RequestCompleted,
     RequestPhaseChanged,
     open_application,
@@ -56,6 +57,7 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
+from cicada.persistence.contracts import LaunchIdentity
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
     CheckDefinition,
@@ -206,6 +208,12 @@ async def _ollama_reachable(base_url: str) -> bool:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.save_session and args.resume is not None:
+        print("--save-session 与 --resume 互斥: 保存新会话与恢复已有会话只能二选一", file=sys.stderr)
+        return 2
+    if (args.save_session or args.resume is not None) and args.tui:
+        print("持久会话的 TUI 入口 (自动保存/恢复) 在阶段 05 开放; 当前仅单次 CLI 支持", file=sys.stderr)
+        return 2
     if not args.tui and args.prompt is None:
         print("缺少 prompt: 单次模式需要位置参数 prompt (交互入口用 --tui)", file=sys.stderr)
         return 2
@@ -244,6 +252,9 @@ async def _run(args: argparse.Namespace) -> int:
     if check_error is not None:
         print(check_error, file=sys.stderr)
         return 2
+    if (args.save_session or args.resume is not None) and checks:
+        print("检查模式暂不支持持久会话 (恢复在 03 开放)", file=sys.stderr)
+        return 2
     if checks and args.num_ctx is not None and args.num_ctx < CHECK_MODE_MIN_NUM_CTX:
         print(
             f"检查模式要求 --num-ctx >= {CHECK_MODE_MIN_NUM_CTX}, 收到 {args.num_ctx}",
@@ -281,6 +292,7 @@ async def _run(args: argparse.Namespace) -> int:
                 f"timeout={timeout_s:g}s verification_run_id={plan.verification_run_id} "
                 f"max_turns={CHECK_MODE_MAX_TURNS}]"
             )
+    max_turns = CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -289,6 +301,14 @@ async def _run(args: argparse.Namespace) -> int:
             return 2
         model_plugin = fake_model_plugin(FakeModel(script))
         model_label = "fake"
+        identity = LaunchIdentity(
+            provider="fake", model=model_label, base_url=None, think=None,
+            options={}, max_request_bytes=None, max_turns=max_turns,
+            prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+            instructions_sha256=prompt_info.instructions_sha256,
+            checks_signature=None, sources={},
+        )
+        preflight = None
     else:
         num_ctx = args.num_ctx if args.num_ctx is not None else DEFAULT_NUM_CTX
         source = "cli" if args.num_ctx is not None else "default"
@@ -313,14 +333,36 @@ async def _run(args: argparse.Namespace) -> int:
                 f"[config model={config.model} context_requested={num_ctx} source={source} "
                 f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
             )
-        if not await _ollama_reachable(config.base_url):
-            print(
-                f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
-                file=sys.stderr,
-            )
-            return 2
+        identity = LaunchIdentity(
+            provider="ollama", model=config.model, base_url=config.base_url, think=config.think,
+            options=dict(config.options), max_request_bytes=config.max_request_bytes,
+            max_turns=max_turns,
+            prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+            instructions_sha256=prompt_info.instructions_sha256,
+            checks_signature=None, sources={"num_ctx": source},
+        )
+        if args.save_session or args.resume is not None:
+            # 持久路径: 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
+            async def preflight() -> None:
+                if not await _ollama_reachable(config.base_url):
+                    raise ApplicationOpenError(
+                        f"Ollama 不可达: {config.base_url} "
+                        "(请先启动 Ollama, 或用 --script 走 fake model)"
+                    )
+        else:
+            preflight = None
+            if not await _ollama_reachable(config.base_url):
+                print(
+                    f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
+                    file=sys.stderr,
+                )
+                return 2
         model_plugin = ollama_plugin(config)
         model_label = config.model
+
+    persistence_config = None
+    if args.save_session or args.resume is not None:
+        persistence_config = PersistenceConfig(session_id=args.resume, identity=identity)
 
     app_config = ApplicationConfig(
         workspace=workspace,
@@ -328,17 +370,25 @@ async def _run(args: argparse.Namespace) -> int:
         prompt_info=prompt_info,
         model_plugin=model_plugin,
         plan=plan,
-        max_turns=CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS,
+        max_turns=max_turns,
         model_label=model_label,
+        persistence=persistence_config,
     )
     if args.tui:
         assert run_tui_session_fn is not None
         return await _run_tui(run_tui_session_fn, app_config, initial_prompt=args.prompt)
     try:
-        session = await open_application(app_config)
+        session = await open_application(app_config, preflight=preflight)
     except ApplicationOpenError as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
+
+    if session.persistence is not None:
+        state = session.persistence
+        print(
+            f"[session id={state.session_id} mode={state.mode} "
+            f"restored_requests={state.restored_request_count}]"
+        )
 
     def on_update(update) -> None:
         # 旧 CLI 打印适配: 只转发内核事件; 忽略文本增量与阶段/完成通知, 避免重复输出
@@ -354,12 +404,22 @@ async def _run(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"invalid prompt: {exc}", file=sys.stderr)
             return 2
+        except RuntimeError as exc:
+            # 持久路径: 开始记录失败/存储锁存等拒绝; 请求可能已消耗 (退出码 1)
+            print(f"{exc}", file=sys.stderr)
+            return 1
     finally:
         unsubscribe()
         await session.aclose()
     print(build_run_summary(outcome.result))
     if outcome.decision is not None:
         print(build_delivery_section(outcome.decision, outcome.view, outcome.evidence, plan))
+    if outcome.persistence is not None:
+        facts = outcome.persistence
+        if facts.saved:
+            print(f"[session saved request_id={facts.request_id} seq={facts.seq}]")
+        else:
+            print(f"[session save failed: {facts.error}]", file=sys.stderr)
     return outcome.exit_code
 
 
@@ -431,6 +491,14 @@ def main() -> int:
             f"检查命令超时秒数 (默认 {CHECK_TIMEOUT_DEFAULT_S:g}; 范围 "
             f"({CHECK_TIMEOUT_MIN_S:g}, {CHECK_TIMEOUT_MAX_S:g}]; 仅检查模式)"
         ),
+    )
+    parser.add_argument(
+        "--save-session", action="store_true",
+        help="单次模式创建持久会话并保存本次请求 (默认不落盘); 与检查模式/--tui 组合暂不支持",
+    )
+    parser.add_argument(
+        "--resume", metavar="SESSION_ID",
+        help="按 UUIDv4 会话 ID 恢复持久会话, 新请求追加保存; 与 --save-session 互斥",
     )
     parser.add_argument(
         "prompt", nargs="?", default=None,
