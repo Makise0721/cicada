@@ -10,8 +10,9 @@ ToolDocument (03 工具卡) + CheckProjection (05 检查事实) + FooterComponen
 - 生命周期: frontend 退出 (正常或不可恢复失败) 后 await session.aclose()
   (本函数是唯一 close owner); 关闭结果观察者与 ConversationView 订阅保留到
   ApplicationClosed 送达 (session 收尾清空观察者) 再退订;
-- 退出码: 启动失败 2 (CLI 层); frontend 不可恢复失败/关闭抛错/
+- 退出码: 启动失败 2 (CLI 层); frontend 不可恢复失败/会话不可恢复崩溃/关闭抛错/
   ApplicationClosed.error 非空优先 1; 正常关闭取最近请求退出码, 无请求 0;
+  frontend 异常与终端恢复错误经 stderr 如实留痕 (renderer 已停, 不写屏);
 - renderer 停止后由同一终端适配独占写一次晚到关闭短错误 (不重启 renderer,
   不存在同时写屏的两个 owner)。
 """
@@ -19,6 +20,7 @@ ToolDocument (03 工具卡) + CheckProjection (05 检查事实) + FooterComponen
 from __future__ import annotations
 
 import asyncio
+import sys
 from typing import TYPE_CHECKING, Callable
 
 from cicada.ui.conversation_view import ConversationView
@@ -61,7 +63,14 @@ async def run_tui_session(
         diagnostics=diagnostics,
     )
     view.editor.focused = True  # 硬件光标标记: IME 候选窗跟随编辑光标
-    view.on_unrecoverable = lambda: _request_exit(refs)
+    # 会话不可恢复崩溃 (execute 异常且 state 已入 closing/closed): 退出码优先 1
+    state: dict[str, bool] = {"unrecoverable": False}
+
+    def _flag_unrecoverable() -> None:
+        state["unrecoverable"] = True
+        _request_exit(refs)
+
+    view.on_unrecoverable = _flag_unrecoverable
 
     def _toggle_tools() -> None:
         view.handle_ctrl_o()
@@ -98,14 +107,16 @@ async def run_tui_session(
             await asyncio.sleep(0)  # 让 run_async 先行: terminal.start + 首帧
             view.on_submit(initial_prompt.strip())
         try:
-            await runner
+            restore_errors = await runner
         except asyncio.CancelledError:
             await _close_application(session)
             raise
-        except Exception:
-            # frontend 自身异常: 终端恢复由 frontend 收尾尽力而为, 应用关闭监督收尾
+        except Exception as exc:
+            # frontend 自身异常: 终端恢复由 run_async 收尾尽力而为, 应用关闭监督收尾;
+            # 异常细节经 stderr 如实留痕 (renderer 已停, 不写屏), 退出 1
             await _close_application(session)
             view.close()
+            _report_stderr(f"frontend failure: {exc!r}")
             return 1
         if frontend.terminal_failed:
             await _close_application(session)
@@ -119,8 +130,13 @@ async def run_tui_session(
     finally:
         unsubscribe_close()
 
+    # 停止阶段的终端恢复错误: renderer 已停, stderr 如实留痕 (不写屏、不改退出码)
+    if restore_errors:
+        _report_stderr("terminal restore errors: " + "; ".join(restore_errors))
     if close_state.closed_error is not None:
         _write_late_close_error(terminal, close_state.closed_error)
+        return 1
+    if state["unrecoverable"]:
         return 1
     return close_state.last_exit_code if close_state.last_exit_code is not None else 0
 
@@ -150,6 +166,11 @@ async def _close_application(session: "ApplicationSession") -> str | None:
     except Exception as exc:
         return f"close failed: {exc!r}"
     return None
+
+
+def _report_stderr(message: str) -> None:
+    """renderer 已停止后的组合层留痕: stderr 单行 (不写屏、不重启 renderer)。"""
+    print(f"[cicada] {message}", file=sys.stderr)
 
 
 def _write_late_close_error(terminal: Terminal, message: str) -> None:

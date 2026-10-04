@@ -41,6 +41,9 @@ BLOCKING_MAX_BYTES = 8192
 STATUS_MAX_LINES = 20
 STATUS_MAX_BYTES = 8192
 STATUS_FIELD_MAX_BYTES = 512
+# 检查结论条目整体限额 (同旧 presenter _bounded_body 口径)
+DELIVERY_MAX_LINES = 64
+DELIVERY_MAX_BYTES = 16384
 
 
 def clip_lines(text: str, max_lines: int, max_bytes: int) -> tuple[tuple[str, ...], int, int, bool]:
@@ -197,11 +200,22 @@ class CheckProjection:
                 self._receipts_this_request.add(receipt_id)
 
     def on_request_completed(self, outcome: "RequestOutcome") -> list[str] | None:
-        """记录最近完成 outcome; 检查模式返回结论行, 正常模式返回 None (安静)。"""
+        """记录最近完成 outcome; 检查模式返回结论行, 正常模式返回 None (安静)。
+
+        结论行整体受 64 行/16384 bytes 限额约束 (同旧 presenter _bounded_body),
+        超限给截断标记; 阻断原因段另受 32 行/8192 bytes 限额。
+        """
         self._last_completed = outcome
         if outcome.decision is None:
             return None
-        return ["检查结论", *delivery_lines(outcome, self._session, self._receipts_this_request)]
+        lines = ["检查结论", *delivery_lines(outcome, self._session, self._receipts_this_request)]
+        kept, original_lines, original_bytes, truncated = clip_lines(
+            "\n".join(lines), DELIVERY_MAX_LINES, DELIVERY_MAX_BYTES
+        )
+        kept = list(kept)
+        if truncated:
+            kept.extend(truncation_note(tuple(kept), original_lines, original_bytes, True))
+        return kept
 
     # --- /status 事实 -----------------------------------------------------------------
 
@@ -249,6 +263,8 @@ __all__ = [
     "BLOCKING_MAX_LINES",
     "CHECK_TOOL_NAME",
     "CURRENT_RUN_CHECK_LABEL",
+    "DELIVERY_MAX_BYTES",
+    "DELIVERY_MAX_LINES",
     "CheckProjection",
     "HISTORICAL_NEUTRAL_LABEL",
     "HISTORICAL_PASS_LABEL",

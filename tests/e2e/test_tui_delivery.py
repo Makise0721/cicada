@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from prompt_toolkit.key_binding.key_processor import KeyPress
 
-from cicada.application import open_application
+from cicada.application import ApplicationSession, open_application
 from cicada.ui import MainScreenFrontend, run_tui_session
 from tui_fixture import (
     CTRL_C,
@@ -417,3 +417,102 @@ async def test_run_tui_cli_assembles_diagnostics_from_config(tmp_path):
     assert any("轮次上限: 6" in line for line in captured)
     # /status 实际显示包含注入诊断
     assert stage.contains("prompt 版本: stage-acceptance")
+
+
+# --- 审查修复回归: 晚到关闭错误 / 不可恢复崩溃 / 终端恢复留痕 -------------------------
+
+
+async def test_close_failure_takes_priority_one_and_writes_short_error(tmp_path, monkeypatch):
+    """aclose 抛错: 晚到关闭错误优先退出 1, renderer 停止后由同一终端适配写一次短错误."""
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+    )
+    stage = StageTerminal()
+    try:
+        async def boom():
+            raise RuntimeError("close exploded")
+
+        monkeypatch.setattr(session, "aclose", boom)
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
+        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        code = await asyncio.wait_for(task, timeout=15)
+        assert code == 1, "关闭抛错优先退出 1"
+        short_errors = [w for w in stage.terminal.written if "[cicada] 关闭错误" in w]
+        assert len(short_errors) == 1, "renderer 停止后恰好一次短错误"
+        assert "close exploded" in short_errors[0]
+        monkeypatch.undo()  # 恢复真实 aclose 供清理
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_application_closed_error_takes_priority_one(tmp_path, monkeypatch):
+    """runtime.stop 失败: ApplicationClosed.error 非空经真实关闭事件回归退出 1."""
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+    )
+    stage = StageTerminal()
+    try:
+        async def boom():
+            raise RuntimeError("runtime stop failed")
+
+        monkeypatch.setattr(session._app.runtime, "stop", boom)
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
+        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        code = await asyncio.wait_for(task, timeout=15)
+        assert code == 1, "ApplicationClosed.error 非空优先退出 1"
+        short_errors = [w for w in stage.terminal.written if "[cicada] 关闭错误" in w]
+        assert len(short_errors) == 1 and "runtime stop failed" in short_errors[0]
+        assert session.state == "closed"
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_request_crash_without_request_completed_exits_one(tmp_path, monkeypatch):
+    """请求中途崩溃 (无 RequestCompleted): 会话不可恢复, 退出 1 而非 0."""
+
+    async def boom(self, result):
+        raise RuntimeError("finalizer exploded")
+
+    monkeypatch.setattr(ApplicationSession, "_finalize_request", boom)
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+    )
+    stage = StageTerminal()
+    try:
+        code = await asyncio.wait_for(
+            run_tui_session(session, initial_prompt="首问", terminal=stage.terminal), timeout=15
+        )
+        assert code == 1, "不可恢复崩溃优先退出 1"
+        assert stage.contains("finalizer exploded"), "gate 错误条目如实显示"
+        assert session.state == "closed"
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_restore_errors_reported_on_stderr(tmp_path, capsys):
+    """正常关闭但终端恢复失败: stderr 单行留痕, 退出码不受影响."""
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+    )
+    stage = StageTerminal()
+    stage.terminal.restore_errors = ["raw mode restore failed: injected"]
+    try:
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
+        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        code = await asyncio.wait_for(task, timeout=15)
+        assert code == 0, "恢复错误不改退出码 (P15 清单不含该项)"
+        captured = capsys.readouterr()
+        assert "raw mode restore failed: injected" in captured.err, "stderr 如实留痕"
+        assert session.state == "closed"
+    finally:
+        if session.state != "closed":
+            await session.aclose()

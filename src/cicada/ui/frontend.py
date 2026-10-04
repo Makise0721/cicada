@@ -70,16 +70,20 @@ class MainScreenFrontend:
         self._stopped = False
         self._escape_prefix_timeout = escape_prefix_timeout
         self._recovering = False
+        self._frame_rows = 24  # 每帧 render_once 前快照 (帧合成内不重读尺寸)
 
     # --- 帧合成 -----------------------------------------------------------------
 
     def _render_frame_lines(self, width: int) -> list[str]:
         lines = list(self._document_lines(width))
+        # 帧内不重读终端尺寸: rows 用本帧 render_once 前的快照, 避免一帧内
+        # viewport 用旧尺寸而编辑器/底栏行数用新尺寸 (缩放恰落排版期间)
+        rows = self._frame_rows
         # 设计 §4: 编辑器正文 1–5 行; 低高度 (8 行) 时 1–3 行, 剩余给对话
-        max_rows = min(5, max(3, int(self._terminal.rows * 0.3)))
+        max_rows = min(5, max(3, int(rows * 0.3)))
         lines.extend(self._editor.render(width, max_rows))
         if self._footer_lines is not None:
-            lines.extend(self._footer_lines(width, self._terminal.rows))
+            lines.extend(self._footer_lines(width, rows))
         return lines
 
     # --- 调度 (TuiBase.requestRender 移植) -----------------------------------------
@@ -137,7 +141,8 @@ class MainScreenFrontend:
 
     def _do_render(self) -> None:
         try:
-            self._screen.render_once(self._terminal.columns, self._terminal.rows)
+            self._frame_rows = self._terminal.rows
+            self._screen.render_once(self._terminal.columns, self._frame_rows)
         except Exception as exc:
             self.ui_failures.append(f"render failed: {exc!r}")
             self._attempt_recovery()
@@ -155,8 +160,9 @@ class MainScreenFrontend:
         if self._stopped:
             return
         try:
+            self._frame_rows = self._terminal.rows
             self._screen.reset_render_state()
-            self._screen.render_once(self._terminal.columns, self._terminal.rows)
+            self._screen.render_once(self._terminal.columns, self._frame_rows)
         except Exception as exc:
             self.terminal_failed = True
             self.ui_failures.append(f"terminal write failed permanently: {exc!r}")
@@ -290,19 +296,34 @@ class MainScreenFrontend:
     # --- 生命周期 ---------------------------------------------------------------------
 
     async def run_async(self) -> list[str]:
-        """运行至退出; 返回停止时的恢复错误列表 (空 = 干净恢复)。"""
+        """运行至退出; 返回停止时的恢复错误列表 (空 = 干净恢复)。
+
+        terminal.start 与 exit_event 等待整体在 try 内: 正常退出、写失败永久
+        退出与任务被取消三条路径都执行收尾 (置停止态 -> 停定时器 -> 停止序列
+        -> terminal.stop 恢复模式), 取消也不例外 (US21: 取消退出的终端恢复)。
+        """
         loop = asyncio.get_running_loop()
-        self._terminal.start(self._on_input_batch, lambda: self.request_render())
-        self._last_render_at = loop.time()
-        self.request_render_now()
         try:
+            self._terminal.start(self._on_input_batch, lambda: self.request_render())
+            self._last_render_at = loop.time()
+            self.request_render_now()
             await self._exit_event.wait()
         finally:
+            # 终态冲刷: 退出前的待渲染请求 (如 gate 错误条目) 在收尾前落屏一次,
+            # 不随 _stopped 丢弃 (规格: 终态事件不丢弃); 失败照常记录不阻断收尾
+            if self._render_requested:
+                self._render_requested = False
+                try:
+                    self._frame_rows = self._terminal.rows
+                    self._screen.render_once(self._terminal.columns, self._frame_rows)
+                except Exception as exc:
+                    self.ui_failures.append(f"final render failed: {exc!r}")
             self._stopped = True
             self._cancel_render_timer()
             self._disarm_escape_prefix()
             self._write_stop_sequence()
-        return self._terminal.stop()
+            stop_errors = self._terminal.stop()
+        return stop_errors
 
     def request_exit(self) -> None:
         self._exit_event.set()

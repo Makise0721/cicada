@@ -247,8 +247,10 @@ def truncate_to_width(text: str, max_width: int, ellipsis: str = "…") -> str:
 
 
 def wrap_text_ansi(text: str, width: int) -> list[str]:
-    """按词换行, CJK 可断; ANSI 状态跨行保留 (utils.wrapTextWithAnsi 子集)。
+    """按词换行, CJK 可断; 不感知 ANSI (Pi utils.wrapTextWithAnsi 的纯文本子集)。
 
+    调用方必须先剥离/清理 ANSI (本仓库各组件经 sanitize_display 后进入);
+    含转义序列的文本会被按可见内容计宽并可能在块边界截断序列。
     只做换行, 不填充不改背景。供消息/工具组件排版使用; 编辑器用
     word_wrap_line (带原始索引) 而不是本函数。
     """

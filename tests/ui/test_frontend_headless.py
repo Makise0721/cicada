@@ -591,3 +591,14 @@ async def test_ctrl_o_hook():
         assert h.editor.get_text() == "草稿"  # Ctrl+O 不进草稿
     finally:
         await h.stop()
+
+
+async def test_run_async_cancel_still_restores_terminal():
+    """任务被取消: run_async 收尾仍执行 terminal.stop (US21 取消退出的终端恢复)。"""
+    h = Harness()
+    await h.start()
+    h.runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(h.runner, timeout=5)
+    assert h.terminal.stopped, "取消路径不跳过终端模式恢复"
+    assert h.frontend._stopped

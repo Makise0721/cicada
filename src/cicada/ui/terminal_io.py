@@ -13,8 +13,9 @@ Node stdin/stdout:
 - 适配器拥有: bracketed paste 开关序列、raw 模式生命周期、尺寸轮询、
   停止时的模式恢复与恢复错误收集。write 失败向上抛, 恢复矩阵归 frontend。
 
-FakeTerminal 供 headless 检查与演示注入: 可控尺寸、脚本化按键、写捕获、
-write/get_size/输入关闭故障注入。
+FakeTerminal 供 headless 检查与演示注入: 可控尺寸、脚本化按键、写捕获与
+write 故障注入 (fail_write)、停止恢复错误注入 (restore_errors); get_size/
+输入读取故障由测试对真实适配器以替身注入 (见 test_frontend_headless)。
 """
 
 from __future__ import annotations
@@ -238,9 +239,7 @@ class FakeTerminal:
         self.rows = rows
         self.written: list[str] = []
         self.feed_screen: Callable[[str], None] | None = None  # 写镜像 (VT 屏断言用)
-        self.input_closed = False
         self.fail_write = False
-        self.fail_size = False
         self.restore_errors: list[str] = []
         self.started = False
         self.stopped = False

@@ -272,3 +272,42 @@ def test_plain_mode_has_zero_ui_imports(tmp_path):
         timeout=60,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_tui_startup_is_quiet_no_prompt_or_config_lines(tmp_path, monkeypatch, capsys):
+    """P12: --tui 启动不打印 prompt/config 诊断行 (身份进 /status); 单次模式保持打印。"""
+    import asyncio
+
+    import cicada.__main__ as m
+
+    script = tmp_path / "script.json"
+    script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+
+    class FakeTTY:
+        def isatty(self) -> bool:
+            return True
+
+        def reconfigure(self, **kwargs) -> None:  # main() 入口的编码设置
+            return None
+
+    monkeypatch.setattr(sys, "stdin", FakeTTY())
+    monkeypatch.setattr(sys, "stdout", FakeTTY())
+
+    captured: dict = {}
+
+    async def fake_run_tui_session(session, **kwargs):
+        captured["has_diagnostics"] = kwargs.get("diagnostics") is not None
+        return 0
+
+    monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["cicada", "--tui", "--workspace", str(tmp_path), "--script", str(script)],
+    )
+    code = m.main()
+    out = capsys.readouterr().out
+    assert code == 0
+    assert captured["has_diagnostics"], "CLI 必须注入诊断"
+    assert "prompt version=" not in out, "TUI 启动不打印 prompt 身份行"
+    assert "[config model=" not in out, "TUI 启动不打印 config 行"
+    assert "[check_mode" not in out

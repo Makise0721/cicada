@@ -235,7 +235,8 @@ class FooterComponent:
     def render(self, width: int, rows: int) -> list[str]:
         dim = FOOTER_DIM
         pwd = format_workspace(self._workspace)
-        pwd_line = truncate_to_width(fg(dim, pwd), width, fg(dim, "..."))
+        # 先对纯文本截断再套样式: truncate_to_width 会剥离 SGR, 反向会丢 dim 色
+        pwd_line = fg(dim, truncate_to_width(pwd, width, "..."))
 
         stats_left = self._stats_left()
         model = self._model_label or "不可得"

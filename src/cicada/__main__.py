@@ -265,20 +265,22 @@ async def _run(args: argparse.Namespace) -> int:
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
         return 2
-    _print_prompt_info(prompt_info)
+    if not args.tui:  # TUI 静默: prompt 身份进 /status (P12)
+        _print_prompt_info(prompt_info)
     plan: VerificationPlan | None = None
     if checks:
         root = Path(os.path.realpath(Path(workspace).expanduser()))
         plan = VerificationPlan(
             verification_run_id=generate_verification_run_id(), root=root, checks=checks
         )
-        timeout_s = checks[0].timeout_s
-        print(
-            f"[check_mode checks={len(checks)} "
-            f"ids={','.join(check.check_id for check in checks)} "
-            f"timeout={timeout_s:g}s verification_run_id={plan.verification_run_id} "
-            f"max_turns={CHECK_MODE_MAX_TURNS}]"
-        )
+        if not args.tui:
+            timeout_s = checks[0].timeout_s
+            print(
+                f"[check_mode checks={len(checks)} "
+                f"ids={','.join(check.check_id for check in checks)} "
+                f"timeout={timeout_s:g}s verification_run_id={plan.verification_run_id} "
+                f"max_turns={CHECK_MODE_MAX_TURNS}]"
+            )
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -302,14 +304,15 @@ async def _run(args: argparse.Namespace) -> int:
             options=options,
             max_request_bytes=request_limit,
         )
-        policy_line = (
-            f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
-            if checks else ""
-        )
-        print(
-            f"[config model={config.model} context_requested={num_ctx} source={source} "
-            f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
-        )
+        if not args.tui:
+            policy_line = (
+                f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
+                if checks else ""
+            )
+            print(
+                f"[config model={config.model} context_requested={num_ctx} source={source} "
+                f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
+            )
         if not await _ollama_reachable(config.base_url):
             print(
                 f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
