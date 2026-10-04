@@ -255,6 +255,22 @@ class ToolDocument:
         self._expanded = not self._expanded
         self._touch()
 
+    @property
+    def version(self) -> int:
+        """单调内容版本 (条目/输出/展开变化即递增); 组合层条目缓存键用 (票据 05)。"""
+        return self._version
+
+    def render_card(self, index: int, width: int) -> list[str]:
+        """单卡渲染 (票据 05 组合): 到达序第 index 张卡的显示行。
+
+        越界是组合层缺陷: 有界处理 (记 ui_failures 返回空), 不抛异常杀渲染。
+        """
+        width = max(1, int(width))
+        if not 0 <= index < len(self._cards):
+            self._record_failure(f"render_card index out of range: {index}")
+            return []
+        return self._render_card(self._cards[index], width)
+
     def render_lines(self, width: int) -> list[str]:
         """按当前列宽产出全部工具卡的显示行 (含返回副本, 修改不影响缓存)。"""
         width = max(1, int(width))
@@ -377,6 +393,29 @@ class ToolDocument:
         self._touch()
 
 
+class ToolCardEntry:
+    """单卡 transcript 条目适配 (票据 05 组合): 按到达序委托 ToolDocument 渲染。
+
+    每张工具卡在创建时经 transcript.add_entry 挂载一个本适配条目, 保持文档
+    顺序与消息交错一致; 渲染按 (宽度, 文档版本) 缓存, 展开切换或内容更新
+    (版本递增) 后重排。
+    """
+
+    def __init__(self, document: "ToolDocument", index: int) -> None:
+        self._document = document
+        self._index = index
+        self._cache: tuple[int, int, list[str]] | None = None
+
+    def render(self, width: int) -> list[str]:
+        cached = self._cache
+        version = self._document.version
+        if cached is not None and cached[0] == width and cached[1] == version:
+            return list(cached[2])
+        lines = self._document.render_card(self._index, width)
+        self._cache = (width, version, list(lines))
+        return lines
+
+
 __all__ = [
     "BOLD",
     "BOLD_OFF",
@@ -386,6 +425,7 @@ __all__ = [
     "TOOL_BG_ERROR",
     "TOOL_BG_PENDING",
     "TOOL_BG_SUCCESS",
+    "ToolCardEntry",
     "ToolCardView",
     "ToolDocument",
 ]

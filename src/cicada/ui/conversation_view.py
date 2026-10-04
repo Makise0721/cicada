@@ -15,6 +15,10 @@
   回调 (宿主传 frontend.request_render 合并节流)。
 - 正常对话不出现内部 phase 标签; 诊断细节归 /status (票据 05 的只读
   diagnostics 对象可经 build(diagnostics=...) 注入, 本模块默认只给已发布事实)。
+- 票据 05 组合接线: 工具卡经 ToolDocument 投影并按到达序挂载显示文档
+  (add_entry); 检查事实经 CheckProjection 消费 RequestCompleted.outcome
+  (结论条目只在 decision 非空时追加, 正常完成安静); /status 汇集检查事实
+  与注入诊断并施加有界限额。
 """
 
 from __future__ import annotations
@@ -38,9 +42,15 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
+from cicada.ui.checks import (
+    PROCESS_UNCERTAIN_LABEL,
+    CheckProjection,
+    bound_status_lines,
+)
 from cicada.ui.editor import Editor
 from cicada.ui import theme
 from cicada.ui.theme import FooterComponent
+from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
 
 HELP_TEXT = "\n".join(
@@ -76,7 +86,13 @@ class ConversationView:
         self._diagnostics = diagnostics
         self.transcript = Transcript()
         self._gate = AdmissionGate(session)
-        self._gate.on_error = self.transcript.append_error
+        self._gate.on_error = self._on_gate_error
+        # 票据 05 组合钩子: 会话进入 closing/closed 且 execute 异常到达时由宿主
+        # 决定退出前端 (避免 barrier 内界面失去退出路径); 默认无动作
+        self.on_unrecoverable: Callable[[], None] | None = None
+        # 票据 05: 工具卡文档片段与检查事实投影
+        self.tools = ToolDocument()
+        self._checks = CheckProjection(session)
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
         self._unsubscribe = session.subscribe(self._on_application_update)
@@ -104,18 +120,34 @@ class ConversationView:
         if isinstance(update, AgentEventReceived):
             self._project_agent_event(update.event)
         elif isinstance(update, RequestPhaseChanged):
+            self._checks.note_phase(update.run_id, update.phase)
             self._gate.note_phase(update.phase)
         elif isinstance(update, RequestCompleted):
             outcome = update.outcome
             self.transcript.record_request_result(outcome.result.stop_reason, outcome.result.error)
+            # 检查结论条目只在 decision 非空 (检查模式) 时追加; 正常完成安静
+            summary = self._checks.on_request_completed(outcome)
+            if summary is not None:
+                self.transcript.append_system("\n".join(summary))
             self._gate.note_request_completed()
         elif isinstance(update, HistoryCleared):
             # /clear 只清模型历史: 显示文档保留, 追加系统条目说明
             self.transcript.append_system("已清空模型历史（已显示记录与验证状态保留）。")
+            if self._session.has_process_uncertain():
+                self.transcript.append_system(f"{PROCESS_UNCERTAIN_LABEL}：清空历史不解锁。")
         elif isinstance(update, ApplicationClosed):
             self._gate.note_closed()
         if self._on_update is not None:
             self._on_update()
+
+    def _on_gate_error(self, message: str) -> None:
+        """execute 异常如实成条; 会话已进入 closing/closed 时通知宿主退出前端。"""
+        self.transcript.append_error(message)
+        if (
+            self._session.state in ("closing", "closed")
+            and self.on_unrecoverable is not None
+        ):
+            self.on_unrecoverable()
 
     def _project_agent_event(self, event: Event) -> None:
         if isinstance(event, TurnStarted):
@@ -127,6 +159,13 @@ class ConversationView:
             self.transcript.complete_assistant(event.run_id, turn_index, event.message)
         elif isinstance(event, ModelCallCompleted):
             self.transcript.add_metrics(event.metrics)
+        # 工具卡与检查回执收集: 全部内核事件过一遍 (各自过滤)
+        self._checks.observe_event(event)
+        before = len(self.tools.entries)
+        self.tools.apply(event)
+        new_entries = self.tools.entries
+        for index in range(before, len(new_entries)):
+            self.transcript.add_entry(ToolCardEntry(self.tools, index))
 
     # --- MainScreenFrontend 注入面 ----------------------------------------------------
 
@@ -171,6 +210,10 @@ class ConversationView:
         if self._gate.busy() and self._session.state == "idle":
             self._gate.arm_pending_cancel()
 
+    def handle_ctrl_o(self) -> None:
+        """Ctrl+O 接缝 (票据 05): 切换工具输出展开; 只改展示, 不触请求或工具。"""
+        self.tools.toggle_expand()
+
     def handle_exit(self) -> None:
         """退出回调 (Ctrl+D 与 /exit 共用): 仅 idle 且无 reservation 时执行。"""
         if is_enter_barrier(self._session, self._gate):
@@ -206,15 +249,16 @@ class ConversationView:
         return False  # 未知命令提示且草稿保留
 
     def _status_text(self) -> str:
-        """/status 的最小事实: 已发布状态 + 计量口径; 05 可经 diagnostics 注入更多。"""
+        """/status: 已发布状态 + 检查事实 + 计量口径 + 注入诊断; 整体有界 (P12)。"""
         lines = [
             f"状态: {self._session.state}",
             f"模型: {self._session.config.model_label or '不可得'}",
             self.transcript.metrics_summary(),
         ]
+        lines.extend(self._checks.status_lines())
         if self._diagnostics is not None:
             lines.extend(self._diagnostics())
-        return "\n".join(lines)
+        return "\n".join(bound_status_lines(lines))
 
 
 def build(
