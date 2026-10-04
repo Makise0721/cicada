@@ -320,6 +320,7 @@ class ApplicationSession:
         self.observer_errors: list[BaseException] = []
         self._cancel_token: CancelToken | None = None
         self._active_done: asyncio.Future | None = None
+        self._clearing = False  # 持久清空进行中: 与 execute 互斥 (契约 §3)
         self._process_uncertain = False
         self._closing = False
         self._closed = False
@@ -421,6 +422,10 @@ class ApplicationSession:
                 raise RuntimeError(
                     f"storage_failed: earlier session save failed ({self._storage_failed}); "
                     "new coding requests are refused"
+                )
+            if self._clearing:
+                raise RuntimeError(
+                    "a persistent clear is in progress; new requests are refused until it settles"
                 )
             try:
                 self._request_id = await self._store.begin_request(self._epoch_id or "", prompt)
@@ -634,22 +639,29 @@ class ApplicationSession:
         """持久清空: 先可靠提交清空边界, 成功后才清内存历史; 失败内存不变.
 
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
+        清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
         if self._store is None:
             self.clear_history()
             return
         if self._closing or self._closed or self._state != "idle":
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
+        if self._clearing:
+            raise RuntimeError("a persistent clear is already in progress")
+        self._clearing = True
         try:
-            new_generation = await self._store.commit_clear(self._epoch_id or "")
-        except PersistenceError as exc:
-            self._latch_storage_failed(str(exc))
-            raise RuntimeError(
-                f"session clear failed to persist; in-memory history is unchanged: {exc}"
-            ) from exc
-        self._context_generation = new_generation
-        self._history.clear()
-        self._notify(HistoryCleared())
+            try:
+                new_generation = await self._store.commit_clear(self._epoch_id or "")
+            except PersistenceError as exc:
+                self._latch_storage_failed(str(exc))
+                raise RuntimeError(
+                    f"session clear failed to persist; in-memory history is unchanged: {exc}"
+                ) from exc
+            self._context_generation = new_generation
+            self._history.clear()
+            self._notify(HistoryCleared())
+        finally:
+            self._clearing = False
 
     # --- 关闭 ----------------------------------------------------------------------
 
@@ -791,9 +803,12 @@ async def open_application(
 ) -> ApplicationSession:
     """输入/preflight/boot/initialize 成功才返回; 部分启动失败关闭已取得资源.
 
-    持久模式次序 (契约 §1): 校验配置及 workspace -> 独占 lease -> 打开/校验存档 ->
+    持久模式次序: 校验配置及 workspace -> 独占 lease -> 打开/校验存档 ->
     恢复准入与已知配置冲突 -> preflight -> bootstrap (store 插件注册首位, 最后清理) ->
     核对实际工具指纹 -> 写入新的启动代次 -> 注入闭合历史并发布会话.
+    与契约 §1 的记载差异: 契约要求注入先于启动代次, 实现中 epoch_id 是会话构造
+    参数故 start_epoch 先行, 语义等价 (会话发布前完成全部写入); 偏差记录见
+    shared-boundary-handoff.md §4.
     """
     plan = config.plan
     policy_state: dict[str, object] = {}
@@ -846,33 +861,41 @@ async def open_application(
             raise ApplicationOpenError(f"boot failed: {exc}") from exc
 
     if store is not None and snapshot is not None and config.persistence is not None:
-        fingerprint = _tool_fingerprint(app)
-        saved_identity = snapshot.identity
-        if saved_identity is not None and saved_identity.tool_fingerprint != fingerprint:
-            await app.aclose()  # store 已由插件拥有, 经 runtime 清理
-            raise ApplicationOpenError(
-                "restored session tool declarations differ from the current launch "
-                "(tool_fingerprint)"
-            )
+        # 指纹核对/启动代次/会话构造的每条失败路径都必须释放 app (store 随 runtime 清理)
         try:
-            epoch_id = await store.start_epoch(
-                StoredIdentity(launch=config.persistence.identity, tool_fingerprint=fingerprint)
+            fingerprint = _tool_fingerprint(app)
+            saved_identity = snapshot.identity
+            if saved_identity is not None and saved_identity.tool_fingerprint != fingerprint:
+                raise ApplicationOpenError(
+                    "restored session tool declarations differ from the current launch "
+                    "(tool_fingerprint)"
+                )
+            try:
+                epoch_id = await store.start_epoch(
+                    StoredIdentity(launch=config.persistence.identity, tool_fingerprint=fingerprint)
+                )
+            except PersistenceError as exc:
+                raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
+            session = ApplicationSession(
+                app=app,
+                config=config,
+                service=policy_state.get("service"),  # type: ignore[arg-type]
+                policy=policy_state.get("policy"),  # type: ignore[arg-type]
+                store=store,
+                epoch_id=epoch_id,
+                persistence_mode="resume" if config.persistence.session_id is not None else "save",
+                restored_history=snapshot.canonical_history,
+                restored_requests=snapshot.requests,
+                restored_context_generation=snapshot.context_generation,
             )
-        except PersistenceError as exc:
+        except ApplicationOpenError:
             await app.aclose()
-            raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
-        session = ApplicationSession(
-            app=app,
-            config=config,
-            service=policy_state.get("service"),  # type: ignore[arg-type]
-            policy=policy_state.get("policy"),  # type: ignore[arg-type]
-            store=store,
-            epoch_id=epoch_id,
-            persistence_mode="resume" if config.persistence.session_id is not None else "save",
-            restored_history=snapshot.canonical_history,
-            restored_requests=snapshot.requests,
-            restored_context_generation=snapshot.context_generation,
-        )
+            raise
+        except BaseException as exc:
+            await app.aclose()
+            if isinstance(exc, Exception):
+                raise ApplicationOpenError(f"session bootstrap failed: {exc}") from exc
+            raise
     else:
         session = ApplicationSession(
             app=app,

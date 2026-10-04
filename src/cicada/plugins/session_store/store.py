@@ -216,6 +216,8 @@ class SQLiteSessionStore:
         self._closing = False
         self._closed = False
         self._drained = threading.Event()
+        # _state 只在 worker 线程持锁修改; recovery_snapshot 在调用线程持锁读取
+        self._state_lock = threading.Lock()
         self._worker.start()
 
     # --- port: 只读 ------------------------------------------------------------------
@@ -230,7 +232,8 @@ class SQLiteSessionStore:
 
     def recovery_snapshot(self) -> RecoverySnapshot:
         """按当前已提交事实重建的隔离快照 (点时视图, 嵌套数据已复制)."""
-        return self._build_snapshot()
+        with self._state_lock:
+            return self._build_snapshot()
 
     # --- port: 事务 ------------------------------------------------------------------
 
@@ -287,6 +290,7 @@ class SQLiteSessionStore:
                 raise PersistenceError(
                     "a previous request is still pending; only one active request is allowed"
                 )
+            self._check_db_size(len(begin_payload.encode("utf-8")))
             request_id = str(uuid.uuid4())
             now = time.time()
             self._immediate()
@@ -343,8 +347,8 @@ class SQLiteSessionStore:
                 raise PersistenceError(f"unknown request for commit: {request_id}")
             if record.status == "committed":
                 raise PersistenceError(
-                    f"request {request_id} was already committed; a second commit needs identical "
-                    "content, which the store does not accept from a different payload"
+                    f"request {request_id} was already committed; repeated commits are "
+                    "rejected (the store never appends twice)"
                 )
             if record.status != "pending":
                 raise PersistenceError(f"request {request_id} is {record.status}; cannot commit")
@@ -415,6 +419,7 @@ class SQLiteSessionStore:
             if epoch_id != self._state.current_epoch_id:
                 raise PersistenceError(f"unknown epoch for commit_clear: {epoch_id}")
             new_generation = self._state.context_generation + 1
+            self._check_db_size(1024)  # clear 行固定小载荷; 上界含行开销
             self._immediate()
             try:
                 self._conn.execute(
@@ -478,7 +483,8 @@ class SQLiteSessionStore:
             result: Any = None
             error: BaseException | None = None
             try:
-                result = job()
+                with self._state_lock:  # 事务与状态更新对快照读取原子
+                    result = job()
             except sqlite3.Error as exc:
                 # 事务执行中的 SQL 失败属于存储故障, 不把裸 sqlite3.Error 泄给调用方
                 error = StorageWriteError(f"session store SQL failed: {exc}")
@@ -620,7 +626,10 @@ def _read_back(connection: sqlite3.Connection) -> None:
 
 
 def _acquire_lease(lock_path: Path) -> int:
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as exc:
+        raise StorageUnavailableError(f"cannot open session lock file: {exc}") from exc
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -694,7 +703,11 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
     db_path = directory / f"{session_id}.sqlite3"
     if not db_path.is_file():
         raise SessionNotFoundError(f"no session archive for id {session_id}")
-    if db_path.stat().st_size > MAX_DB_BYTES:
+    try:
+        size = db_path.stat().st_size
+    except OSError as exc:
+        raise StorageUnavailableError(f"cannot stat session archive: {exc}") from exc
+    if size > MAX_DB_BYTES:
         raise ArchiveLimitError(
             f"session database exceeds the v1 size limit ({MAX_DB_BYTES} bytes)"
         )
@@ -716,6 +729,10 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
                 raise StorageUnavailableError(f"session archive is not readable: {exc}") from exc
             raise ArchiveFormatError(f"session archive is not readable: {exc}") from exc
         except sqlite3.DatabaseError as exc:
+            connection.close()
+            raise ArchiveFormatError(f"session archive is not readable: {exc}") from exc
+        except sqlite3.Error as exc:
+            # InterfaceError 等非 DatabaseError 的 sqlite3.Error 同样不得裸逃逸
             connection.close()
             raise ArchiveFormatError(f"session archive is not readable: {exc}") from exc
         except BaseException:
@@ -783,11 +800,16 @@ def _load_state(
         raise WorkspaceMismatchError(
             f"session belongs to workspace {stored_workspace!r}, not {canonical_workspace!r}"
         )
+    short_title = str(short_title)
+    if len(short_title) > SHORT_TITLE_MAX_CHARS:
+        raise ArchiveFormatError(
+            f"session short title exceeds the v1 limit ({SHORT_TITLE_MAX_CHARS} chars)"
+        )
     state = _LoadedState(
         session_id=session_id,
         canonical_workspace=str(stored_workspace),
         created_at=float(created_at),
-        short_title=str(short_title),
+        short_title=short_title,
     )
 
     epoch_ids: set[str] = set()
@@ -861,7 +883,12 @@ def _load_state(
                     outcome = decode_outcome_facts(payload["outcome"])
                 except (CodecError, KeyError, TypeError) as exc:
                     raise ArchiveFormatError(f"request record {seq} is corrupt: {exc}") from exc
-                validate_history_structure(messages)
+                try:
+                    validate_history_structure(messages)
+                except ValueError as exc:
+                    raise ArchiveFormatError(
+                        f"request record {seq} has an invalid message structure: {exc}"
+                    ) from exc
                 if not messages or not isinstance(messages[0], UserMessage):
                     raise ArchiveFormatError(f"request record {seq} must start with the user prompt")
                 if str(request_id) in committed:
@@ -880,6 +907,12 @@ def _load_state(
     state.context_generation = generation
     state.committed_count = len(committed)
     state.message_count = total_messages
+    intent_ids = {request_id for request_id, _epoch_id, _begin_seq, _status in intents}
+    for request_id, entry in committed.items():
+        if request_id not in intent_ids:
+            raise ArchiveFormatError(
+                f"request record {entry[0]} has no matching request intent (orphan record)"
+            )
     for request_id, epoch_id, begin_seq, status in intents:
         prompt = prompt_by_begin_seq.get(begin_seq)
         if prompt is None:

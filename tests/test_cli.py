@@ -442,3 +442,57 @@ def test_resume_after_workspace_move_rejected(tmp_path):
     assert proc.returncode == 2
     assert "session store open failed" in proc.stderr
     assert "workspace" in proc.stderr
+
+
+class _CaptureStream:
+    """main() 会调用 reconfigure; 捕获文本供断言."""
+
+    def __init__(self) -> None:
+        self.value = ""
+
+    def write(self, text: str) -> int:
+        self.value += text
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def reconfigure(self, **kwargs) -> None:  # main() 入口的编码设置
+        return None
+
+
+def _run_main_with_storage_failure(tmp_path, monkeypatch, method: str):
+    """经 in-process main() 钉住「执行期间保存失败退出码 1」的 CLI 接线 (契约 §6)."""
+    import cicada.__main__ as m
+    from cicada.persistence.contracts import PersistenceError
+    from cicada.plugins.session_store.store import SQLiteSessionStore
+
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+
+    async def failing(self, *args, **kwargs):
+        raise PersistenceError("disk gone")
+
+    monkeypatch.setattr(SQLiteSessionStore, method, failing)
+    out, err = _CaptureStream(), _CaptureStream()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["cicada", "--workspace", str(tmp_path), "--script", str(script),
+         "--save-session", "任务"],
+    )
+    code = m.main()
+    return code, err.value
+
+
+def test_begin_save_failure_exits_one(tmp_path, monkeypatch):
+    code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, "begin_request")
+    assert code == 1, err
+    assert "session save failed before the request started" in err
+
+
+def test_commit_save_failure_exits_one(tmp_path, monkeypatch):
+    code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, "commit_request")
+    assert code == 1, err
+    assert "[session save failed:" in err

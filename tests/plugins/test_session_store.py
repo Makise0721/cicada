@@ -1,7 +1,7 @@
 """SQLite 会话存储聚焦测试: lease、事务、限额、损坏拒绝与关闭纪律.
 
-证明 A06 (单写入者/真实 Windows 文件锁)、A07 (打开前拒绝并保留原文件)、
-A02 的存储层 roundtrip、A04 基础路径的事务明确结果与取消不回滚.
+证明 A06 (单写入者/真实 Windows 文件锁, 含独立进程)、A07 (打开前拒绝并保留
+原文件)、A02 的存储层 roundtrip、A04 基础路径的事务明确结果与取消不回滚.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -106,13 +107,85 @@ async def test_new_session_creates_files_and_close_keeps_lock_file(tmp_path):
     await store.aclose()  # 幂等
 
 
-async def test_second_process_cannot_lock_the_same_session(tmp_path):
+async def test_second_open_in_same_process_is_refused_by_lock(tmp_path):
+    """同进程第二句柄同样被 Windows 区域锁拒绝 (锁按句柄拥有, 系统级生效)."""
     first = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     with pytest.raises(LeaseHeldError):
         open_session_store(directory=tmp_path, session_id=first.session_id, workspace=tmp_path)
     await first.aclose()
     second = open_session_store(directory=tmp_path, session_id=first.session_id, workspace=tmp_path)
     await second.aclose()
+
+
+def test_independent_process_holds_lease_until_exit(tmp_path):
+    """A06 的独立进程证明: 子进程持锁期间父进程取锁失败, 子进程退出后可重新取锁."""
+    import subprocess
+    import sys
+
+    src = Path(__file__).resolve().parents[2] / "src"
+    work = tmp_path / "ws"
+    work.mkdir()
+    seed = open_session_store(directory=tmp_path, session_id=None, workspace=work)
+    session_id = seed.session_id
+    asyncio.run(seed.aclose())
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "\n".join([
+            "import sys, time",
+            f"sys.path.insert(0, {str(src)!r})",
+            "from cicada.plugins.session_store import open_session_store",
+            f"store = open_session_store(directory={str(tmp_path)!r}, "
+            f"session_id={session_id!r}, workspace={str(work)!r})",
+            "print('READY', flush=True)",
+            "time.sleep(20)",
+        ])],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        line = child.stdout.readline()
+        assert line.strip() == "READY", f"child failed to open the store: {child.stderr.read()}"
+        with pytest.raises(LeaseHeldError):
+            open_session_store(directory=tmp_path, session_id=session_id, workspace=work)
+    finally:
+        child.terminate()
+        child.wait(timeout=20)
+    assert child.poll() is not None, "子进程必须已退出"
+    # 内核/杀软对句柄与区域锁的最终释放可能有亚秒级延迟: 有界重试
+    reopened: object = None
+    for _ in range(40):
+        try:
+            reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=work)
+            break
+        except LeaseHeldError:
+            time.sleep(0.05)
+    assert reopened is not None, "子进程退出后必须能重新取锁"
+    asyncio.run(reopened.aclose())
+
+
+async def test_store_plugin_activates_first_in_persistent_topology(tmp_path):
+    """钉住持久拓扑: store 插件在名单首位、零依赖 -> 最先激活 -> runtime 逆序清理时最后释放.
+
+    这是「store 最后清理」的注册顺序机制回归; 02 换显式 capability requires 时本测试
+    仍应通过 (首位激活变为依赖推导), 语义不变.
+    """
+    from cicada.boot import bootstrap
+    from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+    from cicada.plugins.coding.workspace import workspace_plugin
+    from cicada.plugins.session_store import session_store_plugin
+
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    definitions = [
+        session_store_plugin(store),
+        workspace_plugin(tmp_path),
+        fake_model_plugin(FakeModel([])),
+    ]
+    app = await bootstrap(definitions, tool_capabilities=(), system_prompt="t", max_turns=6)
+    assert app.report.activated[0] == "session-store", app.report.activated
+    await app.runtime.stop()  # 逆序清理: store 最后被插件 scope 释放
+    assert store._closed, "逆序清理后 store 必须已被插件 scope 释放"
 
 
 async def test_released_lease_allows_reacquire_after_process_style_close(tmp_path):

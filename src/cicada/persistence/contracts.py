@@ -292,7 +292,7 @@ class SessionStorePort(Protocol):
 
     async def commit_request(self, request_id: str, *, messages: tuple[Message, ...],
                              outcome: RequestOutcomeFacts) -> int:
-        """完整请求单事务提交; 成功返回 records 序号. 幂等同内容, 冲突拒绝."""
+        """完整请求单事务提交; 成功返回 records 序号. 重复提交 (含同内容) 一律拒绝."""
         ...
 
     async def commit_clear(self, epoch_id: str) -> int:
