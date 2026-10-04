@@ -223,6 +223,55 @@ class InterruptedRequest:
     status: Literal["pending", "interrupted"]
 
 
+# --- 进程活动 (02; 契约 §4) ----------------------------------------------------------------
+
+
+TERMINAL_KIND = Literal["proven_terminal", "not_started", "unproven_terminal"]
+
+
+@dataclass(frozen=True)
+class ProcessTerminalFacts:
+    """命令终结的结构化事实; 包装器按既有 P4 分类写入, 存档只存事实不重判."""
+
+    kind: TERMINAL_KIND
+    exit_code: int | None = None
+    output_complete: bool | None = None
+    timed_out: bool = False
+    cancelled: bool = False
+    receipt_id: str | None = None      # check(action=run) 保留身份; 03 用真实账本核对
+    reason: str | None = None          # not_started/unproven 的来源说明
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("proven_terminal", "not_started", "unproven_terminal"):
+            raise ValueError("ProcessTerminalFacts.kind must be a known terminal kind")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ValueError("ProcessTerminalFacts.exit_code must be an int or None")
+        if self.output_complete is not None and not isinstance(self.output_complete, bool):
+            raise ValueError("ProcessTerminalFacts.output_complete must be a bool or None")
+        if not isinstance(self.timed_out, bool) or not isinstance(self.cancelled, bool):
+            raise ValueError("ProcessTerminalFacts.timed_out/cancelled must be bools")
+        if self.receipt_id is not None and (not isinstance(self.receipt_id, str) or not self.receipt_id):
+            raise ValueError("ProcessTerminalFacts.receipt_id must be a nonempty str or None")
+        if self.reason is not None and not isinstance(self.reason, str):
+            raise ValueError("ProcessTerminalFacts.reason must be a str or None")
+
+
+@dataclass(frozen=True)
+class ProcessActivityFacts:
+    """恢复快照中的一条进程活动; terminal=None 表示已登记但没有可靠终结记录."""
+
+    activity_id: str
+    request_id: str
+    tool_name: str
+    call_id: str
+    arguments_digest: str
+    description: str
+    started_at: float
+    terminal: ProcessTerminalFacts | None
+
+
 @dataclass(frozen=True)
 class RecoverySnapshot:
     """打开存档后的隔离恢复快照; 不含 live 插件对象, 嵌套 details 已复制."""
@@ -237,6 +286,22 @@ class RecoverySnapshot:
     requests: tuple[RestoredRequest, ...]          # 已提交完整请求 (全部代次)
     interrupted: tuple[InterruptedRequest, ...]
     canonical_history: tuple[Message, ...]          # 当前代次的闭合历史 (已过结构校验)
+    process_activities: tuple[ProcessActivityFacts, ...] = ()   # 全部代次的进程活动
+
+    @property
+    def has_unproven_process_activity(self) -> bool:
+        """存在已登记但终结未证 (或完全缺失终结记录) 的活动 -> 恢复为查看状态 (契约 D3)."""
+        return any(
+            activity.terminal is None or activity.terminal.kind == "unproven_terminal"
+            for activity in self.process_activities
+        )
+
+    def unproven_process_activities(self) -> tuple[ProcessActivityFacts, ...]:
+        """列出阻断续写的活动, 供拒绝理由点名; 顺序与存档加载顺序一致."""
+        return tuple(
+            activity for activity in self.process_activities
+            if activity.terminal is None or activity.terminal.kind == "unproven_terminal"
+        )
 
 
 @dataclass(frozen=True)
@@ -293,6 +358,19 @@ class SessionStorePort(Protocol):
     async def commit_request(self, request_id: str, *, messages: tuple[Message, ...],
                              outcome: RequestOutcomeFacts) -> int:
         """完整请求单事务提交; 成功返回 records 序号. 重复提交 (含同内容) 一律拒绝."""
+        ...
+
+    async def begin_process(self, request_id: str, *, tool_name: str, call_id: str,
+                            arguments: Mapping[str, object]) -> str:
+        """命令真正执行前可靠登记活动开始, 返回 activity_id.
+
+        失败时调用方零命令执行并锁存 storage_failed; request_id 必须是当前
+        pending intent. 02 起属于 port; 01 存档 (v1 schema) 已含 process_activity 表.
+        """
+        ...
+
+    async def end_process(self, activity_id: str, terminal: ProcessTerminalFacts) -> None:
+        """登记结构化终结事实; 开始/终结关联错误拒绝; 写入失败保留真实工具结果."""
         ...
 
     async def commit_clear(self, epoch_id: str) -> int:

@@ -26,6 +26,7 @@ from cicada.persistence.contracts import (
     MAX_JSON_DEPTH,
     LaunchIdentity,
     PersistenceError,
+    ProcessTerminalFacts,
     RequestOutcomeFacts,
     StoredIdentity,
 )
@@ -145,7 +146,7 @@ def _take_stop_reason(obj: dict[str, Any], key: str, where: str) -> StopReason:
 def dumps_strict(payload: object) -> str:
     try:
         return json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise CodecError(f"value is not strictly JSON-serializable: {exc}") from exc
 
 
@@ -342,6 +343,77 @@ def decode_outcome_facts(raw: str) -> RequestOutcomeFacts:
         finalized=_take_bool(parsed, "finalized", where),
         finalization_notes=tuple(notes),
         model_calls=decode_model_calls(dumps_strict(parsed["model_calls"])),
+    )
+
+
+# --- 进程活动事实 (02) ------------------------------------------------------------------
+
+
+_TERMINAL_KINDS = frozenset(("proven_terminal", "not_started", "unproven_terminal"))
+
+_TERMINAL_KEYS = frozenset({
+    "kind", "exit_code", "output_complete", "timed_out", "cancelled", "receipt_id", "reason",
+})
+
+_ACTIVITY_BEGIN_KEYS = frozenset({"description", "arguments_digest", "started_at"})
+
+
+def encode_terminal_facts(facts: ProcessTerminalFacts) -> dict[str, Any]:
+    """终结事实 -> 严格 JSON dict (store 落 end_json 前再经字节限额核对)."""
+    payload: dict[str, Any] = {
+        "kind": facts.kind,
+        "exit_code": facts.exit_code,
+        "output_complete": facts.output_complete,
+        "timed_out": facts.timed_out,
+        "cancelled": facts.cancelled,
+        "receipt_id": facts.receipt_id,
+        "reason": facts.reason,
+    }
+    dumps_strict(payload)
+    return payload
+
+
+def decode_terminal_facts(payload: Any) -> ProcessTerminalFacts:
+    """严格 JSON dict -> 终结事实; 未知键/类型不符按存档损坏拒绝."""
+    where = "process terminal facts"
+    _exact_keys(payload, _TERMINAL_KEYS, where)
+    kind = payload["kind"]
+    if kind not in _TERMINAL_KINDS:
+        raise CodecError(f"{where}.kind must be one of {sorted(_TERMINAL_KINDS)}")
+    try:
+        return ProcessTerminalFacts(
+            kind=kind,
+            exit_code=_take_opt_int(payload, "exit_code", where),
+            output_complete=_take_opt_bool(payload, "output_complete", where),
+            timed_out=_take_bool(payload, "timed_out", where),
+            cancelled=_take_bool(payload, "cancelled", where),
+            receipt_id=_take_opt_str(payload, "receipt_id", where),
+            reason=_take_opt_str(payload, "reason", where),
+        )
+    except ValueError as exc:
+        raise CodecError(f"{where} is inconsistent: {exc}") from exc
+
+
+def encode_activity_begin(description: str, arguments_digest: str, started_at: float) -> str:
+    """活动开始记录 -> 严格 JSON (store 落 begin_json)."""
+    return dumps_strict({
+        "description": description,
+        "arguments_digest": arguments_digest,
+        "started_at": started_at,
+    })
+
+
+def decode_activity_begin(payload: Any) -> tuple[str, str, float]:
+    """严格 JSON dict -> (description, arguments_digest, started_at)."""
+    where = "process activity begin"
+    _exact_keys(payload, _ACTIVITY_BEGIN_KEYS, where)
+    digest = _take_str(payload, "arguments_digest", where)
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise CodecError(f"{where}.arguments_digest must be a sha256 hex digest")
+    return (
+        _take_str(payload, "description", where),
+        digest,
+        _take_float(payload, "started_at", where),
     )
 
 

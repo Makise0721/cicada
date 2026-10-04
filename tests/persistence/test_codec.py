@@ -183,3 +183,50 @@ def test_outcome_facts_roundtrip():
                                         elapsed_s=0.5),),
     )
     assert decode_outcome_facts(encode_outcome_facts(facts)) == facts
+
+
+# --- 02: 进程活动终结事实与开始记录 -----------------------------------------------------
+
+
+def test_terminal_facts_roundtrip_all_kinds():
+    from cicada.persistence.codec import decode_terminal_facts, encode_terminal_facts
+    from cicada.persistence.contracts import ProcessTerminalFacts
+
+    for facts in (
+        ProcessTerminalFacts(kind="proven_terminal", exit_code=0, output_complete=True),
+        ProcessTerminalFacts(kind="proven_terminal", exit_code=3, output_complete=True,
+                             receipt_id="receipt-1"),
+        ProcessTerminalFacts(kind="not_started", reason="pwsh executable not found on PATH"),
+        ProcessTerminalFacts(kind="unproven_terminal", timed_out=True,
+                             exit_code=None, output_complete=False, reason="timed out before EOF"),
+        ProcessTerminalFacts(kind="unproven_terminal", cancelled=True),
+    ):
+        encoded = encode_terminal_facts(facts)
+        assert decode_terminal_facts(json.loads(json.dumps(encoded))) == facts
+
+
+def test_terminal_facts_decode_rejects_unknown_keys_and_kinds():
+    from cicada.persistence.codec import decode_terminal_facts
+
+    with pytest.raises(CodecError, match="unexpected keys"):
+        decode_terminal_facts({"kind": "proven_terminal", "extra": 1})
+    with pytest.raises(CodecError, match="kind"):
+        decode_terminal_facts({"kind": "nonsense"})
+
+
+def test_activity_begin_roundtrip_and_digest_validation():
+    from cicada.persistence.codec import decode_activity_begin, encode_activity_begin
+
+    encoded = json.loads(encode_activity_begin('{"command": "x"}', "a" * 64, 12.5))
+    assert decode_activity_begin(encoded) == ('{"command": "x"}', "a" * 64, 12.5)
+    with pytest.raises(CodecError, match="sha256"):
+        decode_activity_begin({"description": "d", "arguments_digest": "zz", "started_at": 1.0})
+    with pytest.raises(CodecError, match="unexpected keys"):
+        decode_activity_begin({"description": "d", "arguments_digest": "a" * 64, "extra": 1})
+
+
+def test_dumps_strict_rejects_unserializable_objects():
+    from cicada.persistence.codec import dumps_strict
+
+    with pytest.raises(CodecError, match="serializable"):
+        dumps_strict({"command": object()})

@@ -28,6 +28,7 @@ from cicada.persistence.contracts import (
     LaunchIdentity,
     LeaseHeldError,
     PersistenceError,
+    ProcessTerminalFacts,
     RequestOutcomeFacts,
     SessionNotFoundError,
     StorageUnavailableError,
@@ -508,3 +509,183 @@ async def test_dispatch_after_close_rejected(tmp_path):
     await store.aclose()
     with pytest.raises(StorageUnavailableError):
         await store.begin_request(epoch, "迟到请求")
+
+
+# --- 02: 进程活动 begin/end 与恢复证据 -------------------------------------------------------
+
+
+_PROVEN = ProcessTerminalFacts(kind="proven_terminal", exit_code=0, output_complete=True)
+_UNPROVEN = ProcessTerminalFacts(kind="unproven_terminal", timed_out=True, reason="timed out")
+
+
+async def test_process_activity_begin_end_roundtrip_and_snapshot_evidence(tmp_path):
+    """begin 在快照里是未证终结, end 后变已证; 重开存档事实保持, 关系完整."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "带命令的请求")
+    activity_id = await store.begin_process(
+        request_id, tool_name="powershell", call_id="c1",
+        arguments={"command": "exit 0", "timeout": 5},
+    )
+    open_snapshot = store.recovery_snapshot()
+    assert len(open_snapshot.process_activities) == 1
+    activity = open_snapshot.process_activities[0]
+    assert activity.activity_id == activity_id
+    assert activity.request_id == request_id
+    assert activity.tool_name == "powershell" and activity.call_id == "c1"
+    assert activity.terminal is None
+    assert activity.description.startswith('{"command"')
+    assert open_snapshot.has_unproven_process_activity
+    assert open_snapshot.unproven_process_activities() == (activity,)
+
+    await store.end_process(activity_id, _PROVEN)
+    closed_snapshot = store.recovery_snapshot()
+    assert closed_snapshot.process_activities[0].terminal == _PROVEN
+    assert not closed_snapshot.has_unproven_process_activity
+
+    await store.commit_request(
+        request_id, messages=_suffix(("带命令的请求", "答")), outcome=_outcome()
+    )
+    session_id = store.session_id
+    await store.aclose()
+
+    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    restored = reopened.recovery_snapshot()
+    assert len(restored.process_activities) == 1
+    assert restored.process_activities[0].terminal == _PROVEN
+    assert restored.process_activities[0].arguments_digest == activity.arguments_digest
+    assert not restored.has_unproven_process_activity
+    await reopened.aclose()
+
+
+async def test_begin_process_relation_and_input_validation(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "请求")
+    with pytest.raises(PersistenceError, match="unknown request"):
+        await store.begin_process(
+            "00000000-0000-4000-8000-000000000000", tool_name="powershell",
+            call_id="c0", arguments={"command": "x"},
+        )
+    with pytest.raises(PersistenceError, match="nonempty str"):
+        await store.begin_process(request_id, tool_name="", call_id="c1", arguments={})
+    with pytest.raises(PersistenceError, match="nonempty str"):
+        await store.begin_process(request_id, tool_name="powershell", call_id="", arguments={})
+    with pytest.raises(PersistenceError, match="JSON object"):
+        await store.begin_process(request_id, tool_name="powershell", call_id="c1", arguments=["x"])
+    with pytest.raises(PersistenceError, match="serializable"):
+        await store.begin_process(
+            request_id, tool_name="powershell", call_id="c1", arguments={"command": object()}
+        )
+    # 已提交请求不能再登记活动
+    await store.commit_request(request_id, messages=_suffix(("请求", "答")), outcome=_outcome())
+    with pytest.raises(PersistenceError, match="pending request"):
+        await store.begin_process(request_id, tool_name="powershell", call_id="c2", arguments={})
+    await store.aclose()
+
+
+async def test_end_process_rejects_unknown_and_double_terminal(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "请求")
+    activity_id = await store.begin_process(
+        request_id, tool_name="powershell", call_id="c1", arguments={"command": "x"}
+    )
+    with pytest.raises(PersistenceError, match="unknown process activity"):
+        await store.end_process("not-an-activity-id", _PROVEN)
+    await store.end_process(activity_id, _PROVEN)
+    with pytest.raises(PersistenceError, match="already has a terminal record"):
+        await store.end_process(activity_id, _UNPROVEN)
+    await store.aclose()
+
+
+async def test_commit_request_refuses_open_process_activity(tmp_path):
+    """完整提交等待本请求全部活动写入: 未闭合活动在 store 侧也被拒绝."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "有未闭合活动的请求")
+    activity_id = await store.begin_process(
+        request_id, tool_name="powershell", call_id="c1", arguments={"command": "x"}
+    )
+    with pytest.raises(PersistenceError, match="process activity"):
+        await store.commit_request(
+            request_id, messages=_suffix(("有未闭合活动的请求", "答")), outcome=_outcome()
+        )
+    await store.end_process(activity_id, _PROVEN)
+    seq = await store.commit_request(
+        request_id, messages=_suffix(("有未闭合活动的请求", "答")), outcome=_outcome()
+    )
+    assert seq == 2
+    await store.aclose()
+
+
+def test_orphan_process_activity_rejected_and_file_unchanged(tmp_path):
+    """活动引用未知请求属关系损坏: 加载拒绝, 原文件字节不变."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    asyncio.run(_populate(store))
+    asyncio.run(store.aclose())
+    db_path = tmp_path / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db_path))
+    connection.execute(
+        "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+        " arguments_digest, begin_json, end_json) VALUES ('a-ghost', 'ghost-request',"
+        " 'powershell', 'c9', ?, ?, NULL)",
+        ("a" * 64, json.dumps({"description": "d", "arguments_digest": "a" * 64, "started_at": 1.0})),
+    )
+    connection.commit()
+    connection.close()
+    before = db_path.read_bytes()
+    with pytest.raises(ArchiveFormatError, match="unknown request"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    assert db_path.read_bytes() == before
+
+
+def test_corrupt_process_activity_records_rejected_on_load(tmp_path):
+    """begin/end JSON 损坏与 digest 列不一致都按存档损坏拒绝."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    epoch = asyncio.run(store.start_epoch(_identity()))
+
+    async def stage():
+        request_id = await store.begin_request(epoch, "损坏面")
+        return await store.begin_process(
+            request_id, tool_name="powershell", call_id="c1", arguments={"command": "x"}
+        )
+
+    asyncio.run(stage())
+    asyncio.run(store.aclose())
+    db_path = tmp_path / f"{session_id}.sqlite3"
+
+    connection = sqlite3.connect(str(db_path))
+    original_begin, original_digest = connection.execute(
+        "SELECT begin_json, arguments_digest FROM process_activity"
+    ).fetchone()
+    connection.close()
+
+    for column, payload, match in (
+        ("begin_json", "not-json", "begin is corrupt"),
+        ("end_json", '{"kind": "nonsense"}', "terminal record is corrupt"),
+    ):
+        connection = sqlite3.connect(str(db_path))
+        connection.execute(f"UPDATE process_activity SET {column} = ?", (payload,))
+        connection.commit()
+        connection.close()
+        with pytest.raises(ArchiveFormatError, match=match):
+            open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+        connection = sqlite3.connect(str(db_path))
+        if column == "begin_json":
+            connection.execute(
+                "UPDATE process_activity SET begin_json = ?", (original_begin,))
+        else:
+            connection.execute("UPDATE process_activity SET end_json = NULL")
+        connection.commit()
+        connection.close()
+
+    # digest 列与 begin_json 不一致同样拒绝
+    connection = sqlite3.connect(str(db_path))
+    connection.execute("UPDATE process_activity SET arguments_digest = ?", ("b" * 64,))
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="digest does not match"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)

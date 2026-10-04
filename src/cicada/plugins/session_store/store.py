@@ -29,12 +29,16 @@ from typing import Any, Callable, Literal, TypeVar
 from cicada.core.messages import Message, UserMessage, isolate_message, validate_history_structure
 from cicada.persistence.codec import (
     CodecError,
+    decode_activity_begin,
     decode_identity,
     decode_messages,
     decode_outcome_facts,
+    decode_terminal_facts,
+    encode_activity_begin,
     encode_identity,
     encode_messages,
     encode_outcome_facts,
+    encode_terminal_facts,
     dumps_strict,
     strict_load,
 )
@@ -52,6 +56,8 @@ from cicada.persistence.contracts import (
     InterruptedRequest,
     LeaseHeldError,
     PersistenceError,
+    ProcessActivityFacts,
+    ProcessTerminalFacts,
     RecoverySnapshot,
     RequestOutcomeFacts,
     RestoredRequest,
@@ -175,6 +181,18 @@ class _CommittedRequest:
 
 
 @dataclass
+class _ActivityRecord:
+    activity_id: str
+    request_id: str
+    tool_name: str
+    call_id: str
+    arguments_digest: str
+    description: str
+    started_at: float
+    terminal: ProcessTerminalFacts | None
+
+
+@dataclass
 class _LoadedState:
     session_id: str
     canonical_workspace: str
@@ -189,6 +207,7 @@ class _LoadedState:
     current_epoch_id: str | None = None
     requests: list[_CommittedRequest] = field(default_factory=list)
     intents: dict[str, _IntentRecord] = field(default_factory=dict)
+    activities: dict[str, _ActivityRecord] = field(default_factory=dict)
 
 
 # --- store 实现 -------------------------------------------------------------------------
@@ -352,6 +371,16 @@ class SQLiteSessionStore:
                 )
             if record.status != "pending":
                 raise PersistenceError(f"request {request_id} is {record.status}; cannot commit")
+            open_activities = [
+                activity_id
+                for activity_id, activity in self._state.activities.items()
+                if activity.request_id == request_id and activity.terminal is None
+            ]
+            if open_activities:
+                raise PersistenceError(
+                    f"request {request_id} still has {len(open_activities)} process activity "
+                    "without a terminal record; the full commit waits for every activity write"
+                )
             if self._state.committed_count + 1 > MAX_COMMITTED_REQUESTS:
                 raise ArchiveLimitError(
                     f"session exceeds the v1 request limit ({MAX_COMMITTED_REQUESTS})"
@@ -435,6 +464,107 @@ class SQLiteSessionStore:
             self._state.next_seq += 1
             self._state.context_generation = new_generation
             return new_generation
+
+        return await self._dispatch(job)
+
+    async def begin_process(
+        self, request_id: str, *, tool_name: str, call_id: str, arguments: Any
+    ) -> str:
+        """命令真正执行前可靠登记活动开始; 失败由调用方零执行并锁存存储故障."""
+        if not isinstance(tool_name, str) or not tool_name:
+            raise PersistenceError("process activity tool_name must be a nonempty str")
+        if not isinstance(call_id, str) or not call_id:
+            raise PersistenceError("process activity call_id must be a nonempty str")
+        if not isinstance(arguments, dict):
+            raise PersistenceError("process activity arguments must be a JSON object")
+        try:
+            canonical = dumps_strict(arguments)
+        except CodecError as exc:
+            raise PersistenceError(f"process activity arguments are not strictly serializable: {exc}") from exc
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        description = _bounded_description(canonical)
+
+        def job() -> str:
+            record = self._state.intents.get(request_id)
+            if record is None:
+                raise PersistenceError(f"unknown request for process activity: {request_id}")
+            if record.status != "pending":
+                raise PersistenceError(
+                    f"request {request_id} is {record.status}; activities require a pending request"
+                )
+            started_at = time.time()
+            begin_json = self._encode_checked(
+                encode_activity_begin(description, digest, started_at),
+                MAX_METADATA_BYTES,
+                "process activity begin",
+            )
+            self._check_db_size(len(begin_json.encode("utf-8")))
+            activity_id = str(uuid.uuid4())
+            self._immediate()
+            try:
+                self._conn.execute(
+                    "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+                    " arguments_digest, begin_json, end_json) VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                    (activity_id, request_id, tool_name, call_id, digest, begin_json),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._state.activities[activity_id] = _ActivityRecord(
+                activity_id=activity_id,
+                request_id=request_id,
+                tool_name=tool_name,
+                call_id=call_id,
+                arguments_digest=digest,
+                description=description,
+                started_at=started_at,
+                terminal=None,
+            )
+            return activity_id
+
+        return await self._dispatch(job)
+
+    async def end_process(self, activity_id: str, terminal: ProcessTerminalFacts) -> None:
+        """登记结构化终结事实; 重复终结或未知活动按关系错误拒绝."""
+        if not isinstance(terminal, ProcessTerminalFacts):
+            raise PersistenceError("end_process requires ProcessTerminalFacts")
+        end_json = self._encode_checked(
+            encode_terminal_facts(terminal), MAX_METADATA_BYTES, "process terminal evidence"
+        )
+
+        def job() -> None:
+            record = self._state.activities.get(activity_id)
+            if record is None:
+                raise PersistenceError(f"unknown process activity: {activity_id}")
+            if record.terminal is not None:
+                raise PersistenceError(
+                    f"process activity {activity_id} already has a terminal record"
+                )
+            self._immediate()
+            try:
+                cursor = self._conn.execute(
+                    "UPDATE process_activity SET end_json = ? WHERE activity_id = ? AND end_json IS NULL",
+                    (end_json, activity_id),
+                )
+                if cursor.rowcount != 1:
+                    raise PersistenceError(
+                        f"process activity {activity_id} changed state concurrently"
+                    )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._state.activities[activity_id] = _ActivityRecord(
+                activity_id=record.activity_id,
+                request_id=record.request_id,
+                tool_name=record.tool_name,
+                call_id=record.call_id,
+                arguments_digest=record.arguments_digest,
+                description=record.description,
+                started_at=record.started_at,
+                terminal=terminal,
+            )
 
         return await self._dispatch(job)
 
@@ -572,6 +702,19 @@ class SQLiteSessionStore:
                 isolate_message(message)
                 for item in self._state.requests if item.context_generation == current
                 for message in item.messages
+            ),
+            process_activities=tuple(
+                ProcessActivityFacts(
+                    activity_id=record.activity_id,
+                    request_id=record.request_id,
+                    tool_name=record.tool_name,
+                    call_id=record.call_id,
+                    arguments_digest=record.arguments_digest,
+                    description=record.description,
+                    started_at=record.started_at,
+                    terminal=record.terminal,
+                )
+                for record in self._state.activities.values()
             ),
         )
 
@@ -947,6 +1090,51 @@ def _load_state(
             state.intents[request_id] = _IntentRecord(
                 epoch_id=epoch_id, prompt=prompt, status=status  # type: ignore[arg-type]
             )
+
+    for activity_id, request_id, tool_name, call_id, digest, begin_json, end_json in connection.execute(
+        "SELECT activity_id, request_id, tool_name, call_id, arguments_digest, begin_json, end_json"
+        " FROM process_activity ORDER BY rowid"
+    ):
+        if str(request_id) not in state.intents:
+            raise ArchiveFormatError(
+                f"process activity {activity_id} references unknown request {request_id}"
+            )
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ArchiveFormatError(f"process activity {activity_id} has an invalid tool name")
+        if not isinstance(call_id, str) or not call_id:
+            raise ArchiveFormatError(f"process activity {activity_id} has an invalid call id")
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ArchiveFormatError(f"process activity {activity_id} has an invalid arguments digest")
+        _check_text_size(str(begin_json), MAX_METADATA_BYTES, "process activity begin")
+        try:
+            description, begin_digest, started_at = decode_activity_begin(
+                _load_payload(str(begin_json))
+            )
+        except CodecError as exc:
+            raise ArchiveFormatError(f"process activity {activity_id} begin is corrupt: {exc}") from exc
+        if begin_digest != digest:
+            raise ArchiveFormatError(
+                f"process activity {activity_id} begin digest does not match its column"
+            )
+        terminal: ProcessTerminalFacts | None = None
+        if end_json is not None:
+            _check_text_size(str(end_json), MAX_METADATA_BYTES, "process terminal evidence")
+            try:
+                terminal = decode_terminal_facts(_load_payload(str(end_json)))
+            except CodecError as exc:
+                raise ArchiveFormatError(
+                    f"process activity {activity_id} terminal record is corrupt: {exc}"
+                ) from exc
+        state.activities[str(activity_id)] = _ActivityRecord(
+            activity_id=str(activity_id),
+            request_id=str(request_id),
+            tool_name=str(tool_name),
+            call_id=str(call_id),
+            arguments_digest=digest,
+            description=description,
+            started_at=started_at,
+            terminal=terminal,
+        )
     state.requests.sort(key=lambda item: item.seq)
     return state
 
@@ -961,3 +1149,14 @@ def _load_payload(raw: str) -> dict[str, Any]:
 def _check_text_size(text: str, limit: int, what: str) -> None:
     if len(text.encode("utf-8")) > limit:
         raise ArchiveLimitError(f"{what} exceeds the v1 limit ({limit} bytes)")
+
+
+_DESCRIPTION_MAX_BYTES = 512
+
+
+def _bounded_description(canonical_arguments: str) -> str:
+    """参数派生的有界描述: 规范 JSON 前缀, UTF-8 边界安全; 完整参数以 digest 定位."""
+    data = canonical_arguments.encode("utf-8")
+    if len(data) <= _DESCRIPTION_MAX_BYTES:
+        return canonical_arguments
+    return data[:_DESCRIPTION_MAX_BYTES].decode("utf-8", "ignore") + "…"
