@@ -117,7 +117,20 @@ class SystemEntry:
         self.text = text
 
     def render(self, width: int) -> list[str]:
-        return _wrap_lines(sanitize_display(self.text), width)
+        prefix = " " if width > 4 else ""
+        return ["", *_wrap_with_prefix(prefix, sanitize_display(self.text), width)]
+
+
+class InformationEntry(SystemEntry):
+    """命令信息块: 事实正文与标题/分组装饰分开保存。"""
+
+    def __init__(self, title: str, sections: list[tuple[str, list[str]]]) -> None:
+        super().__init__("\n".join(row for _, rows in sections for row in rows))
+        self.title = title
+        self.sections = [(heading, list(rows)) for heading, rows in sections]
+
+    def render(self, width: int) -> list[str]:
+        return theme.information_lines(self.title, self.sections, width)
 
 
 class ErrorEntry:
@@ -168,6 +181,9 @@ class Transcript:
         entry = SystemEntry(text)
         self._entries.append(entry)
         return entry
+
+    def append_information(self, title: str, sections: list[tuple[str, list[str]]]) -> None:
+        self._entries.append(InformationEntry(title, sections))
 
     def append_error(self, text: str) -> ErrorEntry:
         entry = ErrorEntry(text)
@@ -276,6 +292,7 @@ __all__ = [
     "AssistantEntry",
     "CancelledEntry",
     "ErrorEntry",
+    "InformationEntry",
     "SystemEntry",
     "Transcript",
     "TranscriptEntry",

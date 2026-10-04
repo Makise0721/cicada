@@ -54,13 +54,6 @@ from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
 
-HELP_TEXT = "\n".join(
-    (
-        "可用命令:",
-        *(f"{item.command} {item.description}" for item in SLASH_COMMANDS),
-        "//内容 发送以斜杠开头的普通文本（转义）",
-    )
-)
 
 class ConversationView:
     """ApplicationSession 与显示文档/输入回调之间的唯一组合层。"""
@@ -226,10 +219,16 @@ class ConversationView:
             return False
         command = text.strip()
         if command == "/help":
-            self.transcript.append_system(HELP_TEXT)
+            command_width = max(len(item.command) for item in SLASH_COMMANDS)
+            self.transcript.append_information("命令帮助", [
+                ("可用命令", [
+                    f"{item.command:<{command_width}}  {item.description}" for item in SLASH_COMMANDS
+                ]),
+                ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
+            ])
             return True
         if command == "/status":
-            self.transcript.append_system(self._status_text())
+            self.transcript.append_information("会话信息", self._status_sections())
             return True
         if command == "/clear":
             try:
@@ -245,17 +244,33 @@ class ConversationView:
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
 
-    def _status_text(self) -> str:
+    def _status_sections(self) -> list[tuple[str, list[str]]]:
         """/status: 已发布状态 + 检查事实 + 计量口径 + 注入诊断; 整体有界 (P12)。"""
-        lines = [
+        session_lines = [
             f"状态: {self._session.state}",
             f"模型: {self._session.config.model_label or '不可得'}",
-            self.transcript.metrics_summary(),
         ]
-        lines.extend(self._checks.status_lines())
-        if self._diagnostics is not None:
-            lines.extend(self._diagnostics())
-        return "\n".join(bound_status_lines(lines))
+        diagnostics = self._diagnostics() if self._diagnostics is not None else []
+        # CLI 诊断重复提供相同模型事实时只展示一次，保留任何不同的诊断值。
+        diagnostics = [line for line in diagnostics if line != session_lines[1]]
+        sections = [
+            ("会话", session_lines),
+            ("计量", [self.transcript.metrics_summary()]),
+            ("检查", self._checks.status_lines()),
+            ("配置", diagnostics),
+        ]
+        # 保留原有字段顺序及整体限额; 装饰标题/空行不挤占事实行预算。
+        bounded = bound_status_lines([line for _, rows in sections for line in rows])
+        result: list[tuple[str, list[str]]] = []
+        offset = 0
+        for heading, rows in sections:
+            kept = bounded[offset:offset + len(rows)]
+            if kept:
+                result.append((heading, kept))
+            offset += len(rows)
+        if offset < len(bounded):
+            result.append(("", bounded[offset:]))
+        return result
 
 
 def build(

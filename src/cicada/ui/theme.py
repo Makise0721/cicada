@@ -65,6 +65,40 @@ def editor_border() -> Callable[[str], str]:
     return lambda line: fg(EDITOR_BORDER, line)
 
 
+def information_lines(
+    title: str, sections: list[tuple[str, list[str]]], width: int,
+) -> list[str]:
+    """Pi 信息块: 强调标题、低亮标签、分组留白与一列缩进。
+
+    来源: pi-mono@1a584a7a interactive-mode.ts handleSessionCommand (MIT)。
+    只排版已提供的事实; 标题和分组不参与字段限额或模型历史。
+    """
+    pad = " " if width > 4 else ""
+    content_width = max(1, width - len(pad) * 2)
+    lines = [""]
+
+    def append(text: str) -> None:
+        lines.extend(pad + chunk for chunk in wrap_text_ansi(text, content_width))
+
+    append(f"\x1b[1m{sanitize_display(title)}\x1b[0m")
+    for heading, rows in sections:
+        if not rows:
+            continue
+        lines.append("")
+        if heading:
+            append(f"\x1b[1m{sanitize_display(heading)}\x1b[0m")
+        for row in rows:
+            cleaned = sanitize_display(row)
+            if cleaned.startswith("/"):
+                name, separator, description = cleaned.partition(" ")
+                styled = fg(MD_CODE, name) + separator + fg(MUTED_GRAY, description)
+            else:
+                label, separator, value = cleaned.partition(": ")
+                styled = fg(MUTED_GRAY, label + separator) + value if separator else cleaned
+            append(styled)
+    return lines
+
+
 # --- 用户消息背景盒 (Pi user-message.ts: Box(outputPad, 1) + userMessageBg) ------------
 
 
@@ -288,5 +322,6 @@ __all__ = [
     "fg",
     "format_tokens",
     "format_workspace",
+    "information_lines",
     "user_message_lines",
 ]

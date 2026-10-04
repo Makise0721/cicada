@@ -24,7 +24,7 @@ from prompt_toolkit.keys import Keys
 
 from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.editor import Editor
-from cicada.ui.main_screen import MainScreen
+from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.terminal_io import Terminal
 
 MIN_RENDER_INTERVAL_S = 1.0 / 60.0  # Pi MIN_RENDER_INTERVAL_MS = 16
@@ -79,6 +79,8 @@ class MainScreenFrontend:
 
     def _render_frame_lines(self, width: int) -> list[str]:
         lines = list(self._document_lines(width))
+        if lines and strip_terminal_sequences(lines[-1]).strip():
+            lines.append("")  # 输出与编辑器上边框之间留一行。
         # 帧内不重读终端尺寸: rows 用本帧 render_once 前的快照, 避免一帧内
         # viewport 用旧尺寸而编辑器/底栏行数用新尺寸 (缩放恰落排版期间)
         rows = self._frame_rows

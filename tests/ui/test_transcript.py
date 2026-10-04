@@ -230,4 +230,6 @@ def test_newline_and_tab_survive_sanitization_but_tab_widens():
     t.append_system("a\tb")
     lines = t.render(80)
     # tab 归一化为 3 空格由 renderer 完成; 文档层不丢内容
-    assert len(lines) == 1
+    body = [line for line in lines if line.strip()]
+    assert len(body) == 1
+    assert "a\tb" in body[0]

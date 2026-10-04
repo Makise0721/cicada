@@ -26,7 +26,7 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.prompting import PromptInfo
 from cicada.ui.admission import AdmissionGate
 from cicada.ui.conversation_view import ConversationView, build
-from cicada.ui.main_screen import visible_width
+from cicada.ui.main_screen import strip_terminal_sequences, visible_width
 from cicada.ui.transcript import (
     AssistantEntry,
     CancelledEntry,
@@ -325,7 +325,7 @@ async def test_commands_idle_only_with_escape_and_unknown_hint(tmp_path):
         assert h.submit("/help") is True
         assert any("/status" in line for line in h.lines())
         assert h.submit("/status") is True
-        joined = "\n".join(h.lines())
+        joined = "\n".join(strip_terminal_sequences(line) for line in h.lines())
         assert "状态: idle" in joined and "模型: fake" in joined
         assert "计量: 不可得" in joined  # 无计量数据不当作 0
         assert h.submit("/未知命令") is False  # 未知命令提示且草稿保留

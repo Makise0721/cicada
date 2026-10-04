@@ -37,6 +37,58 @@ from tui_fixture import (
 DRAFT_KEYS = [KeyPress(ch, ch) for ch in "忙碌草稿"]
 
 
+@pytest.mark.parametrize("columns, rows", [(40, 8), (100, 36)])
+async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_path, columns, rows):
+    """真实 VT 主屏: 回答、信息分组和输入框彼此分开，缩放后仍保留全文。"""
+    session = await open_application(
+        make_config(tmp_path, script_json({"text": "回答结束。", "stop": True}), chunks=1)
+    )
+    stage = StageTerminal(columns, rows)
+    try:
+        task = asyncio.ensure_future(run_tui_session(
+            session, terminal=stage.terminal,
+            diagnostics=lambda: ["prompt 版本: builtin:p4-v1", "轮次上限: 50"],
+        ))
+        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
+        stage.emit(text_keys("hi"))
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("回答结束。") and session.state == "idle")
+        await asyncio.sleep(0.05)
+        stage.emit(text_keys("/status"))
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("会话信息"))
+        stage.emit(text_keys("/help"))
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("命令帮助"))
+        # 同一文档在宽窗口重新排版，检查实际屏幕而非渲染器内部状态。
+        stage.set_size(100, 45)
+        assert await wait_until(lambda: stage.contains("命令帮助"))
+        lines = [line.rstrip() for line in stage.visible_lines()]
+        answer = lines.index(" 回答结束。")
+        info = lines.index(" 会话信息")
+        help_title = lines.index(" 命令帮助")
+        assert not any(lines[answer + 1:info])
+        assert info > answer + 1
+        for heading in (" 会话", " 计量", " 检查", " 配置"):
+            assert heading in lines[info:help_title]
+        assert " 状态: idle" in lines
+        assert " 模型: fake" in lines
+        assert " prompt 版本: builtin:p4-v1" in lines
+        assert " 轮次上限: 50" in lines
+        assert any(line.startswith(" /help") and "显示本帮助" in line for line in lines)
+        assert lines[help_title - 1] == ""
+        last_body = next(i for i, line in enumerate(lines) if "//内容" in line)
+        assert lines[last_body + 1] == "", "命令输出与编辑器边框之间留白"
+        assert len(model_of(session).requests) == 1
+        assert len(session.history) == 2, "显示命令不进入模型历史"
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        assert await asyncio.wait_for(task, timeout=15) == 0
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
 async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
     session = await open_application(make_config(tmp_path, script_json({"text": "unused", "stop": True})))
     stage = StageTerminal()
