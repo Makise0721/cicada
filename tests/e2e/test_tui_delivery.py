@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -37,7 +38,7 @@ from tui_fixture import (
 DRAFT_KEYS = [KeyPress(ch, ch) for ch in "忙碌草稿"]
 
 
-@pytest.mark.parametrize("columns, rows", [(40, 8), (100, 36)])
+@pytest.mark.parametrize("columns, rows", [(10, 8), (20, 8), (40, 8), (100, 36)])
 async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_path, columns, rows):
     """真实 VT 主屏: 回答、信息分组和输入框彼此分开，缩放后仍保留全文。"""
     session = await open_application(
@@ -47,12 +48,16 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
     try:
         task = asyncio.ensure_future(run_tui_session(
             session, terminal=stage.terminal,
-            diagnostics=lambda: ["prompt 版本: builtin:p4-v1", "轮次上限: 50"],
+            diagnostics=lambda: [
+                "prompt 版本: builtin:p4-v1", "prompt sha256: " + "a" * 64, "轮次上限: 50",
+            ],
         ))
         assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
         stage.emit(text_keys("hi"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("回答结束。") and session.state == "idle")
+        assert await wait_until(
+            lambda: "回答结束。" in "".join(stage.text().split()) and session.state == "idle"
+        )
         await asyncio.sleep(0.05)
         stage.emit(text_keys("/status"))
         stage.emit([ENTER])
@@ -60,6 +65,12 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         stage.emit(text_keys("/help"))
         stage.emit([ENTER])
         assert await wait_until(lambda: stage.contains("命令帮助"))
+        compact = "".join(stage.text().split())
+        assert "清空模型历史（已显示记录保留）" in compact
+        assert "a" * 64 in compact, "窄窗换行保留完整 hash"
+        assert not re.search(r"\[[0-9;]+m", stage.text()), "不能显示被拆开的 SGR 碎片"
+        cursor_row = stage.vt.cursor_row
+        assert not stage.vt.screen_text()[cursor_row].strip(), "硬件光标仍在空输入行"
         # 同一文档在宽窗口重新排版，检查实际屏幕而非渲染器内部状态。
         stage.set_size(100, 45)
         assert await wait_until(lambda: stage.contains("命令帮助"))

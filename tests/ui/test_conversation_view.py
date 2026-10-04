@@ -344,6 +344,28 @@ async def test_commands_idle_only_with_escape_and_unknown_hint(tmp_path):
         await session.aclose()
 
 
+async def test_status_multiline_field_keeps_its_section_when_total_is_clipped(tmp_path):
+    from dataclasses import replace
+
+    config = replace(_config(_repo(tmp_path), _script()), model_label="fake\n模型续行")
+    session = await open_application(config)
+    view = ConversationView(session, diagnostics=lambda: [f"诊断{i}: 原始值" for i in range(20)])
+    try:
+        assert view.on_submit("/status") is True
+        lines = [strip_terminal_sequences(line).strip() for line in view.document_lines(100)]
+        session_heading, metrics_heading, config_heading = (
+            lines.index(name) for name in ("会话", "计量", "配置")
+        )
+        assert "模型续行" in lines[session_heading:metrics_heading]
+        assert "计量: 不可得" in lines[metrics_heading:config_heading]
+        assert "模型续行" not in lines[config_heading:]
+        assert any("…[已截断: 显示" in line for line in lines)
+        assert session.history == ()
+    finally:
+        view.close()
+        await session.aclose()
+
+
 async def test_clear_keeps_display_and_appends_system_entry(tmp_path):
     session = await open_application(_config(_repo(tmp_path), _script(
         {"text": "第一轮", "stop": True},

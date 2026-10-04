@@ -20,7 +20,7 @@ from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
 
-from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
+from cicada.ui.main_screen import truncate_to_width, visible_width, word_wrap_line, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
 # --- dark.json 固定颜色 (var 引用已解析) ----------------------------------------------
@@ -77,25 +77,28 @@ def information_lines(
     content_width = max(1, width - len(pad) * 2)
     lines = [""]
 
-    def append(text: str) -> None:
-        lines.extend(pad + chunk for chunk in wrap_text_ansi(text, content_width))
+    def append_heading(text: str) -> None:
+        for chunk in wrap_text_ansi(sanitize_display(text), content_width):
+            lines.append(pad + f"\x1b[1m{chunk}\x1b[0m")
 
-    append(f"\x1b[1m{sanitize_display(title)}\x1b[0m")
+    append_heading(title)
     for heading, rows in sections:
         if not rows:
             continue
         lines.append("")
         if heading:
-            append(f"\x1b[1m{sanitize_display(heading)}\x1b[0m")
+            append_heading(heading)
         for row in rows:
-            cleaned = sanitize_display(row)
-            if cleaned.startswith("/"):
-                name, separator, description = cleaned.partition(" ")
-                styled = fg(MD_CODE, name) + separator + fg(MUTED_GRAY, description)
-            else:
-                label, separator, value = cleaned.partition(": ")
-                styled = fg(MUTED_GRAY, label + separator) + value if separator else cleaned
-            append(styled)
+            for logical in sanitize_display(row).split("\n"):
+                command = logical.startswith("/")
+                label, separator, _ = logical.partition(" " if command else ": ")
+                label_end = len(label) if command else (len(label + separator) if separator else 0)
+                for chunk in word_wrap_line(logical, content_width):
+                    split_at = max(0, min(len(chunk.text), label_end - chunk.start_index))
+                    prefix, body = chunk.text[:split_at], chunk.text[split_at:]
+                    styled = fg(MD_CODE if command else MUTED_GRAY, prefix)
+                    styled += fg(MUTED_GRAY, body) if command else body
+                    lines.append(pad + styled)
     return lines
 
 

@@ -44,8 +44,12 @@ from cicada.core.events import (
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
 from cicada.ui.checks import (
     PROCESS_UNCERTAIN_LABEL,
+    STATUS_MAX_BYTES,
+    STATUS_MAX_LINES,
     CheckProjection,
-    bound_status_lines,
+    clip_lines,
+    clip_status_field,
+    truncation_note,
 )
 from cicada.ui.editor import Editor
 from cicada.ui.commands import SLASH_COMMANDS
@@ -260,16 +264,28 @@ class ConversationView:
             ("配置", diagnostics),
         ]
         # 保留原有字段顺序及整体限额; 装饰标题/空行不挤占事实行预算。
-        bounded = bound_status_lines([line for _, rows in sections for line in rows])
+        clipped_sections = [
+            (heading, [clip_status_field(row) for row in rows]) for heading, rows in sections
+        ]
+        fields = [row for _, rows in clipped_sections for row in rows]
+        total = "\n".join(fields)
+        if len(fields) <= STATUS_MAX_LINES and len(total.encode("utf-8")) <= STATUS_MAX_BYTES:
+            return clipped_sections
+        kept, original_lines, original_bytes, truncated = clip_lines(
+            total, STATUS_MAX_LINES, STATUS_MAX_BYTES,
+        )
         result: list[tuple[str, list[str]]] = []
         offset = 0
-        for heading, rows in sections:
-            kept = bounded[offset:offset + len(rows)]
-            if kept:
-                result.append((heading, kept))
-            offset += len(rows)
-        if offset < len(bounded):
-            result.append(("", bounded[offset:]))
+        for heading, rows in clipped_sections:
+            # clip_lines 展开字段内换行; 加入字段间换行以保留尾部空行归属。
+            count = sum(len((row + "\n").splitlines()) for row in rows)
+            group = list(kept[offset:offset + count])
+            if group:
+                result.append((heading, group))
+            offset += count
+        notes = truncation_note(kept, original_lines, original_bytes, truncated)
+        if notes:
+            result.append(("", list(notes)))
         return result
 
 
