@@ -48,6 +48,7 @@ from cicada.ui.checks import (
     bound_status_lines,
 )
 from cicada.ui.editor import Editor
+from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
@@ -56,16 +57,10 @@ from cicada.ui.transcript import Transcript
 HELP_TEXT = "\n".join(
     (
         "可用命令:",
-        "/help 显示本帮助",
-        "/status 显示状态与计量",
-        "/clear 清空模型历史（已显示记录保留）",
-        "/exit 退出程序",
+        *(f"{item.command} {item.description}" for item in SLASH_COMMANDS),
         "//内容 发送以斜杠开头的普通文本（转义）",
     )
 )
-
-KNOWN_COMMANDS = ("/help", "/status", "/clear", "/exit")
-
 
 class ConversationView:
     """ApplicationSession 与显示文档/输入回调之间的唯一组合层。"""

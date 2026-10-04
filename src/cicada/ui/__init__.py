@@ -24,6 +24,7 @@ import sys
 from typing import TYPE_CHECKING, Callable
 
 from cicada.ui.conversation_view import ConversationView
+from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.frontend import MainScreenFrontend
 from cicada.ui.terminal_io import PromptToolkitTerminal, Terminal
 
@@ -86,6 +87,7 @@ async def run_tui_session(
         on_ctrl_o=_toggle_tools,
         on_exit=view.handle_exit,
         footer_lines=view.footer.render,
+        command_menu=SlashCommandMenu(),
     )
     refs["frontend"] = frontend
 

@@ -14,6 +14,7 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.key_binding.key_processor import KeyPress
 
 from cicada.ui.editor import Editor
+from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.frontend import ESCAPE_PREFIX_TIMEOUT_S, MainScreenFrontend
 from cicada.ui.terminal_io import FakeTerminal
 from tests.ui.vt_screen import VtScreen
@@ -32,7 +33,7 @@ def text_keys(text: str) -> list[KeyPress]:
 class Harness:
     """headless 前端驱动: FakeTerminal + VtScreen 镜像 + 可控文档。"""
 
-    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12):
+    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12, commands=False, on_submit=None):
         self.terminal = FakeTerminal(columns, rows)
         self.vt = VtScreen(columns, rows)
         self.terminal.feed_screen = self.vt.feed
@@ -47,11 +48,12 @@ class Harness:
             self.terminal,
             document_lines=lambda width: list(self.doc_lines),
             editor=self.editor,
-            on_submit=self.submitted.append,
+            on_submit=on_submit if on_submit is not None else self.submitted.append,
             on_escape=self._on_escape,
             on_ctrl_c=self._on_ctrl_c,
             on_exit=self._on_exit,
             escape_prefix_timeout=escape_timeout,
+            command_menu=SlashCommandMenu() if commands else None,
         )
         self.runner: asyncio.Task | None = None
 

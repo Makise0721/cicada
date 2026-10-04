@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit.key_binding.key_processor import KeyPress
+from prompt_toolkit.keys import Keys
 
 from cicada.application import ApplicationSession, open_application
 from cicada.ui import MainScreenFrontend, run_tui_session
@@ -34,6 +35,61 @@ from tui_fixture import (
 )
 
 DRAFT_KEYS = [KeyPress(ch, ch) for ch in "忙碌草稿"]
+
+
+async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
+    session = await open_application(make_config(tmp_path, script_json({"text": "unused", "stop": True})))
+    stage = StageTerminal()
+    task = asyncio.create_task(run_tui_session(session, terminal=stage.terminal))
+    try:
+        assert await wait_until(lambda: stage.contains("fake"))
+        stage.emit(text_keys("/"))
+        assert await wait_until(lambda: stage.contains("→ help")), "输入斜杠后列出可用命令"
+        assert all(stage.contains(name) for name in ("status", "clear", "exit"))
+        stage.emit([KeyPress(Keys.Down, "\x1b[B")])
+        assert await wait_until(lambda: stage.contains("→ status"))
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("状态: idle")), "Enter 执行选中的 /status"
+        assert session.history == ()
+        assert model_of(session).requests == []
+        stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        assert await asyncio.wait_for(task, timeout=5) == 0
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path):
+    session = await open_application(make_config(
+        tmp_path, script_json({"text": "完成回答", "stop": True}), chunks=2, delay=0.05
+    ))
+    stage = StageTerminal(columns=40, rows=8)
+    task = asyncio.create_task(run_tui_session(session, terminal=stage.terminal))
+    try:
+        assert await wait_until(lambda: stage.contains("fake"))
+        stage.emit(text_keys("问题") + [ENTER])
+        assert await wait_until(lambda: session.state == "executing")
+        stage.emit(text_keys("/") + [KeyPress(Keys.Down, "\x1b[B"), ENTER])
+        assert await wait_until(lambda: session.state == "idle" and stage.contains("完成回答"))
+        assert not stage.contains("状态: idle")
+        assert len(model_of(session).requests) == 1
+        assert "→ status" in "\n".join(stage.vt.screen_text())
+        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "/"
+        stage.emit([ENTER])
+        assert await wait_until(lambda: stage.contains("状态: idle"))
+        assert len(model_of(session).requests) == 1
+        stage.emit(text_keys("/exit") + [ENTER])
+        assert await asyncio.wait_for(task, timeout=5) == 0
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if session.state != "closed":
+            await session.aclose()
 
 
 def _repo(tmp_path: Path) -> Path:

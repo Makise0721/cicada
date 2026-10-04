@@ -22,6 +22,7 @@ from typing import Callable
 
 from prompt_toolkit.keys import Keys
 
+from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen
 from cicada.ui.terminal_io import Terminal
@@ -47,6 +48,7 @@ class MainScreenFrontend:
         on_exit: Callable[[], None] | None = None,
         escape_prefix_timeout: float = ESCAPE_PREFIX_TIMEOUT_S,
         footer_lines: Callable[[int, int], list[str]] | None = None,
+        command_menu: SlashCommandMenu | None = None,
     ) -> None:
         self._terminal = terminal
         self._editor = editor
@@ -57,6 +59,7 @@ class MainScreenFrontend:
         self._on_ctrl_o = on_ctrl_o
         self._on_exit = on_exit
         self._footer_lines = footer_lines
+        self._command_menu = command_menu
         self.ui_failures: list[str] = []
         self.terminal_failed = False
         self._screen = MainScreen(self._render_frame_lines, terminal.write)
@@ -81,10 +84,23 @@ class MainScreenFrontend:
         rows = self._frame_rows
         # 设计 §4: 编辑器正文 1–5 行; 低高度 (8 行) 时 1–3 行, 剩余给对话
         max_rows = min(5, max(3, int(rows * 0.3)))
+        footer = self._footer_lines(width, rows) if self._footer_lines is not None else []
+        self._sync_command_menu()
+        menu = (
+            self._command_menu.render(width, min(4, max(0, rows - len(footer) - 3)))
+            if self._command_menu is not None else []
+        )
+        if menu:
+            # 菜单与底栏先留空间，低窗口仍保留编辑光标所在的正文行。
+            max_rows = max(1, min(max_rows, rows - len(menu) - len(footer) - 2))
         lines.extend(self._editor.render(width, max_rows))
-        if self._footer_lines is not None:
-            lines.extend(self._footer_lines(width, rows))
+        lines.extend(menu)
+        lines.extend(footer)
         return lines
+
+    def _sync_command_menu(self) -> None:
+        if self._command_menu is not None:
+            self._command_menu.sync(self._editor.get_text(), at_end=self._editor.cursor_at_end())
 
     # --- 调度 (TuiBase.requestRender 移植) -----------------------------------------
 
@@ -183,6 +199,7 @@ class MainScreenFrontend:
         self._render_immediate()
 
     def _dispatch_key(self, key) -> None:
+        self._sync_command_menu()
         data = key.data
         # Ctrl+C / Ctrl+D: 与 Escape 前缀无关, 直接派发
         if key.key in (Keys.ControlC,) or data == "\x03":
@@ -235,9 +252,13 @@ class MainScreenFrontend:
             self._editor.move_cursor(0, 1)
             return
         if key.key is Keys.Up:
+            if self._command_menu is not None and self._command_menu.move(-1):
+                return
             self._editor.move_cursor(-1, 0)
             return
         if key.key is Keys.Down:
+            if self._command_menu is not None and self._command_menu.move(1):
+                return
             self._editor.move_cursor(1, 0)
             return
         if key.key is Keys.Home:
@@ -258,7 +279,9 @@ class MainScreenFrontend:
             if text:
                 self._editor.clear()
             return
-        stripped = text.strip()
+        self._sync_command_menu()
+        selected = self._command_menu.selected if self._command_menu is not None else None
+        stripped = selected.command if selected is not None else text.strip()
         if self._on_submit is None:
             self._editor.clear()
             return
@@ -290,6 +313,10 @@ class MainScreenFrontend:
         self._dispatch_escape()
 
     def _dispatch_escape(self) -> None:
+        self._sync_command_menu()
+        if self._command_menu is not None and self._command_menu.dismiss():
+            self.request_render_now()
+            return
         if self._on_escape is not None:
             self._on_escape()
 

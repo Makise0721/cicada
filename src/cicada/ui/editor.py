@@ -3,7 +3,7 @@
 来源: pi-mono@1a584a7a packages/tui/src/components/editor.ts (MIT,
 Copyright (c) 2025 Mario Zechner); 只移植 01 所需子集: 横线几何、按宽度
 换行 (wordWrapLine)、硬件光标标记、图素级编辑、撤销栈与历史导航。
-自动补全、粘贴折叠标记、kill ring、字符跳转不在本期。
+斜线命令菜单由 frontend/commands 组合；粘贴折叠标记、kill ring、字符跳转不在本期。
 
 边界:
 - 本模块是纯状态+渲染, 不接触终端; 按键语义 (哪个 KeyPress 触发哪个
@@ -118,6 +118,12 @@ class Editor:
 
     def is_empty(self) -> bool:
         return len(self.state.lines) == 1 and self.state.lines[0] == ""
+
+    def cursor_at_end(self) -> bool:
+        return (
+            self.state.cursor_line == len(self.state.lines) - 1
+            and self.state.cursor_col == len(self.state.lines[-1])
+        )
 
     @property
     def rendered_visible_count(self) -> int:
