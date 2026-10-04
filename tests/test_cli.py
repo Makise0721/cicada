@@ -496,3 +496,102 @@ def test_commit_save_failure_exits_one(tmp_path, monkeypatch):
     code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, "commit_request")
     assert code == 1, err
     assert "[session save failed:" in err
+
+
+# --- 02: view-only 恢复退出码与中断显示 --------------------------------------------------
+
+
+def _cli_identity(work):
+    """与 CLI fake 剧本路径一致的启动身份; 直建存档时用于准入匹配."""
+    from cicada.persistence.contracts import LaunchIdentity
+    from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
+
+    _prompt, info = compose_system_prompt(work, None, tools=DEFAULT_TOOLS, checks=())
+    return LaunchIdentity(
+        provider="fake", model="fake", base_url=None, think=None, options={},
+        max_request_bytes=None, max_turns=50,
+        prompt_version=info.version, prompt_sha256=info.prompt_sha256,
+        instructions_sha256=info.instructions_sha256, checks_signature=None, sources={},
+    )
+
+
+def _seed_archive(work: Path, session_id: str, *, open_activity: bool) -> None:
+    """向真实 CLI 保存的存档注入 pending intent (+可选未闭合活动), 继承合法身份/指纹."""
+    import hashlib
+    import sqlite3
+
+    from cicada.persistence.codec import dumps_strict
+
+    db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    prompt_payload = dumps_strict({"prompt": "被中断的问"})
+    request_id = "11111111-2222-4333-8444-555555555555"
+    arguments = {"command": "Start-Sleep -Seconds 30"}
+    canonical = dumps_strict(arguments)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    begin_json = dumps_strict({
+        "description": canonical[:512], "arguments_digest": digest, "started_at": 1.0,
+    })
+    connection = sqlite3.connect(str(db))
+    epoch = connection.execute(
+        "SELECT epoch_id FROM epoch ORDER BY opened_at DESC LIMIT 1"
+    ).fetchone()[0]
+    generation = connection.execute(
+        "SELECT context_generation FROM records ORDER BY seq DESC LIMIT 1"
+    ).fetchone()[0]
+    seq = connection.execute("SELECT MAX(seq) FROM records").fetchone()[0] + 1
+    connection.execute(
+        "INSERT INTO records (seq, epoch_id, context_generation, kind, request_id,"
+        " created_at, payload_json, payload_sha256) VALUES (?, ?, ?, 'request_begin', ?, 0, ?, NULL)",
+        (seq, epoch, generation, request_id, prompt_payload),
+    )
+    connection.execute(
+        "INSERT INTO request_intents (request_id, epoch_id, begin_seq, status)"
+        " VALUES (?, ?, ?, 'pending')",
+        (request_id, epoch, seq),
+    )
+    if open_activity:
+        connection.execute(
+            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+            " arguments_digest, begin_json, end_json) VALUES ('activity-1', ?, 'powershell',"
+            " 'c-pending', ?, ?, NULL)",
+            (request_id, digest, begin_json),
+        )
+    connection.commit()
+    connection.close()
+
+
+def test_resume_view_only_exits_three_without_execution(tmp_path):
+    """A15: 未证终结活动的恢复, CLI 新 prompt 零执行并退出码 3."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)), "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+    _seed_archive(work, session_id, open_activity=True)
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "不应执行的问")
+    assert proc.returncode == 3, (proc.stdout, proc.stderr)
+    assert f"[session id={session_id} mode=resume restored_requests=1]" in proc.stdout
+    assert "[session interrupted_requests=1]" in proc.stdout
+    assert "[session view-only:" in proc.stderr
+    assert "powershell" in proc.stderr
+    assert ">> " not in proc.stdout, "view-only 会话零工具执行"
+    assert "[session saved" not in proc.stdout
+
+
+def test_resume_with_pending_intent_prints_interrupted_and_continues(tmp_path):
+    """A15: 无未证终结活动的中断可继续; 中断计数进入显示."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)), "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+    _seed_archive(work, session_id, open_activity=False)
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "中断后的新问题")
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert "[session interrupted_requests=1]" in proc.stdout
+    assert "mode=resume restored_requests=1" in proc.stdout
+    assert "[session saved request_id=" in proc.stdout

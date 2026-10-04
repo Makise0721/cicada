@@ -389,6 +389,13 @@ async def _run(args: argparse.Namespace) -> int:
             f"[session id={state.session_id} mode={state.mode} "
             f"restored_requests={state.restored_request_count}]"
         )
+        if session.restored_interrupted:
+            print(f"[session interrupted_requests={len(session.restored_interrupted)}]")
+        if session.view_only_reason is not None:
+            # A15: 未证终结活动的恢复仅可查看; CLI 新 prompt 零执行并退出码 3 (契约 §6)
+            print(f"[session view-only: {session.view_only_reason}]", file=sys.stderr)
+            await session.aclose()
+            return 3
 
     def on_update(update) -> None:
         # 旧 CLI 打印适配: 只转发内核事件; 忽略文本增量与阶段/完成通知, 避免重复输出
