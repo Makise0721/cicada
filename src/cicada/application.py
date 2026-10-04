@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -26,6 +28,19 @@ from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
 from cicada.core.messages import Message, isolate_message, isolate_tool_result
+from cicada.persistence.contracts import (
+    LaunchIdentity,
+    PersistenceState,
+    PersistenceError,
+    RecoverySnapshot,
+    RequestOutcomeFacts,
+    RequestPersistenceFacts,
+    RestoredRequest,
+    SessionStorePort,
+    StoredIdentity,
+    conflicting_launch_fields,
+)
+from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.process import process_plugin
 from cicada.plugins.coding.tool_check import check_plugin
@@ -129,6 +144,7 @@ class ApplicationConfig:
     plan: VerificationPlan | None = None
     max_turns: int = 50
     model_label: str = ""
+    persistence: PersistenceConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -139,6 +155,29 @@ class ApplicationConfig:
             raise ValueError("max_turns must be a positive integer")
         if self.plan is not None and not isinstance(self.plan, VerificationPlan):
             raise ValueError("plan must be a VerificationPlan or None")
+        if self.persistence is not None:
+            if not isinstance(self.persistence, PersistenceConfig):
+                raise ValueError("persistence must be a PersistenceConfig or None")
+            if self.plan is not None:
+                raise ValueError("persistent sessions do not support check mode yet (ticket 03)")
+
+
+@dataclass(frozen=True)
+class PersistenceConfig:
+    """持久会话入口配置; session_id=None 表示创建新会话, 否则按精确 ID 恢复.
+
+    identity 是启动层给出的有效配置身份 (默认值已解析); 04 前恢复要求与
+    存档完全一致, 冲突在 bootstrap 前拒绝.
+    """
+
+    session_id: str | None
+    identity: LaunchIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, LaunchIdentity):
+            raise ValueError("PersistenceConfig.identity must be a LaunchIdentity")
+        if self.session_id is not None and not isinstance(self.session_id, str):
+            raise ValueError("PersistenceConfig.session_id must be a str or None")
 
 
 @dataclass(frozen=True)
@@ -150,6 +189,7 @@ class RequestOutcome:
     evidence: ChangeEvidence | None
     decision: DeliveryDecision | None
     exit_code: int
+    persistence: RequestPersistenceFacts | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +256,7 @@ def _isolate_outcome(outcome: RequestOutcome) -> RequestOutcome:
         evidence=outcome.evidence,
         decision=outcome.decision,
         exit_code=outcome.exit_code,
+        persistence=outcome.persistence,
     )
 
 
@@ -248,12 +289,31 @@ class ApplicationSession:
         config: ApplicationConfig,
         service: Verifier | None,
         policy: RunPolicy | None,
+        store: SessionStorePort | None = None,
+        epoch_id: str | None = None,
+        persistence_mode: Literal["save", "resume"] | None = None,
+        restored_history: tuple[Message, ...] = (),
+        restored_requests: tuple[RestoredRequest, ...] = (),
+        restored_context_generation: int = 0,
     ) -> None:
         self._app = app
         self._config = config
         self._service = service
         self._policy = policy
-        self._history: list[Message] = []
+        self._history: list[Message] = [isolate_message(m) for m in restored_history]
+        self._store = store
+        self._epoch_id = epoch_id
+        self._persistence_mode = persistence_mode
+        self._restored_requests = restored_requests
+        self._restored_request_count = len(restored_requests)
+        self._restored_model_call_count = sum(
+            len(request.outcome.model_calls) for request in restored_requests
+        )
+        self._context_generation = restored_context_generation
+        self._request_id: str | None = None
+        self._saved_request_count = 0
+        self._last_committed_seq: int | None = None
+        self._storage_failed: str | None = None
         self._state: SessionStateName = "idle"
         self._run_id: str | None = None
         self._observers: list[Callable[[ApplicationUpdate], None]] = []
@@ -291,6 +351,28 @@ class ApplicationSession:
 
     def has_process_uncertain(self) -> bool:
         return self._process_uncertain
+
+    @property
+    def persistence(self) -> PersistenceState | None:
+        """只读持久状态快照; 无持久化为 None."""
+        if self._store is None:
+            return None
+        return PersistenceState(
+            session_id=self._store.session_id,
+            epoch_id=self._epoch_id or "",
+            mode=self._persistence_mode or "save",
+            context_generation=self._context_generation,
+            restored_request_count=self._restored_request_count,
+            restored_model_call_count=self._restored_model_call_count,
+            saved_request_count=self._saved_request_count,
+            last_committed_seq=self._last_committed_seq,
+            storage_failed=self._storage_failed,
+        )
+
+    @property
+    def restored_requests(self) -> tuple[RestoredRequest, ...]:
+        """打开时恢复的已提交请求事实 (含逐轮计量); 无持久化为空元组."""
+        return self._restored_requests
 
     # --- 订阅 ----------------------------------------------------------------------
 
@@ -333,6 +415,21 @@ class ApplicationSession:
             raise RuntimeError(
                 "process_uncertain: new coding requests are refused; only status, clear or exit remain"
             )
+        if self._store is not None:
+            # 可靠提交请求开始 intent; 失败零模型调用并锁存 storage_failed (D2)
+            if self._storage_failed is not None:
+                raise RuntimeError(
+                    f"storage_failed: earlier session save failed ({self._storage_failed}); "
+                    "new coding requests are refused"
+                )
+            try:
+                self._request_id = await self._store.begin_request(self._epoch_id or "", prompt)
+            except PersistenceError as exc:
+                self._latch_storage_failed(str(exc))
+                raise RuntimeError(
+                    f"session save failed before the request started; "
+                    f"no model call or tool execution was made: {exc}"
+                ) from exc
         loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
@@ -357,6 +454,14 @@ class ApplicationSession:
             if self._active_done is not None and not self._active_done.done():
                 self._active_done.set_result(None)
         # 先更新隔离的 state/history, 再通知订阅者; 应用把后缀追加一次
+        if self._store is not None:
+            # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1
+            persisted = await self._commit_request(result, outcome)
+            outcome = replace(
+                outcome,
+                persistence=persisted,
+                exit_code=1 if not persisted.saved else outcome.exit_code,
+            )
         self._history.extend(isolate_message(m) for m in result.messages)
         if outcome.view is not None and outcome.view.process_uncertain:
             self._process_uncertain = True
@@ -464,6 +569,42 @@ class ApplicationSession:
             ),
         )
 
+    # --- 持久提交 -------------------------------------------------------------------
+
+    def _latch_storage_failed(self, detail: str) -> None:
+        if self._storage_failed is None:
+            self._storage_failed = detail
+
+    async def _commit_request(self, result: RunResult, outcome: RequestOutcome) -> RequestPersistenceFacts:
+        """完整请求单事务提交; 返回持久事实, 失败不抛出而是锁存 storage_failed."""
+        assert self._request_id is not None and self._store is not None
+        decision = outcome.decision
+        facts = RequestOutcomeFacts(
+            run_id=result.run_id,
+            stop_reason=result.stop_reason,
+            error=result.error,
+            exit_code=outcome.exit_code,
+            finalized=True,
+            finalization_notes=(
+                tuple(decision.blocking_reasons)
+                if decision is not None and not decision.can_deliver else ()
+            ),
+            model_calls=result.model_calls,
+        )
+        messages = tuple(isolate_message(m) for m in result.messages)
+        try:
+            seq = await self._store.commit_request(
+                self._request_id, messages=messages, outcome=facts
+            )
+        except PersistenceError as exc:
+            self._latch_storage_failed(str(exc))
+            return RequestPersistenceFacts(
+                request_id=self._request_id, saved=False, error=str(exc)
+            )
+        self._saved_request_count += 1
+        self._last_committed_seq = seq
+        return RequestPersistenceFacts(request_id=self._request_id, saved=True, seq=seq)
+
     # --- 取消 / 清空 ---------------------------------------------------------------
 
     def cancel(self) -> None:
@@ -475,9 +616,38 @@ class ApplicationSession:
             self._cancel_token.cancel()
 
     def clear_history(self) -> None:
-        """仅空闲允许; 清除模型历史, 保留 App/Agent、基线/账本/锁存和已有工件."""
+        """仅空闲允许; 清除模型历史, 保留 App/Agent、基线/账本/锁存和已有工件.
+
+        持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
+        """
+        if self._store is not None:
+            raise RuntimeError(
+                "persistent sessions must use clear_context(); the synchronous entry is refused "
+                "to keep the clear boundary reliable"
+            )
         if self._closing or self._closed or self._state != "idle":
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
+        self._history.clear()
+        self._notify(HistoryCleared())
+
+    async def clear_context(self) -> None:
+        """持久清空: 先可靠提交清空边界, 成功后才清内存历史; 失败内存不变.
+
+        无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
+        """
+        if self._store is None:
+            self.clear_history()
+            return
+        if self._closing or self._closed or self._state != "idle":
+            raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
+        try:
+            new_generation = await self._store.commit_clear(self._epoch_id or "")
+        except PersistenceError as exc:
+            self._latch_storage_failed(str(exc))
+            raise RuntimeError(
+                f"session clear failed to persist; in-memory history is unchanged: {exc}"
+            ) from exc
+        self._context_generation = new_generation
         self._history.clear()
         self._notify(HistoryCleared())
 
@@ -552,8 +722,79 @@ def _incomplete_evidence(reason: str) -> ChangeEvidence:
     )
 
 
-async def open_application(config: ApplicationConfig) -> ApplicationSession:
-    """输入/preflight/boot/initialize 成功才返回; 部分启动失败关闭已取得资源."""
+def _tool_fingerprint(app: App) -> str:
+    """bootstrap 解析后的实际工具声明指纹: 稳定顺序 + 完整 schema 内容."""
+    tools = getattr(app.agent, "_tools", {})
+    specs = [
+        {
+            "name": tools[name].spec.name,
+            "description": tools[name].spec.description,
+            "parameters": tools[name].spec.parameters,
+        }
+        for name in sorted(tools)
+    ]
+    encoded = json.dumps(specs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _open_persistent_store(
+    config: ApplicationConfig,
+) -> tuple[SQLiteSessionStore, RecoverySnapshot]:
+    """打开或新建会话存储; 失败时已取得资源由本函数释放, 统一映射为启动错误."""
+    persistence = config.persistence
+    assert persistence is not None
+    try:
+        store = open_session_store(
+            directory=Path(config.workspace) / ".cicada" / "sessions",
+            session_id=persistence.session_id,
+            workspace=config.workspace,
+        )
+    except PersistenceError as exc:
+        raise ApplicationOpenError(f"session store open failed: {exc}") from exc
+    return store, store.recovery_snapshot()
+
+
+def _admit_persistent_resume(persistence: PersistenceConfig, snapshot: RecoverySnapshot) -> None:
+    """01 阶段的恢复准入: 中断续写与配置差异在 bootstrap 前拒绝, 无副作用."""
+    if persistence.session_id is None:
+        return
+    if snapshot.interrupted:
+        raise ApplicationOpenError(
+            "the session has an interrupted request; continuing it is refused in this stage "
+            "(process-terminal evidence arrives in ticket 02)"
+        )
+    saved_identity = snapshot.identity
+    if saved_identity is None:
+        raise ApplicationOpenError(
+            "the session archive has no saved launch identity to compare against"
+        )
+    conflicts = conflicting_launch_fields(saved_identity.launch, persistence.identity)
+    if conflicts:
+        raise ApplicationOpenError(
+            "restored session config conflicts with the current launch: " + ", ".join(conflicts)
+        )
+
+
+async def _run_preflight(preflight: Callable[[], object] | None) -> None:
+    """恢复路径的模型可达性探测: 必须在格式/配置预检之后、bootstrap 之前执行."""
+    if preflight is None:
+        return
+    if not callable(preflight):
+        raise TypeError("preflight must be a callable or None")
+    outcome = preflight()
+    if inspect.isawaitable(outcome):
+        await outcome
+
+
+async def open_application(
+    config: ApplicationConfig, *, preflight: Callable[[], object] | None = None
+) -> ApplicationSession:
+    """输入/preflight/boot/initialize 成功才返回; 部分启动失败关闭已取得资源.
+
+    持久模式次序 (契约 §1): 校验配置及 workspace -> 独占 lease -> 打开/校验存档 ->
+    恢复准入与已知配置冲突 -> preflight -> bootstrap (store 插件注册首位, 最后清理) ->
+    核对实际工具指纹 -> 写入新的启动代次 -> 注入闭合历史并发布会话.
+    """
     plan = config.plan
     policy_state: dict[str, object] = {}
 
@@ -564,23 +805,81 @@ async def open_application(config: ApplicationConfig) -> ApplicationSession:
         policy_state["service"] = service
         return wrapped
 
-    try:
-        app: App = await bootstrap(
-            default_definitions(config.workspace, config.model_plugin, plan),
-            tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
-            system_prompt=config.system_prompt,
-            model_policy=_model_policy if plan is not None else None,
-            max_turns=config.max_turns,
-        )
-    except BootError as exc:
-        raise ApplicationOpenError(f"boot failed: {exc}") from exc
+    store: SQLiteSessionStore | None = None
+    snapshot: RecoverySnapshot | None = None
+    if config.persistence is not None:
+        store, snapshot = _open_persistent_store(config)
 
-    session = ApplicationSession(
-        app=app,
-        config=config,
-        service=policy_state.get("service"),  # type: ignore[arg-type]
-        policy=policy_state.get("policy"),  # type: ignore[arg-type]
-    )
+    definitions: list[PluginDefinition] = []
+    if store is not None:
+        definitions.append(session_store_plugin(store))
+    definitions.extend(default_definitions(config.workspace, config.model_plugin, plan))
+
+    if store is not None:
+        assert snapshot is not None and config.persistence is not None
+        try:
+            _admit_persistent_resume(config.persistence, snapshot)
+            await _run_preflight(preflight)
+            app: App = await bootstrap(
+                definitions,
+                tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
+                system_prompt=config.system_prompt,
+                model_policy=_model_policy if plan is not None else None,
+                max_turns=config.max_turns,
+            )
+        except BootError as exc:
+            await store.aclose()
+            raise ApplicationOpenError(f"boot failed: {exc}") from exc
+        except BaseException:
+            await store.aclose()
+            raise
+    else:
+        try:
+            app = await bootstrap(
+                definitions,
+                tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
+                system_prompt=config.system_prompt,
+                model_policy=_model_policy if plan is not None else None,
+                max_turns=config.max_turns,
+            )
+        except BootError as exc:
+            raise ApplicationOpenError(f"boot failed: {exc}") from exc
+
+    if store is not None and snapshot is not None and config.persistence is not None:
+        fingerprint = _tool_fingerprint(app)
+        saved_identity = snapshot.identity
+        if saved_identity is not None and saved_identity.tool_fingerprint != fingerprint:
+            await app.aclose()  # store 已由插件拥有, 经 runtime 清理
+            raise ApplicationOpenError(
+                "restored session tool declarations differ from the current launch "
+                "(tool_fingerprint)"
+            )
+        try:
+            epoch_id = await store.start_epoch(
+                StoredIdentity(launch=config.persistence.identity, tool_fingerprint=fingerprint)
+            )
+        except PersistenceError as exc:
+            await app.aclose()
+            raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
+        session = ApplicationSession(
+            app=app,
+            config=config,
+            service=policy_state.get("service"),  # type: ignore[arg-type]
+            policy=policy_state.get("policy"),  # type: ignore[arg-type]
+            store=store,
+            epoch_id=epoch_id,
+            persistence_mode="resume" if config.persistence.session_id is not None else "save",
+            restored_history=snapshot.canonical_history,
+            restored_requests=snapshot.requests,
+            restored_context_generation=snapshot.context_generation,
+        )
+    else:
+        session = ApplicationSession(
+            app=app,
+            config=config,
+            service=policy_state.get("service"),  # type: ignore[arg-type]
+            policy=policy_state.get("policy"),  # type: ignore[arg-type]
+        )
     if plan is None:
         return session
     try:
