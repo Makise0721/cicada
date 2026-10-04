@@ -677,3 +677,68 @@ async def test_sealed_store_gives_late_writes_definitive_results(tmp_path, monke
     await reopened.aclose()
 
 
+async def test_close_waits_for_inflight_clear_producer(tmp_path):
+    """A14: close 与持久清空同时到达 —— 监督对象含清空生产者, 不提前封店."""
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    await session.execute("问")
+    store = session._store
+    release = asyncio.Event()
+    original_clear = store.commit_clear
+
+    async def gated_clear(epoch_id):
+        await release.wait()
+        return await original_clear(epoch_id)
+
+    store.commit_clear = gated_clear  # type: ignore[method-assign]
+    clear_task = asyncio.create_task(session.clear_context())
+    await asyncio.sleep(0.1)  # commit_clear 已派发并挂在闸门上
+    close_task = asyncio.create_task(session.aclose())
+    await asyncio.sleep(0.3)
+    assert session.state in ("closing", "closed"), "close 意图已锁存"
+    release.set()
+    await asyncio.wait_for(clear_task, timeout=15)
+    await asyncio.wait_for(close_task, timeout=15)
+    assert session.state == "closed"
+    assert session._close_problems == [], "清空生产者在监督窗口内完成, 不进关闭诊断"
+    # 清空已落库: 重开存档代次前进
+    from cicada.plugins.session_store import open_session_store
+
+    reopened = open_session_store(
+        directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
+    )
+    assert reopened.recovery_snapshot().context_generation == 1
+    await reopened.aclose()
+
+
+async def test_repeated_outer_cancel_during_commit_keeps_completion(tmp_path):
+    """A04/A14: 提交等待时重复外层取消 —— completion 持续受拥有, 结果不丢."""
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    store = session._store
+    release = asyncio.Event()
+    original_commit = store.commit_request
+
+    async def gated_commit(request_id, *, messages, outcome):
+        result = await original_commit(request_id, messages=messages, outcome=outcome)
+        await release.wait()
+        return result
+
+    store.commit_request = gated_commit  # type: ignore[method-assign]
+    task = asyncio.create_task(session.execute("会取消提交等待的问"))
+    await asyncio.sleep(0.1)  # 内核已完成, commit 事务已派发, completion 挂在闸门上
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()  # 重复取消: 不得丢弃 completion 或把事务当作未发生
+    await asyncio.sleep(0.05)
+    release.set()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.persistence is not None and outcome.persistence.saved, (
+        "受拥有 completion 的提交结果照常交付"
+    )
+    assert session.persistence.saved_request_count == 1
+    await session.aclose()
+
+
