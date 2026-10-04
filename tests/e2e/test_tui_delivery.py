@@ -192,6 +192,8 @@ async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path):
         )
         assert await wait_until(lambda: len(model_of(session).requests) == 1), "首问只提交一次"
         assert await wait_until(lambda: stage.contains("首问") and stage.contains("回答"))
+        # /exit 只在 idle 生效: 内容落屏早于状态翻转 (16ms 渲染节流), 先等 idle
+        assert await wait_until(lambda: session.state == "idle")
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
@@ -215,6 +217,7 @@ async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path):
         assert await wait_until(lambda: session.state == "executing")
         stage.emit([CTRL_C])
         assert await wait_until(lambda: stage.contains("已取消"))
+        assert await wait_until(lambda: session.state == "idle"), "取消后回 idle 再退出"
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
