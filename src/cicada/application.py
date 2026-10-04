@@ -29,6 +29,7 @@ from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
 from cicada.core.messages import Message, isolate_message, isolate_tool_result
 from cicada.persistence.contracts import (
+    InterruptedRequest,
     LaunchIdentity,
     PersistenceState,
     PersistenceError,
@@ -40,6 +41,7 @@ from cicada.persistence.contracts import (
     StoredIdentity,
     conflicting_launch_fields,
 )
+from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.process import process_plugin
@@ -295,6 +297,8 @@ class ApplicationSession:
         restored_history: tuple[Message, ...] = (),
         restored_requests: tuple[RestoredRequest, ...] = (),
         restored_context_generation: int = 0,
+        restored_interrupted: tuple[InterruptedRequest, ...] = (),
+        view_only_reason: str | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -309,6 +313,8 @@ class ApplicationSession:
         self._restored_model_call_count = sum(
             len(request.outcome.model_calls) for request in restored_requests
         )
+        self._restored_interrupted = restored_interrupted
+        self._view_only_reason = view_only_reason
         self._context_generation = restored_context_generation
         self._request_id: str | None = None
         self._saved_request_count = 0
@@ -320,6 +326,7 @@ class ApplicationSession:
         self.observer_errors: list[BaseException] = []
         self._cancel_token: CancelToken | None = None
         self._active_done: asyncio.Future | None = None
+        self._clear_done: asyncio.Future | None = None  # 清空生产者完成标记 (close 监督对象)
         self._clearing = False  # 持久清空进行中: 与 execute 互斥 (契约 §3)
         self._process_uncertain = False
         self._closing = False
@@ -375,6 +382,28 @@ class ApplicationSession:
         """打开时恢复的已提交请求事实 (含逐轮计量); 无持久化为空元组."""
         return self._restored_requests
 
+    @property
+    def restored_interrupted(self) -> tuple[InterruptedRequest, ...]:
+        """打开时存档中的未完成 intent (诊断与显示; 不进入可续写历史)."""
+        return self._restored_interrupted
+
+    @property
+    def view_only_reason(self) -> str | None:
+        """非空 = 恢复准入发现未证终结活动, 仅可查看; 新编码请求被拒绝 (契约 D3).
+
+        清空不解锁此状态; 普通/检查模式及配置覆盖都不能绕过 (A15).
+        """
+        return self._view_only_reason
+
+    @property
+    def active_request_id(self) -> str | None:
+        """当前 (或最近一次) 请求的持久 ID; 活动包装器经协调器读取."""
+        return self._request_id
+
+    def latch_storage_failure(self, detail: str) -> None:
+        """活动包装器等生产者的公开锁存入口; 幂等, 首次失败固定原因."""
+        self._latch_storage_failed(detail)
+
     # --- 订阅 ----------------------------------------------------------------------
 
     def subscribe(self, handler: Callable[[ApplicationUpdate], None]) -> Callable[[], None]:
@@ -412,6 +441,11 @@ class ApplicationSession:
             raise RuntimeError(f"application is {self._state}; a request must finish before the next one")
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt must be a nonempty request")
+        if self._view_only_reason is not None:
+            raise RuntimeError(
+                f"session is view-only after restore ({self._view_only_reason}); "
+                "new coding requests are refused"
+            )
         if self._config.plan is not None and self._process_uncertain:
             raise RuntimeError(
                 "process_uncertain: new coding requests are refused; only status, clear or exit remain"
@@ -460,8 +494,15 @@ class ApplicationSession:
                 self._active_done.set_result(None)
         # 先更新隔离的 state/history, 再通知订阅者; 应用把后缀追加一次
         if self._store is not None:
-            # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1
-            persisted = await self._commit_request(result, outcome)
+            # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1。
+            # 提交 completion 由协调器持有: 外层重复取消不取消事务、不当作未发生
+            commit_task = asyncio.ensure_future(self._commit_request(result, outcome))
+            while True:
+                try:
+                    persisted = await asyncio.shield(commit_task)
+                    break
+                except asyncio.CancelledError:
+                    continue
             outcome = replace(
                 outcome,
                 persistence=persisted,
@@ -649,6 +690,7 @@ class ApplicationSession:
         if self._clearing:
             raise RuntimeError("a persistent clear is already in progress")
         self._clearing = True
+        self._clear_done = asyncio.get_running_loop().create_future()
         try:
             try:
                 new_generation = await self._store.commit_clear(self._epoch_id or "")
@@ -662,6 +704,8 @@ class ApplicationSession:
             self._notify(HistoryCleared())
         finally:
             self._clearing = False
+            if self._clear_done is not None and not self._clear_done.done():
+                self._clear_done.set_result(None)
 
     # --- 关闭 ----------------------------------------------------------------------
 
@@ -679,19 +723,25 @@ class ApplicationSession:
         deadline = time.monotonic() + CLOSE_SUPERVISION_S
         self._close_deadline = deadline
         self._close_latch.set()
-        # 取消活动请求并等待现有请求路径 (含 P4 收尾) 终结, 共享同一截止时间
-        if self._active_done is not None and not self._active_done.done():
-            if self._cancel_token is not None:
-                self._cancel_token.cancel()
+        # 取消活动请求并等待现有请求/清空生产者终结 (含持久提交与活动写入),
+        # 共享同一截止时间; execute 与 clear 互斥, 至多一个在途
+        producers = [
+            done for done in (self._active_done, self._clear_done)
+            if done is not None and not done.done()
+        ]
+        if producers and self._cancel_token is not None:
+            self._cancel_token.cancel()
+        for producer in producers:
             try:
                 await asyncio.wait_for(
-                    asyncio.shield(self._active_done),
+                    asyncio.shield(producer),
                     timeout=max(0.0, deadline - time.monotonic()),
                 )
             except asyncio.TimeoutError:
                 self._close_problems.append(
-                    "the active request did not finalize before the close supervision deadline"
+                    "the active operation did not finalize before the close supervision deadline"
                 )
+                break  # 截止时间已耗尽; 未完成生产者保持强引用与关闭诊断
         # 解除核心到应用的订阅; 应用 observer 保留到 ApplicationClosed 送达后
         self._unsubscribe_core()
         stop_error: str | None = None
@@ -749,6 +799,21 @@ def _tool_fingerprint(app: App) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _bind_store_last_cleanup(
+    definitions: list[PluginDefinition],
+) -> list[PluginDefinition]:
+    """持久拓扑: 每个资源插件显式 require session.store (契约 §1)。
+
+    store 最先激活 -> runtime 逆序清理时模型/进程等资源先清理、store 最后释放;
+    依赖方向显式可核对, 不靠注册顺序推断。
+    """
+    return [
+        definition if "session.store" in definition.provides
+        else replace(definition, requires=definition.requires | {"session.store"})
+        for definition in definitions
+    ]
+
+
 def _open_persistent_store(
     config: ApplicationConfig,
 ) -> tuple[SQLiteSessionStore, RecoverySnapshot]:
@@ -766,15 +831,16 @@ def _open_persistent_store(
     return store, store.recovery_snapshot()
 
 
-def _admit_persistent_resume(persistence: PersistenceConfig, snapshot: RecoverySnapshot) -> None:
-    """01 阶段的恢复准入: 中断续写与配置差异在 bootstrap 前拒绝, 无副作用."""
+def _admit_persistent_resume(
+    persistence: PersistenceConfig, snapshot: RecoverySnapshot
+) -> str | None:
+    """恢复准入: 配置冲突在 bootstrap 前拒绝 (无副作用); 返回 view-only 原因或 None.
+
+    无未证终结活动的中断请求可以继续 (pending intent 只标中断并显示);
+    存在未证终结/未闭合活动时恢复为查看状态, 不能经模式或配置覆盖解除 (A15).
+    """
     if persistence.session_id is None:
-        return
-    if snapshot.interrupted:
-        raise ApplicationOpenError(
-            "the session has an interrupted request; continuing it is refused in this stage "
-            "(process-terminal evidence arrives in ticket 02)"
-        )
+        return None
     saved_identity = snapshot.identity
     if saved_identity is None:
         raise ApplicationOpenError(
@@ -785,6 +851,19 @@ def _admit_persistent_resume(persistence: PersistenceConfig, snapshot: RecoveryS
         raise ApplicationOpenError(
             "restored session config conflicts with the current launch: " + ", ".join(conflicts)
         )
+    unproven = snapshot.unproven_process_activities()
+    if unproven:
+        first = unproven[0]
+        return (
+            f"restored session has {len(unproven)} process activity without proven "
+            f"termination (first: {first.tool_name} call {first.call_id}, "
+            + (
+                f"reason: {first.terminal.reason}"
+                if first.terminal is not None and first.terminal.reason
+                else "no terminal record"
+            ) + ")"
+        )
+    return None
 
 
 async def _run_preflight(preflight: Callable[[], object] | None) -> None:
@@ -825,21 +904,35 @@ async def open_application(
     if config.persistence is not None:
         store, snapshot = _open_persistent_store(config)
 
+    # 活动包装器经 tool_policy 装入; 协调器在会话构造后绑定 (契约 §3)
+    coordinator = ActivityCoordinator()
+    tool_policy = None
+    if store is not None:
+        assert store is not None
+
+        def tool_policy(tool, runtime, _store=store, _coordinator=coordinator):
+            return ProcessActivityWrapper(tool, _store, _coordinator)
+
     definitions: list[PluginDefinition] = []
     if store is not None:
         definitions.append(session_store_plugin(store))
-    definitions.extend(default_definitions(config.workspace, config.model_plugin, plan))
+        definitions.extend(_bind_store_last_cleanup(
+            default_definitions(config.workspace, config.model_plugin, plan)
+        ))
+    else:
+        definitions.extend(default_definitions(config.workspace, config.model_plugin, plan))
 
     if store is not None:
         assert snapshot is not None and config.persistence is not None
         try:
-            _admit_persistent_resume(config.persistence, snapshot)
+            view_only_reason = _admit_persistent_resume(config.persistence, snapshot)
             await _run_preflight(preflight)
             app: App = await bootstrap(
                 definitions,
                 tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
                 system_prompt=config.system_prompt,
                 model_policy=_model_policy if plan is not None else None,
+                tool_policy=tool_policy,
                 max_turns=config.max_turns,
             )
         except BootError as exc:
@@ -876,6 +969,8 @@ async def open_application(
                 )
             except PersistenceError as exc:
                 raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
+            # start_epoch 已把 pending intent 标中断: 重取点时快照, 会话交接事实与存档一致
+            snapshot = store.recovery_snapshot()
             session = ApplicationSession(
                 app=app,
                 config=config,
@@ -887,7 +982,10 @@ async def open_application(
                 restored_history=snapshot.canonical_history,
                 restored_requests=snapshot.requests,
                 restored_context_generation=snapshot.context_generation,
+                restored_interrupted=snapshot.interrupted,
+                view_only_reason=view_only_reason,
             )
+            coordinator.bind(session)
         except ApplicationOpenError:
             await app.aclose()
             raise

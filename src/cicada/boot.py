@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import inspect
 
 from cicada.core.agent import Agent
-from cicada.core.ports import ModelPort
+from cicada.core.ports import ModelPort, Tool
 from cicada.runtime.plugin import PluginDefinition
 from cicada.runtime.runtime import CapabilityError, PluginRuntime, StartupReport
 
@@ -20,6 +20,8 @@ class BootError(RuntimeError):
 
 
 ModelPolicy = Callable[[ModelPort, PluginRuntime], ModelPort]
+# 02: 与 model_policy 同构的工具策略; 仅持久模式装入活动包装器 (契约 §3)
+ToolPolicy = Callable[[Tool, PluginRuntime], Tool]
 
 
 @dataclass
@@ -39,14 +41,17 @@ async def bootstrap(
     model_capability: str = "model",
     system_prompt: str = "",
     model_policy: ModelPolicy | None = None,
+    tool_policy: ToolPolicy | None = None,
     max_turns: int = 50,
 ) -> App:
     if not isinstance(system_prompt, str):
-        raise TypeError(f"system_prompt must be a str, got {type(system_prompt).__name__}")
+        raise TypeError(f"system_prompt must be str, got {type(system_prompt).__name__}")
     if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns <= 0:
         raise ValueError("max_turns must be a positive integer")
     if model_policy is not None and not callable(model_policy):
         raise TypeError("model_policy must be a synchronous callable or None")
+    if tool_policy is not None and not callable(tool_policy):
+        raise TypeError("tool_policy must be a synchronous callable or None")
     runtime = PluginRuntime()
     for definition in definitions:
         runtime.register(definition)
@@ -57,6 +62,24 @@ async def bootstrap(
     try:
         model = runtime.capability(model_capability)
         tools = {tool.spec.name: tool for name in tool_capabilities for tool in _as_tools(runtime.capability(name), name)}
+        if tool_policy is not None:
+            wrapped: dict[str, Tool] = {}
+            for name, tool in tools.items():
+                replacement = tool_policy(tool, runtime)
+                if inspect.isawaitable(replacement):
+                    if inspect.iscoroutine(replacement):
+                        replacement.close()
+                    raise BootError("tool_policy must return a Tool synchronously")
+                if (
+                    not callable(getattr(replacement, "execute", None))
+                    or not hasattr(replacement, "spec")
+                    or replacement.spec != tool.spec
+                ):
+                    raise BootError(
+                        f"tool_policy must return a Tool preserving the original spec ({name})"
+                    )
+                wrapped[name] = replacement
+            tools = wrapped
         if model_policy is not None:
             model = model_policy(model, runtime)
             if inspect.isawaitable(model):

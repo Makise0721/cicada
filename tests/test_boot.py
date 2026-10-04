@@ -216,3 +216,85 @@ async def test_bootstrap_invalid_turn_limit_does_not_start_plugins(turns):
     with pytest.raises(ValueError, match="max_turns"):
         await bootstrap([PluginDefinition("unused", setup)], tool_capabilities=(), max_turns=turns)
     assert setups == []
+
+
+# --- 02: tool_policy 工厂 ----------------------------------------------------------------
+
+
+async def test_bootstrap_tool_policy_wraps_every_tool_preserving_spec():
+    from cicada.core.messages import ToolResult
+
+    model = FakeModel([
+        [ToolCallEvent("c1", "echo", '{"text":"hi"}'), StreamDone("tool_use")],
+        [TextDelta("done"), StreamDone("stop")],
+    ])
+    seen = []
+
+    def policy(tool, runtime):
+        seen.append(tool.spec.name)
+
+        class Wrapped:
+            @property
+            def spec(self):
+                return tool.spec
+
+            async def execute(self, arguments, ctx):
+                result = await tool.execute(arguments, ctx)
+                return ToolResult(
+                    call_id=result.call_id, name=result.name,
+                    content=result.content + "|wrapped", is_error=result.is_error,
+                )
+
+        return Wrapped()
+
+    app = await bootstrap(
+        [fake_model_plugin(model), fake_tools_plugin([EchoTool()])],
+        tool_capabilities=("tools",), system_prompt="rules", tool_policy=policy,
+    )
+    result = await app.agent.run("task")
+    assert seen == ["echo"]
+    assert result.stop_reason == "stop"
+    tool_message = [m for m in result.messages if isinstance(m, ToolResultMessage)][0]
+    assert tool_message.result.content == "hi|wrapped"
+    await app.aclose()
+
+
+async def test_bootstrap_tool_policy_rejects_async_or_spec_changing_results():
+    from cicada.core.ports import ToolSpec
+
+    async def async_policy(tool, runtime):
+        return tool
+
+    with pytest.raises(BootError, match="synchronously"):
+        await bootstrap(
+            [fake_model_plugin(FakeModel([])), fake_tools_plugin([EchoTool()])],
+            tool_capabilities=("tools",), tool_policy=async_policy,
+        )
+
+    class SpecChanger:
+        spec = ToolSpec(name="echo", description="changed", parameters={"type": "object"})
+
+        async def execute(self, arguments, ctx):
+            raise AssertionError("must not run")
+
+    with pytest.raises(BootError, match="preserving the original spec"):
+        await bootstrap(
+            [fake_model_plugin(FakeModel([])), fake_tools_plugin([EchoTool()])],
+            tool_capabilities=("tools",), tool_policy=lambda t, r: SpecChanger(),
+        )
+
+
+async def test_bootstrap_tool_policy_failure_closes_started_runtime():
+    seen_runtime = []
+
+    def recording_policy(tool, runtime):
+        seen_runtime.append(runtime)
+        raise RuntimeError("wrapper exploded")
+
+    with pytest.raises(BootError, match="wrapper exploded"):
+        await bootstrap(
+            [fake_model_plugin(FakeModel([])), fake_tools_plugin([EchoTool()])],
+            tool_capabilities=("tools",), tool_policy=recording_policy,
+        )
+    with pytest.raises(CapabilityError):
+        seen_runtime[0].capability("tools")
