@@ -1,5 +1,9 @@
 """非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>"
 交互入口: uv run python -m cicada --tui --workspace <dir> [同上模型/检查旗标] [首问]
+持久会话 (05): --tui 默认自动保存新会话; --resume <ID> 恢复, --resume 不带 ID
+在 --tui 下启动会话选择器 (只读列表, Esc 取消退出码 0); --list-sessions 列出
+本工作区会话 (只读分页, 无需 prompt/TUI/模型探测)。恢复显示从只读快照重建
+(历史回答/工具卡/旧检查归属/累计计量/中断标记), 不重放旧执行事件。
 
 模型来源二选一:
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
