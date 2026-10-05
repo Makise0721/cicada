@@ -16,6 +16,9 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
+# 04: 与应用级测试共享存档身份读取 helper (避免同段 SQL 复制)
+from test_persistence_application import _latest_epoch_identity as _latest_epoch_launch
+
 
 def run_cli(*args: str) -> subprocess.CompletedProcess:
     env = {
@@ -436,22 +439,28 @@ def test_resume_with_current_config_requires_resume(tmp_path):
     assert "--resume-with-current-config 只能与 --resume" in proc.stderr
 
 
-def _latest_epoch_launch(work: Path, session_id: str):
-    """读存档最新 epoch 的身份 (04 差异记录证据)."""
-    import sqlite3
+def test_resume_zero_epoch_archive_reports_missing_identity(tmp_path):
+    """零 epoch 存档 (如保存进程在 bootstrap 前崩溃遗留) 恢复时点名拒绝, 不静默退出。"""
+    import asyncio
 
-    from cicada.persistence.codec import decode_identity
+    from cicada.plugins.session_store import open_session_store
 
-    db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
-    connection = sqlite3.connect(str(db))
-    try:
-        row = connection.execute(
-            "SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1"
-        ).fetchone()
-    finally:
-        connection.close()
-    assert row is not None
-    return decode_identity(row[0])
+    work = tmp_path / "ws"
+    work.mkdir()
+
+    async def _seed() -> str:
+        store = open_session_store(
+            directory=work / ".cicada" / "sessions", session_id=None, workspace=work
+        )
+        session_id = store.session_id
+        await store.aclose()
+        return session_id
+
+    session_id = asyncio.run(_seed())
+    proc = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                   "--resume", session_id, "问")
+    assert proc.returncode == 2
+    assert "no saved launch identity" in proc.stderr
 
 
 def test_resume_with_current_config_adopts_check_mode_and_records_epoch(tmp_path):
@@ -467,7 +476,7 @@ def test_resume_with_current_config_adopts_check_mode_and_records_epoch(tmp_path
                       "--resume", session_id, "--resume-with-current-config",
                       "--check-command", "exit 0", "第二问")
     assert adopted.returncode == 3, (adopted.stdout, adopted.stderr)  # 检查模式: stop 但检查未运行
-    assert f"[session id={session_id} mode=resume" in adopted.stdout
+    assert f"[session id={session_id} mode=resume restored_requests=1]" in adopted.stdout
     assert "[session saved request_id=" in adopted.stdout
 
     stored = _latest_epoch_launch(work, session_id)
@@ -772,13 +781,20 @@ def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
         stub.requests.clear()
 
         same = run_cli("--workspace", str(work), "--ollama-url", stub.url,
-                       "--resume", session_id, "--num-ctx", "8192", "第三问")
+                       "--resume", session_id,
+                       "--model", "stub-model", "--think", "--num-ctx", "8192", "第三问")
         assert same.returncode == 0, (same.stdout, same.stderr)
-        assert "context_requested=8192 source=cli" in same.stdout
+        assert "model=stub-model context_requested=8192 source=cli think=true" in same.stdout
+        stub.requests.clear()
+
+        inherited_url = run_cli("--workspace", str(work), "--resume", session_id, "第四问")
+        assert inherited_url.returncode == 0, (inherited_url.stdout, inherited_url.stderr)
+        # 省略 --ollama-url: 服务地址继承存档 (仍指向本替身)
+        assert stub.requests == ["GET /api/version", "POST /api/chat"], "base_url 继承存档"
         stub.requests.clear()
 
         conflict = run_cli("--workspace", str(work), "--ollama-url", stub.url,
-                           "--resume", session_id, "--num-ctx", "4096", "第四问")
+                           "--resume", session_id, "--num-ctx", "4096", "第五问")
         assert conflict.returncode == 2
         assert "config conflicts" in conflict.stderr
         assert "options" in conflict.stderr
@@ -892,3 +908,18 @@ def test_fake_resume_records_new_script_source_per_epoch(tmp_path):
 
     stored = _latest_epoch_launch(work, session_id)
     assert stored.launch.sources.get("script") == str(second_script), "新剧本来源记入新 epoch"
+
+
+def test_resume_normal_archive_with_checks_conflicts_on_signature(tmp_path):
+    """普通存档 + 显式 --check-command 恢复: checks_signature 冲突点名拒绝 (AC2 组合钉)."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    script = _script(tmp_path)
+    first = run_cli("--workspace", str(work), "--script", str(script), "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "--check-command", "exit 0", "第二问")
+    assert proc.returncode == 2
+    assert "config conflicts" in proc.stderr
+    assert "checks_signature" in proc.stderr

@@ -118,7 +118,15 @@ async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdenti
         print(f"session store open failed: {exc}", file=sys.stderr)
         return None
     try:
-        return store.recovery_snapshot().identity
+        identity = store.recovery_snapshot().identity
+        if identity is None:
+            # 零 epoch 存档 (如保存进程在 bootstrap 前崩溃遗留): 与恢复准入同一拒绝
+            print(
+                "--resume: the session archive has no saved launch identity to compare against",
+                file=sys.stderr,
+            )
+            return None
+        return identity
     finally:
         await store.aclose()
 
