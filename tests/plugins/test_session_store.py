@@ -1154,3 +1154,128 @@ async def test_load_rejects_receipt_relinked_to_foreign_activity(tmp_path):
     connection.close()
     with pytest.raises(ArchiveFormatError, match="does not carry the same receipt identity"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+# --- 05: 工作区会话列表 (A12) -----------------------------------------------------------------
+
+
+async def _make_session(directory: Path, *, requests: int = 1, title: str | None = None) -> str:
+    """经真实 store 建一个带提交请求的会话; 返回 session_id。"""
+    store = open_session_store(directory=directory, session_id=None, workspace=directory)
+    session_id = store.session_id
+    epoch = await store.start_epoch(_identity())
+    for index in range(requests):
+        prompt = f"问题 {index}"
+        request_id = await store.begin_request(epoch, prompt)
+        await store.commit_request(
+            request_id, messages=_suffix((prompt, f"回答 {index}")),
+            outcome=_outcome(run_id=f"run-{index + 1}"),
+        )
+    await store.aclose()
+    if title is not None:
+        connection = sqlite3.connect(str(directory / f"{session_id}.sqlite3"))
+        connection.execute("UPDATE session SET short_title = ?", (title,))
+        connection.commit()
+        connection.close()
+    return session_id
+
+
+def test_list_sessions_empty_directory(tmp_path):
+    from cicada.plugins.session_store import list_sessions
+
+    page = list_sessions(directory=tmp_path)
+    assert page.entries == () and page.next_cursor is None
+
+
+async def test_list_sessions_reports_counts_title_and_order(tmp_path):
+    from cicada.plugins.session_store import list_sessions
+
+    first = await _make_session(tmp_path, requests=1)
+    second = await _make_session(tmp_path, requests=2, title="修登录页")
+    page = list_sessions(directory=tmp_path)
+    assert page.next_cursor is None
+    assert [entry.session_id for entry in page.entries] == [second, first], "按最近提交时间降序"
+    top = page.entries[0]
+    assert top.committed_requests == 2 and top.interrupted_requests == 0
+    assert top.short_title == "修登录页"
+    assert top.updated_at is not None and not top.occupied and not top.blocked
+    assert page.entries[1].committed_requests == 1
+    assert page.entries[1].short_title != "", "提交后有短标题"
+
+
+async def test_list_sessions_marks_occupied_bad_and_blockers(tmp_path):
+    from cicada.plugins.session_store import list_sessions
+
+    busy = await _make_session(tmp_path, requests=1)
+    blocked = await _make_session(tmp_path, requests=1)
+    holder = open_session_store(directory=tmp_path, session_id=busy, workspace=tmp_path)
+    try:
+        # 阻断证据: 未闭合活动 + 不可信回执 (02/03 同源注入方式)
+        import hashlib as _hashlib
+
+        from cicada.persistence.codec import dumps_strict
+
+        db = tmp_path / f"{blocked}.sqlite3"
+        connection = sqlite3.connect(str(db))
+        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
+        seq = connection.execute("SELECT MAX(seq) FROM records").fetchone()[0] + 1
+        prompt_payload = dumps_strict({"prompt": "被中断的问"})
+        request_id = "11111111-2222-4333-8444-555555555555"
+        connection.execute(
+            "INSERT INTO records (seq, epoch_id, context_generation, kind, request_id,"
+            " created_at, payload_json, payload_sha256) VALUES (?, ?, 0, 'request_begin', ?, 0, ?, NULL)",
+            (seq, epoch, request_id, prompt_payload),
+        )
+        connection.execute(
+            "INSERT INTO request_intents (request_id, epoch_id, begin_seq, status)"
+            " VALUES (?, ?, ?, 'pending')",
+            (request_id, epoch, seq),
+        )
+        arguments = {"command": "Start-Sleep -Seconds 30"}
+        canonical = dumps_strict(arguments)
+        digest = _hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        connection.execute(
+            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+            " arguments_digest, begin_json, end_json) VALUES ('activity-1', ?, 'powershell',"
+            " 'c-pending', ?, ?, NULL)",
+            (request_id, digest, dumps_strict({
+                "description": canonical[:512], "arguments_digest": digest, "started_at": 1.0,
+            })),
+        )
+        connection.commit()
+        connection.close()
+        # 另一个坏档: 不是合法 SQLite 文件
+        (tmp_path / "00000000-1111-4222-8333-444444444444.sqlite3").write_bytes(b"not a database")
+
+        page = list_sessions(directory=tmp_path)
+        by_id = {entry.session_id: entry for entry in page.entries}
+        assert len(page.entries) == 3, "坏档不消失 (不伪装成空列表/缺失)"
+        assert by_id[busy].occupied, "lease 被持有的会话标注占用"
+        assert not by_id[blocked].occupied
+        assert by_id[blocked].blocked and by_id[blocked].interrupted_requests == 1
+        assert by_id[blocked].unproven_activities == 1
+        bad = by_id["00000000-1111-4222-8333-444444444444"]
+        assert bad.error is not None and "not a database" in bad.error
+        assert bad.occupied is False
+    finally:
+        await holder.aclose()
+
+
+async def test_list_sessions_pagination_cursor(tmp_path):
+    from cicada.plugins.session_store import list_sessions
+
+    for _ in range(3):
+        await _make_session(tmp_path, requests=1)
+    page_one = list_sessions(directory=tmp_path, limit=2)
+    assert len(page_one.entries) == 2 and page_one.next_cursor is not None
+    page_two = list_sessions(directory=tmp_path, limit=2, cursor=page_one.next_cursor)
+    assert len(page_two.entries) == 1 and page_two.next_cursor is None
+    ids = {entry.session_id for entry in page_one.entries + page_two.entries}
+    assert len(ids) == 3, "分页不重不漏"
+
+
+def test_list_sessions_invalid_cursor_rejected(tmp_path):
+    from cicada.plugins.session_store import list_sessions
+
+    with pytest.raises(ValueError, match="invalid list cursor"):
+        list_sessions(directory=tmp_path, cursor="not-a-number")

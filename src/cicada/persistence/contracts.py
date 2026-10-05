@@ -401,6 +401,44 @@ class RequestPersistenceFacts:
     error: str | None = None
 
 
+# --- 会话列表 (05; 契约 §3 list_sessions) ---------------------------------------------------
+
+LIST_SESSIONS_PAGE_SIZE = 25
+
+
+@dataclass(frozen=True)
+class SessionSummary:
+    """列表中单个会话的有界事实; error 非空 = 坏档/不可读 (其余字段仅部分可信).
+
+    blocked 是恢复阻断的证据聚合: 未证终结/未闭合活动或不可信终结回执
+    (与恢复准入 view-only 派生同源), 列表只作标注, 不替代打开时校验.
+    """
+
+    session_id: str
+    short_title: str
+    created_at: float
+    updated_at: float | None          # 最近提交记录时间; 无记录为 None
+    committed_requests: int
+    interrupted_requests: int         # pending/interrupted intent 总数
+    occupied: bool                    # lease 疑似被其他进程持有
+    unproven_activities: int
+    untrusted_receipts: int
+    error: str | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.unproven_activities > 0 or self.untrusted_receipts > 0
+
+
+@dataclass(frozen=True)
+class SessionPage:
+    """有界分页列表; next_cursor 非空表示还有更多条目 (不声称其余不存在)."""
+
+    directory: str
+    entries: tuple[SessionSummary, ...]
+    next_cursor: str | None
+
+
 @dataclass(frozen=True)
 class PersistenceState:
     """应用暴露的只读持久状态; 字段为打开/保存到当前时刻的事实快照."""
