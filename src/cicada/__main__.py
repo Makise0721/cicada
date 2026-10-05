@@ -505,7 +505,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--save-session", action="store_true",
-        help="单次模式创建持久会话并保存本次请求 (默认不落盘); 与检查模式/--tui 组合暂不支持",
+        help="单次模式创建持久会话并保存本次请求 (默认不落盘); 检查模式可组合, 与 --tui 组合暂不支持",
     )
     parser.add_argument(
         "--resume", metavar="SESSION_ID",

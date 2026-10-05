@@ -165,8 +165,8 @@ uv run --frozen python -m cicada --help
 | `--script` | 使用 JSON 剧本；不能与 `--model`、`--ollama-url`、`--think` 或 `--num-ctx` 同时使用 |
 | `--check-command` | 指定检查的 PowerShell 命令（可重复，最多 8 条，每条 ≤4096 bytes）；给出即进入检查模式，按顺序分配 `check-1`…`check-N` |
 | `--check-timeout` | 检查命令超时秒数，默认 120，范围 (0, 300]；仅检查模式可用 |
-| `--save-session` | 单次模式创建持久会话并保存本次请求（默认不落盘）；存档写入 `<workspace>/.cicada/sessions/<id>.sqlite3`，输出 session ID；与检查模式或 `--tui` 组合暂不支持 |
-| `--resume SESSION_ID` | 按 UUIDv4 会话 ID 恢复持久会话：完整规范历史、工具记录与计量恢复后提交新 prompt，旧工具不重放；恢复要求当前启动配置与存档一致（冲突在副作用前拒绝），并追加保存；存档中上次未完成的请求显示为中断记录——无未证终结的进程活动时可继续，存在时恢复为仅可查看（view-only），新 prompt 零执行并退出码 3 |
+| `--save-session` | 单次模式创建持久会话并保存本次请求（默认不落盘）；存档写入 `<workspace>/.cicada/sessions/<id>.sqlite3`，输出 session ID；检查模式可组合保存（旧检查回执作为历史事实持久化，恢复后不构成当前验证权威）；与 `--tui` 组合暂不支持 |
+| `--resume SESSION_ID` | 按 UUIDv4 会话 ID 恢复持久会话：完整规范历史、工具记录与计量恢复后提交新 prompt，旧工具不重放；恢复要求当前启动配置与存档一致（含检查定义签名，冲突在副作用前拒绝），并追加保存；存档中上次未完成的请求显示为中断记录——无未证终结的进程活动时可继续，存在时恢复为仅可查看（view-only），新 prompt 零执行并退出码 3 |
 
 启动时会显示模型、上下文请求值及来源、系统提示版本与哈希（不打印提示全文）；运行结束后输出运行摘要（模型调用次数、token 计量的已知总和与报告覆盖率、本地与 provider 耗时分别标注）。摘要只陈述计量事实，不代表任务验收结论。
 
