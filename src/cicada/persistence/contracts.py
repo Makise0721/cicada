@@ -272,6 +272,73 @@ class ProcessActivityFacts:
     terminal: ProcessTerminalFacts | None
 
 
+# --- 历史检查回执 (03; 契约 §5) -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredReceipt:
+    """历史检查回执的持久事实; 只作来源核对, 不构成当前验证权威.
+
+    definition_fingerprint 是检查定义 (check_id/command/timeout) 的稳定摘要;
+    终结字段与 P4 CheckReceipt 同语义, 经严格 codec 存取.
+    """
+
+    verification_run_id: str
+    receipt_id: str
+    epoch_id: str
+    request_id: str
+    definition_fingerprint: str
+    execution_status: str          # exited/launch_failed/timed_out/cancelled/error
+    exit_code: int | None
+    timed_out: bool
+    cancelled: bool
+    output_complete: bool
+    failure_kind: str | None
+    activity_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("verification_run_id", "receipt_id", "epoch_id", "request_id",
+                     "definition_fingerprint", "execution_status"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"StoredReceipt.{name} must be a nonempty str")
+        if self.execution_status not in (
+            "exited", "launch_failed", "timed_out", "cancelled", "error",
+        ):
+            raise ValueError("StoredReceipt.execution_status must be a known status")
+        if len(self.definition_fingerprint) != 64 or any(
+            c not in "0123456789abcdef" for c in self.definition_fingerprint
+        ):
+            raise ValueError("StoredReceipt.definition_fingerprint must be a sha256 hex digest")
+        if self.exit_code is not None and (
+            isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
+        ):
+            raise ValueError("StoredReceipt.exit_code must be an int or None")
+        for name in ("timed_out", "cancelled", "output_complete"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"StoredReceipt.{name} must be a bool")
+        if self.failure_kind is not None and not isinstance(self.failure_kind, str):
+            raise ValueError("StoredReceipt.failure_kind must be a str or None")
+        if self.activity_id is not None and not isinstance(self.activity_id, str):
+            raise ValueError("StoredReceipt.activity_id must be a str or None")
+
+
+def receipt_terminal_trustworthy(receipt: StoredReceipt) -> bool:
+    """回执自身是否记录可靠终结事实; 判定与 run_policy._receipt_terminates 同语义.
+
+    存档中存在不可信终结的回执 = 存档已记录 process_uncertain 的证据 (契约 D3),
+    恢复为查看状态.
+    """
+    if receipt.cancelled or receipt.timed_out:
+        return False
+    if receipt.execution_status == "launch_failed":
+        return receipt.exit_code is None
+    return (
+        receipt.execution_status == "exited"
+        and receipt.output_complete
+        and receipt.exit_code is not None
+    )
+
+
 @dataclass(frozen=True)
 class RecoverySnapshot:
     """打开存档后的隔离恢复快照; 不含 live 插件对象, 嵌套 details 已复制."""
@@ -287,6 +354,12 @@ class RecoverySnapshot:
     interrupted: tuple[InterruptedRequest, ...]
     canonical_history: tuple[Message, ...]          # 当前代次的闭合历史 (已过结构校验)
     process_activities: tuple[ProcessActivityFacts, ...] = ()   # 全部代次的进程活动
+    restored_receipts: tuple[StoredReceipt, ...] = ()           # 历史检查回执 (03)
+
+    @property
+    def recorded_process_uncertain(self) -> bool:
+        """存档是否记录了不可信终结的检查回执 (跨恢复 process_uncertain 证据)."""
+        return any(not receipt_terminal_trustworthy(r) for r in self.restored_receipts)
 
     @property
     def has_unproven_process_activity(self) -> bool:
@@ -356,8 +429,13 @@ class SessionStorePort(Protocol):
         ...
 
     async def commit_request(self, request_id: str, *, messages: tuple[Message, ...],
-                             outcome: RequestOutcomeFacts) -> int:
-        """完整请求单事务提交; 成功返回 records 序号. 重复提交 (含同内容) 一律拒绝."""
+                             outcome: RequestOutcomeFacts,
+                             receipts: tuple[StoredReceipt, ...] = ()) -> int:
+        """完整请求单事务提交; 成功返回 records 序号. 重复提交 (含同内容) 一律拒绝.
+
+        03 起 receipts 在同一事务写入 historical_receipts (检查模式); 既有调用
+        不传则行为不变. 全有或全无: 回执行与请求记录、intent 状态同事务落库.
+        """
         ...
 
     async def begin_process(self, request_id: str, *, tool_name: str, call_id: str,

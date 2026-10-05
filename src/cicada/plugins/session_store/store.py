@@ -22,7 +22,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, TypeVar
 
@@ -33,11 +33,13 @@ from cicada.persistence.codec import (
     decode_identity,
     decode_messages,
     decode_outcome_facts,
+    decode_receipt_terminal,
     decode_terminal_facts,
     encode_activity_begin,
     encode_identity,
     encode_messages,
     encode_outcome_facts,
+    encode_receipt_terminal,
     encode_terminal_facts,
     dumps_strict,
     strict_load,
@@ -65,6 +67,7 @@ from cicada.persistence.contracts import (
     StorageUnavailableError,
     StorageWriteError,
     StoredIdentity,
+    StoredReceipt,
     UnknownArchiveVersionError,
     WorkspaceMismatchError,
 )
@@ -208,6 +211,7 @@ class _LoadedState:
     requests: list[_CommittedRequest] = field(default_factory=list)
     intents: dict[str, _IntentRecord] = field(default_factory=dict)
     activities: dict[str, _ActivityRecord] = field(default_factory=dict)
+    receipts: dict[str, StoredReceipt] = field(default_factory=dict)
 
 
 # --- store 实现 -------------------------------------------------------------------------
@@ -347,11 +351,28 @@ class SQLiteSessionStore:
         return await self._dispatch(job)
 
     async def commit_request(
-        self, request_id: str, *, messages: tuple[Message, ...], outcome: RequestOutcomeFacts
+        self, request_id: str, *, messages: tuple[Message, ...], outcome: RequestOutcomeFacts,
+        receipts: tuple[StoredReceipt, ...] = (),
     ) -> int:
         validate_history_structure(messages)
         if not messages or not isinstance(messages[0], UserMessage):
             raise PersistenceError("committed request messages must start with the user prompt")
+        if not isinstance(receipts, tuple) or any(
+            not isinstance(receipt, StoredReceipt) for receipt in receipts
+        ):
+            raise PersistenceError("receipts must be a tuple of StoredReceipt")
+        if len({receipt.receipt_id for receipt in receipts}) != len(receipts):
+            raise PersistenceError("receipt ids must be unique within one commit")
+        receipt_rows = [
+            (
+                receipt,
+                self._encode_checked(
+                    encode_receipt_terminal(receipt), MAX_METADATA_BYTES,
+                    "receipt terminal evidence",
+                ),
+            )
+            for receipt in receipts
+        ]
         payload = self._encode_checked(
             {
                 "messages": encode_messages(messages),
@@ -378,6 +399,22 @@ class SQLiteSessionStore:
                 raise PersistenceError(
                     "committed request messages must start with the exact intent prompt"
                 )
+            for receipt, _terminal_json in receipt_rows:
+                if receipt.receipt_id in self._state.receipts:
+                    # 先于请求归属检查: 同一回执改挂到新请求也属重复关联
+                    raise PersistenceError(
+                        f"receipt {receipt.receipt_id} was already persisted; "
+                        "the same receipt is not copied into every request"
+                    )
+                if receipt.request_id != request_id:
+                    raise PersistenceError(
+                        f"receipt {receipt.receipt_id} references request {receipt.request_id}, "
+                        f"not the committing request {request_id}"
+                    )
+                if receipt.epoch_id != record.epoch_id:
+                    raise PersistenceError(
+                        f"receipt {receipt.receipt_id} epoch does not match the request epoch"
+                    )
             open_activities = [
                 activity_id
                 for activity_id, activity in self._state.activities.items()
@@ -425,6 +462,33 @@ class SQLiteSessionStore:
                         "UPDATE session SET short_title = ? WHERE session_id = ?",
                         (short_title, self._state.session_id),
                     )
+                linked_receipts: list[StoredReceipt] = []
+                for receipt, terminal_json in receipt_rows:
+                    # 关联到本请求内终结事实带同一 receipt_id 的活动 (check-run 包装器记录)
+                    receipt_activity = next(
+                        (
+                            activity_id
+                            for activity_id, activity in self._state.activities.items()
+                            if activity.request_id == request_id
+                            and activity.terminal is not None
+                            and activity.terminal.receipt_id == receipt.receipt_id
+                        ),
+                        None,
+                    )
+                    self._conn.execute(
+                        "INSERT INTO historical_receipts (verification_run_id, receipt_id,"
+                        " epoch_id, request_id, activity_id, definition_fingerprint,"
+                        " terminal_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            receipt.verification_run_id, receipt.receipt_id, receipt.epoch_id,
+                            receipt.request_id, receipt_activity, receipt.definition_fingerprint,
+                            terminal_json,
+                        ),
+                    )
+                    linked_receipts.append(
+                        replace(receipt, activity_id=receipt_activity)
+                        if receipt_activity != receipt.activity_id else receipt
+                    )
                 self._conn.execute("COMMIT")
             except BaseException:
                 self._conn.execute("ROLLBACK")
@@ -433,6 +497,8 @@ class SQLiteSessionStore:
             self._state.committed_count += 1
             self._state.message_count += len(messages)
             self._state.short_title = short_title
+            for receipt in linked_receipts:
+                self._state.receipts[receipt.receipt_id] = receipt
             self._state.intents[request_id] = _IntentRecord(
                 epoch_id=record.epoch_id, prompt=record.prompt, status="committed"
             )
@@ -736,6 +802,7 @@ class SQLiteSessionStore:
                 )
                 for record in self._state.activities.values()
             ),
+            restored_receipts=tuple(self._state.receipts.values()),
         )
 
 
@@ -1193,6 +1260,61 @@ def _load_state(
             started_at=started_at,
             terminal=terminal,
         )
+    for (verification_run_id, receipt_id, epoch_id, request_id, activity_id,
+         fingerprint, terminal_json) in connection.execute(
+        "SELECT verification_run_id, receipt_id, epoch_id, request_id, activity_id,"
+        " definition_fingerprint, terminal_json FROM historical_receipts ORDER BY rowid"
+    ):
+        if not isinstance(verification_run_id, str) or not verification_run_id:
+            raise ArchiveFormatError(f"receipt {receipt_id} has an invalid verification run id")
+        if not isinstance(receipt_id, str) or not receipt_id:
+            raise ArchiveFormatError("historical receipt must carry a nonempty receipt id")
+        if str(epoch_id) not in epoch_ids:
+            raise ArchiveFormatError(f"receipt {receipt_id} references an unknown epoch")
+        intent = state.intents.get(str(request_id)) if request_id is not None else None
+        if intent is None:
+            raise ArchiveFormatError(f"receipt {receipt_id} references unknown request {request_id}")
+        if intent.status != "committed":
+            raise ArchiveFormatError(
+                f"receipt {receipt_id} references request {request_id} which is {intent.status}; "
+                "receipts are only written with a committed request"
+            )
+        if intent.epoch_id != str(epoch_id):
+            raise ArchiveFormatError(f"receipt {receipt_id} epoch does not match its request")
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64 or any(
+            c not in "0123456789abcdef" for c in fingerprint
+        ):
+            raise ArchiveFormatError(f"receipt {receipt_id} has an invalid definition fingerprint")
+        if activity_id is not None and str(activity_id) not in state.activities:
+            raise ArchiveFormatError(f"receipt {receipt_id} references an unknown process activity")
+        if activity_id is not None and state.activities[str(activity_id)].request_id != str(request_id):
+            raise ArchiveFormatError(f"receipt {receipt_id} activity does not belong to its request")
+        _check_text_size(str(terminal_json), MAX_METADATA_BYTES, "receipt terminal evidence")
+        try:
+            (execution_status, exit_code, timed_out, cancelled,
+             output_complete, failure_kind) = decode_receipt_terminal(_load_payload(str(terminal_json)))
+        except CodecError as exc:
+            raise ArchiveFormatError(f"receipt {receipt_id} terminal record is corrupt: {exc}") from exc
+        try:
+            receipt = StoredReceipt(
+                verification_run_id=verification_run_id,
+                receipt_id=receipt_id,
+                epoch_id=str(epoch_id),
+                request_id=str(request_id),
+                definition_fingerprint=fingerprint,
+                execution_status=execution_status,
+                exit_code=exit_code,
+                timed_out=timed_out,
+                cancelled=cancelled,
+                output_complete=output_complete,
+                failure_kind=failure_kind,
+                activity_id=str(activity_id) if activity_id is not None else None,
+            )
+        except ValueError as exc:
+            raise ArchiveFormatError(f"receipt {receipt_id} is inconsistent: {exc}") from exc
+        if receipt.receipt_id in state.receipts:
+            raise ArchiveFormatError(f"receipt {receipt.receipt_id} appears more than once")
+        state.receipts[receipt.receipt_id] = receipt
     state.requests.sort(key=lambda item: item.seq)
     return state
 

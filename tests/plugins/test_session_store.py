@@ -894,3 +894,156 @@ async def test_aclose_retry_after_drain_timeout_completes_release(tmp_path, monk
     reopened = open_session_store(directory=tmp_path, session_id=store.session_id, workspace=tmp_path)
     assert reopened.recovery_snapshot().context_generation == 1
     await reopened.aclose() 
+
+
+# --- 03: 历史检查回执写入与加载 ---------------------------------------------------------------
+
+
+def _receipt(request_id: str, epoch_id: str, receipt_id: str = "r-1", **overrides):
+    from cicada.persistence.contracts import StoredReceipt
+
+    fields = dict(
+        verification_run_id="run-old",
+        receipt_id=receipt_id,
+        epoch_id=epoch_id,
+        request_id=request_id,
+        definition_fingerprint="f" * 64,
+        execution_status="exited",
+        exit_code=0,
+        timed_out=False,
+        cancelled=False,
+        output_complete=True,
+        failure_kind=None,
+    )
+    fields.update(overrides)
+    return StoredReceipt(**fields)
+
+
+async def test_commit_with_receipts_roundtrip_and_activity_link(tmp_path):
+    """回执行与请求同事务落库; check 活动按 receipt_id 自动关联; 重开事实保持."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "带检查的问")
+    activity_id = await store.begin_process(
+        request_id, tool_name="check", call_id="c1",
+        arguments={"action": "run", "check_id": "check-1"},
+    )
+    await store.end_process(activity_id, ProcessTerminalFacts(
+        kind="proven_terminal", exit_code=0, output_complete=True, receipt_id="r-1",
+    ))
+    messages = (
+        UserMessage(text="带检查的问"),
+        AssistantMessage(text="", tool_calls=(ToolCall("c1", "check", "{}"),)),
+        ToolResultMessage(result=ToolResult(
+            "c1", "check", "passed", details={"receipt_id": "r-1", "exit_code": 0,
+                                              "output_complete": True},
+        )),
+        AssistantMessage(text="答"),
+    )
+    seq = await store.commit_request(
+        request_id, messages=messages, outcome=_outcome(),
+        receipts=(_receipt(request_id, epoch),),
+    )
+    assert seq == 2
+    snapshot = store.recovery_snapshot()
+    assert len(snapshot.restored_receipts) == 1
+    receipt = snapshot.restored_receipts[0]
+    assert receipt.receipt_id == "r-1" and receipt.activity_id == activity_id
+    assert not snapshot.recorded_process_uncertain
+    session_id = store.session_id
+    await store.aclose()
+
+    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    restored = reopened.recovery_snapshot()
+    assert len(restored.restored_receipts) == 1
+    assert restored.restored_receipts[0].activity_id == activity_id
+    assert not restored.recorded_process_uncertain
+    await reopened.aclose()
+
+
+async def test_commit_receipts_relation_and_duplicate_validation(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "问")
+    await store.commit_request(request_id, messages=_suffix(("问", "答")), outcome=_outcome(),
+                               receipts=(_receipt(request_id, epoch),))
+    other = await store.begin_request(epoch, "第二问")  # 前一请求已提交, 允许新 intent
+    messages = _suffix(("第二问", "答"))
+    with pytest.raises(PersistenceError, match="not the committing request"):
+        await store.commit_request(other, messages=messages, outcome=_outcome(),
+                                   receipts=(_receipt(request_id, epoch, receipt_id="r-other"),))
+    with pytest.raises(PersistenceError, match="unique within one commit"):
+        await store.commit_request(other, messages=messages, outcome=_outcome(),
+                                   receipts=(_receipt(other, epoch, receipt_id="r-dup"),
+                                             _receipt(other, epoch, receipt_id="r-dup")))
+    with pytest.raises(PersistenceError, match="epoch does not match"):
+        await store.commit_request(other, messages=messages, outcome=_outcome(),
+                                   receipts=(_receipt(other, "ghost-epoch", receipt_id="r-epoch"),))
+    await store.commit_request(other, messages=messages, outcome=_outcome())
+    # 同一回执不得在后续请求重复关联 (同一 receipt 不逐请求复制)
+    request3 = await store.begin_request(epoch, "第三问")
+    with pytest.raises(PersistenceError, match="already persisted"):
+        await store.commit_request(request3, messages=_suffix(("第三问", "答")),
+                                   outcome=_outcome(),
+                                   receipts=(_receipt(request_id, epoch),))
+    await store.aclose()
+
+
+async def test_untrustworthy_receipt_records_process_uncertain(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "超时检查")
+    await store.commit_request(
+        request_id, messages=_suffix(("超时检查", "答")), outcome=_outcome(),
+        receipts=(_receipt(request_id, epoch, execution_status="timed_out", exit_code=None,
+                           output_complete=False, failure_kind="timeout"),),
+    )
+    session_id = store.session_id
+    await store.aclose()
+    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    assert reopened.recovery_snapshot().recorded_process_uncertain
+    await reopened.aclose()
+
+
+def test_load_rejects_receipt_relation_violations(tmp_path):
+    """回执引用未知 epoch/未提交请求/损坏 terminal_json 都按关系损坏拒绝."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+
+    async def seed_with_receipt():
+        epoch = await store.start_epoch(_identity())
+        request_id = await store.begin_request(epoch, "问")
+        await store.commit_request(
+            request_id, messages=_suffix(("问", "答")), outcome=_outcome(),
+            receipts=(_receipt(request_id, epoch),),
+        )
+
+    asyncio.run(seed_with_receipt())
+    asyncio.run(store.aclose())
+    db = tmp_path / f"{session_id}.sqlite3"
+
+    connection = sqlite3.connect(str(db))
+    connection.execute("UPDATE historical_receipts SET terminal_json = 'not-json'")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="terminal record is corrupt"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+    connection = sqlite3.connect(str(db))
+    original = connection.execute("SELECT terminal_json FROM historical_receipts").fetchone()[0]
+    connection.execute("UPDATE historical_receipts SET terminal_json = ?",
+                       (original.replace('"exited"', '"nonsense"'),))
+    connection.execute("UPDATE historical_receipts SET request_id = 'ghost-request'")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="unknown request"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+    connection = sqlite3.connect(str(db))
+    connection.execute("UPDATE historical_receipts SET request_id ="
+                       " (SELECT request_id FROM request_intents LIMIT 1)")
+    connection.execute("UPDATE historical_receipts SET epoch_id = 'ghost-epoch'")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="unknown epoch"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)

@@ -29,6 +29,7 @@ from cicada.persistence.contracts import (
     ProcessTerminalFacts,
     RequestOutcomeFacts,
     StoredIdentity,
+    StoredReceipt,
 )
 
 _STOP_REASONS = frozenset(("stop", "tool_use", "length", "error", "aborted"))
@@ -356,6 +357,49 @@ _TERMINAL_KEYS = frozenset({
 })
 
 _ACTIVITY_BEGIN_KEYS = frozenset({"description", "arguments_digest", "started_at"})
+
+_RECEIPT_TERMINAL_KEYS = frozenset({
+    "execution_status", "exit_code", "timed_out", "cancelled", "output_complete", "failure_kind",
+})
+
+_RECEIPT_TERMINAL_STATUSES = frozenset(
+    ("exited", "launch_failed", "timed_out", "cancelled", "error")
+)
+
+
+def encode_receipt_terminal(receipt: StoredReceipt) -> dict[str, Any]:
+    """回执终结事实 -> 严格 JSON dict (store 落 terminal_json 前再经限额核对)."""
+    payload: dict[str, Any] = {
+        "execution_status": receipt.execution_status,
+        "exit_code": receipt.exit_code,
+        "timed_out": receipt.timed_out,
+        "cancelled": receipt.cancelled,
+        "output_complete": receipt.output_complete,
+        "failure_kind": receipt.failure_kind,
+    }
+    dumps_strict(payload)
+    return payload
+
+
+def decode_receipt_terminal(payload: Any) -> tuple[str, int | None, bool, bool, bool, str | None]:
+    """严格 JSON dict -> (execution_status, exit_code, timed_out, cancelled,
+    output_complete, failure_kind); 未知键/类型不符按存档损坏拒绝."""
+    where = "stored receipt terminal"
+    _exact_keys(payload, _RECEIPT_TERMINAL_KEYS, where)
+    status = payload["execution_status"]
+    if status not in _RECEIPT_TERMINAL_STATUSES:
+        raise CodecError(f"{where}.execution_status must be one of {sorted(_RECEIPT_TERMINAL_STATUSES)}")
+    failure_kind = payload["failure_kind"]
+    if failure_kind is not None and not isinstance(failure_kind, str):
+        raise CodecError(f"{where}.failure_kind must be a string or null")
+    return (
+        status,
+        _take_opt_int(payload, "exit_code", where),
+        _take_bool(payload, "timed_out", where),
+        _take_bool(payload, "cancelled", where),
+        _take_bool(payload, "output_complete", where),
+        failure_kind,
+    )
 
 
 def encode_terminal_facts(facts: ProcessTerminalFacts) -> dict[str, Any]:
