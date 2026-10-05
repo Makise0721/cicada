@@ -424,6 +424,166 @@ async def test_resume_with_tool_fingerprint_mismatch_refused_and_lease_released(
     await reopened.aclose()
 
 
+# --- 04: --resume-with-current-config (显式采用当前配置) ---------------------------------------
+
+
+def _latest_epoch_identity(root: Path, session_id: str):
+    """读存档最新 epoch 的身份; 用于核对差异记录通道."""
+    import sqlite3
+
+    from cicada.persistence.codec import decode_identity
+
+    db = root / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    try:
+        row = connection.execute(
+            "SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return decode_identity(row[0])
+
+
+async def test_resume_adopt_current_config_skips_conflict_and_records_epoch(tmp_path):
+    """A11: 显式采用当前配置恢复——冲突不拒绝, 差异记入新 epoch, 历史与代次保持."""
+    from dataclasses import replace as dc_replace
+
+    from cicada.application import ApplicationConfig, PersistenceConfig
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    await session.execute("第一问")
+    session_id = session.persistence.session_id
+    assert session.persistence.context_generation == 0
+    await session.aclose()
+
+    changed_identity = dc_replace(_identity(), max_turns=9, sources={"num_ctx": "cli"})
+    config = dc_replace(
+        _config(root, _script({"text": "恢复后的回答", "stop": True}), session_id=session_id),
+        persistence=PersistenceConfig(
+            session_id=session_id, identity=changed_identity, adopt_current_config=True
+        ),
+    )
+    resumed = await open_application(config)
+    assert resumed.persistence is not None and resumed.persistence.mode == "resume"
+    assert resumed.persistence.restored_request_count == 1, "采用当前配置不清空恢复历史"
+    assert resumed.persistence.context_generation == 0, "换配置不增上下文代次 (与清空耦合)"
+    assert len(resumed.history) > 0, "恢复的对话历史保持"
+    outcome = await resumed.execute("第二问")
+    assert outcome.exit_code == 0 and outcome.persistence.saved
+    await resumed.aclose()
+
+    stored = _latest_epoch_identity(root, session_id)
+    assert stored.launch.max_turns == 9, "新 epoch 记录采用的当前配置"
+    assert stored.launch.sources.get("resume_config") == "current"
+    assert stored.launch.sources.get("changed_fields") == "max_turns"
+    assert stored.launch.sources.get("num_ctx") == "cli"
+
+
+async def test_resume_adopt_current_config_without_differences_records_no_change(tmp_path):
+    from dataclasses import replace as dc_replace
+
+    from cicada.application import ApplicationConfig, PersistenceConfig
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    await session.execute("问")
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    config = dc_replace(
+        _config(root, _script(), session_id=session_id),
+        persistence=PersistenceConfig(
+            session_id=session_id, identity=_identity(), adopt_current_config=True
+        ),
+    )
+    resumed = await open_application(config)
+    await resumed.aclose()
+    stored = _latest_epoch_identity(root, session_id)
+    assert stored.launch.sources.get("resume_config") == "current"
+    assert "changed_fields" not in stored.launch.sources, "无差异不记录 changed_fields"
+
+
+async def test_resume_adopt_current_config_keeps_view_only(tmp_path):
+    """A15: 显式配置覆盖不解除未证终结活动的查看状态."""
+    from dataclasses import replace as dc_replace
+
+    from cicada.application import ApplicationConfig, PersistenceConfig
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(
+        {"tool_calls": [{"id": "c1", "name": "powershell",
+                         "arguments": {"command": "Start-Sleep -Seconds 30", "timeout": 30}}],
+         "tool_use": True},
+        {"text": "done", "stop": True},
+    ), session_id=None))
+    task = asyncio.create_task(session.execute("会留下未证终结的请求"))
+    await asyncio.sleep(0.3)
+    session.cancel()
+    outcome = await asyncio.wait_for(task, timeout=15)
+    assert outcome.persistence is not None and outcome.persistence.saved
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    changed_identity = dc_replace(_identity(), max_turns=9)
+    config = dc_replace(
+        _config(root, _script(), session_id=session_id),
+        persistence=PersistenceConfig(
+            session_id=session_id, identity=changed_identity, adopt_current_config=True
+        ),
+    )
+    resumed = await open_application(config)
+    assert resumed.view_only_reason is not None, "配置覆盖不解除 view-only"
+    model = resumed._app.agent._model
+    assert isinstance(model, FakeModel)
+    with pytest.raises(RuntimeError, match="view-only"):
+        await resumed.execute("新请求被拒绝")
+    assert model.requests == [], "view-only 会话零模型调用"
+    await resumed.aclose()
+
+
+async def test_resume_adopt_current_config_adopts_changed_tool_fingerprint(
+    tmp_path, monkeypatch
+):
+    """显式采用当前配置时工具指纹差异不拒绝 (当前启动整体被采用), 新指纹记入 epoch."""
+    from dataclasses import replace as dc_replace
+
+    from cicada.application import ApplicationConfig, PersistenceConfig
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    await session.execute("问")
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    import cicada.application as app_module
+
+    monkeypatch.setattr(app_module, "_tool_fingerprint", lambda app: "fingerprint-changed")
+    config = dc_replace(
+        _config(root, _script(), session_id=session_id),
+        persistence=PersistenceConfig(
+            session_id=session_id, identity=_identity(), adopt_current_config=True
+        ),
+    )
+    resumed = await open_application(config)
+    assert resumed.persistence is not None and resumed.persistence.mode == "resume"
+    await resumed.aclose()
+    stored = _latest_epoch_identity(root, session_id)
+    assert stored.tool_fingerprint == "fingerprint-changed"
+
+
+def test_persistence_config_requires_launch_identity():
+    """AC5: 无必要身份的持久编程调用拒绝; ephemeral 调用不受影响 (persistence=None)."""
+    from cicada.application import PersistenceConfig
+
+    with pytest.raises(ValueError, match="LaunchIdentity"):
+        PersistenceConfig(session_id=None, identity=None)  # type: ignore[arg-type]
+
+
 async def test_check_mode_with_persistence_opened_at_config(tmp_path):
     """03: 检查模式 + 持久会话组合放开; 真实执行面由 A08/A10 集成测试覆盖."""
     from cicada.application import ApplicationConfig, PersistenceConfig

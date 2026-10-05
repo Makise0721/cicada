@@ -179,18 +179,23 @@ class ApplicationConfig:
 class PersistenceConfig:
     """持久会话入口配置; session_id=None 表示创建新会话, 否则按精确 ID 恢复.
 
-    identity 是启动层给出的有效配置身份 (默认值已解析); 04 前恢复要求与
-    存档完全一致, 冲突在 bootstrap 前拒绝.
+    identity 是启动层给出的有效配置身份 (默认值已解析)。默认恢复要求 identity
+    与存档一致; adopt_current_config=True (--resume-with-current-config) 显式
+    采用当前配置: 身份/工具指纹差异不拒绝, 差异记入新 epoch 的身份来源, 不解除
+    view-only/process_uncertain 阻断 (04)。
     """
 
     session_id: str | None
     identity: LaunchIdentity
+    adopt_current_config: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, LaunchIdentity):
             raise ValueError("PersistenceConfig.identity must be a LaunchIdentity")
         if self.session_id is not None and not isinstance(self.session_id, str):
             raise ValueError("PersistenceConfig.session_id must be a str or None")
+        if not isinstance(self.adopt_current_config, bool):
+            raise ValueError("PersistenceConfig.adopt_current_config must be a bool")
 
 
 @dataclass(frozen=True)
@@ -1045,11 +1050,12 @@ def _admit_persistent_resume(
         raise ApplicationOpenError(
             "the session archive has no saved launch identity to compare against"
         )
-    conflicts = conflicting_launch_fields(saved_identity.launch, persistence.identity)
-    if conflicts:
-        raise ApplicationOpenError(
-            "restored session config conflicts with the current launch: " + ", ".join(conflicts)
-        )
+    if not persistence.adopt_current_config:
+        conflicts = conflicting_launch_fields(saved_identity.launch, persistence.identity)
+        if conflicts:
+            raise ApplicationOpenError(
+                "restored session config conflicts with the current launch: " + ", ".join(conflicts)
+            )
     unproven = snapshot.unproven_process_activities()
     if unproven:
         first = unproven[0]
@@ -1172,14 +1178,29 @@ async def open_application(
         try:
             fingerprint = _tool_fingerprint(app)
             saved_identity = snapshot.identity
-            if saved_identity is not None and saved_identity.tool_fingerprint != fingerprint:
-                raise ApplicationOpenError(
-                    "restored session tool declarations differ from the current launch "
-                    "(tool_fingerprint)"
-                )
+            adopt = config.persistence.adopt_current_config
+            if saved_identity is not None and not adopt:
+                if saved_identity.tool_fingerprint != fingerprint:
+                    raise ApplicationOpenError(
+                        "restored session tool declarations differ from the current launch "
+                        "(tool_fingerprint)"
+                    )
+            epoch_launch = config.persistence.identity
+            if (
+                saved_identity is not None
+                and adopt
+                and config.persistence.session_id is not None
+            ):
+                # 04: 显式采用当前配置——身份/指纹差异不拒绝, 差异记入新 epoch 的
+                # 身份来源 (sources 只作记录, 不参与同配置比对)
+                changed = conflicting_launch_fields(saved_identity.launch, epoch_launch)
+                sources = {**epoch_launch.sources, "resume_config": "current"}
+                if changed:
+                    sources["changed_fields"] = ",".join(changed)
+                epoch_launch = replace(epoch_launch, sources=sources)
             try:
                 epoch_id = await store.start_epoch(
-                    StoredIdentity(launch=config.persistence.identity, tool_fingerprint=fingerprint)
+                    StoredIdentity(launch=epoch_launch, tool_fingerprint=fingerprint)
                 )
             except PersistenceError as exc:
                 raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
