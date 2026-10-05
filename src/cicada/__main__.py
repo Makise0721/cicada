@@ -58,7 +58,7 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
-from cicada.persistence.contracts import LaunchIdentity
+from cicada.persistence.contracts import LaunchIdentity, PersistenceError, StoredIdentity
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
     CheckDefinition,
@@ -66,6 +66,7 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
+from cicada.plugins.session_store import open_session_store
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
@@ -89,6 +90,48 @@ CHECK_MODE_NUM_PREDICT = 2048
 CHECK_MODE_MAX_TURNS = 25
 CHECK_MODE_MAX_REQUEST_BYTES = 65536
 NORMAL_MODE_MAX_TURNS = 50
+
+# 04: 存档 options 的已知键 (ollama 透传); 继承前拒绝未知键与非法值
+KNOWN_OLLAMA_OPTION_KEYS = ("num_ctx", "num_predict")
+
+
+async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdentity | None:
+    """恢复前的存档身份预读; 失败返回 None (错误消息已打印, 调用方退出码 2).
+
+    省略参数的继承需要存档值才能构造模型插件; 顺带把格式/workspace 校验提前到
+    模型插件构造与可达性探测之前 (契约 §1 次序)。store 打开后立即关闭, 存档的
+    完整校验与租约由 open_application 再次完成。
+    """
+    try:
+        store = open_session_store(
+            directory=Path(workspace) / ".cicada" / "sessions",
+            session_id=session_id,
+            workspace=Path(workspace),
+        )
+    except PersistenceError as exc:
+        print(f"session store open failed: {exc}", file=sys.stderr)
+        return None
+    try:
+        return store.recovery_snapshot().identity
+    finally:
+        await store.aclose()
+
+
+def _validate_saved_options(options: dict[str, object]) -> str | None:
+    """存档 options 键/值校验; 返回错误消息或 None (契约 §6: 未知配置键不执行)."""
+    unknown = sorted(str(key) for key in options if key not in KNOWN_OLLAMA_OPTION_KEYS)
+    if unknown:
+        return (
+            f"存档配置包含未知配置键: {', '.join(unknown)} "
+            f"(当前程序仅支持: {', '.join(KNOWN_OLLAMA_OPTION_KEYS)})"
+        )
+    for key in KNOWN_OLLAMA_OPTION_KEYS:
+        value = options.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return f"存档配置 {key} 必须是正整数, 存档记录 {value!r}"
+    return None
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -298,6 +341,27 @@ async def _run(args: argparse.Namespace) -> int:
                 f"max_turns={CHECK_MODE_MAX_TURNS}]"
             )
     max_turns = CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS
+    # 04: 默认恢复预读存档身份——省略参数继承存档, 显式参数与存档比对;
+    # 检查定义只存签名不存命令, 检查模式存档遗漏 --check-command 时明确拒绝
+    saved_launch: LaunchIdentity | None = None
+    if args.resume is not None and not args.resume_with_current_config:
+        saved_stored = await _read_saved_identity(workspace, args.resume)
+        if saved_stored is None:
+            return 2
+        if saved_stored.launch.checks_signature is not None and not checks:
+            print(
+                "--resume: 存档为检查模式会话, 检查定义不保存在存档中, 无法省略继承; "
+                "请显式给出与保存时相同的 --check-command, "
+                "或用 --resume-with-current-config 以当前配置恢复",
+                file=sys.stderr,
+            )
+            return 2
+        if saved_stored.launch.provider == "ollama":
+            saved_launch = saved_stored.launch
+            option_error = _validate_saved_options(dict(saved_launch.options))
+            if option_error is not None:
+                print(f"--resume: {option_error}", file=sys.stderr)
+                return 2
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -318,17 +382,40 @@ async def _run(args: argparse.Namespace) -> int:
         )
         preflight = None
     else:
-        num_ctx = args.num_ctx if args.num_ctx is not None else DEFAULT_NUM_CTX
-        source = "cli" if args.num_ctx is not None else "default"
+        # 04: 省略的模型/服务地址/think/窗口继承存档 (来源记 archive); 显式值保持
+        # 原语义, 与存档的差异由恢复准入点名拒绝
+        sources: dict[str, str] = {}
+        eff_model = args.model or DEFAULT_CONFIG.model
+        eff_base_url = args.ollama_url or DEFAULT_CONFIG.base_url
+        eff_think: bool | None = bool(args.think)
+        num_ctx_source = "cli" if args.num_ctx is not None else "default"
+        if args.num_ctx is not None:
+            num_ctx = args.num_ctx
+        elif saved_launch is not None and saved_launch.options.get("num_ctx") is not None:
+            num_ctx = saved_launch.options["num_ctx"]
+            num_ctx_source = "archive"
+        else:
+            num_ctx = DEFAULT_NUM_CTX
+        if saved_launch is not None:
+            if args.model is None:
+                eff_model = saved_launch.model
+                sources["model"] = "archive"
+            if args.ollama_url is None and saved_launch.base_url is not None:
+                eff_base_url = saved_launch.base_url
+                sources["base_url"] = "archive"
+            if not args.think:
+                eff_think = saved_launch.think
+                sources["think"] = "archive"
+        sources["num_ctx"] = num_ctx_source
         options: dict[str, object] = {"num_ctx": num_ctx}
         request_limit: int | None = None
         if checks:
             options["num_predict"] = CHECK_MODE_NUM_PREDICT
             request_limit = CHECK_MODE_MAX_REQUEST_BYTES
         config = OllamaConfig(
-            base_url=args.ollama_url or DEFAULT_CONFIG.base_url,
-            model=args.model or DEFAULT_CONFIG.model,
-            think=args.think,
+            base_url=eff_base_url,
+            model=eff_model,
+            think=eff_think,
             options=options,
             max_request_bytes=request_limit,
         )
@@ -338,7 +425,7 @@ async def _run(args: argparse.Namespace) -> int:
                 if checks else ""
             )
             print(
-                f"[config model={config.model} context_requested={num_ctx} source={source} "
+                f"[config model={config.model} context_requested={num_ctx} source={num_ctx_source} "
                 f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
             )
         identity = LaunchIdentity(
@@ -350,7 +437,7 @@ async def _run(args: argparse.Namespace) -> int:
             checks_signature=(
                 verification_checks_signature(plan.checks) if plan is not None else None
             ),
-            sources={"num_ctx": source},
+            sources=sources,
         )
         if args.save_session or args.resume is not None:
             # 持久路径: 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)

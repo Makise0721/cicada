@@ -11,6 +11,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -30,6 +31,60 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
         env=env,
         timeout=60,
     )
+
+
+class _OllamaStub:
+    """最小本地 Ollama 替身 (A11 真实模型组合的确定性证据):
+
+    GET /api/version -> 200 (preflight); POST /api/chat -> 单条 NDJSON stop 终结流.
+    requests 记录收到的请求行, 用于「参数来源/冲突字段/零意外调用」断言。
+    """
+
+    def __init__(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        outer = self
+        self.requests: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args) -> None:
+                pass
+
+            def _reply(self, body: bytes, content_type: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:
+                outer.requests.append(f"GET {self.path}")
+                self._reply(b'{"version": "stub"}', "application/json")
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                outer.requests.append(f"POST {self.path}")
+                self._reply(
+                    b'{"message": {"role": "assistant", "content": "stub answer"},'
+                    b' "done": true, "done_reason": "stop"}\n',
+                    "application/x-ndjson",
+                )
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def stop(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
 
 def _dead_port() -> int:
@@ -688,3 +743,124 @@ def test_resume_with_pending_intent_prints_interrupted_and_continues(tmp_path):
     assert "[session interrupted_requests=1]" in proc.stdout
     assert "mode=resume restored_requests=1" in proc.stdout
     assert "[session saved request_id=" in proc.stdout
+
+
+# --- 04: 默认恢复的配置继承 (A11; 真实模型组合 + 本地 ollama 替身) ------------------------------
+
+
+def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
+    """省略参数继承存档 (来源 archive), 显式相同可用, 显式不同点名冲突且零模型探测."""
+    stub = _OllamaStub()
+    try:
+        work = tmp_path / "ws"
+        work.mkdir()
+        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                        "--model", "stub-model", "--think", "--num-ctx", "8192",
+                        "--save-session", "第一问")
+        assert first.returncode == 0, (first.stdout, first.stderr)
+        assert "model=stub-model context_requested=8192 source=cli think=true" in first.stdout
+        assert stub.requests == ["GET /api/version", "POST /api/chat"]
+        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+        stub.requests.clear()
+
+        inherited = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                            "--resume", session_id, "第二问")
+        assert inherited.returncode == 0, (inherited.stdout, inherited.stderr)
+        # 省略 model/think/num-ctx 全部继承存档, 来源标记 archive
+        assert "model=stub-model context_requested=8192 source=archive think=true" in inherited.stdout
+        assert stub.requests == ["GET /api/version", "POST /api/chat"], "恰一次探测与一次调用"
+        stub.requests.clear()
+
+        same = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                       "--resume", session_id, "--num-ctx", "8192", "第三问")
+        assert same.returncode == 0, (same.stdout, same.stderr)
+        assert "context_requested=8192 source=cli" in same.stdout
+        stub.requests.clear()
+
+        conflict = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                           "--resume", session_id, "--num-ctx", "4096", "第四问")
+        assert conflict.returncode == 2
+        assert "config conflicts" in conflict.stderr
+        assert "options" in conflict.stderr
+        assert stub.requests == [], "配置冲突先于可达性探测 (零模型请求)"
+    finally:
+        stub.stop()
+
+
+def test_resume_unknown_saved_option_key_rejected(tmp_path):
+    """契约 §6: 未知配置键不执行——继承前明确拒绝且零模型探测."""
+    import sqlite3
+
+    stub = _OllamaStub()
+    try:
+        work = tmp_path / "ws"
+        work.mkdir()
+        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                        "--num-ctx", "8192", "--save-session", "问")
+        assert first.returncode == 0, first.stderr
+        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+        db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+        connection = sqlite3.connect(str(db))
+        try:
+            row = connection.execute(
+                "SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+            payload = json.loads(row[0])
+            payload["options"]["bogus_threads"] = 4
+            connection.execute(
+                "UPDATE epoch SET identity_json = ? WHERE identity_json = ?",
+                (json.dumps(payload), row[0]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        stub.requests.clear()
+        proc = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                       "--resume", session_id, "问")
+        assert proc.returncode == 2
+        assert "未知配置键" in proc.stderr and "bogus_threads" in proc.stderr
+        assert stub.requests == []
+    finally:
+        stub.stop()
+
+
+def test_resume_omitted_checks_on_check_mode_archive_rejected(tmp_path):
+    """检查定义只存签名: 检查模式存档省略 --check-command 恢复时给出明确指引."""
+    work = _git_worktree(tmp_path)
+    script = _script(tmp_path)
+    first = run_cli("--workspace", str(work), "--script", str(script),
+                    "--save-session", "--check-command", "exit 0", "第一问")
+    assert first.returncode == 3, first.stderr  # 检查模式: stop 但检查未运行
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "第二问")
+    assert proc.returncode == 2
+    assert "--check-command" in proc.stderr
+    assert "--resume-with-current-config" in proc.stderr
+
+
+def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path):
+    """A11: 旗标下省略参数取当前默认 (而非存档), 差异记入新 epoch."""
+    stub = _OllamaStub()
+    try:
+        work = tmp_path / "ws"
+        work.mkdir()
+        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                        "--num-ctx", "8192", "--save-session", "第一问")
+        assert first.returncode == 0, first.stderr
+        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+        stub.requests.clear()
+
+        adopted = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+                          "--resume", session_id, "--resume-with-current-config", "第二问")
+        assert adopted.returncode == 0, (adopted.stdout, adopted.stderr)
+        # 省略 --num-ctx 取当前默认 32768 (非存档 8192), 来源 default
+        assert "context_requested=32768 source=default" in adopted.stdout
+        assert "[session saved request_id=" in adopted.stdout
+
+        stored = _latest_epoch_launch(work, session_id)
+        assert stored.launch.options.get("num_ctx") == 32768
+        assert stored.launch.sources.get("resume_config") == "current"
+        assert "options" in stored.launch.sources.get("changed_fields", "")
+    finally:
+        stub.stop()
