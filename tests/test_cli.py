@@ -864,3 +864,31 @@ def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path):
         assert "options" in stored.launch.sources.get("changed_fields", "")
     finally:
         stub.stop()
+
+
+def test_fake_resume_records_new_script_source_per_epoch(tmp_path):
+    """AC5 复核: fake 恢复显式提供后继剧本, 新来源记入新 epoch; 旧剧本不重放、
+    剧本内容不参与身份比对 (01 宽进点维持, 来源可追溯)."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    first_script = tmp_path / "first.json"
+    first_script.write_text(json.dumps([
+        {"tool_calls": [{"id": "c1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
+         "tool_use": True},
+        {"text": "第一轮", "stop": True},
+    ]), encoding="utf-8")
+    second_script = tmp_path / "second.json"
+    second_script.write_text(json.dumps([{"text": "恢复后回答", "stop": True}]), encoding="utf-8")
+
+    first = run_cli("--workspace", str(work), "--script", str(first_script),
+                    "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    second = run_cli("--workspace", str(work), "--script", str(second_script),
+                     "--resume", session_id, "第二问")
+    assert second.returncode == 0, second.stderr
+    assert ">> glob" not in second.stdout, "后继剧本只服务新调用, 旧剧本不重放"
+
+    stored = _latest_epoch_launch(work, session_id)
+    assert stored.launch.sources.get("script") == str(second_script), "新剧本来源记入新 epoch"

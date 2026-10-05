@@ -14,6 +14,12 @@
 首问提交; 进程退出码: 启动失败 2, UI 不可恢复/关闭错误优先 1, 正常关闭取最后
 一条请求的退出码 (无请求 0). 单次模式要求位置 prompt; 普通 UI 导入要求为零 (T14).
 
+持久恢复配置 (04): --resume 默认继承存档的模型/服务地址/think/窗口请求值
+(省略参数取存档, 显式参数与存档比对, 冲突点名拒绝且零模型探测); 检查定义只存
+签名, 检查模式存档恢复需显式给出相同 --check-command. --resume-with-current-config
+与 --resume 组合, 显式采用当前默认与显式输入, 与存档的差异记入新启动代次;
+两者都不换工作区、不解除 view-only/process_uncertain 恢复阻断.
+
 P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
 是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
 profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes. 运行结束后
@@ -378,7 +384,9 @@ async def _run(args: argparse.Namespace) -> int:
             checks_signature=(
                 verification_checks_signature(plan.checks) if plan is not None else None
             ),
-            sources={},
+            # 04: 后继剧本是本次启动的显式输入; 来源记录进 epoch 身份 (不参与比对,
+            # 不当作 live 模型行为或自动执行历史的授权)
+            sources={"script": str(Path(args.script))},
         )
         preflight = None
     else:
