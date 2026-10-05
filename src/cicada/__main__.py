@@ -367,6 +367,10 @@ async def _launch_session_selector(workspace: Path) -> str | None:
 async def _run(args: argparse.Namespace) -> int:
     if args.list_sessions:
         return _run_list_sessions(args)
+    if args.list_cursor is not None:
+        # 审查 05-F6: 游标只属于列表入口; 误用时拒绝而非静默忽略并执行请求
+        print("--list-cursor 只能与 --list-sessions 一起使用", file=sys.stderr)
+        return 2
     if args.save_session and args.resume is not None:
         print("--save-session 与 --resume 互斥: 保存新会话与恢复已有会话只能二选一", file=sys.stderr)
         return 2
@@ -468,6 +472,18 @@ async def _run(args: argparse.Namespace) -> int:
                 f"max_turns={CHECK_MODE_MAX_TURNS}]"
             )
     max_turns = CHECK_MODE_MAX_TURNS if checks else NORMAL_MODE_MAX_TURNS
+    # 05: --tui --resume 不带 ID = 启动选择器 (选择期间无模型/工具活动; Esc 退出码 0)。
+    # 选定后回写 args.resume, 使下方继承预读与按 ID 路径完全同路 (审查 05-H1);
+    # 终端构造/启动失败为启动环境错误, 单行 stderr + 退出码 2 (审查 05-F5)
+    if args.tui and args.resume is _RESUME_PICK:
+        try:
+            picked = await _launch_session_selector(Path(args.workspace))
+        except Exception as exc:
+            print(f"session selector failed: {exc!r}", file=sys.stderr)
+            return 2
+        if picked is None:
+            return 0
+        args.resume = picked
     # 04: 默认恢复预读存档身份——省略参数继承存档, 显式参数与存档比对;
     # 检查定义只存签名不存命令, 检查模式存档遗漏 --check-command 时明确拒绝
     saved_launch: LaunchIdentity | None = None
@@ -587,13 +603,7 @@ async def _run(args: argparse.Namespace) -> int:
         model_plugin = ollama_plugin(config)
         model_label = config.model
 
-    # 05: --tui --resume 不带 ID = 启动选择器 (选择期间无模型/工具活动; Esc 退出码 0)
     resume_id = args.resume if isinstance(args.resume, str) else None
-    if args.tui and args.resume is _RESUME_PICK:
-        picked = await _launch_session_selector(Path(args.workspace))
-        if picked is None:
-            return 0
-        resume_id = picked
     if args.tui or args.save_session or args.resume is not None:
         persistence_config = PersistenceConfig(
             session_id=resume_id,
@@ -749,7 +759,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--save-session", action="store_true",
-        help="单次模式创建持久会话并保存本次请求 (默认不落盘); 检查模式可组合, 与 --tui 组合暂不支持",
+        help="单次模式创建持久会话并保存本次请求 (默认不落盘); 检查模式可组合; --tui 已默认保存, 该旗标组合允许但不改变行为",
     )
     parser.add_argument(
         "--resume", nargs="?", const=_RESUME_PICK, default=None, metavar="SESSION_ID",

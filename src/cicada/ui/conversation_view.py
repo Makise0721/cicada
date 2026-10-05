@@ -285,7 +285,11 @@ class ConversationView:
         return False  # 未知命令提示且草稿保留
 
     async def _run_persistent_clear(self) -> None:
-        """等待持久清空提交落定; 成功的确认条目由 HistoryCleared 投影追加。"""
+        """等待持久清空提交落定; 成功的确认条目由 HistoryCleared 投影追加。
+
+        取消路径 (外层取消且事务最终成功, 应用同步内存后传播 CancelledError)
+        也必须释放屏障 (审查 05-F8): 用 BaseException 分支保证, 取消如实再传播。
+        """
         try:
             await self._session.clear_context()
         except Exception as exc:
@@ -295,6 +299,10 @@ class ConversationView:
             if self._on_update is not None:
                 self._on_update()
             return
+        except BaseException:
+            # CancelledError 等: 屏障释放后如实传播, 不吞异常
+            self._gate.note_clear_settled()
+            raise
         self._gate.note_clear_settled()
 
     def _status_sections(self) -> list[tuple[str, list[str]]]:

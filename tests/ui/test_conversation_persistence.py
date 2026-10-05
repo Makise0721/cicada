@@ -177,3 +177,30 @@ async def test_status_persistence_section_after_save(tmp_path):
     finally:
         await session.aclose()
         harness.close()
+
+
+async def test_clear_failure_shows_error_and_releases_barrier(tmp_path, monkeypatch):
+    """审查 05-F9: 清空提交失败 → 屏障释放 + 错误如实成条 (内存历史由应用保证不变)."""
+    from cicada.persistence.contracts import StorageWriteError
+
+    root = _repo(tmp_path)
+    session = await open_application(
+        _persistence_config(root, _script({"text": "答", "stop": True}), session_id=None)
+    )
+    harness = Harness(session)
+    try:
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+
+        async def failing(epoch_id):
+            raise StorageWriteError("disk gone")
+
+        session._store.commit_clear = failing  # type: ignore[method-assign]
+        assert harness.submit("/clear")
+        assert await _wait_until(lambda: not harness.view._gate.clearing), "失败后屏障释放"
+        rendered = strip_terminal_sequences(chr(10).join(harness.lines(80)))
+        assert "清空提交失败" in rendered
+        assert "disk gone" in rendered
+    finally:
+        await session.aclose()
+        harness.close()

@@ -1114,3 +1114,105 @@ def test_tui_view_only_restore_exits_three(tmp_path, monkeypatch):
     code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(work),
                                         "--script", str(_script(tmp_path)), "--resume", session_id])
     assert code == 3, err.value
+
+
+def test_tui_resume_with_initial_prompt_executes_once(tmp_path, monkeypatch):
+    """审查 05-M2: 恢复 + 选择后初始 prompt——新请求恰执行一次, 历史不重发."""
+    import asyncio
+
+    import cicada.__main__ as m
+
+    work = tmp_path / "ws"
+    work.mkdir()
+    first_script = tmp_path / "first.json"
+    first_script.write_text(json.dumps([{"text": "第一轮回答", "stop": True}]), encoding="utf-8")
+    save = run_cli("--workspace", str(work), "--script", str(first_script), "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+
+    second_script = tmp_path / "second.json"
+    second_script.write_text(json.dumps([{"text": "恢复后回答", "stop": True}]), encoding="utf-8")
+
+    captured: dict = {}
+
+    async def fake_run_tui_session(session, *, initial_prompt=None, **kwargs):
+        captured["initial_prompt"] = initial_prompt
+        model = session._app.agent._model
+        if initial_prompt:
+            await session.execute(initial_prompt)
+        captured["requests"] = list(model.requests)
+        return 0
+
+    monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
+    err = _CaptureTTY()
+    monkeypatch.setattr(sys, "stdin", _CaptureTTY())
+    monkeypatch.setattr(sys, "stdout", _CaptureTTY())
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["cicada", "--tui", "--workspace", str(work), "--script", str(second_script),
+         "--resume", session_id, "恢复后首问"],
+    )
+    code = m.main()
+    assert code == 0, err.value
+    assert captured["initial_prompt"] == "恢复后首问"
+    assert len(captured["requests"]) == 1, "初始 prompt 只执行一次"
+    messages = captured["requests"][0].messages
+    assert "第一问" in "".join(getattr(msg, "text", "") for msg in messages), "恢复历史进入请求"
+    from cicada.core.messages import UserMessage
+
+    user_texts = [msg.text for msg in messages if isinstance(msg, UserMessage)]
+    assert user_texts[-1] == "恢复后首问", "新 prompt 是最后一条用户消息"
+
+
+def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
+    """审查 05-F10: 列表入口零模型探测 (A12) 且零 UI 依赖导入."""
+    stub = _OllamaStub()
+    try:
+        (tmp_path / ".cicada" / "sessions").mkdir(parents=True)
+        proc = run_cli("--workspace", str(tmp_path), "--ollama-url", stub.url, "--list-sessions")
+        assert proc.returncode == 0, proc.stderr
+        assert stub.requests == [], "列表入口零模型探测"
+    finally:
+        stub.stop()
+
+    code = (
+        "import sys; "
+        f"sys.argv = ['cicada', '--workspace', r'{tmp_path}', '--list-sessions']; "
+        "import cicada.__main__ as m; "
+        "rc = m.main(); "
+        "assert rc == 0, f'exit {rc}'; "
+        "assert 'prompt_toolkit' not in sys.modules, 'UI 依赖被列表入口导入'; "
+        "assert 'rich' not in sys.modules, 'rich 被列表入口导入'"
+    )
+    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_resume_error_history_new_request_exits_zero(tmp_path):
+    """审查 05-F11: 历史失败不当本进程最后请求——error 结局存档恢复后新请求 rc 0."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    error_script = tmp_path / "error.json"
+    error_script.write_text(json.dumps([{"error": "boom"}]), encoding="utf-8")
+    first = run_cli("--workspace", str(work), "--script", str(error_script), "--save-session", "第一问")
+    assert first.returncode == 1, (first.stdout, first.stderr)  # error 结局
+    assert "[session saved request_id=" in first.stdout, "错误结局仍保存真实终结 (A03)"
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    second = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                     "--resume", session_id, "第二问")
+    assert second.returncode == 0, (second.stdout, second.stderr)
+    assert "[session saved request_id=" in second.stdout
+
+
+def test_list_cursor_without_list_sessions_rejected(tmp_path):
+    """审查 05-F6: 游标只属于列表入口; 误用拒绝而非静默执行请求."""
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+                   "--list-cursor", "3", "任务")
+    assert proc.returncode == 2
+    assert "--list-cursor 只能与 --list-sessions" in proc.stderr

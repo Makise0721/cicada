@@ -140,3 +140,26 @@ def test_selector_pagination(tmp_path):
     terminal = FakeTerminal(columns=60, rows=12)
     session_id, _ = _run_selector(terminal, directory, keys=[RIGHT, LEFT, ENTER], limit=2)
     assert session_id == ids[2], "翻回第一页后选定最近会话"
+
+
+def test_selector_bad_archive_enter_refused_until_escape(tmp_path):
+    """审查 05-M1: 坏档行 Enter 被拒 (选择器不结束), Escape 才取消——守卫真实驱动."""
+    directory = tmp_path / "sessions"
+    directory.mkdir()
+    asyncio.run(_make_session(directory, title="好的会话"))
+    (directory / "00000000-1111-4222-8333-444444444444.sqlite3").write_bytes(b"garbage")
+
+    async def drive():
+        terminal = FakeTerminal(columns=100, rows=12)
+        task = asyncio.create_task(run_session_selector(terminal, directory))
+        await asyncio.sleep(0.05)
+        terminal.emit([DOWN])  # 坏档排最后 (无提交记录)
+        await asyncio.sleep(0.01)
+        terminal.emit([ENTER])
+        await asyncio.sleep(0.05)
+        assert not task.done(), "坏档行 Enter 被拒, 选择器保持运行"
+        terminal.emit([ESCAPE])
+        return await asyncio.wait_for(task, timeout=10)
+
+    session_id, errors = asyncio.run(drive())
+    assert session_id is None and errors == []
