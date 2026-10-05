@@ -40,6 +40,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import httpx
@@ -64,7 +65,13 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
-from cicada.persistence.contracts import LaunchIdentity, PersistenceError, StoredIdentity
+from cicada.persistence.contracts import (
+    LIST_SESSIONS_PAGE_SIZE,
+    LaunchIdentity,
+    PersistenceError,
+    SessionPage,
+    StoredIdentity,
+)
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
     CheckDefinition,
@@ -72,7 +79,7 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
-from cicada.plugins.session_store import open_session_store
+from cicada.plugins.session_store import list_sessions, open_session_store
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
@@ -146,6 +153,72 @@ def _validate_saved_options(options: dict[str, object]) -> str | None:
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return f"存档配置 {key} 必须是正整数, 存档记录 {value!r}"
     return None
+
+
+_LIST_TITLE_MAX_CHARS = 30
+_LIST_ERROR_MAX_CHARS = 80
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
+def render_session_page(page: SessionPage) -> list[str]:
+    """--list-sessions 的有界输出行 (纯函数, 单测覆盖翻页与标注)。"""
+    lines = [f"会话列表 共 {len(page.entries)} 条 (目录 {page.directory})"]
+    if not page.entries:
+        lines.append("（本工作区暂无会话存档）")
+        return lines
+    for entry in page.entries:
+        updated = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.updated_at))
+            if entry.updated_at is not None else "无记录"
+        )
+        line = (
+            f"{entry.session_id}  {_clip(entry.short_title, _LIST_TITLE_MAX_CHARS)}  "
+            f"更新={updated}  请求={entry.committed_requests} 中断={entry.interrupted_requests}"
+        )
+        if entry.occupied:
+            line += " [占用]"
+        if entry.blocked:
+            line += (
+                f" [阻断: 未证终结活动×{entry.unproven_activities};"
+                f" 不可信回执×{entry.untrusted_receipts}]"
+            )
+        if entry.error is not None:
+            line += f" [坏档: {_clip(entry.error, _LIST_ERROR_MAX_CHARS)}]"
+        lines.append(line)
+    if page.next_cursor is not None:
+        lines.append(
+            f"第 {LIST_SESSIONS_PAGE_SIZE} 条之后仍有会话, 下一页: "
+            f"--list-cursor {page.next_cursor} (每页 {LIST_SESSIONS_PAGE_SIZE} 条)"
+        )
+    return lines
+
+
+def _run_list_sessions(args: argparse.Namespace) -> int:
+    """--list-sessions: 本 workspace 只读分页列表; 无 prompt/TUI/模型探测 (契约 §6)."""
+    if (
+        args.save_session or args.resume is not None or args.resume_with_current_config
+        or args.tui
+    ):
+        print(
+            "--list-sessions 是只读列表入口, 不能与 --save-session/--resume/--tui 组合",
+            file=sys.stderr,
+        )
+        return 2
+    if args.prompt is not None:
+        print("--list-sessions 不执行请求, 不接受位置 prompt", file=sys.stderr)
+        return 2
+    directory = Path(args.workspace) / ".cicada" / "sessions"
+    try:
+        page = list_sessions(directory=directory, cursor=args.list_cursor)
+    except ValueError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    for line in render_session_page(page):
+        print(line)
+    return 0
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -266,6 +339,8 @@ async def _ollama_reachable(base_url: str) -> bool:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.list_sessions:
+        return _run_list_sessions(args)
     if args.save_session and args.resume is not None:
         print("--save-session 与 --resume 互斥: 保存新会话与恢复已有会话只能二选一", file=sys.stderr)
         return 2
@@ -631,6 +706,17 @@ def main() -> int:
             "与 --resume 一起使用: 显式采用当前默认与显式参数恢复 (省略项取当前默认而非存档), "
             "与存档的差异记入新启动代次; 不换工作区、不解除恢复阻断"
         ),
+    )
+    parser.add_argument(
+        "--list-sessions", action="store_true",
+        help=(
+            f"列出本工作区的持久会话 (只读分页, 每页 {LIST_SESSIONS_PAGE_SIZE} 条; "
+            "无需 prompt/TUI/模型探测; 不能与 --save-session/--resume/--tui 组合)"
+        ),
+    )
+    parser.add_argument(
+        "--list-cursor", default=None, metavar="CURSOR",
+        help="--list-sessions 的翻页游标 (上一页输出末行给出)",
     )
     parser.add_argument(
         "prompt", nargs="?", default=None,

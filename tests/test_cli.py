@@ -923,3 +923,77 @@ def test_resume_normal_archive_with_checks_conflicts_on_signature(tmp_path):
     assert proc.returncode == 2
     assert "config conflicts" in proc.stderr
     assert "checks_signature" in proc.stderr
+
+
+# --- 05: --list-sessions 只读分页列表 (A12) ----------------------------------------------------
+
+
+def test_list_sessions_reports_saved_sessions_and_rejects_execution_flags(tmp_path):
+    work = tmp_path / "ws"
+    work.mkdir()
+    script = _script(tmp_path)
+    first = run_cli("--workspace", str(work), "--script", str(script),
+                    "--save-session", "修复登录页的问题")
+    assert first.returncode == 0, first.stderr
+    id_one = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    proc = run_cli("--workspace", str(work), "--list-sessions")
+    assert proc.returncode == 0, proc.stderr
+    assert "会话列表" in proc.stdout
+    assert id_one in proc.stdout and "修复登录页的问题" in proc.stdout
+    assert "请求=1" in proc.stdout
+
+    for extra in (["任务"], ["--save-session"], ["--resume", id_one],
+                  ["--resume-with-current-config"], ["--tui"]):
+        combo = run_cli("--workspace", str(work), "--list-sessions", *extra)
+        assert combo.returncode == 2, extra
+
+
+def test_list_sessions_marks_bad_archive_and_occupied(tmp_path):
+    work = tmp_path / "ws"
+    work.mkdir()
+    script = _script(tmp_path)
+    proc = run_cli("--workspace", str(work), "--script", str(script), "--save-session", "问")
+    assert proc.returncode == 0, proc.stderr
+    session_id = proc.stdout.split("[session id=")[1].split(" ")[0]
+    (work / ".cicada" / "sessions" / "00000000-1111-4222-8333-444444444444.sqlite3").write_bytes(
+        b"not a database"
+    )
+    # 同进程持有 lease: 子进程列表看到占用标注
+    from cicada.plugins.session_store import open_session_store
+
+    holder = open_session_store(directory=work / ".cicada" / "sessions",
+                                session_id=session_id, workspace=work)
+    try:
+        listing = run_cli("--workspace", str(work), "--list-sessions")
+        assert listing.returncode == 0, listing.stderr
+        assert session_id in listing.stdout and "占用" in listing.stdout
+        assert "00000000-1111-4222-8333-444444444444" in listing.stdout
+        assert "坏档" in listing.stdout, "坏文件是明确错误项, 不是缺失"
+    finally:
+        import asyncio as _asyncio
+
+        _asyncio.run(holder.aclose())
+
+
+def test_render_session_page_bounded_and_paged():
+    """翻页提示与有界渲染的纯函数单测 (子进程只覆盖扁平列表)."""
+    import cicada.__main__ as m
+    from cicada.persistence.contracts import SessionPage, SessionSummary
+
+    entries = tuple(
+        SessionSummary(
+            session_id=f"id-{index}", short_title=f"标题 {index}", created_at=1.0,
+            updated_at=100.0 + index, committed_requests=index, interrupted_requests=0,
+            occupied=index == 1, unproven_activities=2 if index == 1 else 0,
+            untrusted_receipts=0,
+        )
+        for index in range(2)
+    )
+    lines = m.render_session_page(SessionPage(directory="d", entries=entries, next_cursor="25"))
+    text = "\n".join(lines)
+    assert "id-0" in text and "标题 1" in text and "请求=1" in text
+    assert "占用" in text and "未证终结活动×2" in text
+    assert "--list-cursor 25" in text
+    empty = m.render_session_page(SessionPage(directory="d", entries=(), next_cursor=None))
+    assert any("暂无会话" in line for line in empty)
