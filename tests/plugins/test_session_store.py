@@ -1279,3 +1279,72 @@ def test_list_sessions_invalid_cursor_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="invalid list cursor"):
         list_sessions(directory=tmp_path, cursor="not-a-number")
+
+
+async def test_list_sessions_accepts_relative_directory(tmp_path, monkeypatch):
+    """相对目录 listing (06): as_uri 只接受绝对路径, 列表必须自行 resolve。"""
+    from cicada.plugins.session_store import list_sessions
+
+    sessions = tmp_path / "sessions"
+    session_id = await _make_session(sessions, requests=1)
+    monkeypatch.chdir(tmp_path)
+    page = list_sessions(directory=Path("sessions"))
+    assert page.next_cursor is None
+    assert [entry.session_id for entry in page.entries] == [session_id]
+    assert page.entries[0].error is None, "相对目录不得把有效存档标成坏档"
+    assert page.entries[0].committed_requests == 1
+
+
+async def test_list_sessions_proven_activity_and_trusted_receipt_not_blocked(tmp_path):
+    """06 回归: 已证终结活动 + 可信回执不得标阻断; 终结 JSON 须先解析再进 codec。"""
+    from cicada.plugins.session_store import list_sessions
+    from cicada.persistence.codec import dumps_strict
+
+    session_id = await _make_session(tmp_path, requests=1)
+    db = tmp_path / f"{session_id}.sqlite3"
+    fingerprint = hashlib.sha256(b"check command").hexdigest()
+    connection = sqlite3.connect(str(db))
+    try:
+        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
+        request_id = connection.execute(
+            "SELECT request_id FROM request_intents LIMIT 1"
+        ).fetchone()[0]
+        receipt_id = "chk-" + "a" * 32
+        connection.execute(
+            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+            " arguments_digest, begin_json, end_json) VALUES ('activity-proven', ?, 'check',"
+            " 'check-1', 'digest', ?, ?)",
+            (
+                request_id,
+                dumps_strict({
+                    "description": "自检命令", "arguments_digest": "digest", "started_at": 1.0,
+                }),
+                dumps_strict({
+                    "kind": "proven_terminal", "exit_code": 0, "output_complete": True,
+                    "timed_out": False, "cancelled": False, "receipt_id": receipt_id,
+                    "reason": None,
+                }),
+            ),
+        )
+        connection.execute(
+            "INSERT INTO historical_receipts (verification_run_id, receipt_id, epoch_id,"
+            " request_id, activity_id, definition_fingerprint, terminal_json)"
+            " VALUES ('vrun-listing-test', ?, ?, ?, 'activity-proven', ?, ?)",
+            (
+                receipt_id, epoch, request_id, fingerprint,
+                dumps_strict({
+                    "execution_status": "exited", "exit_code": 0, "timed_out": False,
+                    "cancelled": False, "output_complete": True, "failure_kind": None,
+                }),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    page = list_sessions(directory=tmp_path)
+    assert len(page.entries) == 1
+    entry = page.entries[0]
+    assert entry.session_id == session_id and entry.error is None
+    assert not entry.blocked, "已证活动与可信回执不是阻断证据"
+    assert entry.unproven_activities == 0 and entry.untrusted_receipts == 0

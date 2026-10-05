@@ -19,6 +19,7 @@ from cicada.persistence.codec import (
     CodecError,
     decode_receipt_terminal,
     decode_terminal_facts,
+    strict_load,
 )
 from cicada.persistence.contracts import (
     LIST_SESSIONS_PAGE_SIZE,
@@ -72,7 +73,8 @@ def _summarize_archive(path: Path) -> SessionSummary:
     session_id = path.stem
     occupied = _probe_occupied(path.with_suffix(".lock"))
     try:
-        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+        # as_uri 只接受绝对路径; CLI/选择器可传相对目录, URI 前先 resolve
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
             return _read_summary(connection, session_id, occupied)
         finally:
@@ -114,6 +116,14 @@ def _read_summary(connection: sqlite3.Connection, session_id: str, occupied: boo
     )
 
 
+def _load_payload(raw: str) -> dict:
+    """与 store 加载同源: 严格 JSON 解析后再进 codec; 坏行按 CodecError 保守计数。"""
+    parsed = strict_load(raw)
+    if not isinstance(parsed, dict):
+        raise CodecError("record payload must be a JSON object")
+    return parsed
+
+
 def _count_unproven_activities(connection: sqlite3.Connection) -> int:
     """未证终结/未闭合活动计数; 终结记录解不了按不可信保守标注。"""
     unproven = 0
@@ -122,7 +132,7 @@ def _count_unproven_activities(connection: sqlite3.Connection) -> int:
             unproven += 1
             continue
         try:
-            if decode_terminal_facts(str(end_json)).kind == "unproven_terminal":
+            if decode_terminal_facts(_load_payload(str(end_json))).kind == "unproven_terminal":
                 unproven += 1
         except CodecError:
             unproven += 1
@@ -140,7 +150,7 @@ def _count_untrusted_receipts(connection: sqlite3.Connection) -> int:
         try:
             (
                 execution_status, exit_code, timed_out, cancelled, output_complete, failure_kind,
-            ) = decode_receipt_terminal(values[5])
+            ) = decode_receipt_terminal(_load_payload(str(values[5])))
             receipt = StoredReceipt(
                 verification_run_id=str(values[0]), receipt_id=str(values[1]),
                 epoch_id=str(values[2]), request_id=str(values[3]),
