@@ -44,10 +44,9 @@ def list_sessions(
     if directory.is_dir():
         for path in sorted(directory.glob("*.sqlite3")):
             summary = _summarize_archive(path)
-            key = (
-                -(summary.updated_at if summary.updated_at is not None else float("inf")),
-                summary.session_id,
-            )
+            # 降序按最近提交; 无记录 (含坏档) 排最后, 文件名稳定次序
+            updated = summary.updated_at
+            key = (-updated if updated is not None else float("inf"), summary.session_id)
             rows.append((key[0], key[1], summary))
     rows.sort(key=lambda item: (item[0], item[1]))
     page = rows[offset : offset + limit]
