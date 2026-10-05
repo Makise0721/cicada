@@ -374,6 +374,69 @@ def test_save_session_and_resume_are_mutually_exclusive(tmp_path):
     assert "互斥" in proc.stderr
 
 
+def test_resume_with_current_config_requires_resume(tmp_path):
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+                   "--resume-with-current-config", "任务")
+    assert proc.returncode == 2
+    assert "--resume-with-current-config 只能与 --resume" in proc.stderr
+
+
+def _latest_epoch_launch(work: Path, session_id: str):
+    """读存档最新 epoch 的身份 (04 差异记录证据)."""
+    import sqlite3
+
+    from cicada.persistence.codec import decode_identity
+
+    db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    try:
+        row = connection.execute(
+            "SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return decode_identity(row[0])
+
+
+def test_resume_with_current_config_adopts_check_mode_and_records_epoch(tmp_path):
+    """04: 显式采用当前配置恢复——检查模式差异不拒绝, 新 epoch 记录采用与差异."""
+    work = _git_worktree(tmp_path)
+    script = _script(tmp_path)
+    first = run_cli("--workspace", str(work), "--script", str(script), "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    # 默认恢复时切换检查模式是冲突; 显式采用当前配置则放行并记录
+    adopted = run_cli("--workspace", str(work), "--script", str(script),
+                      "--resume", session_id, "--resume-with-current-config",
+                      "--check-command", "exit 0", "第二问")
+    assert adopted.returncode == 3, (adopted.stdout, adopted.stderr)  # 检查模式: stop 但检查未运行
+    assert f"[session id={session_id} mode=resume" in adopted.stdout
+    assert "[session saved request_id=" in adopted.stdout
+
+    stored = _latest_epoch_launch(work, session_id)
+    assert stored.launch.checks_signature is not None, "新 epoch 记录采用的检查模式"
+    assert stored.launch.sources.get("resume_config") == "current"
+    assert "checks_signature" in stored.launch.sources.get("changed_fields", "")
+
+
+def test_resume_with_current_config_does_not_lift_view_only(tmp_path):
+    """A15: 未证终结活动的恢复不因显式配置覆盖解除; CLI 新 prompt 零执行退出码 3."""
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)), "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+    _seed_archive(work, session_id, open_activity=True)
+    proc = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                   "--resume", session_id, "--resume-with-current-config", "不应执行的问")
+    assert proc.returncode == 3, (proc.stdout, proc.stderr)
+    assert "[session view-only:" in proc.stderr
+    assert ">> " not in proc.stdout, "view-only 会话零工具执行"
+    assert "[session saved" not in proc.stdout
+
+
 def _git_worktree(tmp_path):
     """检查模式需要 Git 工作树根 (验证基线); 建最小仓库."""
     import subprocess as _sp

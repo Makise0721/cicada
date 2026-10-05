@@ -212,6 +212,13 @@ async def _run(args: argparse.Namespace) -> int:
     if args.save_session and args.resume is not None:
         print("--save-session 与 --resume 互斥: 保存新会话与恢复已有会话只能二选一", file=sys.stderr)
         return 2
+    if args.resume_with_current_config and args.resume is None:
+        print(
+            "--resume-with-current-config 只能与 --resume 一起使用: "
+            "显式采用当前配置仅对恢复有意义",
+            file=sys.stderr,
+        )
+        return 2
     if (args.save_session or args.resume is not None) and args.tui:
         print("持久会话的 TUI 入口 (自动保存/恢复) 在阶段 05 开放; 当前仅单次 CLI 支持", file=sys.stderr)
         return 2
@@ -366,7 +373,11 @@ async def _run(args: argparse.Namespace) -> int:
 
     persistence_config = None
     if args.save_session or args.resume is not None:
-        persistence_config = PersistenceConfig(session_id=args.resume, identity=identity)
+        persistence_config = PersistenceConfig(
+            session_id=args.resume,
+            identity=identity,
+            adopt_current_config=args.resume_with_current_config,
+        )
 
     app_config = ApplicationConfig(
         workspace=workspace,
@@ -510,6 +521,13 @@ def main() -> int:
     parser.add_argument(
         "--resume", metavar="SESSION_ID",
         help="按 UUIDv4 会话 ID 恢复持久会话, 新请求追加保存; 与 --save-session 互斥",
+    )
+    parser.add_argument(
+        "--resume-with-current-config", action="store_true",
+        help=(
+            "与 --resume 一起使用: 显式采用当前默认与显式参数恢复 (省略项取当前默认而非存档), "
+            "与存档的差异记入新启动代次; 不换工作区、不解除恢复阻断"
+        ),
     )
     parser.add_argument(
         "prompt", nargs="?", default=None,
