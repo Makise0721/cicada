@@ -46,6 +46,7 @@ from cicada.application import (
     RequestCompleted,
     RequestPhaseChanged,
     open_application,
+    verification_checks_signature,
 )
 from cicada.core.events import (
     AssistantCompleted,
@@ -252,9 +253,6 @@ async def _run(args: argparse.Namespace) -> int:
     if check_error is not None:
         print(check_error, file=sys.stderr)
         return 2
-    if (args.save_session or args.resume is not None) and checks:
-        print("检查模式暂不支持持久会话 (恢复在 03 开放)", file=sys.stderr)
-        return 2
     if checks and args.num_ctx is not None and args.num_ctx < CHECK_MODE_MIN_NUM_CTX:
         print(
             f"检查模式要求 --num-ctx >= {CHECK_MODE_MIN_NUM_CTX}, 收到 {args.num_ctx}",
@@ -306,7 +304,10 @@ async def _run(args: argparse.Namespace) -> int:
             options={}, max_request_bytes=None, max_turns=max_turns,
             prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
             instructions_sha256=prompt_info.instructions_sha256,
-            checks_signature=None, sources={},
+            checks_signature=(
+                verification_checks_signature(plan.checks) if plan is not None else None
+            ),
+            sources={},
         )
         preflight = None
     else:
@@ -339,7 +340,10 @@ async def _run(args: argparse.Namespace) -> int:
             max_turns=max_turns,
             prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
             instructions_sha256=prompt_info.instructions_sha256,
-            checks_signature=None, sources={"num_ctx": source},
+            checks_signature=(
+                verification_checks_signature(plan.checks) if plan is not None else None
+            ),
+            sources={"num_ctx": source},
         )
         if args.save_session or args.resume is not None:
             # 持久路径: 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)

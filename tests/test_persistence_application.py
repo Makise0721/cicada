@@ -35,11 +35,11 @@ def _texts(messages) -> list[str]:
     ]
 
 
-def _identity() -> LaunchIdentity:
+def _identity(checks_signature: str | None = None) -> LaunchIdentity:
     return LaunchIdentity(
         provider="fake", model="fake", base_url=None, think=None, options={},
         max_turns=6, prompt_version="test", prompt_sha256="a" * 64,
-        instructions_sha256=None, checks_signature=None, sources={},
+        instructions_sha256=None, checks_signature=checks_signature, sources={},
     )
 
 
@@ -232,7 +232,7 @@ async def test_commit_failure_keeps_facts_latches_and_exit_code_one(tmp_path):
                                             session_id=None))
     store = session._store
 
-    async def failing_commit(request_id, *, messages, outcome):
+    async def failing_commit(request_id, *, messages, outcome, receipts=()):
         raise PersistenceError("disk gone")
 
     store.commit_request = failing_commit  # type: ignore[method-assign]
@@ -318,7 +318,7 @@ async def test_resume_with_pending_intent_without_unproven_activity_continues(tm
                                             session_id=None))
     store = session._store
 
-    async def failing_commit(request_id, *, messages, outcome):
+    async def failing_commit(request_id, *, messages, outcome, receipts=()):
         raise PersistenceError("commit lost")
 
     store.commit_request = failing_commit  # type: ignore[method-assign]
@@ -424,7 +424,8 @@ async def test_resume_with_tool_fingerprint_mismatch_refused_and_lease_released(
     await reopened.aclose()
 
 
-async def test_check_mode_with_persistence_rejected_at_config(tmp_path):
+async def test_check_mode_with_persistence_opened_at_config(tmp_path):
+    """03: 检查模式 + 持久会话组合放开; 真实执行面由 A08/A10 集成测试覆盖."""
     from cicada.application import ApplicationConfig, PersistenceConfig
     from cicada.plugins.coding.verification import generate_verification_run_id
     from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
@@ -435,15 +436,15 @@ async def test_check_mode_with_persistence_rejected_at_config(tmp_path):
         root=Path(root),
         checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
     )
-    with pytest.raises(ValueError, match="check mode"):
-        ApplicationConfig(
-            workspace=root,
-            system_prompt="s",
-            prompt_info=_prompt_info(root),
-            model_plugin=fake_model_plugin(FakeModel([])),
-            plan=plan,
-            persistence=PersistenceConfig(session_id=None, identity=_identity()),
-        )
+    config = ApplicationConfig(
+        workspace=root,
+        system_prompt="s",
+        prompt_info=_prompt_info(root),
+        model_plugin=fake_model_plugin(FakeModel([])),
+        plan=plan,
+        persistence=PersistenceConfig(session_id=None, identity=_identity()),
+    )
+    assert config.plan is not None
 
 
 # --- 02: 拓扑清理顺序与关闭拥有权 (A14) --------------------------------------------------------
@@ -721,8 +722,9 @@ async def test_repeated_outer_cancel_during_commit_keeps_completion(tmp_path):
     release = asyncio.Event()
     original_commit = store.commit_request
 
-    async def gated_commit(request_id, *, messages, outcome):
-        result = await original_commit(request_id, messages=messages, outcome=outcome)
+    async def gated_commit(request_id, *, messages, outcome, receipts=()):
+        result = await original_commit(request_id, messages=messages, outcome=outcome,
+                                       receipts=receipts)
         await release.wait()
         return result
 
@@ -859,3 +861,256 @@ async def test_clear_cancel_syncs_memory_before_propagating(tmp_path):
     await reopened.aclose()
 
 
+
+
+# --- 03: A08/A09/A10 检查模式持久化集成 -------------------------------------------------------
+
+_CHECK_RUN = {"tool_calls": [{"id": "k1", "name": "check",
+                             "arguments": {"action": "run", "check_id": "check-1"}}],
+              "tool_use": True}
+
+
+def _check_config(root, entries, *, session_id=None, command="exit 0", timeout_s=30.0):
+    """检查模式 + 持久会话的应用配置; 同一 root/检查定义保证 checks_signature 一致."""
+    from cicada.application import (
+        ApplicationConfig,
+        PersistenceConfig,
+        verification_checks_signature,
+    )
+    from cicada.plugins.coding.verification import generate_verification_run_id
+    from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
+
+    checks = (CheckDefinition("check-1", command, timeout_s=timeout_s),)
+    plan = VerificationPlan(
+        verification_run_id=generate_verification_run_id(), root=Path(root), checks=checks,
+    )
+    return ApplicationConfig(
+        workspace=root, system_prompt="test system prompt", prompt_info=_prompt_info(root),
+        model_plugin=fake_model_plugin(FakeModel(_script(*entries))), plan=plan, max_turns=6,
+        model_label="fake",
+        persistence=PersistenceConfig(
+            session_id=session_id, identity=_identity(verification_checks_signature(checks)),
+        ),
+    )
+
+
+def _inner_model(session):
+    from cicada.run_policy import RunPolicy
+
+    model = session._app.agent._model
+    assert isinstance(model, RunPolicy)
+    return model.inner
+
+
+async def test_check_mode_save_resume_old_pass_is_historical_new_ledger_independent(tmp_path):
+    """A08: 旧真实 PASS 回执恢复到新验证运行 —— 新运行/基线/账本独立, 旧 PASS 仅历史."""
+    from cicada.core.messages import ToolResultMessage
+
+    root = _repo(tmp_path)
+    session = await open_application(_check_config(root, (
+        _CHECK_RUN, {"text": "已检查", "stop": True},
+    )))
+    first = await session.execute("第一问")
+    assert first.exit_code == 0, "检查真实跑过且通过"
+    assert first.view is not None and first.view.checks[0].status == "passed"
+    old_run_id = session.verification_run_id
+    old_receipt_id = first.view.receipts[0].receipt_id
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    resumed = await open_application(_check_config(root, (
+        {"text": "恢复后作答", "stop": True},
+    ), session_id=session_id))
+    assert resumed.verification_run_id != old_run_id, "新验证运行"
+    inner = _inner_model(resumed)
+    outcome2 = await resumed.execute("第二问")
+    assert outcome2.exit_code == 3, "新账本空: 检查未运行不交付"
+    assert outcome2.view is not None
+    assert outcome2.view.checks[0].status == "not_run", "旧 PASS 不进当前账本"
+    assert outcome2.view.process_uncertain is False, "旧前缀不按新账本锁存"
+
+    sent = inner.requests[0]
+    tool_messages = [m for m in sent.messages if isinstance(m, ToolResultMessage)]
+    assert tool_messages, "实际 ModelRequest 携带恢复前缀"
+    assert "historical result from a previous verification run" in tool_messages[0].result.content
+    assert "not applicable to the current verification run" in tool_messages[0].result.content
+    assert "verification_run_id" in sent.system_prompt, "控制段是当前运行的"
+    # 原始记录不改: 规范历史无投影标记, details/call 身份保持
+    canonical_tool = [m for m in resumed.history if isinstance(m, ToolResultMessage)][0]
+    assert "historical result" not in canonical_tool.result.content
+    assert canonical_tool.result.details["receipt_id"] == old_receipt_id
+    assert canonical_tool.result.call_id == "k1"
+    await resumed.aclose()
+
+    # 新检查跑过才可能当前通过; 新回执独立持久化
+    third = await open_application(_check_config(root, (
+        _CHECK_RUN, {"text": "重新检查后作答", "stop": True},
+    ), session_id=session_id))
+    outcome3 = await third.execute("第三问")
+    assert outcome3.exit_code == 0
+    assert outcome3.view is not None
+    assert outcome3.view.checks[0].freshness == "current"
+    assert outcome3.view.receipts[0].receipt_id != old_receipt_id, "新回执与旧回执身份不同"
+    await third.aclose()
+
+    from cicada.plugins.session_store import open_session_store
+
+    store = open_session_store(
+        directory=root / ".cicada" / "sessions", session_id=session_id, workspace=root,
+    )
+    snapshot = store.recovery_snapshot()
+    receipt_ids = {r.receipt_id for r in snapshot.restored_receipts}
+    assert {old_receipt_id} < receipt_ids and len(receipt_ids) == 2
+    assert not snapshot.recorded_process_uncertain
+    await store.aclose()
+
+
+async def test_prefix_tamper_after_resume_refuses_before_sending(tmp_path):
+    """A09: 恢复后前缀被改动 -> 发送前拒绝, 内层模型零请求."""
+    root = _repo(tmp_path)
+    session = await open_application(_check_config(root, (
+        {"text": "答", "stop": True}, {"text": "二答", "stop": True},
+    )))
+    await session.execute("第一问")
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    resumed = await open_application(_check_config(root, (
+        {"text": "恢复后作答", "stop": True},
+    ), session_id=session_id))
+    resumed._history[0] = UserMessage(text="被改写的前缀")  # 模拟前缀改动
+    outcome = await resumed.execute("第二问")
+    assert outcome.result.stop_reason == "error"
+    assert "changed since the proof was built" in (outcome.result.error or "")
+    assert _inner_model(resumed).requests == [], "发送前拒绝, 零请求"
+    await resumed.aclose()
+
+
+async def test_check_then_clear_drops_context_keeps_display_and_receipts(tmp_path):
+    """A10: 真实检查后清空 —— 保存恢复不复活旧上下文, 旧显示与回执保留."""
+    from cicada.application import OperationBusy
+
+    root = _repo(tmp_path)
+    session = await open_application(_check_config(root, (
+        _CHECK_RUN, {"text": "已检查", "stop": True}, {"text": "清空后作答", "stop": True},
+    )))
+    busy_operations: list[str] = []
+
+    def on_update(update):
+        if isinstance(update, OperationBusy):
+            busy_operations.append(update.operation)
+
+    session.subscribe(on_update)
+    first = await session.execute("第一问")
+    assert first.exit_code == 0
+    old_receipt_id = first.view.receipts[0].receipt_id
+    await session.clear_context()
+    assert busy_operations == ["clear"], "operation_busy 可消费"
+    assert session.history == ()
+    second = await session.execute("第二问")
+    assert second.persistence is not None and second.persistence.saved
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    resumed = await open_application(_check_config(root, (
+        {"text": "恢复后作答", "stop": True},
+    ), session_id=session_id))
+    assert [m.text for m in resumed.history if isinstance(m, UserMessage)] == ["第二问"], (
+        "清空边界后的模型上下文不复活旧消息"
+    )
+    assert resumed.persistence.restored_request_count == 2, "原始显示记录保留"
+    await resumed.aclose()
+
+    from cicada.plugins.session_store import open_session_store
+
+    store = open_session_store(
+        directory=root / ".cicada" / "sessions", session_id=session_id, workspace=root,
+    )
+    snapshot = store.recovery_snapshot()
+    assert [r.receipt_id for r in snapshot.restored_receipts] == [old_receipt_id], "旧回执保留"
+    await store.aclose()
+
+
+async def test_clear_failure_keeps_memory_and_prefix_proof(tmp_path):
+    """A04 清空路径: 提交失败时内存历史与初始恢复前缀证明都不变."""
+    root = _repo(tmp_path)
+    first = await open_application(_check_config(root, (
+        {"text": "答", "stop": True},
+    )))
+    await first.execute("第一问")
+    session_id = first.persistence.session_id
+    await first.aclose()
+
+    session = await open_application(_check_config(root, (
+        {"text": "二答", "stop": True},
+    ), session_id=session_id))
+    assert session._projection is not None
+    assert session._projection.proof.length == 2, "恢复前缀为初始历史"
+    store = session._store
+
+    async def failing_clear(epoch_id):
+        raise PersistenceError("disk gone")
+
+    store.commit_clear = failing_clear  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="in-memory history is unchanged"):
+        await session.clear_context()
+    assert len(session.history) == 2, "内存历史不变"
+    # 前缀证明同样未重置 (清空失败 -> 两者都保持; storage_failed 另按契约锁存)
+    assert session._projection.proof.length == 2, "前缀证明未随失败清空重置"
+    await session.aclose()
+
+
+async def test_uncertain_latch_survives_clear_and_restore_is_view_only(tmp_path):
+    """A15: 超时检查锁存 process_uncertain —— 清空不解锁, 恢复仅可查看且新服务同步."""
+    from cicada.core.cancel import CancelToken
+
+    root = _repo(tmp_path)
+    session = await open_application(_check_config(root, (
+        _CHECK_RUN, {"text": "超时后作答", "stop": True},
+    ), command="Start-Sleep -Seconds 8", timeout_s=1.0))
+    first = await session.execute("第一问")
+    assert first.view is not None and first.view.process_uncertain
+    assert session.has_process_uncertain()
+    with pytest.raises(RuntimeError, match="process_uncertain"):
+        await session.execute("锁存后拒绝新请求")
+    await session.clear_context()
+    assert session.has_process_uncertain(), "清空不解除锁存"
+    view = await session._service.refresh(CancelToken())
+    assert view.process_uncertain, "验证服务锁存与控制段保持"
+    session_id = session.persistence.session_id
+    await session.aclose()
+
+    resumed = await open_application(_check_config(root, (
+        {"text": "恢复后作答", "stop": True},
+    ), command="Start-Sleep -Seconds 8", timeout_s=1.0, session_id=session_id))
+    # 超时检查同时留下未证活动与不可信回执; 此处任一证据都阻断 (收据路径单独单测)
+    assert resumed.view_only_reason is not None
+    with pytest.raises(RuntimeError, match="view-only"):
+        await resumed.execute("恢复后仍拒绝")
+    view2 = await resumed._service.refresh(CancelToken())
+    assert view2.process_uncertain, "新验证服务同步锁存, 交付判断一致"
+    await resumed.aclose()
+
+
+def test_admission_derives_view_only_from_untrusted_receipts_alone():
+    """A15: 无未证活动时, 不可信回执单独构成跨恢复 process_uncertain 证据."""
+    from cicada.application import PersistenceConfig, _admit_persistent_resume
+    from cicada.persistence.contracts import RecoverySnapshot, StoredIdentity, StoredReceipt
+
+    identity = _identity()
+    snapshot = RecoverySnapshot(
+        session_id="s", canonical_workspace="w", created_at=0.0, short_title="",
+        identity=StoredIdentity(launch=identity, tool_fingerprint="fp"),
+        epoch_count=1, context_generation=0, requests=(), interrupted=(),
+        canonical_history=(),
+        restored_receipts=(
+            StoredReceipt("run-old", "r-bad", "e", "q", "f" * 64, "timed_out", None,
+                          True, False, False, "timeout"),
+        ),
+    )
+    reason = _admit_persistent_resume(
+        PersistenceConfig(session_id="s", identity=identity), snapshot,
+    )
+    assert reason is not None
+    assert "process_uncertain" in reason
+    assert "r-bad" in reason

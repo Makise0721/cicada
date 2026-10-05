@@ -27,7 +27,8 @@ from cicada.boot import App, BootError, bootstrap
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
-from cicada.core.messages import Message, isolate_message, isolate_tool_result
+from cicada.core.messages import Message, ToolResultMessage, isolate_message, isolate_tool_result
+from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
     ArchiveLimitError,
     InterruptedRequest,
@@ -42,9 +43,18 @@ from cicada.persistence.contracts import (
     StorageUnavailableError,
     StorageWriteError,
     StoredIdentity,
+    StoredReceipt,
     conflicting_launch_fields,
+    receipt_terminal_trustworthy,
 )
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
+from cicada.run_policy import (
+    HistoricalPrefixProof,
+    HistoricalProjection,
+    PrefixEntry,
+    RunPolicy,
+    verification_policy,
+)
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.process import process_plugin
@@ -65,7 +75,6 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.plugins.coding.workspace import workspace_plugin
 from cicada.prompting import PromptInfo
 from cicada.reporting import DeliveryDecision, decide_delivery
-from cicada.run_policy import RunPolicy, verification_policy
 from cicada.runtime.plugin import PluginDefinition
 
 ApplicationPhase = Literal["executing", "cancelling", "finalizing", "idle"]
@@ -163,8 +172,7 @@ class ApplicationConfig:
         if self.persistence is not None:
             if not isinstance(self.persistence, PersistenceConfig):
                 raise ValueError("persistence must be a PersistenceConfig or None")
-            if self.plan is not None:
-                raise ValueError("persistent sessions do not support check mode yet (ticket 03)")
+            # 03 起检查模式 + 持久会话组合放开 (票据 03); 恢复要求 checks_signature 一致
 
 
 @dataclass(frozen=True)
@@ -225,6 +233,17 @@ class HistoryCleared:
 
 
 @dataclass(frozen=True)
+class OperationBusy:
+    """非请求操作进行中 (当前: 持久清空提交).
+
+    只读补充原请求 phase: 请求生命周期已有 RequestPhaseChanged, 清空等操作
+    经本事件让 UI 输入屏障可消费 (05 接线); 完成由 HistoryCleared 标记.
+    """
+
+    operation: Literal["clear"]
+
+
+@dataclass(frozen=True)
 class ApplicationClosed:
     """关闭完成或明确清理失败; error 非空不代表所有资源均已成功释放."""
 
@@ -232,7 +251,8 @@ class ApplicationClosed:
 
 
 ApplicationUpdate = (
-    AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared | ApplicationClosed
+    AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
+    | OperationBusy | ApplicationClosed
 )
 
 
@@ -301,7 +321,9 @@ class ApplicationSession:
         restored_requests: tuple[RestoredRequest, ...] = (),
         restored_context_generation: int = 0,
         restored_interrupted: tuple[InterruptedRequest, ...] = (),
+        restored_receipts: tuple[StoredReceipt, ...] = (),
         view_only_reason: str | None = None,
+        projection: HistoricalProjection | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -318,6 +340,8 @@ class ApplicationSession:
         )
         self._restored_interrupted = restored_interrupted
         self._view_only_reason = view_only_reason
+        self._projection = projection                    # 前缀证明容器; 清空成功后重置 (03)
+        self._persisted_receipt_ids = {r.receipt_id for r in restored_receipts}
         self._context_generation = restored_context_generation
         self._request_id: str | None = None
         self._saved_request_count = 0
@@ -666,9 +690,10 @@ class ApplicationSession:
             model_calls=result.model_calls,
         )
         messages = tuple(isolate_message(m) for m in result.messages)
+        receipts = self._new_receipts(outcome)
         try:
             seq = await self._store.commit_request(
-                self._request_id, messages=messages, outcome=facts
+                self._request_id, messages=messages, outcome=facts, receipts=receipts
             )
         except PersistenceError as exc:
             self._latch_storage_failed(str(exc))
@@ -677,7 +702,33 @@ class ApplicationSession:
             )
         self._saved_request_count += 1
         self._last_committed_seq = seq
+        self._persisted_receipt_ids.update(receipt.receipt_id for receipt in receipts)
         return RequestPersistenceFacts(request_id=self._request_id, saved=True, seq=seq)
+
+    def _new_receipts(self, outcome: RequestOutcome) -> tuple[StoredReceipt, ...]:
+        """本请求新产生的检查回执 (尚未持久化的); 与请求记录同事务落库 (03)."""
+        view = outcome.view
+        if self._config.plan is None or view is None or self._epoch_id is None:
+            return ()
+        return tuple(
+            StoredReceipt(
+                verification_run_id=receipt.verification_run_id,
+                receipt_id=receipt.receipt_id,
+                epoch_id=self._epoch_id,
+                request_id=self._request_id or "",
+                definition_fingerprint=_receipt_fingerprint(
+                    receipt.check_id, receipt.command, receipt.timeout_s
+                ),
+                execution_status=receipt.execution_status,
+                exit_code=receipt.exit_code,
+                timed_out=receipt.timed_out,
+                cancelled=receipt.cancelled,
+                output_complete=receipt.output_complete,
+                failure_kind=receipt.failure_kind,
+            )
+            for receipt in view.receipts
+            if receipt.receipt_id not in self._persisted_receipt_ids
+        )
 
     # --- 取消 / 清空 ---------------------------------------------------------------
 
@@ -719,6 +770,7 @@ class ApplicationSession:
             raise RuntimeError("a persistent clear is already in progress")
         self._clearing = True
         self._clear_done = asyncio.get_running_loop().create_future()
+        self._notify(OperationBusy(operation="clear"))
         try:
             # 清空事务的 completion 受拥有: 外层取消先等明确结果; 成功则先完成内存
             # 同步再传播取消, 避免存档代次前进而内存未清的分叉 (契约 §1)
@@ -744,6 +796,9 @@ class ApplicationSession:
             self._context_generation = new_generation
             self._history.clear()
             self._notify(HistoryCleared())
+            if self._projection is not None:
+                # 前缀证明与内存历史同步重置; 失败路径不会到达这里 (契约 §5)
+                self._projection.reset()
             if clear_cancelled:
                 raise asyncio.CancelledError()
         finally:
@@ -843,6 +898,66 @@ def _tool_fingerprint(app: App) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def verification_checks_signature(checks) -> str:
+    """检查定义的稳定摘要; 进入 LaunchIdentity.checks_signature 参与恢复比对 (03)."""
+    payload = [
+        {"check_id": check.check_id, "command": check.command, "timeout_s": check.timeout_s}
+        for check in checks
+    ]
+    return hashlib.sha256(dumps_strict(payload).encode("utf-8")).hexdigest()
+
+
+def _receipt_fingerprint(check_id: str, command: str, timeout_s: float) -> str:
+    return hashlib.sha256(dumps_strict(
+        {"check_id": check_id, "command": command, "timeout_s": timeout_s}
+    ).encode("utf-8")).hexdigest()
+
+
+def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
+    """从恢复事实构建前缀证明容器; 回执引用缺失/错挂属恢复关系错误, 模型零请求."""
+    receipts_by_id = {receipt.receipt_id: receipt for receipt in snapshot.restored_receipts}
+    entries: list[PrefixEntry] = []
+    for request in snapshot.requests:
+        if request.context_generation != snapshot.context_generation:
+            continue
+        for message in request.messages:
+            receipt_id: str | None = None
+            verification_run_id: str | None = None
+            if isinstance(message, ToolResultMessage) and message.result.name == "check":
+                details = (
+                    message.result.details if isinstance(message.result.details, dict) else {}
+                )
+                candidate = details.get("receipt_id")
+                if isinstance(candidate, str) and candidate:
+                    receipt = receipts_by_id.get(candidate)
+                    if receipt is None:
+                        raise ApplicationOpenError(
+                            f"restored history references check receipt {candidate} "
+                            "that is not in the archive (relation error)"
+                        )
+                    if receipt.request_id != request.request_id:
+                        raise ApplicationOpenError(
+                            f"restored receipt {candidate} does not belong to its request"
+                        )
+                    receipt_id = candidate
+                    verification_run_id = receipt.verification_run_id
+            entries.append(PrefixEntry(
+                epoch_id=request.epoch_id,
+                request_id=request.request_id,
+                seq=request.seq,
+                message_sha256=hashlib.sha256(
+                    encode_messages((message,)).encode("utf-8")
+                ).hexdigest(),
+                receipt_id=receipt_id,
+                verification_run_id=verification_run_id,
+            ))
+    if len(entries) != len(snapshot.canonical_history):
+        raise ApplicationOpenError(
+            "restored requests do not reconstruct the canonical history (relation error)"
+        )
+    return HistoricalProjection(HistoricalPrefixProof(entries=tuple(entries)))
+
+
 def _bind_store_last_cleanup(
     definitions: list[PluginDefinition],
 ) -> list[PluginDefinition]:
@@ -907,6 +1022,17 @@ def _admit_persistent_resume(
                 else "no terminal record"
             ) + ")"
         )
+    untrusted = [
+        receipt for receipt in snapshot.restored_receipts
+        if not receipt_terminal_trustworthy(receipt)
+    ]
+    if untrusted:
+        # 存档级 process_uncertain 证据 (契约 D3): 检查回执终结不可信, 仅可查看
+        return (
+            f"restored archive records process_uncertain "
+            f"({len(untrusted)} check receipt without trustworthy terminal facts; "
+            f"first: receipt {untrusted[0].receipt_id})"
+        )
     return None
 
 
@@ -935,10 +1061,12 @@ async def open_application(
     """
     plan = config.plan
     policy_state: dict[str, object] = {}
+    # 恢复前缀证明容器 (03): 检查模式 + 持久会话时由 RunPolicy 每次发送前核对
+    history_projection: HistoricalProjection | None = None
 
     def _model_policy(model, runtime):
         service = runtime.capability(VERIFICATION_CAPABILITY)
-        wrapped = verification_policy(model, service)
+        wrapped = verification_policy(model, service, history=history_projection)
         policy_state["policy"] = wrapped
         policy_state["service"] = service
         return wrapped
@@ -947,6 +1075,8 @@ async def open_application(
     snapshot: RecoverySnapshot | None = None
     if config.persistence is not None:
         store, snapshot = _open_persistent_store(config)
+    if store is not None and plan is not None:
+        history_projection = HistoricalProjection()
 
     # 活动包装器经 tool_policy 装入; 协调器在会话构造后绑定 (契约 §3)
     coordinator = ActivityCoordinator()
@@ -1015,6 +1145,16 @@ async def open_application(
                 raise ApplicationOpenError(f"session epoch start failed: {exc}") from exc
             # start_epoch 已把 pending intent 标中断: 重取点时快照, 会话交接事实与存档一致
             snapshot = store.recovery_snapshot()
+            if history_projection is not None:
+                try:
+                    built = _build_prefix_proof(snapshot)
+                except ApplicationOpenError:
+                    raise
+                except Exception as exc:
+                    raise ApplicationOpenError(
+                        f"restored prefix proof build failed: {exc}"
+                    ) from exc
+                history_projection.proof = built.proof
             session = ApplicationSession(
                 app=app,
                 config=config,
@@ -1027,7 +1167,9 @@ async def open_application(
                 restored_requests=snapshot.requests,
                 restored_context_generation=snapshot.context_generation,
                 restored_interrupted=snapshot.interrupted,
+                restored_receipts=snapshot.restored_receipts,
                 view_only_reason=view_only_reason,
+                projection=history_projection,
             )
             coordinator.bind(session)
         except ApplicationOpenError:
@@ -1056,4 +1198,17 @@ async def open_application(
         await app.aclose()
         detail = f" ({capture.failure_kind}): {capture.error}" if capture.error else ""
         raise ApplicationOpenError(f"verification initialize failed{detail}")
+    if (
+        store is not None
+        and snapshot is not None
+        and snapshot.recorded_process_uncertain
+        and session._service is not None
+    ):
+        # 跨恢复 process_uncertain: 应用准入与新验证服务控制段一致 (A15);
+        # 清空不解除, 交付判断沿用 P4 既有锁存语义
+        session._process_uncertain = True
+        session._service.mark_process_uncertain(
+            "restored archive records process_uncertain "
+            "(check receipts without trustworthy terminal facts)"
+        )
     return session

@@ -374,21 +374,50 @@ def test_save_session_and_resume_are_mutually_exclusive(tmp_path):
     assert "互斥" in proc.stderr
 
 
-def test_save_session_with_check_mode_rejected(tmp_path):
+def _git_worktree(tmp_path):
+    """检查模式需要 Git 工作树根 (验证基线); 建最小仓库."""
+    import subprocess as _sp
+
+    work = tmp_path / "ws"
+    work.mkdir()
+    _sp.run(["git", "init", "-q"], cwd=work, check=True, capture_output=True)
+    (work / "sample.py").write_text("VALUE = 1" + chr(10), encoding="utf-8")
+    _sp.run(["git", "add", "."], cwd=work, check=True, capture_output=True)
+    _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-q", "-m", "baseline"], cwd=work, check=True, capture_output=True)
+    return work
+
+
+def test_save_session_with_check_mode_persists(tmp_path):
+    """03: 检查模式 + 持久保存放开 —— 真实子进程保存成功."""
+    work = _git_worktree(tmp_path)
     script = _script(tmp_path)
-    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
+    proc = run_cli("--workspace", str(work), "--script", str(script),
                    "--save-session", "--check-command", "exit 0", "任务")
-    assert proc.returncode == 2
-    assert "检查模式暂不支持持久会话" in proc.stderr
+    # 检查模式语义: 模型 stop 但检查未运行 -> 3; 保存照常完成
+    assert proc.returncode == 3, (proc.stdout, proc.stderr)
+    assert "[session id=" in proc.stdout
+    assert "[session saved request_id=" in proc.stdout
 
 
-def test_resume_with_check_mode_rejected(tmp_path):
+def test_resume_check_mode_same_checks_continues_and_different_conflicts(tmp_path):
+    work = _git_worktree(tmp_path)
     script = _script(tmp_path)
-    proc = run_cli("--workspace", str(tmp_path), "--script", str(script),
-                   "--resume", "123e4567-e89b-42d3-a456-426614174000",
-                   "--check-command", "exit 0", "任务")
-    assert proc.returncode == 2
-    assert "检查模式暂不支持持久会话" in proc.stderr
+    first = run_cli("--workspace", str(work), "--script", str(script),
+                    "--save-session", "--check-command", "exit 0", "第一问")
+    assert first.returncode == 3, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    same = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "--check-command", "exit 0", "第二问")
+    assert same.returncode == 3, (same.stdout, same.stderr)
+    assert f"[session id={session_id} mode=resume restored_requests=1]" in same.stdout
+    assert "[session saved request_id=" in same.stdout
+
+    conflict = run_cli("--workspace", str(work), "--script", str(script),
+                       "--resume", session_id, "--check-command", "exit 1", "第三问")
+    assert conflict.returncode == 2
+    assert "checks_signature" in conflict.stderr
 
 
 def test_persistence_with_tui_rejected(tmp_path):
