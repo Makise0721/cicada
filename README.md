@@ -223,14 +223,16 @@ model_plugin = ollama_plugin(
 
 ```powershell
 # 无真实模型调用的测试
-uv run --frozen pytest -q -m 'not live'
+uv run --frozen python -m pytest -q -m 'not live'
 
 # 真实 Ollama 冒烟与文件任务闭环
-uv run --frozen pytest -q -m live
+uv run --frozen python -m pytest -q -m live
 
 # 完整套件，包含 live 用例
-uv run --frozen pytest -q
+uv run --frozen python -m pytest -q
 ```
+
+命令须用 `python -m pytest`（而非直接 `pytest`）：跨目录的 `tests.` 导入依赖项目根在 sys.path，直接调用会在收集期报 `No module named 'tests'`。
 
 测试覆盖协议、模型循环、导入边界、插件依赖与清理、Coding 工具、Ollama 录制回放，以及 fake / 真实模型端到端闭环。`live` 用例检查本地服务可达性与模型存在性，条件不满足则 skip；即使排除 live，用例收集仍可能执行有界的服务可达性检查。测试临时目录由配置固定为项目内 `.pytest-tmp`。
 
