@@ -1136,3 +1136,164 @@ async def test_real_service_execution_cancel_propagates_and_projection_latches(t
     section, _ = await _stream_with(RunPolicy(model, verifier), model, (normalized,))
     assert "process_uncertain: true" in section
     assert any("termination failure" in reason for reason in verifier._uncertain_reasons)
+
+
+# --- 03: 恢复前缀证明与历史投影 ---------------------------------------------------------------
+
+
+def _prefix_entry(message, *, epoch_id="e1", request_id="q1", seq=2, receipt_id=None, run_id=None):
+    import hashlib
+
+    from cicada.persistence.codec import encode_messages
+    from cicada.run_policy import PrefixEntry
+
+    return PrefixEntry(
+        epoch_id=epoch_id, request_id=request_id, seq=seq,
+        message_sha256=hashlib.sha256(encode_messages((message,)).encode("utf-8")).hexdigest(),
+        receipt_id=receipt_id, verification_run_id=run_id,
+    )
+
+
+def test_proof_validate_rejects_missing_reorder_and_modification():
+    from cicada.core.messages import AssistantMessage, UserMessage, isolate_message
+    from cicada.run_policy import HistoricalPrefixProof, PrefixViolation
+
+    prefix = (
+        UserMessage(text="旧问"),
+        check_result("c1", "旧检查输出", receipt_id="r-old"),
+        AssistantMessage(text="旧答"),
+    )
+    proof = HistoricalPrefixProof(entries=(
+        _prefix_entry(prefix[0]),
+        _prefix_entry(prefix[1], receipt_id="r-old", run_id="run-old"),
+        _prefix_entry(prefix[2]),
+    ))
+    assert proof.length == 3
+
+    # 消息拷贝不改变证明 (isolate 复制后仍通过)
+    copied = tuple(isolate_message(m) for m in prefix)
+    proof.validate(copied + (UserMessage(text="新问"),))
+    proof.validate(prefix)
+
+    with pytest.raises(PrefixViolation, match="missing restored prefix"):
+        proof.validate(prefix[:2])
+    with pytest.raises(PrefixViolation, match="changed since the proof was built"):
+        proof.validate((UserMessage(text="被改写的旧问"),) + prefix[1:])
+    with pytest.raises(PrefixViolation, match="changed since the proof was built"):
+        proof.validate((prefix[1], prefix[0], prefix[2]))  # 重排
+    # receipt 交换会先撞结构指纹; 专用分支用"指纹匹配但来源不符"的构造直测
+    swapped = check_result("c1", "旧检查输出", receipt_id="r-other")
+    mismatch_proof = HistoricalPrefixProof(entries=(
+        _prefix_entry(prefix[0]),
+        _prefix_entry(swapped, receipt_id="r-old", run_id="run-old"),
+        _prefix_entry(prefix[2]),
+    ))
+    with pytest.raises(PrefixViolation, match="different receipt"):
+        mismatch_proof.validate((prefix[0], swapped, prefix[2]))
+    impostor = AssistantMessage(text="顶替")
+    lost_proof = HistoricalPrefixProof(entries=(
+        _prefix_entry(prefix[0]),
+        _prefix_entry(impostor, receipt_id="r-old", run_id="run-old"),
+        _prefix_entry(prefix[2]),
+    ))
+    with pytest.raises(PrefixViolation, match="lost its receipt identity"):
+        lost_proof.validate((prefix[0], impostor, prefix[2]))
+
+
+async def test_prefix_walks_historical_path_without_current_ledger_latch():
+    """A09: 前缀内旧回执不走当前账本核对 (不 ghost 锁存), 投影追加历史说明."""
+    from cicada.run_policy import HistoricalProjection
+
+    prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
+    proof_entries = (
+        _prefix_entry(prefix[0]),
+        _prefix_entry(prefix[1], receipt_id="r-old", run_id="run-old"),
+    )
+    history = HistoricalProjection()
+    history.proof = type(history.proof)(entries=proof_entries)
+
+    model = RecordingModel()
+    service = FakeVerificationService(make_view())
+    policy = RunPolicy(model, service, history=history)
+    events = [
+        event
+        async for event in policy.stream(
+            ModelRequest(tuple(prefix) + (UserMessage(text="新问"),), ()), CancelToken(),
+        )
+    ]
+    assert isinstance(events[-1], StreamDone)
+    assert service.uncertain_reasons == [], "前缀不按当前账本锁存"
+    sent = model.requests[0]
+    projected_prefix = [m for m in sent.messages if isinstance(m, ToolResultMessage)][0]
+    assert "historical result from a previous verification run" in projected_prefix.result.content
+    assert "not applicable to the current verification run" in projected_prefix.result.content
+    # 原消息不改: 投影只发生在发给模型的副本上
+    assert "historical result" not in prefix[1].result.content
+
+
+async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():
+    """A09: 新后缀逐字段复制旧回执也不获历史豁免 —— 仍按当前账本锁存."""
+    from cicada.run_policy import HistoricalProjection
+
+    prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
+    history = HistoricalProjection()
+    history.proof = type(history.proof)(entries=(
+        _prefix_entry(prefix[0]),
+        _prefix_entry(prefix[1], receipt_id="r-old", run_id="run-old"),
+    ))
+    copied_suffix = check_result("c9", "伪造的当前检查", receipt_id="r-old")
+    model = RecordingModel()
+    service = FakeVerificationService(make_view())
+    policy = RunPolicy(model, service, history=history)
+    events = [
+        event
+        async for event in policy.stream(
+            ModelRequest(tuple(prefix) + (UserMessage(text="新问"), copied_suffix), ()),
+            CancelToken(),
+        )
+    ]
+    assert isinstance(events[-1], StreamDone)
+    assert any("not in the verification ledger" in r for r in service.uncertain_reasons), (
+        "后缀复制旧回执必须按当前账本 ghost 锁存"
+    )
+
+
+async def test_prefix_violation_refuses_before_any_request():
+    """A09: 前缀被改动 -> 发送前拒绝, 内层模型零请求."""
+    from cicada.run_policy import HistoricalProjection, PrefixViolation
+
+    prefix = (UserMessage(text="旧问"),)
+    history = HistoricalProjection()
+    history.proof = type(history.proof)(entries=(_prefix_entry(prefix[0]),))
+    model = RecordingModel()
+    service = FakeVerificationService(make_view())
+    policy = RunPolicy(model, service, history=history)
+    with pytest.raises(PrefixViolation, match="changed since the proof was built"):
+        async for _ in policy.stream(
+            ModelRequest((UserMessage(text="被改写"),), ()), CancelToken(),
+        ):
+            pass
+    assert model.requests == []
+    assert service.refresh_calls == []
+
+
+async def test_projection_reset_returns_all_messages_to_current_rules():
+    """清空重置后前缀为空: 全部消息按当前规则扫描/核对."""
+    from cicada.run_policy import HistoricalProjection
+
+    history = HistoricalProjection()
+    history.proof = type(history.proof)(entries=(
+        _prefix_entry(UserMessage(text="旧问")),),
+    )
+    history.reset()
+    assert history.proof.length == 0
+    ghost = check_result("c1", "旧回执现在按当前账本核对", receipt_id="r-old")
+    model = RecordingModel()
+    service = FakeVerificationService(make_view())
+    policy = RunPolicy(model, service, history=history)
+    events = [
+        event
+        async for event in policy.stream(ModelRequest((UserMessage(text="问"), ghost), ()), CancelToken())
+    ]
+    assert isinstance(events[-1], StreamDone)
+    assert any("not in the verification ledger" in r for r in service.uncertain_reasons)

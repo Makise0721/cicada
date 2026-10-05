@@ -24,13 +24,15 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+import hashlib
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
 from cicada.core.cancel import CancelToken
 from cicada.core.messages import Message, ToolResultMessage
 from cicada.core.ports import ModelPort, ModelRequest, StreamDone, StreamEvent
+from cicada.persistence.codec import CodecError, encode_messages
 from cicada.plugins.coding.verification_contracts import (
     CheckReceipt,
     Freshness,
@@ -122,14 +124,94 @@ class _TerminalScan:
     deferred_receipts: tuple[tuple[str, str], ...]  # (tool, receipt_id)
 
 
+# --- 恢复前缀证明 (03; 契约 §5) --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrefixEntry:
+    """前缀中一个绝对消息位置的来源映射: 旧 epoch/request/seq + 结构指纹 + 回执来源."""
+
+    epoch_id: str
+    request_id: str
+    seq: int
+    message_sha256: str
+    receipt_id: str | None = None          # check 结果的账本身份; 其余消息为 None
+    verification_run_id: str | None = None
+
+
+class PrefixViolation(RuntimeError):
+    """恢复前缀缺失/重排/改动: 每次发送前核对, 违规即拒绝, 模型零请求."""
+
+
+@dataclass(frozen=True)
+class HistoricalPrefixProof:
+    """不可变恢复前缀证明: 绝对位置 → 来源与结构指纹的映射 (契约 §5).
+
+    指纹按单消息的规范编码计算, 消息拷贝不改变证明; 不使用对象 identity 或
+    内容集合查找. 位置 >= length 的新后缀始终按当前规则核对.
+    """
+
+    entries: tuple[PrefixEntry, ...] = ()
+
+    @property
+    def length(self) -> int:
+        return len(self.entries)
+
+    def validate(self, messages: Sequence[Message]) -> None:
+        """核对实际 ModelRequest 的前 N 条消息位置与内容; 违规抛 PrefixViolation."""
+        n = len(self.entries)
+        if len(messages) < n:
+            raise PrefixViolation(
+                f"model request is missing restored prefix messages "
+                f"(expected at least {n}, got {len(messages)})"
+            )
+        for index, (entry, message) in enumerate(zip(self.entries, messages)):
+            try:
+                fingerprint = hashlib.sha256(
+                    encode_messages((message,)).encode("utf-8")
+                ).hexdigest()
+            except CodecError as exc:
+                raise PrefixViolation(
+                    f"restored prefix message {index} is not canonical: {exc}"
+                ) from exc
+            if fingerprint != entry.message_sha256:
+                raise PrefixViolation(
+                    f"restored prefix message {index} changed since the proof was built"
+                )
+            if entry.receipt_id is not None:
+                if not isinstance(message, ToolResultMessage):
+                    raise PrefixViolation(
+                        f"restored prefix message {index} lost its receipt identity"
+                    )
+                details = (
+                    message.result.details
+                    if isinstance(message.result.details, dict) else {}
+                )
+                if details.get("receipt_id") != entry.receipt_id:
+                    raise PrefixViolation(
+                        f"restored prefix message {index} carries a different receipt"
+                    )
+
+
+class HistoricalProjection:
+    """应用持有的证明容器; 持久清空成功后重置为空, 提交失败则不变 (契约 §5)."""
+
+    def __init__(self, proof: HistoricalPrefixProof | None = None) -> None:
+        self.proof = proof if proof is not None else HistoricalPrefixProof()
+
+    def reset(self) -> None:
+        self.proof = HistoricalPrefixProof()
+
+
 
 def verification_policy(
     model: ModelPort,
     service: VerificationService,
     config: RunPolicyConfig | None = None,
+    history: HistoricalProjection | None = None,
 ) -> ModelPort:
     """bootstrap `model_policy(model, runtime)` 可用的同步工厂."""
-    return RunPolicy(model, service, config)
+    return RunPolicy(model, service, config, history)
 
 
 class RunPolicy:
@@ -140,6 +222,7 @@ class RunPolicy:
         inner: ModelPort,
         service: VerificationService,
         config: RunPolicyConfig | None = None,
+        history: HistoricalProjection | None = None,
     ) -> None:
         if not callable(getattr(inner, "stream", None)):
             raise TypeError("inner must be a ModelPort")
@@ -148,13 +231,19 @@ class RunPolicy:
         self.inner = inner
         self.service = service
         self.config = config or RunPolicyConfig()
+        self._history = history if history is not None else HistoricalProjection()
 
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
         # 取消优先: 已取消则不发请求, 也不做刷新
         if cancel.cancelled:
             yield StreamDone("aborted")
             return
-        scan = _scan_terminal_facts(request.messages)
+        prefix_length = self._history.proof.length
+        if prefix_length:
+            # 恢复前缀先核对后发送: 缺失/重排/改动拒绝, 不退回按内容猜归属 (契约 §5)
+            self._history.proof.validate(request.messages)
+        # 终结扫描与账本核对只看新后缀: 前缀走历史路径, 不按当前账本锁存
+        scan = _scan_terminal_facts(request.messages[prefix_length:])
         for reason in scan.reasons:
             self.service.mark_process_uncertain(reason)
         view = await self.service.refresh(cancel)
@@ -166,7 +255,12 @@ class RunPolicy:
         # 的不能交付原因, 不能推迟到下一轮 (否则本轮模型仍看见 "none reported")。
         control = _control_view_with_latches(view, reconciled)
         projected = ModelRequest(
-            messages=tuple(_project_message(message, control, self.config) for message in request.messages),
+            messages=tuple(
+                _project_message(
+                    message, control, self.config, historical=index < prefix_length,
+                )
+                for index, message in enumerate(request.messages)
+            ),
             tools=request.tools,
             system_prompt=_with_control_section(request.system_prompt, control, self.config),
         )
@@ -325,14 +419,29 @@ def _starts_with_any(text: str, markers: tuple[str, ...]) -> bool:
     return any(text.startswith(marker) for marker in markers)
 
 
-def _project_message(message: Message, view: VerificationView | None, config: RunPolicyConfig) -> Message:
+def _project_message(
+    message: Message,
+    view: VerificationView | None,
+    config: RunPolicyConfig,
+    historical: bool = False,
+) -> Message:
     if not isinstance(message, ToolResultMessage):
         return message
     result = message.result
     if result.name not in FRESHNESS_TOOLS:
         return message
-    freshness, reason = _freshness_of(result.details, view)
-    marker = _freshness_marker(result.name, freshness, reason, config)
+    if historical:
+        # 前缀内的历史结果: 只追加历史说明, 不按当前账本核对 (契约 §5).
+        # freshness 文本沿用既有枚举词 (unknown), 不扩大 P4 状态面
+        marker = _freshness_marker(
+            result.name, "unknown",
+            "historical result from a previous verification run; "
+            "not applicable to the current verification run",
+            config,
+        )
+    else:
+        freshness, reason = _freshness_of(result.details, view)
+        marker = _freshness_marker(result.name, freshness, reason, config)
     if marker in result.content:
         return message  # 同一视图重复投影不叠加
     return ToolResultMessage(result=replace(result, content=f"{result.content}\n{marker}"))
