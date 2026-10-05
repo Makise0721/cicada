@@ -221,14 +221,45 @@ class ToolDocument:
         if key in self._by_key:
             self._record_failure(f"duplicate ToolCompleted for terminal card {key}; ignored")
             return
+        self._add_terminal_card(
+            run_id=run_id, turn_index=turn, call_id=result.call_id, name=result.name,
+            args_raw=self._args_by_call.get((run_id, result.call_id)),
+            content=result.content, is_error=result.is_error, artifact=artifact,
+        )
+
+    def add_completed_card(
+        self, *, run_id: str, turn_index: int, call_id: str, name: str,
+        arguments_json: str | None, content: str, is_error: bool,
+        artifact: str | None = None,
+    ) -> int:
+        """恢复投影入口 (票据 05): 直接以终态挂一张完成卡, 返回其到达序下标。
+
+        run_id 由调用方命名空间化 (如 restored:<request_id>), 与本进程新 run
+        不碰撞; 同键重复是调用方缺陷, 记 ui_failures 并返回现有卡下标。
+        """
+        key = (run_id, turn_index, call_id)
+        existing = self._by_key.get(key)
+        if existing is not None:
+            self._record_failure(f"duplicate restored card {key}; ignored")
+            return self._cards.index(existing)
+        self._add_terminal_card(
+            run_id=run_id, turn_index=turn_index, call_id=call_id, name=name,
+            args_raw=arguments_json, content=content, is_error=is_error, artifact=artifact,
+        )
+        return len(self._cards) - 1
+
+    def _add_terminal_card(
+        self, *, run_id: str, turn_index: int, call_id: str, name: str,
+        args_raw: str | None, content: str, is_error: bool, artifact: str | None,
+    ) -> None:
         card = _ToolCard(
             run_id=run_id,
-            turn_index=turn,
-            call_id=result.call_id,
-            name=_clean_text(result.name),
-            args_summary=self._summarize_args(run_id, result.call_id),
+            turn_index=turn_index,
+            call_id=call_id,
+            name=_clean_text(name),
+            args_summary=self._summarize_raw(args_raw),
         )
-        card.complete(result.content, result.is_error)
+        card.complete(content, is_error)
         card.artifact = artifact
         self._append(card)
 
@@ -353,7 +384,9 @@ class ToolDocument:
 
     def _summarize_args(self, run_id: str, call_id: str) -> str:
         """参数摘要: 优先常用主参数, 否则单行 JSON; 全部来自真实事件文本。"""
-        raw = self._args_by_call.get((run_id, call_id))
+        return self._summarize_raw(self._args_by_call.get((run_id, call_id)))
+
+    def _summarize_raw(self, raw: str | None) -> str:
         if raw is None:
             return ""
         text = raw.strip()

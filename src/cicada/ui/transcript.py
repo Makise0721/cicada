@@ -217,6 +217,15 @@ class Transcript:
         entry.stop_reason = message.stop_reason
         entry.error = message.error
 
+    def restore_assistant(self, key_run_id: str, turn_index: int, message: AssistantMessage) -> None:
+        """恢复投影 (票据 05): 以终态直建助手条目; key_run_id 必须命名空间化,
+        避免与本进程新 run_id (如 run-1) 碰撞 (A13)。"""
+        entry = self._assistant_entry(key_run_id, turn_index)
+        entry.text = message.text
+        entry.finalized = True
+        entry.stop_reason = message.stop_reason
+        entry.error = message.error
+
     def _assistant_entry(self, run_id: str, turn_index: int) -> AssistantEntry:
         key = (run_id, turn_index)
         entry = self._assistant_index.get(key)
