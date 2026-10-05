@@ -9,20 +9,23 @@
 - 提供可注入 MainScreenFrontend 的开发组合 build(): document_lines 回调是
   01 冻结的显示文档替换点; on_submit 为受理制 (返回 False = 拒绝且草稿保留)。
 - 斜线命令只在 idle 且无 reservation 时执行: /help /status /clear /exit 与
-  //转义文本; 未知命令提示且草稿保留。/clear 只清模型历史
-  (session.clear_history), 显示文档保留并追加系统条目; 命令输出也是显示条目。
+  //转义文本; 未知命令提示且草稿保留。/clear 在持久会话经共享 async
+  clear_context() 可靠提交 (05), 提交期间输入屏障; 非持久保持旧同步入口。
 - 本模块不起 renderer、不写终端: 组合层只投递状态, 渲染请求经 on_update
   回调 (宿主传 frontend.request_render 合并节流)。
-- 正常对话不出现内部 phase 标签; 诊断细节归 /status (票据 05 的只读
-  diagnostics 对象可经 build(diagnostics=...) 注入, 本模块默认只给已发布事实)。
-- 票据 05 组合接线: 工具卡经 ToolDocument 投影并按到达序挂载显示文档
-  (add_entry); 检查事实经 CheckProjection 消费 RequestCompleted.outcome
-  (结论条目只在 decision 非空时追加, 正常完成安静); /status 汇集检查事实
-  与注入诊断并施加有界限额。
+- 正常对话不出现内部 phase 标签; 诊断细节归 /status (只读 diagnostics 对象
+  经 build(diagnostics=...) 注入, 本模块默认只给已发布事实)。
+- 工具卡经 ToolDocument 投影并按到达序挂载显示文档 (add_entry); 检查事实经
+  CheckProjection 消费 RequestCompleted.outcome; /status 汇集检查事实与注入
+  诊断并施加有界限额。
+- 票据 05: 订阅前先把恢复快照 (restored_requests/restored_interrupted) 投影
+  成只读历史条目 (ui/restore_view), 查看状态原因如实成条; 保存失败显示真实
+  未保存事实 (后继编码由应用 storage_failed 锁存拒绝)。
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Callable
 
 from cicada.application import (
@@ -31,6 +34,7 @@ from cicada.application import (
     ApplicationSession,
     ApplicationUpdate,
     HistoryCleared,
+    OperationBusy,
     RequestCompleted,
     RequestPhaseChanged,
 )
@@ -54,6 +58,7 @@ from cicada.ui.checks import (
 from cicada.ui.editor import Editor
 from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
+from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
@@ -87,6 +92,18 @@ class ConversationView:
         self._checks = CheckProjection(session)
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
+        # 票据 05: 建立订阅前注入只读恢复显示; 查看状态原因如实成条
+        if session.restored_requests or session.restored_interrupted:
+            project_restored_history(
+                self.transcript,
+                self.tools,
+                requests=session.restored_requests,
+                interrupted=session.restored_interrupted,
+            )
+            if session.view_only_reason is not None:
+                self.transcript.append_system(
+                    f"恢复为查看状态（新请求被拒绝）：{session.view_only_reason}"
+                )
         self._unsubscribe = session.subscribe(self._on_application_update)
         # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计
         self.footer = FooterComponent(
@@ -121,7 +138,16 @@ class ConversationView:
             summary = self._checks.on_request_completed(outcome)
             if summary is not None:
                 self.transcript.append_system("\n".join(summary))
+            if outcome.persistence is not None and not outcome.persistence.saved:
+                # 05: 保存失败如实显示; 后继编码由应用 storage_failed 锁存拒绝
+                self.transcript.append_error(
+                    f"[session save failed: {outcome.persistence.error}]"
+                )
             self._gate.note_request_completed()
+        elif isinstance(update, OperationBusy):
+            # 05: 持久清空提交中 (屏障在命令处置时已同步置位, 此处兜底)
+            self._gate.note_clear_started()
+            self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
         elif isinstance(update, HistoryCleared):
             # /clear 只清模型历史: 显示文档保留, 追加系统条目说明
             self.transcript.append_system("已清空模型历史（已显示记录与验证状态保留）。")
@@ -186,7 +212,9 @@ class ConversationView:
 
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
-        取消意图; finalizing/closing/closed 静默; 空闲清草稿。"""
+        取消意图; 持久清空提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self._gate.clearing:
+            return
         if cancel_if_active(self._session):
             return
         if self._session.state in ("finalizing", "closing", "closed"):
@@ -198,7 +226,9 @@ class ConversationView:
 
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
-        空闲与 finalizing/closing/closed 均无动作。"""
+        持久清空提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self._gate.clearing:
+            return
         if cancel_if_active(self._session):
             return
         if self._gate.busy() and self._session.state == "idle":
@@ -235,6 +265,12 @@ class ConversationView:
             self.transcript.append_information("会话信息", self._status_sections())
             return True
         if command == "/clear":
+            if self._session.persistence is not None:
+                # 05: 持久清空经共享 async clear_context() 可靠提交; 命令处置时
+                # 同步置屏障 (先于任务起跑窗口), 落定 (成功/失败) 后释放
+                self._gate.note_clear_started()
+                asyncio.get_running_loop().create_task(self._run_persistent_clear())
+                return True
             try:
                 self._session.clear_history()  # 非空闲已被屏障拦截; 防御捕获
             except RuntimeError as exc:
@@ -248,12 +284,44 @@ class ConversationView:
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
 
+    async def _run_persistent_clear(self) -> None:
+        """等待持久清空提交落定; 成功的确认条目由 HistoryCleared 投影追加。"""
+        try:
+            await self._session.clear_context()
+        except Exception as exc:
+            # 失败: 内存历史不变 (应用保证), 屏障释放并如实成条
+            self._gate.note_clear_settled()
+            self.transcript.append_error(f"清空提交失败: {exc}")
+            if self._on_update is not None:
+                self._on_update()
+            return
+        self._gate.note_clear_settled()
+
     def _status_sections(self) -> list[tuple[str, list[str]]]:
-        """/status: 已发布状态 + 检查事实 + 计量口径 + 注入诊断; 整体有界 (P12)。"""
+        """/status: 已发布状态 + 持久化事实 + 检查事实 + 计量口径 + 注入诊断; 有界 (P12)。"""
         session_lines = [
             f"状态: {self._session.state}",
             f"模型: {self._session.config.model_label or '不可得'}",
         ]
+        persistence = self._session.persistence
+        if persistence is not None:
+            # 05: 会话/保存/恢复来源事实进入状态页
+            session_lines.extend([
+                f"会话 ID: {persistence.session_id}",
+                f"模式: {persistence.mode} · epoch {persistence.epoch_id[:8]}",
+                (
+                    f"上下文代次: {persistence.context_generation} · "
+                    f"已保存 {persistence.saved_request_count} 条 · "
+                    f"恢复 {persistence.restored_request_count} 条"
+                ),
+                f"历史模型调用: {persistence.restored_model_call_count} 次",
+            ])
+            if persistence.storage_failed is not None:
+                session_lines.append(f"保存失败已锁存: {persistence.storage_failed}")
+            if self._session.view_only_reason is not None:
+                session_lines.append(f"查看状态: {self._session.view_only_reason}")
+            if self._session.has_process_uncertain():
+                session_lines.append(PROCESS_UNCERTAIN_LABEL)
         diagnostics = self._diagnostics() if self._diagnostics is not None else []
         # CLI 诊断重复提供相同模型事实时只展示一次，保留任何不同的诊断值。
         diagnostics = [line for line in diagnostics if line != session_lines[1]]

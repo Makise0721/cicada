@@ -31,6 +31,9 @@ class AdmissionGate:
         self._task: asyncio.Task | None = None
         self._reservation_open = False
         self._pending_cancel = False
+        # 票据 05: 持久清空提交中 (OperationBusy("clear") -> HistoryCleared/失败落定);
+        # 期间 Enter/斜线命令/退出屏障, 草稿保持可编辑
+        self._clearing = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
         self.on_error: Callable[[str], None] | None = None
 
@@ -39,6 +42,11 @@ class AdmissionGate:
     @property
     def pending_cancel(self) -> bool:
         return self._pending_cancel
+
+    @property
+    def clearing(self) -> bool:
+        """持久清空提交进行中 (输入屏障; 与请求 reservation 独立)。"""
+        return self._clearing
 
     def busy(self) -> bool:
         """reservation 存在即忙 (含 execute 任务尚未起跑的同步窗口)。"""
@@ -49,10 +57,12 @@ class AdmissionGate:
     def try_admit(self, prompt: str) -> asyncio.Task | None:
         """同步准入: 可执行则先占 reservation 再创建任务, 返回任务; 否则 None。
 
-        拒绝条件: 已有 reservation / session 非 idle (含 closing/closed) / 空提示。
-        返回 None 表示拒绝, 调用方不得伪造用户条目。
+        拒绝条件: 已有 reservation / 持久清空提交中 / session 非 idle
+        (含 closing/closed) / 空提示。返回 None 表示拒绝, 调用方不得伪造用户条目。
         """
         if self._reservation_open:
+            return None
+        if self._clearing:
             return None
         if self._session.state != "idle":
             return None
@@ -98,6 +108,16 @@ class AdmissionGate:
         """RequestCompleted 后核对释放条件 (正常路径 state 已回 idle)。"""
         self._release_if_idle()
 
+    # --- 持久清空屏障 (票据 05) ---------------------------------------------------------
+
+    def note_clear_started(self) -> None:
+        """清空提交开始 (命令处置时同步置位, 先于任务起跑窗口); 幂等。"""
+        self._clearing = True
+
+    def note_clear_settled(self) -> None:
+        """清空提交落定 (成功由 HistoryCleared 投影, 失败由等待任务释放); 幂等。"""
+        self._clearing = False
+
     def note_phase(self, phase: str) -> None:
         """阶段通知: reservation 窗口记录的取消意图在任务实际执行时交给公共 cancel。"""
         if self._pending_cancel and phase == "executing":
@@ -110,6 +130,7 @@ class AdmissionGate:
         self._pending_cancel = False
         self._reservation_open = False
         self._task = None
+        self._clearing = False
 
     # --- 取消意图 ----------------------------------------------------------------------
 
@@ -132,9 +153,12 @@ def cancel_if_active(session: ApplicationSession) -> bool:
 def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """Enter 屏障: 屏障内 Enter 无动作 (不排队、不执行命令、不提示)。
 
-    覆盖 reservation 未起跑窗口与 executing/cancelling/finalizing/closing/closed。
+    覆盖 reservation 未起跑窗口、持久清空提交 (05) 与
+    executing/cancelling/finalizing/closing/closed。
     """
     if gate.busy():
+        return True
+    if gate.clearing:
         return True
     return session.state in (
         "executing",
