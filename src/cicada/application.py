@@ -341,6 +341,7 @@ class ApplicationSession:
         self._restored_interrupted = restored_interrupted
         self._view_only_reason = view_only_reason
         self._projection = projection                    # 前缀证明容器; 清空成功后重置 (03)
+        self._restored_receipts = restored_receipts
         self._persisted_receipt_ids = {r.receipt_id for r in restored_receipts}
         self._context_generation = restored_context_generation
         self._request_id: str | None = None
@@ -413,6 +414,11 @@ class ApplicationSession:
     def restored_interrupted(self) -> tuple[InterruptedRequest, ...]:
         """打开时存档中的未完成 intent (诊断与显示; 不进入可续写历史)."""
         return self._restored_interrupted
+
+    @property
+    def restored_receipts(self) -> tuple[StoredReceipt, ...]:
+        """打开时恢复的历史检查回执事实 (05 显示消费的取数入口; 只读)."""
+        return self._restored_receipts
 
     @property
     def view_only_reason(self) -> str | None:
@@ -913,8 +919,27 @@ def _receipt_fingerprint(check_id: str, command: str, timeout_s: float) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def _receipt_facts_mismatch(receipt: StoredReceipt, details: dict) -> str | None:
+    """消息 details 的终结事实与回执记录不一致 -> 返回原因; 一致返回 None.
+
+    契约 §5「事实不匹配……属于恢复格式/关系错误」: 缺键不比 (None 容忍),
+    显式事实冲突 (exit_code/timed_out/cancelled/output_complete) 拒绝恢复.
+    """
+    exit_code = details.get("exit_code")
+    if (
+        isinstance(exit_code, int) and not isinstance(exit_code, bool)
+        and receipt.exit_code != exit_code
+    ):
+        return f"exit_code {exit_code} but the receipt records {receipt.exit_code}"
+    for key in ("timed_out", "cancelled", "output_complete"):
+        value = details.get(key)
+        if isinstance(value, bool) and getattr(receipt, key) != value:
+            return f"{key} is {value} but the receipt records {getattr(receipt, key)}"
+    return None
+
+
 def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
-    """从恢复事实构建前缀证明容器; 回执引用缺失/错挂属恢复关系错误, 模型零请求."""
+    """从恢复事实构建前缀证明容器; 回执引用缺失/错挂/事实不符属恢复关系错误, 模型零请求."""
     receipts_by_id = {receipt.receipt_id: receipt for receipt in snapshot.restored_receipts}
     entries: list[PrefixEntry] = []
     for request in snapshot.requests:
@@ -939,6 +964,11 @@ def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
                         raise ApplicationOpenError(
                             f"restored receipt {candidate} does not belong to its request"
                         )
+                    mismatch = _receipt_facts_mismatch(receipt, details)
+                    if mismatch is not None:
+                        raise ApplicationOpenError(
+                            f"restored check result contradicts receipt {candidate}: {mismatch}"
+                        )
                     receipt_id = candidate
                     verification_run_id = receipt.verification_run_id
             entries.append(PrefixEntry(
@@ -951,10 +981,20 @@ def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
                 receipt_id=receipt_id,
                 verification_run_id=verification_run_id,
             ))
+    # 显式关系校验: 证明逐位置背书的内容必须就是实际注入的规范历史
+    # (隐式依赖 store 两条推导路径一致不够; 分叉按 fail-closed 拒绝, 见 A09)
     if len(entries) != len(snapshot.canonical_history):
         raise ApplicationOpenError(
             "restored requests do not reconstruct the canonical history (relation error)"
         )
+    for entry, message in zip(entries, snapshot.canonical_history):
+        observed = hashlib.sha256(
+            encode_messages((message,)).encode("utf-8")
+        ).hexdigest()
+        if observed != entry.message_sha256:
+            raise ApplicationOpenError(
+                "restored requests do not reconstruct the canonical history (relation error)"
+            )
     return HistoricalProjection(HistoricalPrefixProof(entries=tuple(entries)))
 
 

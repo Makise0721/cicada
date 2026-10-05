@@ -28,6 +28,10 @@ MAX_JSON_DEPTH = 32                       # 嵌套 JSON 深度上限
 
 SHORT_TITLE_MAX_CHARS = 80                # 列表短标题的有界文字
 
+# 03: 回执行标识/说明字段的有界长度; 写侧构造与加载侧解码对称拒绝
+RECEIPT_ID_MAX_CHARS = 256               # receipt_id/verification_run_id/epoch_id/request_id
+RECEIPT_FAILURE_KIND_MAX_CHARS = 512     # failure_kind 说明文本
+
 
 # --- 错误分类 ---------------------------------------------------------------------------
 
@@ -301,6 +305,11 @@ class StoredReceipt:
                      "definition_fingerprint", "execution_status"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
                 raise ValueError(f"StoredReceipt.{name} must be a nonempty str")
+        for name in ("verification_run_id", "receipt_id", "epoch_id", "request_id"):
+            if len(getattr(self, name)) > RECEIPT_ID_MAX_CHARS:
+                raise ValueError(
+                    f"StoredReceipt.{name} exceeds the v1 limit ({RECEIPT_ID_MAX_CHARS} chars)"
+                )
         if self.execution_status not in (
             "exited", "launch_failed", "timed_out", "cancelled", "error",
         ):
@@ -318,6 +327,11 @@ class StoredReceipt:
                 raise ValueError(f"StoredReceipt.{name} must be a bool")
         if self.failure_kind is not None and not isinstance(self.failure_kind, str):
             raise ValueError("StoredReceipt.failure_kind must be a str or None")
+        if self.failure_kind is not None and len(self.failure_kind) > RECEIPT_FAILURE_KIND_MAX_CHARS:
+            raise ValueError(
+                "StoredReceipt.failure_kind exceeds the v1 limit "
+                f"({RECEIPT_FAILURE_KIND_MAX_CHARS} chars)"
+            )
         if self.activity_id is not None and not isinstance(self.activity_id, str):
             raise ValueError("StoredReceipt.activity_id must be a str or None")
 

@@ -1233,6 +1233,7 @@ async def test_prefix_walks_historical_path_without_current_ledger_latch():
 
 async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():
     """A09: 新后缀逐字段复制旧回执也不获历史豁免 —— 仍按当前账本锁存."""
+    from cicada.core.messages import isolate_message
     from cicada.run_policy import HistoricalProjection
 
     prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
@@ -1241,7 +1242,9 @@ async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():
         _prefix_entry(prefix[0]),
         _prefix_entry(prefix[1], receipt_id="r-old", run_id="run-old"),
     ))
-    copied_suffix = check_result("c9", "伪造的当前检查", receipt_id="r-old")
+    # 逐字段复制: 同 call_id/content/details/receipt_id 的独立副本 (仅对象不同)
+    copied_suffix = isolate_message(prefix[1])
+    assert copied_suffix is not prefix[1]
     model = RecordingModel()
     service = FakeVerificationService(make_view())
     policy = RunPolicy(model, service, history=history)

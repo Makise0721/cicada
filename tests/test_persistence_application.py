@@ -1009,6 +1009,11 @@ async def test_check_then_clear_drops_context_keeps_display_and_receipts(tmp_pat
     assert session.history == ()
     second = await session.execute("第二问")
     assert second.persistence is not None and second.persistence.saved
+    # 账本/基线保持: 清空不触碰验证服务, 新请求仍属同一验证运行 (A10)
+    assert second.view is not None
+    assert second.view.verification_run_id == session.verification_run_id
+    assert second.view.checks[0].status == "passed", "旧检查账本仍在, freshness 不被清空重置"
+    assert session.restored_receipts == (), "新会话无恢复回执"
     session_id = session.persistence.session_id
     await session.aclose()
 
@@ -1114,3 +1119,96 @@ def test_admission_derives_view_only_from_untrusted_receipts_alone():
     assert reason is not None
     assert "process_uncertain" in reason
     assert "r-bad" in reason
+
+
+# --- 03 审查处置: 恢复关系错误的证明构建分支 -----------------------------------------------
+
+
+def _proof_snapshot(messages, receipts):
+    """构造带单一已提交请求的恢复快照 (直接喂 _build_prefix_proof)."""
+    from cicada.persistence.contracts import (
+        RecoverySnapshot,
+        RequestOutcomeFacts,
+        RestoredRequest,
+        StoredIdentity,
+        StoredReceipt,
+    )
+    identity = _identity()
+    return RecoverySnapshot(
+        session_id="s", canonical_workspace="w", created_at=0.0, short_title="",
+        identity=StoredIdentity(launch=identity, tool_fingerprint="fp"),
+        epoch_count=1, context_generation=0,
+        requests=(RestoredRequest(
+            request_id="q1", epoch_id="e1", seq=2, context_generation=0, prompt="问",
+            messages=tuple(messages), outcome=RequestOutcomeFacts(
+                run_id="run-1", stop_reason="stop", error=None, exit_code=0, finalized=True,
+            ), committed_at=0.0,
+        ),),
+        interrupted=(), canonical_history=tuple(messages),
+        restored_receipts=tuple(receipts),
+    )
+
+
+def _check_messages_pair(receipt_id="r-1", *, details=None):
+    from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage
+
+    if details is None:
+        details = {"receipt_id": receipt_id, "exit_code": 0, "timed_out": False,
+                   "cancelled": False, "output_complete": True}
+    messages = (
+        UserMessage(text="问"),
+        AssistantMessage(text="", tool_calls=(ToolCall("k1", "check", "{}"),)),
+        ToolResultMessage(result=ToolResult("k1", "check", "passed", details=details)),
+        AssistantMessage(text="答"),
+    )
+    return messages
+
+
+def _stored(receipt_id="r-1", **overrides):
+    from cicada.persistence.contracts import StoredReceipt
+
+    fields = dict(
+        verification_run_id="run-old", receipt_id=receipt_id, epoch_id="e1",
+        request_id="q1", definition_fingerprint="f" * 64, execution_status="exited",
+        exit_code=0, timed_out=False, cancelled=False, output_complete=True,
+        failure_kind=None,
+    )
+    fields.update(overrides)
+    return StoredReceipt(**fields)
+
+
+def test_prefix_proof_rejects_missing_and_mismatched_receipt_facts():
+    """契约 §5 恢复关系错误: 回执缺失 / 事实与消息矛盾 -> 拒绝, 模型零请求."""
+    from cicada.application import ApplicationOpenError, _build_prefix_proof
+
+    # 回执缺失
+    with pytest.raises(ApplicationOpenError, match="not in the archive"):
+        _build_prefix_proof(_proof_snapshot(_check_messages_pair("r-missing"), ()))
+
+    # 事实矛盾: 消息声称 exit_code=0/output_complete=True, 回执记录 timed_out
+    with pytest.raises(ApplicationOpenError, match="contradicts receipt r-1"):
+        _build_prefix_proof(_proof_snapshot(
+            _check_messages_pair(), (_stored(timed_out=True, exit_code=None,
+                                             output_complete=False),),
+        ))
+
+    # 一致事实通过
+    projection = _build_prefix_proof(_proof_snapshot(_check_messages_pair(), (_stored(),)))
+    assert projection.proof.length == 4
+    assert projection.proof.entries[2].receipt_id == "r-1"
+
+
+def test_prefix_proof_rejects_requests_not_reconstructing_history():
+    """requests 拼接与 canonical_history 逐位置不符 -> 关系错误 (显式校验)."""
+    from cicada.application import ApplicationOpenError, _build_prefix_proof
+
+    snapshot = _proof_snapshot(_check_messages_pair(), (_stored(),))
+    # 篡改 canonical_history 使与 requests 分叉 (条数相同内容不同)
+    from dataclasses import replace as dc_replace
+
+    tampered = dc_replace(
+        snapshot,
+        canonical_history=(UserMessage(text="被改写的问"),) + snapshot.canonical_history[1:],
+    )
+    with pytest.raises(ApplicationOpenError, match="do not reconstruct"):
+        _build_prefix_proof(tampered)

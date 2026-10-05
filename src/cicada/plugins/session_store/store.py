@@ -382,6 +382,17 @@ class SQLiteSessionStore:
             "request payload",
         )
         payload_sha = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        # 回执行 (terminal_json + 标识列) 与请求载荷一并计入 db-size 检查点,
+        # 否则回执字节可把库推过限额, 写出本程序自己拒绝打开的存档
+        receipt_bytes = sum(
+            len(terminal_json.encode("utf-8"))
+            + len(receipt.verification_run_id.encode("utf-8"))
+            + len(receipt.receipt_id.encode("utf-8"))
+            + len(receipt.epoch_id.encode("utf-8"))
+            + len(receipt.request_id.encode("utf-8"))
+            + len(receipt.definition_fingerprint.encode("utf-8"))
+            for receipt, terminal_json in receipt_rows
+        )
 
         def job() -> int:
             record = self._state.intents.get(request_id)
@@ -433,7 +444,7 @@ class SQLiteSessionStore:
                 raise ArchiveLimitError(
                     f"session exceeds the v1 message limit ({MAX_MESSAGES})"
                 )
-            self._check_db_size(len(payload.encode("utf-8")))
+            self._check_db_size(len(payload.encode("utf-8")) + receipt_bytes)
             seq = self._state.next_seq
             now = time.time()
             short_title = self._state.short_title or messages[0].text[:SHORT_TITLE_MAX_CHARS]
@@ -1287,8 +1298,15 @@ def _load_state(
             raise ArchiveFormatError(f"receipt {receipt_id} has an invalid definition fingerprint")
         if activity_id is not None and str(activity_id) not in state.activities:
             raise ArchiveFormatError(f"receipt {receipt_id} references an unknown process activity")
-        if activity_id is not None and state.activities[str(activity_id)].request_id != str(request_id):
-            raise ArchiveFormatError(f"receipt {receipt_id} activity does not belong to its request")
+        if activity_id is not None:
+            activity = state.activities[str(activity_id)]
+            if activity.request_id != str(request_id):
+                raise ArchiveFormatError(f"receipt {receipt_id} activity does not belong to its request")
+            # 与写侧对称: 关联活动必须携带同一回执身份 (check-run 包装器记录)
+            if activity.terminal is None or activity.terminal.receipt_id != receipt_id:
+                raise ArchiveFormatError(
+                    f"receipt {receipt_id} activity does not carry the same receipt identity"
+                )
         _check_text_size(str(terminal_json), MAX_METADATA_BYTES, "receipt terminal evidence")
         try:
             (execution_status, exit_code, timed_out, cancelled,

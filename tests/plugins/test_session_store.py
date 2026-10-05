@@ -1029,10 +1029,21 @@ def test_load_rejects_receipt_relation_violations(tmp_path):
     with pytest.raises(ArchiveFormatError, match="terminal record is corrupt"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
+    # 子用例分开: 非法 execution_status 单独触发 codec 枚举拒绝分支
+    # (第一处篡改后的 terminal_json 已是坏值, 这里写回合法 JSON 再改枚举)
+    valid = json.dumps({"execution_status": "exited", "exit_code": 0, "timed_out": False,
+                        "cancelled": False, "output_complete": True, "failure_kind": None})
     connection = sqlite3.connect(str(db))
-    original = connection.execute("SELECT terminal_json FROM historical_receipts").fetchone()[0]
     connection.execute("UPDATE historical_receipts SET terminal_json = ?",
-                       (original.replace('"exited"', '"nonsense"'),))
+                       (valid.replace('"exited"', '"nonsense"'),))
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="must be one of"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+    connection = sqlite3.connect(str(db))
+    connection.execute("UPDATE historical_receipts SET terminal_json = ?",
+                       (valid.replace('"exited"', '"timed_out"'),))
     connection.execute("UPDATE historical_receipts SET request_id = 'ghost-request'")
     connection.commit()
     connection.close()
@@ -1046,4 +1057,100 @@ def test_load_rejects_receipt_relation_violations(tmp_path):
     connection.commit()
     connection.close()
     with pytest.raises(ArchiveFormatError, match="unknown epoch"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+# --- 03 审查处置: 回执字节配额、id 上界与活动关联对称校验 -------------------------------
+
+
+async def test_receipt_bytes_counted_into_db_size_checkpoint(tmp_path, monkeypatch):
+    """回执行 (terminal_json + 标识列) 计入 db-size 检查点: 超限提交被拒, 不写出打不开的存档."""
+    import cicada.plugins.session_store.store as store_module
+    from cicada.persistence.contracts import StoredReceipt
+
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "带大回执的问")
+    # 单条回执行经 03 上界后已天然有界; 用多条回执叠加越过紧贴当前库容量的限额
+    fat_receipts = tuple(
+        StoredReceipt(
+            verification_run_id="run-old", receipt_id=f"r-fat-{index}", epoch_id=epoch,
+            request_id=request_id, definition_fingerprint="f" * 64,
+            execution_status="exited", exit_code=0, timed_out=False, cancelled=False,
+            output_complete=True, failure_kind="k" * 512,
+        )
+        for index in range(64)
+    )
+    connection = sqlite3.connect(str(tmp_path / f"{store.session_id}.sqlite3"))
+    base_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * 4096
+    connection.close()
+    monkeypatch.setattr(store_module, "MAX_DB_BYTES", base_bytes + 4096)
+    with pytest.raises(ArchiveLimitError, match="size limit"):
+        await store.commit_request(
+            request_id, messages=_suffix(("带大回执的问", "答")), outcome=_outcome(),
+            receipts=fat_receipts,
+        )
+    monkeypatch.undo()
+    session_id = store.session_id
+    await store.aclose()
+    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    assert reopened.recovery_snapshot().restored_receipts == (), "被拒提交不留部分行"
+    await reopened.aclose()
+
+
+async def test_receipt_id_length_cap_rejected_at_write_and_load(tmp_path):
+    from cicada.persistence.contracts import RECEIPT_ID_MAX_CHARS, StoredReceipt
+
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "问")
+    with pytest.raises(ValueError, match="exceeds the v1 limit"):
+        StoredReceipt("r" * (RECEIPT_ID_MAX_CHARS + 1), "r-big", epoch, request_id,
+                      "f" * 64, "exited", 0, False, False, True, None)
+    # 加载侧对称: 直接向库内塞超长 id -> 构造校验拒绝 (inconsistent)
+    await store.commit_request(
+        request_id, messages=_suffix(("问", "答")), outcome=_outcome(),
+        receipts=(_receipt(request_id, epoch),),
+    )
+    session_id = store.session_id
+    await store.aclose()
+    db = tmp_path / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    connection.execute("UPDATE historical_receipts SET receipt_id = ?", ("r" * 300,))
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="inconsistent"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+async def test_load_rejects_receipt_relinked_to_foreign_activity(tmp_path):
+    """加载侧与写侧对称: 回执关联的活动必须携带同一回执身份."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "带检查与命令的问")
+    check_activity = await store.begin_process(
+        request_id, tool_name="check", call_id="c1",
+        arguments={"action": "run", "check_id": "check-1"},
+    )
+    await store.end_process(check_activity, ProcessTerminalFacts(
+        kind="proven_terminal", exit_code=0, output_complete=True, receipt_id="r-1",
+    ))
+    shell_activity = await store.begin_process(
+        request_id, tool_name="powershell", call_id="c2", arguments={"command": "x"},
+    )
+    await store.end_process(shell_activity, _PROVEN)
+    await store.commit_request(
+        request_id, messages=_suffix(("带检查与命令的问", "答")), outcome=_outcome(),
+        receipts=(_receipt(request_id, epoch),),
+    )
+    session_id = store.session_id
+    await store.aclose()
+    db = tmp_path / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    connection.execute(
+        "UPDATE historical_receipts SET activity_id = ?", (shell_activity,),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="does not carry the same receipt identity"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
