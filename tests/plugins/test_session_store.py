@@ -1348,3 +1348,57 @@ async def test_list_sessions_proven_activity_and_trusted_receipt_not_blocked(tmp
     assert entry.session_id == session_id and entry.error is None
     assert not entry.blocked, "已证活动与可信回执不是阻断证据"
     assert entry.unproven_activities == 0 and entry.untrusted_receipts == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        "[1, 2]",
+        '{"kind": "nonsense"}',
+        '{"execution_status": "nonsense"}',
+    ],
+)
+async def test_list_sessions_corrupt_json_rows_count_conservatively(tmp_path, payload):
+    """06 审查 F7: 列表侧坏行按 CodecError 保守计数, 整档不标坏档。"""
+    from cicada.plugins.session_store import list_sessions
+    from cicada.persistence.codec import dumps_strict
+
+    session_id = await _make_session(tmp_path, requests=1)
+    db = tmp_path / f"{session_id}.sqlite3"
+    fingerprint = hashlib.sha256(b"check command").hexdigest()
+    connection = sqlite3.connect(str(db))
+    try:
+        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
+        request_id = connection.execute(
+            "SELECT request_id FROM request_intents LIMIT 1"
+        ).fetchone()[0]
+        receipt_id = "chk-" + "b" * 32
+        connection.execute(
+            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+            " arguments_digest, begin_json, end_json) VALUES ('activity-bad', ?, 'check',"
+            " 'check-bad', 'digest', ?, ?)",
+            (
+                request_id,
+                dumps_strict({
+                    "description": "自检命令", "arguments_digest": "digest", "started_at": 1.0,
+                }),
+                payload,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO historical_receipts (verification_run_id, receipt_id, epoch_id,"
+            " request_id, activity_id, definition_fingerprint, terminal_json)"
+            " VALUES ('vrun-bad', ?, ?, ?, 'activity-bad', ?, ?)",
+            (receipt_id, epoch, request_id, fingerprint, payload),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    page = list_sessions(directory=tmp_path)
+    assert len(page.entries) == 1
+    entry = page.entries[0]
+    assert entry.session_id == session_id and entry.error is None, "坏行是保守计数, 不作废整档"
+    assert entry.unproven_activities == 1 and entry.untrusted_receipts == 1
+    assert entry.blocked
