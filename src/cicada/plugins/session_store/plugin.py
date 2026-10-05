@@ -1,9 +1,10 @@
 """把已打开的会话存储交给插件 runtime 拥有 (会话保存恢复 v1).
 
-store 由应用协调器在 bootstrap 前打开; 插件只负责 provide 与最后清理:
-注册名单中排在首位且不 require 任何能力 -> 拓扑序最先激活 -> runtime stop
-逆序清理时最后释放 (模型/进程资源先清理). 02 的活动包装器将通过显式
-requires 建立同样的顺序约束.
+store 由应用协调器在 bootstrap 前打开; 插件只负责 provide 与最后清理.
+顺序权威在应用层的显式依赖: open_application 的持久装配 (_bind_store_last_cleanup)
+给其余插件定义追加 require "session.store" -> store 拓扑序最先激活 -> runtime stop
+逆序清理时最后释放 (模型/进程资源先清理). 本插件自身零 requires; 注册名单中
+排在首位只是同一顺序的冗余保险, 不是机制本身.
 """
 
 from __future__ import annotations

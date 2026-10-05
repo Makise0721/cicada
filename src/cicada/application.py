@@ -29,6 +29,7 @@ from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
 from cicada.core.messages import Message, isolate_message, isolate_tool_result
 from cicada.persistence.contracts import (
+    ArchiveLimitError,
     InterruptedRequest,
     LaunchIdentity,
     PersistenceState,
@@ -38,6 +39,8 @@ from cicada.persistence.contracts import (
     RequestPersistenceFacts,
     RestoredRequest,
     SessionStorePort,
+    StorageUnavailableError,
+    StorageWriteError,
     StoredIdentity,
     conflicting_launch_fields,
 )
@@ -451,7 +454,8 @@ class ApplicationSession:
                 "process_uncertain: new coding requests are refused; only status, clear or exit remain"
             )
         if self._store is not None:
-            # 可靠提交请求开始 intent; 失败零模型调用并锁存 storage_failed (D2)
+            # 可靠提交请求开始 intent; 失败零模型调用并锁存 storage_failed (D2)。
+            # 等待受拥有: 外层取消不把已派发事务当作未发生, 取得明确结果后才收尾
             if self._storage_failed is not None:
                 raise RuntimeError(
                     f"storage_failed: earlier session save failed ({self._storage_failed}); "
@@ -461,14 +465,38 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a persistent clear is in progress; new requests are refused until it settles"
                 )
-            try:
-                self._request_id = await self._store.begin_request(self._epoch_id or "", prompt)
-            except PersistenceError as exc:
-                self._latch_storage_failed(str(exc))
+            begin_task = asyncio.ensure_future(
+                self._store.begin_request(self._epoch_id or "", prompt)
+            )
+            begin_error: PersistenceError | None = None
+            begin_cancelled = False
+            while True:
+                try:
+                    self._request_id = await asyncio.shield(begin_task)
+                    break
+                except asyncio.CancelledError:
+                    begin_cancelled = True
+                except PersistenceError as exc:
+                    begin_error = exc
+                    break
+            if begin_cancelled:
+                # 已取得事务明确结果后的取消属程序性终止: 与执行期异常一样进入 closing
+                if self._state != "closed":
+                    self._state = "closing"
+                    self._closing = True
+                raise asyncio.CancelledError()
+            if begin_error is not None:
+                # 落盘故障 (不可用/写失败/越限) 才锁存 storage_failed; 关系冲突
+                # (pending 已存在/epoch 不符) 是状态问题, 存储健康, 不得误锁存
+                if isinstance(begin_error, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                    self._latch_storage_failed(str(begin_error))
+                    raise RuntimeError(
+                        f"session save failed before the request started; "
+                        f"no model call or tool execution was made: {begin_error}"
+                    ) from begin_error
                 raise RuntimeError(
-                    f"session save failed before the request started; "
-                    f"no model call or tool execution was made: {exc}"
-                ) from exc
+                    f"cannot start a persisted request: {begin_error}"
+                ) from begin_error
         loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
@@ -692,16 +720,32 @@ class ApplicationSession:
         self._clearing = True
         self._clear_done = asyncio.get_running_loop().create_future()
         try:
-            try:
-                new_generation = await self._store.commit_clear(self._epoch_id or "")
-            except PersistenceError as exc:
-                self._latch_storage_failed(str(exc))
+            # 清空事务的 completion 受拥有: 外层取消先等明确结果; 成功则先完成内存
+            # 同步再传播取消, 避免存档代次前进而内存未清的分叉 (契约 §1)
+            clear_task = asyncio.ensure_future(self._store.commit_clear(self._epoch_id or ""))
+            clear_error: PersistenceError | None = None
+            clear_cancelled = False
+            new_generation: int | None = None
+            while True:
+                try:
+                    new_generation = await asyncio.shield(clear_task)
+                    break
+                except asyncio.CancelledError:
+                    clear_cancelled = True
+                except PersistenceError as exc:
+                    clear_error = exc
+                    break
+            if clear_error is not None:
+                self._latch_storage_failed(str(clear_error))
                 raise RuntimeError(
-                    f"session clear failed to persist; in-memory history is unchanged: {exc}"
-                ) from exc
+                    f"session clear failed to persist; in-memory history is unchanged: {clear_error}"
+                ) from clear_error
+            assert new_generation is not None
             self._context_generation = new_generation
             self._history.clear()
             self._notify(HistoryCleared())
+            if clear_cancelled:
+                raise asyncio.CancelledError()
         finally:
             self._clearing = False
             if self._clear_done is not None and not self._clear_done.done():

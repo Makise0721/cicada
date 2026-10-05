@@ -234,6 +234,7 @@ class SQLiteSessionStore:
         )
         self._closing = False
         self._closed = False
+        self._close_task: asyncio.Task | None = None  # 并发/重试 aclose 共享同一次关闭
         self._drained = threading.Event()
         # _state 只在 worker 线程持锁修改; recovery_snapshot 在调用线程持锁读取
         self._state_lock = threading.Lock()
@@ -264,6 +265,7 @@ class SQLiteSessionStore:
         def job() -> str:
             epoch_id = str(uuid.uuid4())
             now = time.time()
+            self._check_db_size(len(identity_json.encode("utf-8")))
             self._immediate()
             try:
                 if self._state.current_epoch_id is not None:
@@ -371,6 +373,11 @@ class SQLiteSessionStore:
                 )
             if record.status != "pending":
                 raise PersistenceError(f"request {request_id} is {record.status}; cannot commit")
+            if messages[0].text != record.prompt:
+                # 与加载侧同一不变量: 写入侧先拒绝, 避免一次坏提交写出打不开的存档
+                raise PersistenceError(
+                    "committed request messages must start with the exact intent prompt"
+                )
             open_activities = [
                 activity_id
                 for activity_id, activity in self._state.activities.items()
@@ -541,6 +548,7 @@ class SQLiteSessionStore:
                 raise PersistenceError(
                     f"process activity {activity_id} already has a terminal record"
                 )
+            self._check_db_size(len(end_json.encode("utf-8")))
             self._immediate()
             try:
                 cursor = self._conn.execute(
@@ -571,16 +579,28 @@ class SQLiteSessionStore:
     # --- 关闭 ------------------------------------------------------------------------
 
     async def aclose(self) -> None:
-        """排空已派发事务后释放连接与 lease; 超时不提前释放, 让关闭诊断如实记录."""
-        if self._closed or self._closing:
+        """排空已派发事务后释放连接与 lease; 超时不提前释放, 让关闭诊断如实记录.
+
+        并发/重复调用共享同一次关闭任务; 排空超时后再次 aclose() 会重新等待排空
+        (队列可能已清空), 给出补完成释放的路径 —— _closing 只封新事务, 不封收尾.
+        """
+        if self._closed:
             return
-        self._closing = True
-        self._queue.put((None, None, None))  # 停机哨兵: 之前入队的事务全部先完成
+        loop = asyncio.get_running_loop()
+        if self._close_task is None:
+            self._closing = True
+            self._queue.put((None, None, None))  # 停机哨兵: 之前入队的事务全部先完成
+            self._close_task = loop.create_task(self._finish_close())
+        await asyncio.shield(self._close_task)
+
+    async def _finish_close(self) -> None:
         loop = asyncio.get_running_loop()
         drained = await loop.run_in_executor(
             None, self._drained.wait, SESSION_STORE_DRAIN_TIMEOUT_S
         )
         if not drained:
+            # 超时不释放; 放开关闭任务让后续 aclose() 重试排空
+            self._close_task = None
             raise StorageWriteError(
                 "session store still has unfinished transactions after the drain deadline; "
                 "connection and lease are intentionally not released"
@@ -956,12 +976,20 @@ def _load_state(
     )
 
     epoch_ids: set[str] = set()
+    open_epoch_count = 0
     for epoch_id, _opened_at, closed, identity_json, _run in connection.execute(
         "SELECT epoch_id, opened_at, closed, identity_json, verification_run_id"
         " FROM epoch ORDER BY opened_at, epoch_id"
     ):
         if int(closed) not in (0, 1):
             raise ArchiveFormatError("epoch closed flag must be 0 or 1")
+        if int(closed) == 0:
+            open_epoch_count += 1
+            if open_epoch_count > 1:
+                # 写入侧 start_epoch 单事务内只留一个 open epoch; 多个属关系损坏
+                raise ArchiveFormatError(
+                    "session archive has more than one open epoch (unclosed epoch interleaving)"
+                )
         _check_text_size(str(identity_json), MAX_METADATA_BYTES, "epoch identity")
         try:
             identity = decode_identity(str(identity_json))
@@ -974,6 +1002,8 @@ def _load_state(
     # epoch_count == 0 合法: 新建后 bootstrap 前崩溃的空存档, 恢复准入由应用拒绝
 
     prompt_by_begin_seq: dict[int, str] = {}
+    begin_request_ids: dict[int, str] = {}
+    begin_epochs: dict[int, str] = {}
     intents: list[tuple[str, str, int, str]] = []
     for request_id, epoch_id, begin_seq, status in connection.execute(
         "SELECT request_id, epoch_id, begin_seq, status FROM request_intents"
@@ -1000,6 +1030,12 @@ def _load_state(
                 raise ArchiveFormatError("clear record must advance the context generation by one")
             generation = int(record_generation)
             _check_text_size(str(payload_json), MAX_METADATA_BYTES, "clear record")
+            try:
+                clear_payload = _load_payload(str(payload_json))
+            except CodecError as exc:
+                raise ArchiveFormatError(f"clear record {seq} is corrupt: {exc}") from exc
+            if clear_payload != {}:
+                raise ArchiveFormatError(f"clear record {seq} payload must be an empty object")
         elif kind in ("request_begin", "request"):
             if request_id is None:
                 raise ArchiveFormatError(f"{kind} record must carry a request id")
@@ -1018,8 +1054,18 @@ def _load_state(
                 if set(payload) != {"prompt"} or not isinstance(payload["prompt"], str):
                     raise ArchiveFormatError("request_begin payload must hold exactly the prompt")
                 prompt_by_begin_seq[seq] = payload["prompt"]
+                begin_request_ids[seq] = str(request_id)
+                begin_epochs[seq] = str(epoch_id)
             else:
                 _check_text_size(str(payload_json), MAX_REQUEST_PAYLOAD_BYTES, "request record")
+                if _sha is None or not isinstance(_sha, str):
+                    raise ArchiveFormatError(f"request record {seq} must carry a payload digest")
+                observed_sha = hashlib.sha256(str(payload_json).encode("utf-8")).hexdigest()
+                if _sha != observed_sha:
+                    # 提交时写入的摘要必须与载荷一致; 不一致即载荷被篡改或损坏
+                    raise ArchiveFormatError(
+                        f"request record {seq} payload does not match its recorded digest"
+                    )
                 try:
                     payload = _load_payload(str(payload_json))
                     messages = decode_messages(payload["messages"])
@@ -1056,10 +1102,20 @@ def _load_state(
             raise ArchiveFormatError(
                 f"request record {entry[0]} has no matching request intent (orphan record)"
             )
+    referenced_begin_seqs = {begin_seq for _request_id, _epoch_id, begin_seq, _status in intents}
+    for seq in prompt_by_begin_seq:
+        if seq not in referenced_begin_seqs:
+            raise ArchiveFormatError(
+                f"request_begin record {seq} has no matching request intent (orphan record)"
+            )
     for request_id, epoch_id, begin_seq, status in intents:
         prompt = prompt_by_begin_seq.get(begin_seq)
         if prompt is None:
             raise ArchiveFormatError(f"intent {request_id} has no begin record")
+        if begin_request_ids.get(begin_seq) != request_id:
+            raise ArchiveFormatError(f"intent {request_id} does not match its begin record")
+        if begin_epochs.get(begin_seq) != epoch_id:
+            raise ArchiveFormatError(f"intent {request_id} epoch does not match its begin record")
         if status == "committed":
             entry = committed.get(request_id)
             if entry is None:
@@ -1067,6 +1123,8 @@ def _load_state(
                     f"intent {request_id} is committed without a request record"
                 )
             seq, record_epoch, record_generation, messages, outcome, committed_at = entry
+            if record_epoch != epoch_id:
+                raise ArchiveFormatError(f"request record {seq} epoch does not match its intent")
             if messages[0].text != prompt:
                 raise ArchiveFormatError(f"request record {seq} does not match its intent prompt")
             state.requests.append(_CommittedRequest(

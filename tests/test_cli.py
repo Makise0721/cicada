@@ -464,14 +464,15 @@ class _CaptureStream:
 def _run_main_with_storage_failure(tmp_path, monkeypatch, method: str):
     """经 in-process main() 钉住「执行期间保存失败退出码 1」的 CLI 接线 (契约 §6)."""
     import cicada.__main__ as m
-    from cicada.persistence.contracts import PersistenceError
+    from cicada.persistence.contracts import StorageWriteError
     from cicada.plugins.session_store.store import SQLiteSessionStore
 
     script = tmp_path / "s.json"
     script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
 
     async def failing(self, *args, **kwargs):
-        raise PersistenceError("disk gone")
+        # 真实落盘故障类; 裸 PersistenceError 在 02 后按关系冲突分类, 不再锁存
+        raise StorageWriteError("disk gone")
 
     monkeypatch.setattr(SQLiteSessionStore, method, failing)
     out, err = _CaptureStream(), _CaptureStream()

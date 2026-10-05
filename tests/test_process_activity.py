@@ -103,6 +103,14 @@ def test_classify_terminal_matches_p4_definitions():
     launch_failed = classify_terminal(ToolResult("c1", "powershell", "pwsh executable not found on PATH", is_error=True))
     assert launch_failed.kind == "not_started"
 
+    # 哨兵形态 (零执行路径的实际产物) 必须归 not_started: 它与 run_policy 的
+    # PRE_EXECUTION_MARKERS 同文本, 是「不误锁存 process_uncertain」组合链的本地钉子
+    sentinel = classify_terminal(ToolResult("c1", "powershell", "cancelled before execution", is_error=True))
+    assert sentinel.kind == "not_started"
+    from cicada.run_policy import PRE_EXECUTION_MARKERS
+
+    assert "cancelled before execution" in PRE_EXECUTION_MARKERS
+
     timed_out = classify_terminal(ToolResult(
         "c1", "powershell", "[exit_code=-1 timed_out=true]", is_error=True,
         details={"exit_code": None, "timed_out": True, "cancelled": False, "output_complete": False},
@@ -181,6 +189,9 @@ async def test_begin_failure_zero_execution_latch_and_sentinel(tmp_path, monkeyp
     assert inner.calls == [], "开始写入失败必须零命令执行"
     assert token.cancelled, "取消 token 停止后继活动"
     assert sink.failures and "begin failed" in sink.failures[0]
+    # 恒真防护 (包装器无 uncertain 锁存路径): 「不误锁存」的真实证明是哨兵文本
+    # 属 PRE_EXECUTION_MARKERS (见 classify 测试) 且 test_run_policy c5 证明该形态
+    # 不进终结扫描; 此断言只防未来错误引入锁存调用
     assert not sink.uncertain, "命令零执行不得误锁存 process_uncertain"
     await store.aclose()
 
@@ -215,6 +226,7 @@ async def test_outer_cancel_during_begin_wait_writes_not_started_and_returns_sen
     assert result.content == "cancelled before execution" and result.details is None
     assert inner.calls == [], "零命令执行"
     assert token.cancelled
+    # 同上: 恒真防护, 真实证明在 classify 测试与 test_run_policy 的哨兵形态用例
     assert not sink.uncertain, "取消不等同回滚, 不误锁存 process_uncertain"
     activities = store.recovery_snapshot().process_activities
     assert len(activities) == 1
@@ -255,6 +267,43 @@ async def test_token_cancel_during_begin_wait_inner_sees_cancelled_token(tmp_pat
     assert activities[0].terminal is not None
     assert activities[0].terminal.kind == "unproven_terminal"
     assert activities[0].terminal.cancelled is True
+    await store.aclose()
+
+
+async def test_outer_cancel_during_inner_execution_records_unproven_and_propagates(tmp_path):
+    """A04: 取消打在真实执行等待期 —— CancelledError 原样传播, 活动先登记未证终结.
+
+    内核随后把它归一为 "cancelled during execution" (core/agent.py); 本测试钉住
+    包装器在传播前已写 unproven 终结且重复取消不丢登记。
+    """
+    gate = asyncio.Event()
+
+    class GatedTool(ScriptedTool):
+        async def execute(self, arguments, ctx):
+            self.calls.append({"arguments": dict(arguments), "call_id": ctx.call_id})
+            await gate.wait()
+            return _PROVEN_RESULT
+
+    inner = GatedTool(result=_PROVEN_RESULT)
+    store, coordinator, wrapper = _wrap(tmp_path, inner)
+    epoch, request_id = await _begin_request(store)
+    coordinator.bind(_Sink(request_id))
+    token = CancelToken()
+    task = asyncio.create_task(wrapper.execute(
+        {"command": "x"}, ToolContext(call_id="c1", cancel=token),
+    ))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.sleep(0.03)
+    task.cancel()  # 重复取消: 不丢活动登记
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
+    assert len(inner.calls) == 1, "命令确实进入过执行"
+    activities = store.recovery_snapshot().process_activities
+    assert activities[0].terminal is not None
+    assert activities[0].terminal.kind == "unproven_terminal"
+    assert "CancelledError" in (activities[0].terminal.reason or "")
     await store.aclose()
 
 

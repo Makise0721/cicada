@@ -237,31 +237,36 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                       "SELECT COUNT(*) FROM process_activity WHERE end_json IS NOT NULL",
                       lambda rows: int(rows[0][0]) >= 1)
                 gate_b.write_text("go", encoding="utf-8")
+                journal = session_file.with_name(session_file.name + "-journal")
                 hit = False
                 deadline = time.monotonic() + 8.0
                 while time.monotonic() < deadline:
                     try:
                         connection = _connect_ro(session_file)
                         try:
-                            pending, committed = connection.execute(
+                            pending, open_acts, ended, committed = connection.execute(
                                 "SELECT (SELECT COUNT(*) FROM request_intents WHERE status='pending'),"
+                                " (SELECT COUNT(*) FROM process_activity WHERE end_json IS NULL),"
+                                " (SELECT COUNT(*) FROM process_activity WHERE end_json IS NOT NULL),"
                                 " (SELECT COUNT(*) FROM records WHERE kind='request')"
                             ).fetchone()
                         finally:
                             connection.close()
                     except sqlite3.OperationalError:
+                        # 提交事务 EXCLUSIVE 阶段只读不可进: 下一轮重试
                         time.sleep(0.002)
                         continue
-                    pending, committed = int(pending), int(committed)
+                    pending, open_acts, ended, committed = (
+                        int(pending), int(open_acts), int(ended), int(committed),
+                    )
                     if committed >= 2:
                         break  # 已完整提交: 本 attempt 未命中窗口
-                    if kill_point == "before-commit":
-                        ended_open = _counts(session_file)
-                        if pending == 1 and ended_open[1] == 0 and ended_open[2] >= 2:
+                    # journal 命中必须叠加前置: B 的终结已落库且无开放活动,
+                    # 否则 journal 可能属于 end_process 事务而非完整提交
+                    if pending == 1 and open_acts == 0 and ended >= 2:
+                        if kill_point == "before-commit":
                             hit = True
                             break
-                    else:  # mid-commit: ended>=2 后任何 journal 出现就是提交事务在盘
-                        journal = session_file.with_name(session_file.name + "-journal")
                         if journal.exists():
                             hit = True
                             break
@@ -273,10 +278,35 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
 
             marker = work / "marker.txt"
             runs_before_kill = _marker_runs(marker)
-            _kill_tree(child)
+            if kill_point == "mid-commit":
+                # 前置已证两个 pwsh 均退出 (ended>=2): 直接 TerminateProcess 把 kill
+                # 延迟压到毫秒级才能命中提交事务写页窗口; taskkill /T 的外部调用
+                # 耗时足以让 COMMIT 先完成
+                child.kill()
+                child.wait(timeout=30)
+            else:
+                _kill_tree(child)
             time.sleep(0.2)
 
-            pending, open_activities, ended, committed = _counts(session_file)
+            # kill 落地时提交事务的 journal 仍在盘 = mid-commit 真命中 (提交完成后
+            # journal 会被删除且 committed 变 2, 走重试); before-commit 不作要求
+            journal_after_kill = (
+                session_file.with_name(session_file.name + "-journal").exists()
+            )
+
+            # kill 可能停在提交事务写页阶段并留下热 journal: 先用读写连接让
+            # SQLite 完成正常回滚恢复 (与恢复进程下一步 open 的动作一致), 只读
+            # 连接才能进来计数; 恢复失败按本 attempt 未命中处理, 不让整个测试硬失败
+            try:
+                recovery = sqlite3.connect(str(session_file))
+                try:
+                    recovery.execute("SELECT 1 FROM records LIMIT 1").fetchone()
+                finally:
+                    recovery.close()
+                pending, open_activities, ended, committed = _counts(session_file)
+            except (sqlite3.OperationalError, AssertionError):
+                last_error = AssertionError(f"{kill_point}: post-kill read failed")
+                continue
             if kill_point in ("before-commit", "mid-commit"):
                 if committed != 1 or pending != 1:
                     last_error = AssertionError(
@@ -285,6 +315,8 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                     continue
             assert committed == 1, f"恰好第一条请求完整提交 (实际 {committed})"
             assert pending == 1, "第二条请求保持未提交 intent"
+            if kill_point == "mid-commit":
+                assert journal_after_kill, "mid-commit 命中须有提交事务 journal 在盘证据"
 
             facts = _resume_facts(work, session_file.stem, resume_script)
             assert facts["restored"] == 1, "恢复恰好得到之前完整请求"
@@ -319,4 +351,4 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                     gate.write_text("teardown", encoding="utf-8")
             if child.poll() is None:
                 _kill_tree(child)
-    raise AssertionError(f"{kill_point}: {ATTEMPTS} 次尝试均未命中窗口: {last_error}")
+    raise AssertionError(f"{kill_point}: {attempts} 次尝试均未命中窗口: {last_error}")

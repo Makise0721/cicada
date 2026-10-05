@@ -742,3 +742,120 @@ async def test_repeated_outer_cancel_during_commit_keeps_completion(tmp_path):
     await session.aclose()
 
 
+# --- 02 审查处置: begin 等待取消 / 误锁存分类 / 清空等待取消 ------------------------------------
+
+
+async def test_begin_cancel_waits_for_result_then_closing_without_mislatch(tmp_path):
+    """A04: begin 等待外层取消 -> 事务明确结果落库, 应用进 closing, 不误锁存."""
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    store = session._store
+    model = session._app.agent._model
+    assert isinstance(model, FakeModel)
+    release = asyncio.Event()
+    original_begin = store.begin_request
+
+    async def gated_begin(epoch_id, prompt):
+        result = await original_begin(epoch_id, prompt)
+        await release.wait()
+        return result
+
+    store.begin_request = gated_begin  # type: ignore[method-assign]
+    task = asyncio.create_task(session.execute("被取消在开始等待的问"))
+    await asyncio.sleep(0.1)  # begin 事务已派发并挂起
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=15)
+    assert session.state == "closing", "取消属程序性终止, 与执行期异常一样进 closing"
+    assert session.persistence.storage_failed is None, "取消不得误锁存 storage_failed"
+    assert model.requests == [], "零模型调用"
+    with pytest.raises(RuntimeError, match="closing"):
+        await session.execute("closing 后拒绝")
+    await session.aclose()
+
+    # 事务已落库: pending intent 留在存档 (下次 start_epoch 标中断)
+    from cicada.plugins.session_store import open_session_store
+
+    reopened = open_session_store(
+        directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
+    )
+    snapshot = reopened.recovery_snapshot()
+    assert len(snapshot.interrupted) == 1, "取消留下的 pending intent 在快照中可见"
+    await reopened.aclose()
+
+
+async def test_begin_relation_conflict_not_latched_as_storage_failure(tmp_path, monkeypatch):
+    """关系冲突 (pending 已存在) 是状态问题不是落盘失败: 不锁存, 文案不误导."""
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    store = session._store
+
+    async def pending_conflict(epoch_id, prompt):
+        raise PersistenceError(
+            "a previous request is still pending; only one active request is allowed"
+        )
+
+    store.begin_request = pending_conflict  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="cannot start a persisted request"):
+        await session.execute("问")
+    assert session.persistence.storage_failed is None, "关系冲突不得锁存 storage_failed"
+    await session.aclose()
+
+    # 对照: 真实写失败仍锁存
+    session2 = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                             session_id=None))
+    from cicada.persistence.contracts import StorageWriteError
+
+    async def write_failure(epoch_id, prompt):
+        raise StorageWriteError("disk gone")
+
+    session2._store.begin_request = write_failure  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="session save failed before the request started"):
+        await session2.execute("问")
+    assert session2.persistence.storage_failed is not None
+    await session2.aclose()
+
+
+async def test_clear_cancel_syncs_memory_before_propagating(tmp_path):
+    """A04: commit_clear 等待外层取消 -> 先等明确结果并同步内存, 再传播取消."""
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
+                                            session_id=None))
+    await session.execute("问")
+    store = session._store
+    release = asyncio.Event()
+    original_clear = store.commit_clear
+
+    async def gated_clear(epoch_id):
+        result = await original_clear(epoch_id)
+        await release.wait()
+        return result
+
+    store.commit_clear = gated_clear  # type: ignore[method-assign]
+    task = asyncio.create_task(session.clear_context())
+    await asyncio.sleep(0.1)  # 清空事务已派发并挂起
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=15)
+    assert session.history == (), "事务成功后内存先同步, 不留代次分叉"
+    assert session.persistence.context_generation == 1
+    assert session.state == "idle", "清空生产者完成, 会话不进 closing"
+    await session.aclose()
+
+    from cicada.plugins.session_store import open_session_store
+
+    reopened = open_session_store(
+        directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
+    )
+    assert reopened.recovery_snapshot().context_generation == 1, "存档与内存一致"
+    await reopened.aclose()
+
+

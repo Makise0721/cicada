@@ -426,6 +426,22 @@ async def test_missing_table_and_corrupt_payload_rejected(tmp_path):
     )
     connection.commit()
     connection.close()
+    # 载荷被改动后先撞 sha 校验 (摘要仍是原载荷的); 再把摘要一并伪造成匹配值,
+    # JSON 解析损坏才成为拒绝面 —— 两道校验分别钉住
+    with pytest.raises(ArchiveFormatError, match="recorded digest"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    import hashlib as _hashlib
+
+    connection = sqlite3.connect(str(tmp_path / f"{session_id}.sqlite3"))
+    row = connection.execute(
+        "SELECT seq, payload_json FROM records WHERE kind = 'request'"
+    ).fetchone()
+    forged = _hashlib.sha256(str(row[1]).encode("utf-8")).hexdigest()
+    connection.execute(
+        "UPDATE records SET payload_sha256 = ? WHERE seq = ?", (forged, row[0])
+    )
+    connection.commit()
+    connection.close()
     with pytest.raises(ArchiveFormatError, match="corrupt"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
@@ -689,3 +705,192 @@ def test_corrupt_process_activity_records_rejected_on_load(tmp_path):
     connection.close()
     with pytest.raises(ArchiveFormatError, match="digest does not match"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+# --- 02 审查处置: 加载校验篡改面与写读对称 ---------------------------------------------------
+
+
+async def test_commit_request_rejects_prompt_mismatch_at_write_time(tmp_path):
+    """写侧与加载侧同一不变量: 首消息文本 != intent prompt 在提交时拒绝."""
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch, "真实 prompt")
+    with pytest.raises(PersistenceError, match="exact intent prompt"):
+        await store.commit_request(
+            request_id, messages=_suffix(("另一个 prompt", "答")), outcome=_outcome()
+        )
+    # 拒绝后仍可用正确 prompt 提交, 存档可重开
+    seq = await store.commit_request(
+        request_id, messages=_suffix(("真实 prompt", "答")), outcome=_outcome()
+    )
+    assert seq == 2
+    session_id = store.session_id
+    await store.aclose()
+    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+    assert len(reopened.recovery_snapshot().requests) == 1
+    await reopened.aclose()
+
+
+def _seed_tamper_archive(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    asyncio.run(_populate(store))
+    asyncio.run(store.aclose())
+    return tmp_path / f"{session_id}.sqlite3", session_id
+
+
+def test_load_rejects_payload_sha_mismatch(tmp_path):
+    """载荷被篡改但摘要未重算 -> 摘要不一致拒绝, 不静默读出改写历史."""
+    import hashlib as _hl
+
+    db, session_id = _seed_tamper_archive(tmp_path)
+    connection = sqlite3.connect(str(db))
+    payload = connection.execute(
+        "SELECT payload_json FROM records WHERE kind='request'"
+    ).fetchone()[0]
+    tampered = payload.replace("回答 0", "被改写的历史")
+    assert tampered != payload
+    connection.execute(
+        "UPDATE records SET payload_json = ? WHERE kind='request'", (tampered,)
+    )
+    connection.commit()
+    connection.close()
+    assert _hl.sha256(tampered.encode()).hexdigest() != _hl.sha256(payload.encode()).hexdigest()
+    with pytest.raises(ArchiveFormatError, match="recorded digest"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+def test_load_rejects_corrupt_clear_payload(tmp_path):
+    db, session_id = _seed_tamper_archive(tmp_path)
+    connection = sqlite3.connect(str(db))
+    connection.execute("INSERT INTO records (seq, epoch_id, context_generation, kind, request_id,"
+                       " created_at, payload_json, payload_sha256) VALUES (99,"
+                       " (SELECT epoch_id FROM records LIMIT 1), 1, 'clear', NULL, 0,"
+                       " '{totally not json', NULL)")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="clear record .* corrupt"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+def test_load_rejects_clear_payload_with_content(tmp_path):
+    db, session_id = _seed_tamper_archive(tmp_path)
+    connection = sqlite3.connect(str(db))
+    connection.execute("INSERT INTO records (seq, epoch_id, context_generation, kind, request_id,"
+                       " created_at, payload_json, payload_sha256) VALUES (99,"
+                       " (SELECT epoch_id FROM records LIMIT 1), 1, 'clear', NULL, 0,"
+                       " '{\"leftover\": 1}', NULL)")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="empty object"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+def test_load_rejects_begin_request_id_mismatch(tmp_path):
+    db, session_id = _seed_tamper_archive(tmp_path)
+    connection = sqlite3.connect(str(db))
+    connection.execute(
+        "UPDATE records SET request_id = '00000000-0000-4000-8000-0000000000aa'"
+        " WHERE kind = 'request_begin'"
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="does not match its begin record"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+def test_load_rejects_orphan_request_begin(tmp_path):
+    db, session_id = _seed_tamper_archive(tmp_path)
+    connection = sqlite3.connect(str(db))
+    epoch_id, generation = connection.execute(
+        "SELECT epoch_id, context_generation FROM records LIMIT 1"
+    ).fetchone()
+    connection.execute(
+        "INSERT INTO records (seq, epoch_id, context_generation, kind, request_id,"
+        " created_at, payload_json, payload_sha256) VALUES (99, ?, ?, 'request_begin',"
+        " 'ghost-request', 0, ?, NULL)",
+        (epoch_id, generation, json.dumps({"prompt": "孤儿"})),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="orphan record"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+async def test_load_rejects_intent_epoch_mismatch(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    epoch1 = await store.start_epoch(_identity())
+    request_id = await store.begin_request(epoch1, "问")
+    await store.commit_request(request_id, messages=_suffix(("问", "答")), outcome=_outcome())
+    await store.start_epoch(_identity())  # 第二个 epoch: 提供 epoch 交叉校验的对照
+    await store.aclose()
+    db = tmp_path / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    connection.execute(
+        "UPDATE request_intents SET epoch_id ="
+        " (SELECT epoch_id FROM epoch WHERE epoch_id != request_intents.epoch_id LIMIT 1)"
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="epoch does not match"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+async def test_load_rejects_multiple_open_epochs(tmp_path):
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    await store.start_epoch(_identity())
+    await store.aclose()
+    db = tmp_path / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db))
+    identity_json = connection.execute("SELECT identity_json FROM epoch").fetchone()[0]
+    connection.execute(
+        "INSERT INTO epoch (epoch_id, opened_at, closed, identity_json, verification_run_id)"
+        " VALUES ('ghost-epoch', 999, 0, ?, NULL)",
+        (identity_json,),
+    )
+    connection.commit()
+    connection.close()
+    with pytest.raises(ArchiveFormatError, match="more than one open epoch"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
+async def test_aclose_retry_after_drain_timeout_completes_release(tmp_path, monkeypatch):
+    """排空超时后重试 aclose: 队列已清空则补完成释放, 不再静默返回."""
+    import cicada.plugins.session_store.store as store_module
+
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    epoch = await store.start_epoch(_identity())
+    release = threading.Event()
+    original_immediate = store._immediate
+    zone = {"gated": False}
+
+    def gated_immediate():
+        if zone["gated"]:
+            assert release.wait(timeout=30), "事务闸门未被打开"
+        return original_immediate()
+
+    store._immediate = gated_immediate  # type: ignore[method-assign]
+    original_clear = store.commit_clear
+
+    async def marked_clear(epoch_id):
+        zone["gated"] = True
+        try:
+            return await original_clear(epoch_id)
+        finally:
+            zone["gated"] = False
+
+    store.commit_clear = marked_clear  # type: ignore[method-assign]
+    monkeypatch.setattr(store_module, "SESSION_STORE_DRAIN_TIMEOUT_S", 0.2)
+    clear_task = asyncio.create_task(store.commit_clear(epoch))
+    await asyncio.sleep(0.05)
+    with pytest.raises(StorageWriteError, match="drain deadline"):
+        await store.aclose()
+    # 超时后事务仍在途: 重试 aclose 不得静默返回已关闭
+    release.set()
+    await asyncio.wait_for(clear_task, timeout=15)
+    await store.aclose()  # 队列已排空: 补完成释放
+    reopened = open_session_store(directory=tmp_path, session_id=store.session_id, workspace=tmp_path)
+    assert reopened.recovery_snapshot().context_generation == 1
+    await reopened.aclose() 
