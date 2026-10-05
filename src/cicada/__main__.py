@@ -42,6 +42,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
@@ -80,6 +81,7 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
 from cicada.plugins.session_store import list_sessions, open_session_store
+from cicada.plugins.session_store.store import validate_session_id
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
@@ -106,6 +108,9 @@ NORMAL_MODE_MAX_TURNS = 50
 
 # 04: 存档 options 的已知键 (ollama 透传); 继承前拒绝未知键与非法值
 KNOWN_OLLAMA_OPTION_KEYS = ("num_ctx", "num_predict")
+
+# 05: --tui --resume 不带 ID = 启动选择器 (哨兵; 单次模式明确拒绝)
+_RESUME_PICK = object()
 
 
 async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdentity | None:
@@ -338,6 +343,23 @@ async def _ollama_reachable(base_url: str) -> bool:
     return response.is_success
 
 
+async def _launch_session_selector(workspace: Path) -> str | None:
+    """--tui 无 ID 恢复的选择器入口; 返回选中的 session_id (取消为 None)。
+
+    独立成函数: 进程内测试可替换 (真实终端构造依赖 Windows 控制台)。
+    """
+    from cicada.ui.selector import run_session_selector
+    from cicada.ui.terminal_io import PromptToolkitTerminal
+
+    terminal = PromptToolkitTerminal()
+    session_id, restore_errors = await run_session_selector(
+        terminal, workspace / ".cicada" / "sessions"
+    )
+    if restore_errors:
+        print("terminal restore errors: " + "; ".join(restore_errors), file=sys.stderr)
+    return session_id
+
+
 async def _run(args: argparse.Namespace) -> int:
     if args.list_sessions:
         return _run_list_sessions(args)
@@ -351,9 +373,21 @@ async def _run(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if (args.save_session or args.resume is not None) and args.tui:
-        print("持久会话的 TUI 入口 (自动保存/恢复) 在阶段 05 开放; 当前仅单次 CLI 支持", file=sys.stderr)
+    if args.resume is _RESUME_PICK and not args.tui:
+        print(
+            "--resume 不带会话 ID 仅在 --tui 下可用 (启动选择器); "
+            "单次模式请给出精确的会话 ID",
+            file=sys.stderr,
+        )
         return 2
+    if isinstance(args.resume, str):
+        # nargs="?" 会把紧随其后的词当 ID: 提前按 UUIDv4 校验, 错误不延迟到开库
+        try:
+            validate_session_id(args.resume)
+        except PersistenceError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+    # 05: --tui 默认持久保存; --save-session 允许组合但不改变行为 (契约 §6)
     if not args.tui and args.prompt is None:
         print("缺少 prompt: 单次模式需要位置参数 prompt (交互入口用 --tui)", file=sys.stderr)
         return 2
@@ -433,7 +467,7 @@ async def _run(args: argparse.Namespace) -> int:
     # 04: 默认恢复预读存档身份——省略参数继承存档, 显式参数与存档比对;
     # 检查定义只存签名不存命令, 检查模式存档遗漏 --check-command 时明确拒绝
     saved_launch: LaunchIdentity | None = None
-    if args.resume is not None and not args.resume_with_current_config:
+    if isinstance(args.resume, str) and not args.resume_with_current_config:
         saved_stored = await _read_saved_identity(workspace, args.resume)
         if saved_stored is None:
             return 2
@@ -530,8 +564,8 @@ async def _run(args: argparse.Namespace) -> int:
             ),
             sources=sources,
         )
-        if args.save_session or args.resume is not None:
-            # 持久路径: 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
+        if args.save_session or args.resume is not None or args.tui:
+            # 持久路径 (TUI 默认持久): 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
             async def preflight() -> None:
                 if not await _ollama_reachable(config.base_url):
                     raise ApplicationOpenError(
@@ -549,13 +583,21 @@ async def _run(args: argparse.Namespace) -> int:
         model_plugin = ollama_plugin(config)
         model_label = config.model
 
-    persistence_config = None
-    if args.save_session or args.resume is not None:
+    # 05: --tui --resume 不带 ID = 启动选择器 (选择期间无模型/工具活动; Esc 退出码 0)
+    resume_id = args.resume if isinstance(args.resume, str) else None
+    if args.tui and args.resume is _RESUME_PICK:
+        picked = await _launch_session_selector(Path(args.workspace))
+        if picked is None:
+            return 0
+        resume_id = picked
+    if args.tui or args.save_session or args.resume is not None:
         persistence_config = PersistenceConfig(
-            session_id=args.resume,
+            session_id=resume_id,
             identity=identity,
             adopt_current_config=args.resume_with_current_config,
         )
+    else:
+        persistence_config = None
 
     app_config = ApplicationConfig(
         workspace=workspace,
@@ -569,7 +611,9 @@ async def _run(args: argparse.Namespace) -> int:
     )
     if args.tui:
         assert run_tui_session_fn is not None
-        return await _run_tui(run_tui_session_fn, app_config, initial_prompt=args.prompt)
+        return await _run_tui(
+            run_tui_session_fn, app_config, initial_prompt=args.prompt, preflight=preflight
+        )
     try:
         session = await open_application(app_config, preflight=preflight)
     except ApplicationOpenError as exc:
@@ -624,11 +668,12 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _run_tui(
-    run_tui_session_fn, app_config: ApplicationConfig, *, initial_prompt: str | None
+    run_tui_session_fn, app_config: ApplicationConfig, *, initial_prompt: str | None,
+    preflight: Callable[[], object] | None = None,
 ) -> int:
     """--tui 分支: 依赖与 TTY 已在 _run 校验; 打开共享应用并运行生产组合."""
     try:
-        session = await open_application(app_config)
+        session = await open_application(app_config, preflight=preflight)
     except ApplicationOpenError as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
@@ -653,9 +698,15 @@ async def _run_tui(
         check_timeout_s=plan.checks[0].timeout_s if plan is not None else None,
         max_turns=app_config.max_turns,
     )
-    return await run_tui_session_fn(
+    # 恢复阻断: UI 可查看 (新请求被应用拒绝); 无新请求关闭后退出码 3 (契约 §6),
+    # 关闭错误/不可恢复失败优先 1
+    view_only = session.view_only_reason is not None
+    code = await run_tui_session_fn(
         session, initial_prompt=initial_prompt, diagnostics=partial(diagnostics_lines, diagnostics)
     )
+    if code == 1:
+        return 1
+    return 3 if view_only else code
 
 
 def main() -> int:
@@ -697,8 +748,11 @@ def main() -> int:
         help="单次模式创建持久会话并保存本次请求 (默认不落盘); 检查模式可组合, 与 --tui 组合暂不支持",
     )
     parser.add_argument(
-        "--resume", metavar="SESSION_ID",
-        help="按 UUIDv4 会话 ID 恢复持久会话, 新请求追加保存; 与 --save-session 互斥",
+        "--resume", nargs="?", const=_RESUME_PICK, default=None, metavar="SESSION_ID",
+        help=(
+            "按 UUIDv4 会话 ID 恢复持久会话, 新请求追加保存; 与 --save-session 互斥。"
+            "--tui 下可省略 ID: 启动选择器 (Esc 退出)"
+        ),
     )
     parser.add_argument(
         "--resume-with-current-config", action="store_true",

@@ -547,12 +547,17 @@ def test_resume_check_mode_same_checks_continues_and_different_conflicts(tmp_pat
     assert "checks_signature" in conflict.stderr
 
 
-def test_persistence_with_tui_rejected(tmp_path):
-    script = _script(tmp_path)
-    proc = run_cli("--tui", "--workspace", str(tmp_path), "--script", str(script),
-                   "--save-session", "任务")
+def test_resume_without_id_rejected_outside_tui(tmp_path):
+    """05: 无 ID 的 --resume 仅 TUI 可用; 单次模式明确拒绝 (退出码 2)."""
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+                   "任务", "--resume")
     assert proc.returncode == 2
-    assert "阶段 05" in proc.stderr
+    assert "仅在 --tui 下可用" in proc.stderr
+    # nargs="?" 吃词: 紧随 --resume 的词按 UUIDv4 提前校验, 不延迟到开库
+    proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+                   "--resume", "任务")
+    assert proc.returncode == 2
+    assert "UUIDv4" in proc.stderr
 
 
 def test_resume_config_conflict_names_field(tmp_path):
@@ -997,3 +1002,115 @@ def test_render_session_page_bounded_and_paged():
     assert "--list-cursor 25" in text
     empty = m.render_session_page(SessionPage(directory="d", entries=(), next_cursor=None))
     assert any("暂无会话" in line for line in empty)
+
+
+# --- 05: TUI 恢复入口 (按 ID / 选择器 / view-only 退出码) --------------------------------------
+
+
+class _CaptureTTY:
+    """进程内 TUI 驱动: TTY 语义 + 输出捕获 (失败时 stderr 可断言)。"""
+
+    def __init__(self) -> None:
+        self.value = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def reconfigure(self, **kwargs) -> None:
+        return None
+
+    def write(self, data: str) -> int:
+        self.value += data
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+
+def _run_main(monkeypatch, argv, *, tui_code: int = 0):
+    """进程内 main(): TTY 替身 + run_tui_session 替身; 返回 (退出码, stderr 捕获)。"""
+    import cicada.__main__ as m
+
+    async def fake_run_tui_session(session, **kwargs):
+        return tui_code
+
+    monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
+    err = _CaptureTTY()
+    monkeypatch.setattr(sys, "stdin", _CaptureTTY())
+    monkeypatch.setattr(sys, "stdout", _CaptureTTY())
+    monkeypatch.setattr(sys, "stderr", err)
+    monkeypatch.setattr(sys, "argv", ["cicada", *argv])
+    return m.main(), err
+
+
+def test_tui_persistent_save_allowed_and_default(tmp_path, monkeypatch):
+    """05: --tui 默认持久; --save-session 允许组合 (不改变行为); 每次启动自动保存新会话."""
+    for extra in ([], ["--save-session"]):
+        code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(tmp_path),
+                                            "--script", str(_script(tmp_path)), *extra])
+        assert code == 0, err.value
+    archives = list((tmp_path / ".cicada" / "sessions").glob("*.sqlite3"))
+    assert len(archives) == 2, "两次 TUI 启动各自动保存一个新会话"
+
+
+def test_tui_resume_by_id_exit_zero(tmp_path, monkeypatch):
+    """05: TUI 按 ID 恢复打开; 正常关闭退出码 0。"""
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                   "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+
+    code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(work),
+                                        "--script", str(_script(tmp_path)), "--resume", session_id])
+    assert code == 0, err.value
+
+
+def test_tui_resume_selector_cancel_exits_zero(tmp_path, monkeypatch):
+    """05: --tui --resume 无 ID 启动选择器; Esc 取消退出码 0; 未打开任何会话。"""
+    import cicada.__main__ as m
+
+    async def fake_selector(workspace: Path):
+        return None
+
+    monkeypatch.setattr(m, "_launch_session_selector", fake_selector)
+    code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(tmp_path),
+                                        "--script", str(_script(tmp_path)), "--resume"])
+    assert code == 0, err.value
+
+
+def test_tui_resume_selector_pick_opens_session(tmp_path, monkeypatch):
+    """05: 选择器选定 ID 后走共享恢复路径打开该会话。"""
+    import cicada.__main__ as m
+
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                   "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+
+    async def fake_selector(workspace: Path):
+        assert (workspace / ".cicada" / "sessions").is_dir()
+        return session_id
+
+    monkeypatch.setattr(m, "_launch_session_selector", fake_selector)
+    code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(work),
+                                        "--script", str(_script(tmp_path)), "--resume"])
+    assert code == 0, err.value
+
+
+def test_tui_view_only_restore_exits_three(tmp_path, monkeypatch):
+    """05/A15: view-only 恢复的 TUI 可查看; 无新请求关闭后退出码 3。"""
+    work = tmp_path / "ws"
+    work.mkdir()
+    save = run_cli("--workspace", str(work), "--script", str(_script(tmp_path)),
+                   "--save-session", "第一问")
+    assert save.returncode == 0, save.stderr
+    session_id = save.stdout.split("[session id=")[1].split(" ")[0]
+    _seed_archive(work, session_id, open_activity=True)
+
+    code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(work),
+                                        "--script", str(_script(tmp_path)), "--resume", session_id])
+    assert code == 3, err.value
