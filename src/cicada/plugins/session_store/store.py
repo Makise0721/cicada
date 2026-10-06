@@ -34,12 +34,14 @@ from cicada.persistence.codec import (
     decode_messages,
     decode_outcome_facts,
     decode_receipt_terminal,
+    decode_summary_record,
     decode_terminal_facts,
     encode_activity_begin,
     encode_identity,
     encode_messages,
     encode_outcome_facts,
     encode_receipt_terminal,
+    encode_summary_record,
     encode_terminal_facts,
     dumps_strict,
     strict_load,
@@ -50,9 +52,11 @@ from cicada.persistence.contracts import (
     MAX_MESSAGES,
     MAX_METADATA_BYTES,
     MAX_REQUEST_PAYLOAD_BYTES,
+    MAX_SUMMARIES_PER_GENERATION,
     SESSION_APPLICATION_ID,
     SESSION_SCHEMA_VERSION,
     SHORT_TITLE_MAX_CHARS,
+    SUMMARY_TEXT_MAX_BYTES,
     ArchiveFormatError,
     ArchiveLimitError,
     InterruptedRequest,
@@ -68,6 +72,7 @@ from cicada.persistence.contracts import (
     StorageWriteError,
     StoredIdentity,
     StoredReceipt,
+    SummaryRecord,
     UnknownArchiveVersionError,
     WorkspaceMismatchError,
 )
@@ -143,11 +148,69 @@ _SCHEMA_STATEMENTS = (
         PRIMARY KEY (verification_run_id, receipt_id)
     )
     """,
+    """
+    CREATE TABLE summaries (
+        summary_id TEXT PRIMARY KEY,
+        epoch_id TEXT NOT NULL REFERENCES epoch(epoch_id),
+        context_generation INTEGER NOT NULL,
+        first_request_seq INTEGER NOT NULL,
+        last_request_seq INTEGER NOT NULL,
+        message_count INTEGER NOT NULL,
+        end_message_index INTEGER NOT NULL,
+        prefix_sha256 TEXT NOT NULL,
+        summary_json TEXT NOT NULL,
+        payload_sha256 TEXT NOT NULL
+    )
+    """,
 )
 
 _EXPECTED_TABLES = frozenset({
     "session", "epoch", "records", "request_intents", "process_activity", "historical_receipts",
 })
+
+# v1 存档 (升级前) 的期望表集合; 迁移校验面与既有加载共用同一清单
+_V1_EXPECTED_TABLES = _EXPECTED_TABLES
+
+# v1 → v2 原子迁移 (PA04) 的步骤序列; 每步一个连接操作, 全部包在单个显式事务内,
+# 任一步失败整体回滚 (重开只能是完整 v1 或完整 v2)。测试经本常量注入故障点。
+_V2_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    lambda connection: connection.execute(
+        """
+        CREATE TABLE summaries (
+            summary_id TEXT PRIMARY KEY,
+            epoch_id TEXT NOT NULL REFERENCES epoch(epoch_id),
+            context_generation INTEGER NOT NULL,
+            first_request_seq INTEGER NOT NULL,
+            last_request_seq INTEGER NOT NULL,
+            message_count INTEGER NOT NULL,
+            end_message_index INTEGER NOT NULL,
+            prefix_sha256 TEXT NOT NULL,
+            summary_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL
+        )
+        """
+    ),
+    lambda connection: connection.execute(
+        "UPDATE session SET schema_version = ?", (SESSION_SCHEMA_VERSION,)
+    ),
+    lambda connection: connection.execute(f"PRAGMA user_version = {SESSION_SCHEMA_VERSION}"),
+)
+
+
+def _verify_v2_structure(connection: sqlite3.Connection) -> None:
+    """迁移提交前的 v2 结构核对: 双版本标记与新表在位 (PA04, 提交前最后一道)."""
+    row = connection.execute("PRAGMA user_version").fetchone()
+    if row is None or int(row[0]) != SESSION_SCHEMA_VERSION:
+        raise ArchiveFormatError("v2 migration did not confirm user_version")
+    schema_row = connection.execute("SELECT schema_version FROM session").fetchone()
+    if schema_row is None or int(schema_row[0]) != SESSION_SCHEMA_VERSION:
+        raise ArchiveFormatError("v2 migration did not confirm session.schema_version")
+    tables = {
+        str(item[0])
+        for item in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    if "summaries" not in tables:
+        raise ArchiveFormatError("v2 migration did not create the summaries table")
 
 T = TypeVar("T")
 
@@ -212,6 +275,8 @@ class _LoadedState:
     intents: dict[str, _IntentRecord] = field(default_factory=dict)
     activities: dict[str, _ActivityRecord] = field(default_factory=dict)
     receipts: dict[str, StoredReceipt] = field(default_factory=dict)
+    summaries: list[SummaryRecord] = field(default_factory=list)   # 全部代次, 按写入序
+    schema_version: int = SESSION_SCHEMA_VERSION                    # 打开时的存档版本
 
 
 # --- store 实现 -------------------------------------------------------------------------
@@ -438,11 +503,11 @@ class SQLiteSessionStore:
                 )
             if self._state.committed_count + 1 > MAX_COMMITTED_REQUESTS:
                 raise ArchiveLimitError(
-                    f"session exceeds the v1 request limit ({MAX_COMMITTED_REQUESTS})"
+                    f"session exceeds the request limit ({MAX_COMMITTED_REQUESTS})"
                 )
             if self._state.message_count + len(messages) > MAX_MESSAGES:
                 raise ArchiveLimitError(
-                    f"session exceeds the v1 message limit ({MAX_MESSAGES})"
+                    f"session exceeds the message limit ({MAX_MESSAGES})"
                 )
             self._check_db_size(len(payload.encode("utf-8")) + receipt_bytes)
             seq = self._state.next_seq
@@ -548,6 +613,87 @@ class SQLiteSessionStore:
             self._state.next_seq += 1
             self._state.context_generation = new_generation
             return new_generation
+
+        return await self._dispatch(job)
+
+    async def commit_summary(self, record: SummaryRecord) -> None:
+        """可靠提交摘要记录 (02, schema v2); 成功即 store 已接受 (明确结果).
+
+        关系校验: epoch/generation 必须是当前打开值; summary_id 重复拒绝;
+        seq 范围必须引用当前代次已提交完整请求; 每代次摘要数限额;
+        summary_json 与标识列交叉写入, 摘要字节计入 db-size 检查点。
+        """
+        if not isinstance(record, SummaryRecord):
+            raise PersistenceError("commit_summary requires a SummaryRecord")
+        summary_json = self._encode_checked(
+            encode_summary_record(record), MAX_METADATA_BYTES, "summary record"
+        )
+        summary_sha = hashlib.sha256(summary_json.encode("utf-8")).hexdigest()
+        row_bytes = (
+            len(summary_json.encode("utf-8"))
+            + len(record.summary_id.encode("utf-8"))
+            + len(record.epoch_id.encode("utf-8"))
+            + len(record.prefix_sha256.encode("utf-8"))
+            + 64
+        )
+
+        def job() -> None:
+            if record.epoch_id != self._state.current_epoch_id:
+                raise PersistenceError(
+                    f"unknown epoch for commit_summary: {record.epoch_id}"
+                )
+            if record.context_generation != self._state.context_generation:
+                raise PersistenceError(
+                    f"summary generation {record.context_generation} does not match the "
+                    f"current generation {self._state.context_generation}"
+                )
+            if record.summary_id in {item.summary_id for item in self._state.summaries}:
+                raise PersistenceError(
+                    f"summary {record.summary_id} was already persisted; repeated commits are rejected"
+                )
+            seqs = {
+                item.seq for item in self._state.requests
+                if item.context_generation == self._state.context_generation
+            }
+            if record.first_request_seq not in seqs or record.last_request_seq not in seqs:
+                raise PersistenceError(
+                    "summary coverage must reference committed requests of the current generation"
+                )
+            generation_summaries = sum(
+                1 for item in self._state.summaries
+                if item.context_generation == self._state.context_generation
+            )
+            if generation_summaries + 1 > MAX_SUMMARIES_PER_GENERATION:
+                raise ArchiveLimitError(
+                    "session exceeds the summaries-per-generation limit "
+                    f"({MAX_SUMMARIES_PER_GENERATION})"
+                )
+            self._check_db_size(row_bytes)
+            self._immediate()
+            try:
+                self._conn.execute(
+                    "INSERT INTO summaries (summary_id, epoch_id, context_generation,"
+                    " first_request_seq, last_request_seq, message_count, end_message_index,"
+                    " prefix_sha256, summary_json, payload_sha256)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        record.summary_id,
+                        record.epoch_id,
+                        record.context_generation,
+                        record.first_request_seq,
+                        record.last_request_seq,
+                        record.message_count,
+                        record.end_message_index,
+                        record.prefix_sha256,
+                        summary_json,
+                        summary_sha,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._state.summaries.append(record)
 
         return await self._dispatch(job)
 
@@ -748,7 +894,7 @@ class SQLiteSessionStore:
             raise StorageWriteError("cannot read database size before write")
         if int(row[0]) * int(page[0]) + extra_bytes > MAX_DB_BYTES:
             raise ArchiveLimitError(
-                f"session database would exceed the v1 size limit ({MAX_DB_BYTES} bytes)"
+                f"session database would exceed the size limit ({MAX_DB_BYTES} bytes)"
             )
 
     def _encode_checked(self, payload: object, limit: int, what: str) -> str:
@@ -757,7 +903,7 @@ class SQLiteSessionStore:
         except CodecError as exc:
             raise PersistenceError(f"{what} is not strictly serializable: {exc}") from exc
         if len(encoded.encode("utf-8")) > limit:
-            raise ArchiveLimitError(f"{what} exceeds the v1 limit ({limit} bytes)")
+            raise ArchiveLimitError(f"{what} exceeds the limit ({limit} bytes)")
         return encoded
 
     def _build_snapshot(self) -> RecoverySnapshot:
@@ -814,6 +960,10 @@ class SQLiteSessionStore:
                 for record in self._state.activities.values()
             ),
             restored_receipts=tuple(self._state.receipts.values()),
+            summaries=tuple(
+                item for item in self._state.summaries
+                if item.context_generation == current
+            ),
         )
 
 
@@ -848,16 +998,19 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _read_back(connection: sqlite3.Connection) -> None:
-    # application_id 只在新建时写入; 打开既有库时由 _check_identity 校验, 这里仅新建路径到达
-    for pragma, expected in (
+def _read_back(connection: sqlite3.Connection, *, user_version: int | None = SESSION_SCHEMA_VERSION) -> None:
+    # application_id 只在新建时写入; 打开既有库时由 _check_identity 校验, 这里仅新建路径到达。
+    # user_version 仅在新建路径回读 (resume 的版本路由归 _check_identity, 迁移前的 v1 档不钉当前版本)
+    pragmas = [
         ("application_id", SESSION_APPLICATION_ID),
-        ("user_version", SESSION_SCHEMA_VERSION),
         ("synchronous", 3),  # EXTRA
         ("foreign_keys", 1),
         ("temp_store", 2),   # MEMORY
         ("busy_timeout", 1000),
-    ):
+    ]
+    if user_version is not None:
+        pragmas.insert(1, ("user_version", user_version))
+    for pragma, expected in pragmas:
         row = connection.execute(f"PRAGMA {pragma}").fetchone()
         if row is None or int(row[0]) != expected:
             raise ArchiveFormatError(f"session store {pragma} could not be confirmed")
@@ -950,7 +1103,7 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
         raise StorageUnavailableError(f"cannot stat session archive: {exc}") from exc
     if size > MAX_DB_BYTES:
         raise ArchiveLimitError(
-            f"session database exceeds the v1 size limit ({MAX_DB_BYTES} bytes)"
+            f"session database exceeds the size limit ({MAX_DB_BYTES} bytes)"
         )
     lock_fd = _acquire_lease(directory / f"{session_id}.lock")
     try:
@@ -959,9 +1112,14 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
         except sqlite3.Error as exc:
             raise StorageUnavailableError(f"cannot open session database: {exc}") from exc
         try:
-            _check_identity(connection)
+            archive_version = _check_identity(connection)
             _set_session_pragmas(connection)
-            _check_schema(connection)
+            _quick_check(connection)
+            # 版本感知表集合校验 (PA04): v1 档先按 v1 校验面严格核对再迁移
+            expected = _V1_EXPECTED_TABLES if archive_version == 1 else _EXPECTED_TABLES
+            _check_schema_tables(connection, expected)
+            if archive_version == 1:
+                _upgrade_v1_to_v2(connection)
             state = _load_state(connection, session_id, canonical_workspace)
         except sqlite3.OperationalError as exc:
             connection.close()
@@ -990,19 +1148,30 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
         raise
 
 
-def _check_identity(connection: sqlite3.Connection) -> None:
-    for pragma, expected in (
-        ("application_id", SESSION_APPLICATION_ID),
-        ("user_version", SESSION_SCHEMA_VERSION),
-    ):
-        row = connection.execute(f"PRAGMA {pragma}").fetchone()
-        if row is None or int(row[0]) != expected:
-            detail = str(row[0]) if row is not None else "missing"
-            if pragma == "user_version" and row is not None and int(row[0]) != SESSION_SCHEMA_VERSION:
-                raise UnknownArchiveVersionError(
-                    f"session archive version {detail} is not supported (this build reads v{SESSION_SCHEMA_VERSION})"
-                )
-            raise ArchiveFormatError(f"file is not a cicada session archive ({pragma}={detail})")
+def _check_identity(connection: sqlite3.Connection) -> int:
+    """校验 application_id 并返回存档 user_version; 版本路由迁移/拒绝 (PA04).
+
+    v1 (历史档) 返回 1 由调用方原子升级; 等于当前版本直接打开; 其他值按未知
+    版本/坏档拒绝, 不改写原文件。
+    """
+    row = connection.execute("PRAGMA application_id").fetchone()
+    if row is None or int(row[0]) != SESSION_APPLICATION_ID:
+        detail = str(row[0]) if row is not None else "missing"
+        raise ArchiveFormatError(f"file is not a cicada session archive (application_id={detail})")
+    row = connection.execute("PRAGMA user_version").fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version == SESSION_SCHEMA_VERSION:
+        return version
+    if version == 1 and SESSION_SCHEMA_VERSION > 1:
+        return version  # 历史档: 原子升级路径 (PA04)
+    if version > SESSION_SCHEMA_VERSION or version not in (0, 1):
+        raise UnknownArchiveVersionError(
+            f"session archive version {version} is not supported "
+            f"(this build reads v{SESSION_SCHEMA_VERSION})"
+        )
+    raise ArchiveFormatError(
+        f"session archive user_version {version} is not a valid cicada archive version"
+    )
 
 
 def _set_session_pragmas(connection: sqlite3.Connection) -> None:
@@ -1010,20 +1179,43 @@ def _set_session_pragmas(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA temp_store = MEMORY")
     connection.execute("PRAGMA busy_timeout = 1000")
-    _read_back(connection)
+    # user_version 不在此回读: 版本路由归 _check_identity, 迁移前允许 v1
+    _read_back(connection, user_version=None)
 
 
-def _check_schema(connection: sqlite3.Connection) -> None:
+def _quick_check(connection: sqlite3.Connection) -> None:
     row = connection.execute("PRAGMA quick_check").fetchone()
     if row is None or str(row[0]) != "ok":
         raise ArchiveFormatError("session archive failed the SQLite quick check")
+
+
+def _check_schema_tables(connection: sqlite3.Connection, expected: frozenset[str]) -> None:
     tables = {
         str(item[0])
         for item in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    missing = _EXPECTED_TABLES - tables
+    missing = expected - tables
     if missing:
         raise ArchiveFormatError(f"session archive is missing tables: {sorted(missing)}")
+
+
+def _upgrade_v1_to_v2(connection: sqlite3.Connection) -> None:
+    """v1 → v2 原子增量升级 (PA04/A07): 持 lease 且严格校验 v1 后调用.
+
+    单个显式事务内完成摘要表 DDL、session.schema_version 列与 PRAGMA user_version
+    更新及 v2 结构核对; 任一步失败整体回滚, 重开只能是完整 v1 (可重新升级) 或
+    完整 v2, 既有完整请求可恢复。故障注入面: monkeypatch 模块级
+    _V2_MIGRATION_STEPS / _verify_v2_structure。
+    """
+    _immediate_txn(connection)
+    try:
+        for step in _V2_MIGRATION_STEPS:
+            step(connection)
+        _verify_v2_structure(connection)
+        connection.execute("COMMIT")
+    except BaseException:
+        connection.execute("ROLLBACK")
+        raise
 
 
 def _load_state(
@@ -1044,7 +1236,7 @@ def _load_state(
     short_title = str(short_title)
     if len(short_title) > SHORT_TITLE_MAX_CHARS:
         raise ArchiveFormatError(
-            f"session short title exceeds the v1 limit ({SHORT_TITLE_MAX_CHARS} chars)"
+            f"session short title exceeds the limit ({SHORT_TITLE_MAX_CHARS} chars)"
         )
     state = _LoadedState(
         session_id=session_id,
@@ -1169,7 +1361,7 @@ def _load_state(
         state.next_seq = seq + 1
 
     if len(committed) > MAX_COMMITTED_REQUESTS or total_messages > MAX_MESSAGES:
-        raise ArchiveLimitError("session archive exceeds the v1 request/message limits")
+        raise ArchiveLimitError("session archive exceeds the request/message limits")
 
     state.context_generation = generation
     state.committed_count = len(committed)
@@ -1333,6 +1525,66 @@ def _load_state(
         if receipt.receipt_id in state.receipts:
             raise ArchiveFormatError(f"receipt {receipt.receipt_id} appears more than once")
         state.receipts[receipt.receipt_id] = receipt
+
+    # --- 摘要记录 (02, v2): 列与 JSON 交叉核对 + 关系/限额校验 -------------------------
+    committed_by_seq = {entry[0]: entry for entry in committed.values()}  # seq -> entry
+    per_generation_summaries: dict[int, int] = {}
+    for (summary_id, summary_epoch, summary_generation, first_seq, last_seq,
+         message_count, end_index, prefix_sha, summary_json, summary_sha) in connection.execute(
+        "SELECT summary_id, epoch_id, context_generation, first_request_seq,"
+        " last_request_seq, message_count, end_message_index, prefix_sha256, summary_json,"
+        " payload_sha256 FROM summaries ORDER BY rowid"
+    ):
+        if str(summary_epoch) not in epoch_ids:
+            raise ArchiveFormatError(f"summary {summary_id} references an unknown epoch")
+        _check_text_size(str(summary_json), MAX_METADATA_BYTES, "summary record")
+        if not isinstance(summary_sha, str) or (
+            summary_sha != hashlib.sha256(str(summary_json).encode("utf-8")).hexdigest()
+        ):
+            # 与 records 同一不变量: 提交时写入的摘要必须与载荷一致
+            raise ArchiveFormatError(
+                f"summary {summary_id} payload does not match its recorded digest"
+            )
+        try:
+            record = decode_summary_record(_load_payload(str(summary_json)))
+        except CodecError as exc:
+            raise ArchiveFormatError(f"summary {summary_id} is corrupt: {exc}") from exc
+        # 标识列与 JSON 载荷交叉核对: 任何一列被单独篡改都拒绝 (写读对称)
+        if (
+            record.summary_id != str(summary_id)
+            or record.epoch_id != str(summary_epoch)
+            or record.context_generation != int(summary_generation)
+            or record.first_request_seq != int(first_seq)
+            or record.last_request_seq != int(last_seq)
+            or record.message_count != int(message_count)
+            or record.end_message_index != int(end_index)
+            or record.prefix_sha256 != str(prefix_sha)
+        ):
+            raise ArchiveFormatError(
+                f"summary {summary_id} columns do not match its JSON payload"
+            )
+        for seq in (record.first_request_seq, record.last_request_seq):
+            entry = committed_by_seq.get(seq)
+            if entry is None:
+                raise ArchiveFormatError(
+                    f"summary {summary_id} references request record {seq} which does not exist"
+                )
+            if entry[2] != record.context_generation:
+                raise ArchiveFormatError(
+                    f"summary {summary_id} generation does not match its covered requests"
+                )
+        if record.end_message_index > state.message_count:
+            raise ArchiveFormatError(
+                f"summary {summary_id} coverage end exceeds the archived message count"
+            )
+        count = per_generation_summaries.get(record.context_generation, 0) + 1
+        if count > MAX_SUMMARIES_PER_GENERATION:
+            raise ArchiveLimitError(
+                "session archive exceeds the summaries-per-generation limit "
+                f"({MAX_SUMMARIES_PER_GENERATION})"
+            )
+        per_generation_summaries[record.context_generation] = count
+        state.summaries.append(record)
     state.requests.sort(key=lambda item: item.seq)
     return state
 
@@ -1346,7 +1598,7 @@ def _load_payload(raw: str) -> dict[str, Any]:
 
 def _check_text_size(text: str, limit: int, what: str) -> None:
     if len(text.encode("utf-8")) > limit:
-        raise ArchiveLimitError(f"{what} exceeds the v1 limit ({limit} bytes)")
+        raise ArchiveLimitError(f"{what} exceeds the limit ({limit} bytes)")
 
 
 _DESCRIPTION_MAX_BYTES = 512

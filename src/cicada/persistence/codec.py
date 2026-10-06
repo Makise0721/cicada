@@ -30,6 +30,7 @@ from cicada.persistence.contracts import (
     RequestOutcomeFacts,
     StoredIdentity,
     StoredReceipt,
+    SummaryRecord,
 )
 
 _STOP_REASONS = frozenset(("stop", "tool_use", "length", "error", "aborted"))
@@ -69,7 +70,7 @@ def strict_load(raw: str) -> Any:
 
 def _ensure_depth(value: Any, depth: int) -> None:
     if depth > MAX_JSON_DEPTH:
-        raise CodecError(f"JSON nesting exceeds the v1 depth limit ({MAX_JSON_DEPTH})")
+        raise CodecError(f"JSON nesting exceeds the depth limit ({MAX_JSON_DEPTH})")
     if isinstance(value, dict):
         for item in value.values():
             _ensure_depth(item, depth + 1)
@@ -459,6 +460,90 @@ def decode_activity_begin(payload: Any) -> tuple[str, str, float]:
         digest,
         _take_float(payload, "started_at", where),
     )
+
+
+# --- 摘要记录 (02, schema v2) -------------------------------------------------------------
+
+
+_SUMMARY_KEYS = frozenset({
+    "summary_id", "epoch_id", "context_generation", "first_request_seq", "last_request_seq",
+    "message_count", "end_message_index", "prefix_sha256", "text", "provider", "model",
+    "prompt_version", "prompt_sha256", "metrics", "reason", "created_at",
+    "previous_projection_identity",
+})
+
+
+def encode_summary_record(record: SummaryRecord) -> str:
+    """摘要记录 -> 严格 JSON (store 落 summary_json; 列与 JSON 交叉核对)."""
+    payload = {
+        "summary_id": record.summary_id,
+        "epoch_id": record.epoch_id,
+        "context_generation": record.context_generation,
+        "first_request_seq": record.first_request_seq,
+        "last_request_seq": record.last_request_seq,
+        "message_count": record.message_count,
+        "end_message_index": record.end_message_index,
+        "prefix_sha256": record.prefix_sha256,
+        "text": record.text,
+        "provider": record.provider,
+        "model": record.model,
+        "prompt_version": record.prompt_version,
+        "prompt_sha256": record.prompt_sha256,
+        "metrics": None if record.metrics is None else {
+            "input_tokens": record.metrics.input_tokens,
+            "output_tokens": record.metrics.output_tokens,
+            "provider_duration_s": record.metrics.provider_duration_s,
+        },
+        "reason": record.reason,
+        "created_at": record.created_at,
+        "previous_projection_identity": record.previous_projection_identity,
+    }
+    dumps_strict(payload)
+    return dumps_strict(payload)
+
+
+def decode_summary_record(payload: Any) -> SummaryRecord:
+    """严格 JSON dict -> SummaryRecord; 未知键/类型不符按存档损坏拒绝."""
+    where = "summary record"
+    _exact_keys(payload, _SUMMARY_KEYS, where)
+    metrics_raw = payload["metrics"]
+    metrics = None
+    if metrics_raw is not None:
+        metrics_where = f"{where}.metrics"
+        _exact_keys(
+            metrics_raw,
+            frozenset({"input_tokens", "output_tokens", "provider_duration_s"}),
+            metrics_where,
+        )
+        metrics = ModelMetrics(
+            input_tokens=_take_opt_int(metrics_raw, "input_tokens", metrics_where),
+            output_tokens=_take_opt_int(metrics_raw, "output_tokens", metrics_where),
+            provider_duration_s=_take_opt_float(metrics_raw, "provider_duration_s", metrics_where),
+        )
+    try:
+        return SummaryRecord(
+            summary_id=_take_str(payload, "summary_id", where),
+            epoch_id=_take_str(payload, "epoch_id", where),
+            context_generation=_take_int(payload, "context_generation", where),
+            first_request_seq=_take_int(payload, "first_request_seq", where),
+            last_request_seq=_take_int(payload, "last_request_seq", where),
+            message_count=_take_int(payload, "message_count", where),
+            end_message_index=_take_int(payload, "end_message_index", where),
+            prefix_sha256=_take_str(payload, "prefix_sha256", where),
+            text=_take_str(payload, "text", where),
+            provider=_take_str(payload, "provider", where),
+            model=_take_str(payload, "model", where),
+            prompt_version=_take_str(payload, "prompt_version", where),
+            prompt_sha256=_take_str(payload, "prompt_sha256", where),
+            metrics=metrics,
+            reason=_take_str(payload, "reason", where),  # type: ignore[arg-type]
+            created_at=_take_float(payload, "created_at", where),
+            previous_projection_identity=_take_opt_str(
+                payload, "previous_projection_identity", where
+            ),
+        )
+    except ValueError as exc:
+        raise CodecError(f"{where} is inconsistent: {exc}") from exc
 
 
 _IDENTITY_KEYS = frozenset({

@@ -377,7 +377,7 @@ async def test_unknown_version_rejected_and_file_untouched(tmp_path):
     await store.aclose()
     db = tmp_path / f"{session_id}.sqlite3"
     connection = sqlite3.connect(str(db))
-    connection.execute("PRAGMA user_version = 2")
+    connection.execute(f"PRAGMA user_version = {SESSION_SCHEMA_VERSION + 1}")
     connection.commit()
     connection.close()
     before = db.read_bytes()
@@ -1104,7 +1104,7 @@ async def test_receipt_id_length_cap_rejected_at_write_and_load(tmp_path):
     store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "问")
-    with pytest.raises(ValueError, match="exceeds the v1 limit"):
+    with pytest.raises(ValueError, match="exceeds the limit"):
         StoredReceipt("r" * (RECEIPT_ID_MAX_CHARS + 1), "r-big", epoch, request_id,
                       "f" * 64, "exited", 0, False, False, True, None)
     # 加载侧对称: 直接向库内塞超长 id -> 构造校验拒绝 (inconsistent)

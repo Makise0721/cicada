@@ -12,10 +12,11 @@ from typing import Literal, Protocol, runtime_checkable
 
 from cicada.core.events import ModelCallCompleted
 from cicada.core.messages import Message, StopReason
+from cicada.core.ports import ModelMetrics
 
 # --- 版本与限额 (contracts §2; 调整须新版本, 不在同一版本默默改变语义) -----------------
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 # SQLite application_id: "CIC1" 的 32 位编码, 区分 Cicada 会话库
 SESSION_APPLICATION_ID = 0x43494331
 
@@ -31,6 +32,11 @@ SHORT_TITLE_MAX_CHARS = 80                # 列表短标题的有界文字
 # 03: 回执行标识/说明字段的有界长度; 写侧构造与加载侧解码对称拒绝
 RECEIPT_ID_MAX_CHARS = 256               # receipt_id/verification_run_id/epoch_id/request_id
 RECEIPT_FAILURE_KIND_MAX_CHARS = 512     # failure_kind 说明文本
+
+# 02 (schema v2): 摘要记录限额 (spec D8)
+SUMMARY_TEXT_MAX_BYTES = 16 * 1024        # 摘要正文有界长度
+MAX_SUMMARIES_PER_GENERATION = 128        # 每个上下文代次的摘要记录数上限
+SUMMARY_ID_MAX_CHARS = 256                # summary_id/摘要提示版本等标识有界长度
 
 
 # --- 错误分类 ---------------------------------------------------------------------------
@@ -61,7 +67,7 @@ class UnknownArchiveVersionError(ArchiveFormatError):
 
 
 class ArchiveLimitError(PersistenceError):
-    """超出 v1 限额: 打开或写入事务前拒绝, 不静默截断."""
+    """超出会话限额: 打开或写入事务前拒绝, 不静默截断."""
 
 
 class WorkspaceMismatchError(PersistenceError):
@@ -308,7 +314,7 @@ class StoredReceipt:
         for name in ("verification_run_id", "receipt_id", "epoch_id", "request_id"):
             if len(getattr(self, name)) > RECEIPT_ID_MAX_CHARS:
                 raise ValueError(
-                    f"StoredReceipt.{name} exceeds the v1 limit ({RECEIPT_ID_MAX_CHARS} chars)"
+                    f"StoredReceipt.{name} exceeds the limit ({RECEIPT_ID_MAX_CHARS} chars)"
                 )
         if self.execution_status not in (
             "exited", "launch_failed", "timed_out", "cancelled", "error",
@@ -329,7 +335,7 @@ class StoredReceipt:
             raise ValueError("StoredReceipt.failure_kind must be a str or None")
         if self.failure_kind is not None and len(self.failure_kind) > RECEIPT_FAILURE_KIND_MAX_CHARS:
             raise ValueError(
-                "StoredReceipt.failure_kind exceeds the v1 limit "
+                "StoredReceipt.failure_kind exceeds the limit "
                 f"({RECEIPT_FAILURE_KIND_MAX_CHARS} chars)"
             )
         if self.activity_id is not None and not isinstance(self.activity_id, str):
@@ -353,6 +359,87 @@ def receipt_terminal_trustworthy(receipt: StoredReceipt) -> bool:
     )
 
 
+# --- 摘要记录 (02, schema v2; spec D6/D8) ----------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SummaryRecord:
+    """一条已提交摘要的持久事实; 投影切换的可靠提交凭据, 不携带验证权威.
+
+    覆盖范围: 本块自身覆盖规范历史 [start, end) 的消息 (message_count 条),
+    覆盖的完整请求 seq 范围 [first_request_seq, last_request_seq];
+    prefix_sha256 是规范历史 [0:end) 全前缀的规范编码 sha256 (恢复逐块核对);
+    end_message_index 即保留边界 (保留后缀的规范历史起点)。
+    """
+
+    summary_id: str
+    epoch_id: str
+    context_generation: int
+    first_request_seq: int
+    last_request_seq: int
+    message_count: int
+    end_message_index: int
+    prefix_sha256: str
+    text: str
+    provider: str
+    model: str
+    prompt_version: str
+    prompt_sha256: str
+    metrics: ModelMetrics | None
+    reason: Literal["manual", "auto"]
+    created_at: float
+    previous_projection_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("summary_id", "epoch_id", "provider", "model", "prompt_version", "prompt_sha256"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"SummaryRecord.{name} must be a nonempty str")
+            if len(value) > SUMMARY_ID_MAX_CHARS:
+                raise ValueError(
+                    f"SummaryRecord.{name} exceeds the limit ({SUMMARY_ID_MAX_CHARS} chars)"
+                )
+        for name in ("context_generation", "first_request_seq", "last_request_seq",
+                     "message_count", "end_message_index"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"SummaryRecord.{name} must be a nonnegative int")
+        if self.first_request_seq > self.last_request_seq:
+            raise ValueError("SummaryRecord.first_request_seq must not exceed last_request_seq")
+        if self.message_count <= 0:
+            raise ValueError("SummaryRecord.message_count must be positive")
+        if self.end_message_index < self.message_count:
+            raise ValueError(
+                "SummaryRecord.end_message_index must be at least the covered message count"
+            )
+        if (
+            not isinstance(self.prefix_sha256, str)
+            or len(self.prefix_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in self.prefix_sha256)
+        ):
+            raise ValueError("SummaryRecord.prefix_sha256 must be a sha256 hex digest")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("SummaryRecord.text must be a nonempty str")
+        if len(self.text.encode("utf-8")) > SUMMARY_TEXT_MAX_BYTES:
+            raise ValueError(
+                f"SummaryRecord.text exceeds the limit ({SUMMARY_TEXT_MAX_BYTES} bytes)"
+            )
+        if self.metrics is not None and not isinstance(self.metrics, ModelMetrics):
+            raise ValueError("SummaryRecord.metrics must be ModelMetrics or None")
+        if self.reason not in ("manual", "auto"):
+            raise ValueError("SummaryRecord.reason must be 'manual' or 'auto'")
+        if isinstance(self.created_at, bool) or not isinstance(self.created_at, (int, float)):
+            raise ValueError("SummaryRecord.created_at must be a number")
+        if self.previous_projection_identity is not None and (
+            not isinstance(self.previous_projection_identity, str)
+            or len(self.previous_projection_identity) != 64
+            or any(c not in "0123456789abcdef" for c in self.previous_projection_identity)
+        ):
+            raise ValueError(
+                "SummaryRecord.previous_projection_identity must be a sha256 hex digest or None"
+            )
+
+
 @dataclass(frozen=True)
 class RecoverySnapshot:
     """打开存档后的隔离恢复快照; 不含 live 插件对象, 嵌套 details 已复制."""
@@ -369,6 +456,7 @@ class RecoverySnapshot:
     canonical_history: tuple[Message, ...]          # 当前代次的闭合历史 (已过结构校验)
     process_activities: tuple[ProcessActivityFacts, ...] = ()   # 全部代次的进程活动
     restored_receipts: tuple[StoredReceipt, ...] = ()           # 历史检查回执 (03)
+    summaries: tuple[SummaryRecord, ...] = ()                   # 当前代次摘要记录 (02, v2)
 
     @property
     def recorded_process_uncertain(self) -> bool:
@@ -505,6 +593,16 @@ class SessionStorePort(Protocol):
 
     async def commit_clear(self, epoch_id: str) -> int:
         """可靠提交清空边界; 成功返回新的上下文代次."""
+        ...
+
+    async def commit_summary(self, record: SummaryRecord) -> None:
+        """可靠提交摘要记录 (02, schema v2); 成功即 store 已接受 (明确结果).
+
+        关系校验: epoch/generation 必须是当前打开值; summary_id 重复拒绝;
+        seq 范围必须引用当前代次已提交完整请求; 每代次摘要数限额。失败抛
+        PersistenceError, 调用方按真实存储故障处理; 与请求提交同一 worker 纪律
+        (调用方取消不取消事务, 每次派发必得明确结果)。
+        """
         ...
 
     async def aclose(self) -> None:
