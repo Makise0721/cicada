@@ -31,6 +31,7 @@ from cicada.persistence.contracts import (
     ArchiveFormatError,
     ArchiveLimitError,
     LaunchIdentity,
+    PersistenceError,
     RequestOutcomeFacts,
     StoredIdentity,
     SummaryRecord,
@@ -299,8 +300,9 @@ def test_migration_step_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch, s
     before = db_path.read_bytes()
     with pytest.raises(RuntimeError, match="injected migration fault"):
         open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
+    # 02-F2: 回滚后字节级不变 (journal 回滚恢复原页), 版本/关系完整
+    assert db_path.read_bytes() == before, "迁移失败回滚不改写原档字节"
     assert _raw_version(db_path) == (1, 1, False), "回滚后只能是完整 v1"
-    assert len(before) == db_path.stat().st_size or True  # 字节级断言见下方精确核对
     connection = sqlite3.connect(str(db_path))
     try:
         assert connection.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 2
@@ -333,11 +335,12 @@ def test_migration_verify_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch)
     assert _raw_version(db_path) == (1, 1, False)
 
 
-def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path):
-    """独立进程在迁移事务中途终止 (DDL 已执行、COMMIT 未发生).
+@pytest.mark.parametrize("kill_step", [0, 1, 2])
+def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path, kill_step):
+    """独立进程在迁移事务的每个步骤中途终止 (02-F4: 建表/版本标记逐步注入).
 
     重开只能是完整 v1 (热日志回滚, 可重新升级) 或完整 v2, 旧完整请求可恢复,
-    不留混合版本 (PA04)。
+    不留混合版本 (PA04)。「提交后终止」无歧义: COMMIT 已落盘即完整 v2。
     """
     session_id = str(uuid.uuid4())
     directory = tmp_path / "sessions"
@@ -352,10 +355,9 @@ def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path):
         "import cicada.plugins.session_store.store as store_module\n"
         "def _kill(connection):\n"
         "    os._exit(9)\n"
-        "store_module._V2_MIGRATION_STEPS = (\n"
-        "    store_module._V2_MIGRATION_STEPS[0], _kill,\n"
-        "    *store_module._V2_MIGRATION_STEPS[2:],\n"
-        ")\n"
+        f"steps = list(store_module._V2_MIGRATION_STEPS)\n"
+        f"steps[{kill_step}] = _kill\n"
+        "store_module._V2_MIGRATION_STEPS = tuple(steps)\n"
         "try:\n"
         f"    store_module.open_session_store(directory=r'{directory}',\n"
         f"        session_id='{session_id}', workspace=r'{workspace}')\n"
@@ -569,3 +571,84 @@ async def test_summary_codec_roundtrip_and_strictness(tmp_path):
     fresh["reason"] = "sneaky"
     with pytest.raises(CodecError, match="reason"):
         decode_summary_record(fresh)
+
+
+# --- 审查处置 (02 独立审查 2026-10-06) --------------------------------------------------
+
+
+def test_v2_missing_summaries_table_rejected_by_table_set(tmp_path):
+    """02-F5: v2 表集合校验含 summaries; 缺表在第一道防线拒绝 (不再依赖查询兜底)."""
+    fixture_dir = tmp_path / "s"
+    store = open_session_store(directory=fixture_dir, session_id=None, workspace=tmp_path)
+    session_id = store.session_id
+    import asyncio
+
+    asyncio.run(store.aclose())
+    db_path = fixture_dir / f"{session_id}.sqlite3"
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute("DROP TABLE summaries")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ArchiveFormatError, match="missing tables"):
+        open_session_store(directory=fixture_dir, session_id=session_id, workspace=tmp_path)
+
+
+async def test_summary_non_integer_column_tamper_is_format_error(tmp_path):
+    """02-F7: 标识列被篡改为非整数字符串 -> ArchiveFormatError (非裸 ValueError)."""
+    fixture = await _store_with_two_requests(tmp_path)
+    store = fixture.store
+    record = _record_for(store, fixture.epoch_id)
+    await store.commit_summary(record)
+    db_path = store.db_path
+    session_id = store.session_id
+    import asyncio
+
+    await store.aclose()
+    connection = sqlite3.connect(str(db_path))
+    try:
+        connection.execute(
+            "UPDATE summaries SET context_generation = 'not-an-int'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ArchiveFormatError, match="non-integer identity column"):
+        open_session_store(
+            directory=fixture.directory, session_id=session_id, workspace=tmp_path
+        )
+
+
+def test_v1_rejections_happen_before_upgrade_and_leave_file_untouched(tmp_path):
+    """02-F9: v1 档的工作区不匹配/载荷损坏在迁移提交之前拒绝, 原档字节不变.
+
+    审查证实此前这两类拒绝发生在升级之后 (原档被改写为 v2); 现由加载次序保证。
+    """
+    for scenario in ("workspace_mismatch", "corrupt_payload"):
+        session_id = str(uuid.uuid4())
+        directory = tmp_path / f"s-{scenario}"
+        stored_workspace = (
+            str(tmp_path / "original-ws")
+            if scenario == "workspace_mismatch"
+            else os.path.realpath(tmp_path)
+        )
+        _make_v1_archive(directory, session_id, stored_workspace)
+        db_path = directory / f"{session_id}.sqlite3"
+        if scenario == "corrupt_payload":
+            connection = sqlite3.connect(str(db_path))
+            try:
+                connection.execute(
+                    "UPDATE records SET payload_json = '{\"messages\": [], \"outcome\": {}}'"
+                    " WHERE seq = 2"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+        before = db_path.read_bytes()
+        with pytest.raises(PersistenceError):
+            open_session_store(
+                directory=directory, session_id=session_id, workspace=tmp_path
+            )
+        assert _raw_version(db_path) == (1, 1, False), "拒绝发生在迁移前: 仍是 v1"
+        assert db_path.read_bytes() == before, "原档不改写"

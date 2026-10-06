@@ -599,6 +599,12 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a persistent clear is in progress; new requests are refused until it settles"
                 )
+            if self._compacting:
+                # 02/PA05: execute/clear/compact 三向互斥 (应用层, 不依赖 UI 屏障);
+                # 压缩在途时新请求必须等待, 否则其提交会与摘要切换交错
+                raise RuntimeError(
+                    "a compaction is in progress; new requests are refused until it settles"
+                )
             # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
             # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
             if self._budget_policy is not None:
@@ -964,6 +970,10 @@ class ApplicationSession:
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
         if self._clearing:
             raise RuntimeError("a persistent clear is already in progress")
+        if self._compacting:
+            # 02: 压缩在途时清空被拒——clear 推进代次会让在途摘要提交撞关系校验,
+            # 且其失败会被误归存储故障; 等压缩落定后再清 (三向互斥, 审查 02-F8)
+            raise RuntimeError("a compaction is in progress; clear is refused until it settles")
         self._clearing = True
         self._clear_done = asyncio.get_running_loop().create_future()
         self._notify(OperationBusy(operation="clear"))
@@ -1045,6 +1055,11 @@ class ApplicationSession:
             )
         if self._compacting:
             raise RuntimeError("a compaction is already in progress")
+        if self._clearing:
+            # 三向互斥 (审查 02-F8): 清空在途时压缩拒绝, 与 execute/clear 同一面
+            raise RuntimeError(
+                "a persistent clear is in progress; compaction is refused until it settles"
+            )
         if self._compact_sealed:
             raise RuntimeError("application is closing; compaction is sealed")
         # 可压缩区间与摘要输入预算在置位屏障前判定: 拒绝不留下 busy/屏障 (D1)
@@ -1109,8 +1124,12 @@ class ApplicationSession:
                     # 不锁存 storage_failed, 迟到响应丢弃
                     return None
                 except PersistenceError as exc:
-                    # 提交失败: 旧投影不变; 真实存储故障按 commit_request 同面锁存
-                    self._latch_storage_failed(str(exc))
+                    # 提交失败: 旧投影不变。锁存面与 begin 路径同一白名单 (审查
+                    # 02-F12): 真实落盘故障才锁存 storage_failed; 关系冲突
+                    # (代次/seq/重复) 是状态问题, 存储健康, 误锁存会不可逆拒绝
+                    # 本进程后续请求
+                    if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                        self._latch_storage_failed(str(exc))
                     raise RuntimeError(
                         "compaction failed to persist; the model projection is unchanged: "
                         f"{exc}"

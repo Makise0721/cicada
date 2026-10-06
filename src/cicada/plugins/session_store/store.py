@@ -1,4 +1,4 @@
-"""SQLite 单会话存储: lease、串行 worker、v1 关系、限额与逻辑完整性.
+"""SQLite 单会话存储: lease、串行 worker、版本化 schema、限额与逻辑完整性.
 
 物理设置 (设计契约 §2): journal_mode=DELETE + synchronous=EXTRA + foreign_keys=ON
 + temp_store=MEMORY + busy_timeout=1000ms; application_id/user_version 写后回读.
@@ -165,11 +165,14 @@ _SCHEMA_STATEMENTS = (
 )
 
 _EXPECTED_TABLES = frozenset({
-    "session", "epoch", "records", "request_intents", "process_activity", "historical_receipts",
+    "session", "epoch", "records", "request_intents", "process_activity",
+    "historical_receipts", "summaries",
 })
 
 # v1 存档 (升级前) 的期望表集合; 迁移校验面与既有加载共用同一清单
-_V1_EXPECTED_TABLES = _EXPECTED_TABLES
+_V1_EXPECTED_TABLES = frozenset({
+    "session", "epoch", "records", "request_intents", "process_activity", "historical_receipts",
+})
 
 # v1 → v2 原子迁移 (PA04) 的步骤序列; 每步一个连接操作, 全部包在单个显式事务内,
 # 任一步失败整体回滚 (重开只能是完整 v1 或完整 v2)。测试经本常量注入故障点。
@@ -635,6 +638,7 @@ class SQLiteSessionStore:
             + len(record.epoch_id.encode("utf-8"))
             + len(record.prefix_sha256.encode("utf-8"))
             + 64
+            + 40  # 5 个整数标识列的上界估计 (审查 02-F3; 每列 varint+头 ≤8 字节)
         )
 
         def job() -> None:
@@ -1118,9 +1122,13 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
             # 版本感知表集合校验 (PA04): v1 档先按 v1 校验面严格核对再迁移
             expected = _V1_EXPECTED_TABLES if archive_version == 1 else _EXPECTED_TABLES
             _check_schema_tables(connection, expected)
+            # PA04: v1 的全部既有校验面 (工作区/载荷摘要/关系/限额) 在迁移提交之前
+            # 完成——任何拒绝都发生在写入前, 原档不改写 (审查 02-F9); 迁移后补读新表
+            state = _load_state(connection, session_id, canonical_workspace, archive_version)
             if archive_version == 1:
                 _upgrade_v1_to_v2(connection)
-            state = _load_state(connection, session_id, canonical_workspace)
+                state.schema_version = SESSION_SCHEMA_VERSION
+            state.summaries = _load_summaries(connection, state)
         except sqlite3.OperationalError as exc:
             connection.close()
             text = str(exc).lower()
@@ -1219,15 +1227,17 @@ def _upgrade_v1_to_v2(connection: sqlite3.Connection) -> None:
 
 
 def _load_state(
-    connection: sqlite3.Connection, session_id: str, canonical_workspace: str
+    connection: sqlite3.Connection, session_id: str, canonical_workspace: str,
+    archive_version: int,
 ) -> _LoadedState:
+    """按存档版本严格加载 (不含 summaries; v2 由调用方补读, v1 迁移后补读)."""
     rows = connection.execute(
         "SELECT schema_version, session_id, canonical_workspace, created_at, short_title FROM session"
     ).fetchall()
     if len(rows) != 1:
         raise ArchiveFormatError(f"session table must hold exactly one row, found {len(rows)}")
     version, stored_id, stored_workspace, created_at, short_title = rows[0]
-    if int(version) != SESSION_SCHEMA_VERSION or str(stored_id) != session_id:
+    if int(version) != archive_version or str(stored_id) != session_id:
         raise ArchiveFormatError("session row does not match the requested archive")
     if str(stored_workspace) != canonical_workspace:
         raise WorkspaceMismatchError(
@@ -1243,6 +1253,7 @@ def _load_state(
         canonical_workspace=str(stored_workspace),
         created_at=float(created_at),
         short_title=short_title,
+        schema_version=int(archive_version),
     )
 
     epoch_ids: set[str] = set()
@@ -1526,8 +1537,25 @@ def _load_state(
             raise ArchiveFormatError(f"receipt {receipt.receipt_id} appears more than once")
         state.receipts[receipt.receipt_id] = receipt
 
-    # --- 摘要记录 (02, v2): 列与 JSON 交叉核对 + 关系/限额校验 -------------------------
-    committed_by_seq = {entry[0]: entry for entry in committed.values()}  # seq -> entry
+    # 摘要记录不在此加载 (02-F9): v1 档的全部校验面 (工作区/载荷摘要/关系/限额)
+    # 必须在原子迁移提交之前完成, 拒绝不改写原档; summaries 表由调用方在迁移后补读
+    state.requests.sort(key=lambda item: item.seq)
+    return state
+
+
+def _load_summaries(
+    connection: sqlite3.Connection, state: _LoadedState
+) -> list[SummaryRecord]:
+    """v2 摘要表加载: 载荷摘要/列与 JSON 交叉核对/关系/限额 (02).
+
+    在 _load_state 全部既有校验面之后调用 (v1 档在原子升级完成后补读,
+    v2 档直接补读); 独立于请求加载, 保证 v1 拒绝路径不触碰新表 (02-F9)。
+    """
+    epoch_ids = {
+        str(row[0]) for row in connection.execute("SELECT epoch_id FROM epoch")
+    }
+    committed_by_seq = {item.seq: item for item in state.requests}
+    loaded: list[SummaryRecord] = []
     per_generation_summaries: dict[int, int] = {}
     for (summary_id, summary_epoch, summary_generation, first_seq, last_seq,
          message_count, end_index, prefix_sha, summary_json, summary_sha) in connection.execute(
@@ -1535,6 +1563,15 @@ def _load_state(
         " last_request_seq, message_count, end_message_index, prefix_sha256, summary_json,"
         " payload_sha256 FROM summaries ORDER BY rowid"
     ):
+        # 标识列必须是整数 (02-F7): 非整数字符串按损坏拒绝, 不让裸 int() 逃逸
+        raw_int_columns = (summary_generation, first_seq, last_seq, message_count, end_index)
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in raw_int_columns
+        ):
+            raise ArchiveFormatError(
+                f"summary {summary_id} has a non-integer identity column"
+            )
         if str(summary_epoch) not in epoch_ids:
             raise ArchiveFormatError(f"summary {summary_id} references an unknown epoch")
         _check_text_size(str(summary_json), MAX_METADATA_BYTES, "summary record")
@@ -1564,12 +1601,12 @@ def _load_state(
                 f"summary {summary_id} columns do not match its JSON payload"
             )
         for seq in (record.first_request_seq, record.last_request_seq):
-            entry = committed_by_seq.get(seq)
-            if entry is None:
+            item = committed_by_seq.get(seq)
+            if item is None:
                 raise ArchiveFormatError(
                     f"summary {summary_id} references request record {seq} which does not exist"
                 )
-            if entry[2] != record.context_generation:
+            if item.context_generation != record.context_generation:
                 raise ArchiveFormatError(
                     f"summary {summary_id} generation does not match its covered requests"
                 )
@@ -1584,9 +1621,8 @@ def _load_state(
                 f"({MAX_SUMMARIES_PER_GENERATION})"
             )
         per_generation_summaries[record.context_generation] = count
-        state.summaries.append(record)
-    state.requests.sort(key=lambda item: item.seq)
-    return state
+        loaded.append(record)
+    return loaded
 
 
 def _load_payload(raw: str) -> dict[str, Any]:

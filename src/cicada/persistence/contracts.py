@@ -63,7 +63,7 @@ class ArchiveFormatError(PersistenceError):
 
 
 class UnknownArchiveVersionError(ArchiveFormatError):
-    """存档版本高于或不同于本程序支持的 v1."""
+    """存档版本高于或不同于本程序支持的版本."""
 
 
 class ArchiveLimitError(PersistenceError):
