@@ -1372,3 +1372,55 @@ def test_prefix_proof_rejects_requests_not_reconstructing_history():
     )
     with pytest.raises(ApplicationOpenError, match="do not reconstruct"):
         _build_prefix_proof(tampered)
+
+
+async def test_close_during_request_run_commit_still_saved(tmp_path):
+    """阶段收口审查 STG-F2: close 于请求执行在途时启动——提交仍落库、不误锁存.
+
+    钉住"execute 屏障覆盖活动终结及 commit_request"的组合: close 等待请求生产者,
+    提交派发先于 store 释放, 不因关闭产生 StorageUnavailableError 误锁
+    storage_failed (与摘要路径 PA05 的关闭取消口径一致)。
+    """
+    from dataclasses import replace as dc_replace
+
+    from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
+
+    release = asyncio.Event()
+
+    class _GatedModel:
+        def __init__(self) -> None:
+            self.requests: list = []
+
+        async def stream(self, request, cancel):
+            self.requests.append(request)
+            await release.wait()
+            if cancel.cancelled:
+                yield StreamDone("aborted")
+                return
+            yield TextDelta("答")
+            yield StreamDone("stop", metrics=ModelMetrics(input_tokens=10, output_tokens=1))
+
+    model = _GatedModel()
+    config = dc_replace(
+        _config(_repo(tmp_path), [], session_id=None),
+        model_plugin=fake_model_plugin(model),
+    )
+    session = await open_application(config)
+    try:
+        execute_task = asyncio.create_task(session.execute("问"))
+        await asyncio.sleep(0.2)
+        assert session.state == "executing", "请求执行在途"
+        close_task = asyncio.create_task(session.aclose())
+        await asyncio.sleep(0.2)
+        assert session.state in ("executing", "cancelling", "closing"), "close 意图已锁存"
+        release.set()
+        outcome = await asyncio.wait_for(execute_task, timeout=15)
+        assert outcome.persistence is not None and outcome.persistence.saved, (
+            "close 期间请求提交仍落库"
+        )
+        await asyncio.wait_for(close_task, timeout=15)
+        assert session.state == "closed"
+        assert session._close_problems == [], "请求生产者在监督窗口内完成"
+    finally:
+        if session.state != "closed":
+            await session.aclose()

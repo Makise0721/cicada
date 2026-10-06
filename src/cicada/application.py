@@ -459,6 +459,9 @@ class ApplicationSession:
         self._compact_done: asyncio.Future | None = None
         self._compact_token: CancelToken | None = None
         self._compact_sealed = False
+        # 阶段收口审查 STG-F1: execute 的 begin 等待窗内 _state 仍为 idle,
+        # 同步旗标把压缩/清空/新请求互斥补齐到该窗 (不依赖 UI 屏障)
+        self._begin_in_flight = False
         self._process_uncertain = False
         self._closing = False
         self._closed = False
@@ -630,6 +633,12 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a compaction is in progress; new requests are refused until it settles"
                 )
+            if self._begin_in_flight:
+                # 阶段收口审查 STG-F1: 前一请求仍在 begin 等待窗 (state 尚为 idle)
+                raise RuntimeError(
+                    "a previous request is still being started; "
+                    "new requests are refused until it settles"
+                )
         # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
         # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
         if self._budget_policy is not None:
@@ -638,46 +647,50 @@ class ApplicationSession:
         # 即取消本次尝试 (零 begin/零模型调用); begin 后取消语义不变
         token = CancelToken()
         self._cancel_token = token
-        # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
-        # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
-        await self._refuse_overbudget_or_auto_compact(prompt)
-        if self._store is not None:
-            begin_task = asyncio.ensure_future(
-                self._store.begin_request(self._epoch_id or "", prompt)
-            )
-            begin_error: PersistenceError | None = None
-            begin_cancelled = False
-            while True:
-                try:
-                    self._request_id = await asyncio.shield(begin_task)
-                    break
-                except asyncio.CancelledError:
-                    begin_cancelled = True
-                except PersistenceError as exc:
-                    begin_error = exc
-                    break
-            if begin_cancelled:
-                # 已取得事务明确结果后的取消属程序性终止: 与执行期异常一样进入 closing
-                if self._state != "closed":
-                    self._state = "closing"
-                    self._closing = True
-                raise asyncio.CancelledError()
-            if begin_error is not None:
-                # 落盘故障 (不可用/写失败/越限) 才锁存 storage_failed; 关系冲突
-                # (pending 已存在/epoch 不符) 是状态问题, 存储健康, 不得误锁存
-                if isinstance(begin_error, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
-                    self._latch_storage_failed(str(begin_error))
+        # 阶段收口审查 STG-F1: 从首次预估到 begin 落定期间同步占住互斥
+        # (预估内自动压缩另由 _compacting 覆盖); 失败/取消/完成均经 finally 释放
+        self._begin_in_flight = True
+        try:
+            # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
+            # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
+            await self._refuse_overbudget_or_auto_compact(prompt)
+            if self._store is not None:
+                begin_task = asyncio.ensure_future(
+                    self._store.begin_request(self._epoch_id or "", prompt)
+                )
+                begin_error: PersistenceError | None = None
+                begin_cancelled = False
+                while True:
+                    try:
+                        self._request_id = await asyncio.shield(begin_task)
+                        break
+                    except asyncio.CancelledError:
+                        begin_cancelled = True
+                    except PersistenceError as exc:
+                        begin_error = exc
+                        break
+                if begin_cancelled:
+                    # 已取得事务明确结果后的取消属程序性终止: 与执行期异常一样进入 closing
+                    if self._state != "closed":
+                        self._state = "closing"
+                        self._closing = True
+                    raise asyncio.CancelledError()
+                if begin_error is not None:
+                    # 落盘故障 (不可用/写失败/越限) 才锁存 storage_failed; 关系冲突
+                    # (pending 已存在/epoch 不符) 是状态问题, 存储健康, 不得误锁存
+                    if isinstance(begin_error, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                        self._latch_storage_failed(str(begin_error))
+                        raise RuntimeError(
+                            f"session save failed before the request started; "
+                            f"no model call or tool execution was made: {begin_error}"
+                        ) from begin_error
                     raise RuntimeError(
-                        f"session save failed before the request started; "
-                        f"no model call or tool execution was made: {begin_error}"
+                        f"cannot start a persisted request: {begin_error}"
                     ) from begin_error
-                raise RuntimeError(
-                    f"cannot start a persisted request: {begin_error}"
-                ) from begin_error
-        else:
-            # 非持久会话: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用 (D9);
-            # 自动压缩需持久会话, 回调内判定后原样拒绝
-            pass
+        finally:
+            self._begin_in_flight = False
+        # 非持久会话无 begin: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用
+        # (D9); 自动压缩需持久会话, 回调内判定后原样拒绝
         loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
@@ -1021,6 +1034,12 @@ class ApplicationSession:
             # 02: 压缩在途时清空被拒——clear 推进代次会让在途摘要提交撞关系校验,
             # 且其失败会被误归存储故障; 等压缩落定后再清 (三向互斥, 审查 02-F8)
             raise RuntimeError("a compaction is in progress; clear is refused until it settles")
+        if self._begin_in_flight:
+            # 阶段收口审查 STG-F1: 请求 begin 等待窗内 state 仍为 idle, 同步旗标
+            # 补齐互斥 (该窗缺口的 clear 变体在基线已存在)
+            raise RuntimeError(
+                "a request start is being persisted; clear is refused until it settles"
+            )
         self._clearing = True
         self._clear_done = asyncio.get_running_loop().create_future()
         self._notify(OperationBusy(operation="clear"))
@@ -1106,6 +1125,12 @@ class ApplicationSession:
             # 三向互斥 (审查 02-F8): 清空在途时压缩拒绝, 与 execute/clear 同一面
             raise RuntimeError(
                 "a persistent clear is in progress; compaction is refused until it settles"
+            )
+        if self._begin_in_flight:
+            # 阶段收口审查 STG-F1: 请求 begin 等待窗内 state 仍为 idle, 同步旗标
+            # 补齐互斥 (不依赖 UI 屏障), 否则压缩可与在途请求交错
+            raise RuntimeError(
+                "a request start is being persisted; compaction is refused until it settles"
             )
         if self._compact_sealed:
             raise RuntimeError("application is closing; compaction is sealed")

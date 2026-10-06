@@ -671,3 +671,94 @@ async def test_terminal_scan_still_covers_canonical_after_projection(tmp_path):
     assert service.reasons, "被摘要覆盖的未证终结事实仍被扫描锁存 (A11)"
     assert inner.requests, "请求已发出 (投影替换后正常放行)"
     assert inner.requests[0].messages[0].text.startswith("[程序生成的对话摘要]")
+
+
+# --- 阶段收口审查处置 (STG-F1): begin 等待窗的应用层互斥 ----------------------------------
+
+
+async def _begin_gated_execute(session, store, prompt: str):
+    """派发一个停在 begin 等待窗的 execute; 返回 (task, release)。
+
+    store.begin_request 经实例替换挂闸: entered 置位即已到窗内 (state 仍 idle)。
+    """
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    original_begin = store.begin_request
+
+    async def gated_begin(epoch_id, prompt_text):
+        entered.set()
+        await release.wait()
+        return await original_begin(epoch_id, prompt_text)
+
+    store.begin_request = gated_begin  # type: ignore[method-assign]
+    task = asyncio.create_task(session.execute(prompt))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    return task, release
+
+
+async def test_compact_refused_during_begin_window(tmp_path):
+    """STG-F1: begin 等待窗内 state 仍为 idle, 压缩必须被同步旗标拒绝 (不依赖 UI 屏障)."""
+    session, _m, _c, store = await _manual_persistent_session(
+        tmp_path,
+        script=[[StreamDone("stop")], [StreamDone("stop")], [StreamDone("stop")]],
+    )
+    try:
+        await _two_committed_requests(session)
+        task, release = await _begin_gated_execute(session, store, "第三问")
+        assert session.state == "idle"
+        assert not session._compacting and not session._clearing
+        try:
+            await session.compact_context()
+            raise AssertionError("begin 窗内的压缩必须被拒绝")
+        except RuntimeError as exc:
+            assert "being persisted" in str(exc)
+        assert session._context_projection.blocks == (), "拒绝不产生投影切换"
+        release.set()
+        await asyncio.wait_for(task, timeout=15)
+        assert session.state == "idle", "窗关闭后请求正常完成"
+    finally:
+        await session.aclose()
+        await store.aclose()
+
+
+async def test_clear_refused_during_begin_window(tmp_path):
+    """STG-F1: begin 等待窗内清空同样拒绝 (基线已有的 clear 变体一并闭合)."""
+    session, _m, _c, store = await _manual_persistent_session(
+        tmp_path,
+        script=[[StreamDone("stop")], [StreamDone("stop")]],
+    )
+    try:
+        await session.execute("第一问")
+        task, release = await _begin_gated_execute(session, store, "第二问")
+        try:
+            await session.clear_context()
+            raise AssertionError("begin 窗内的清空必须被拒绝")
+        except RuntimeError as exc:
+            assert "being persisted" in str(exc)
+        assert session.persistence.context_generation == 0, "拒绝不推进代次"
+        release.set()
+        await asyncio.wait_for(task, timeout=15)
+    finally:
+        await session.aclose()
+        await store.aclose()
+
+
+async def test_second_execute_refused_during_begin_window(tmp_path):
+    """STG-F1: begin 等待窗内新请求拒绝, 避免 double begin 与交错提交."""
+    session, _m, _c, store = await _manual_persistent_session(
+        tmp_path,
+        script=[[StreamDone("stop")], [StreamDone("stop")]],
+    )
+    try:
+        task, release = await _begin_gated_execute(session, store, "第一问")
+        try:
+            await session.execute("第二问")
+            raise AssertionError("begin 窗内的新请求必须被拒绝")
+        except RuntimeError as exc:
+            assert "still being started" in str(exc)
+        release.set()
+        await asyncio.wait_for(task, timeout=15)
+        assert session.state == "idle"
+    finally:
+        await session.aclose()
+        await store.aclose()
