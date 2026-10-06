@@ -19,7 +19,15 @@ Agent → RunPolicy → BudgetPolicy → 适配器; 内核零改动, 规范历�
 - 请求边界接缝 (spec D1/PA02): note_request_start(committed_count) 由应用在
   每次 execute 准入通过后、首次预算预估之前调用一次, 参数为该时刻规范历史
   消息数; 它建立本次 execute 尝试的预算状态范围, begin 不再调用或清零。
-  committed_count == 0 视为代次重置 (clear) 并丢弃锚。计数语义由 03 消费。
+  committed_count == 0 视为代次重置 (clear) 并丢弃锚。03 起同一接缝重置本次
+  execute 的两项独立额度: 准入自动压缩至多一次 (begin 前预估失败与 begin 后
+  每轮准入失败共享), overflow 重试至多一次; 失败不返还。
+- 自动压缩与 overflow 重试 (spec D7/PA06, 03): 每轮准入失败且尚未尝试时, 经
+  auto_compact 回调先消费额度再压缩, 对有效投影重估; 仍超限按原两道口拒绝。
+  adapter 的 StreamDone("error") 经 classify_overflow 确认上下文超限、该发送
+  零输出 (无任何 TextDelta 含空片段/ToolCallEvent) 且重试额度未用时, 由策略
+  内部暂存该终结错误, 压缩后重发一次; 只向上游发布一次终结。任何可见输出后
+  的上下文错误不重试 (透明重发禁令); 取消不重试且收尾为 aborted 不按 error。
 - 摘要通道 (02) 与 overflow 分类器 (03) 经构造参数注入, 组装接线在
   application 层; 本模块不导入 plugins (导入边界测试钉住)。
 """
@@ -30,7 +38,7 @@ import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from cicada.budget import (
     AnchorInfo,
@@ -58,6 +66,10 @@ from cicada.core.ports import (
 from cicada.persistence.codec import CodecError, encode_messages
 
 SUMMARY_PROMPT_VERSION = "1"
+
+# auto_compact 回调的额度种类: admission=准入自动压缩, overflow=overflow 重试压缩;
+# 两种额度独立, 同属本次 execute 状态 (D7)
+AutoCompactQuota = Literal["admission", "overflow"]
 
 
 def summary_prompt_text() -> str:
@@ -214,6 +226,7 @@ class BudgetPolicy:
         *,
         summarize: ModelPort | Callable[..., Any] | None = None,
         classify_overflow: Callable[[str], bool] | None = None,
+        auto_compact: Callable[[AutoCompactQuota], Any] | None = None,
         projection: ContextProjection | None = None,
     ) -> None:
         if not callable(getattr(inner, "stream", None)):
@@ -224,29 +237,58 @@ class BudgetPolicy:
             raise TypeError("summarize must be a ModelPort or callable or None")
         if classify_overflow is not None and not callable(classify_overflow):
             raise TypeError("classify_overflow must be a callable or None")
+        if auto_compact is not None and not callable(auto_compact):
+            raise TypeError("auto_compact must be a callable or None")
         self.inner = inner
         self.config = config
         # 02/03 注入接缝: summarize 是摘要通道 (02 起为 ModelPort, 生产=同一无状态
-        # 适配器实例); classify_overflow 03 接线。02 只消费 summarize。
+        # 适配器实例); classify_overflow 与 auto_compact 03 接线。
         self._summarize = summarize
         self._classify_overflow = classify_overflow
+        self._auto_compact = auto_compact
         # 模型可见投影容器 (D4): 应用持有同一实例, 压缩/恢复/clear 由应用驱动
         self._projection = projection if projection is not None else ContextProjection()
         self._anchor: _UsageAnchor | None = None
         self._last_report: BudgetReport | None = None
-        self._last_committed_count: int | None = None  # PA02 范围事实; 03 消费
+        self._last_committed_count: int | None = None  # PA02 范围事实
+        # 本次 execute 的两项独立额度 (D7, 03): 接缝重置, begin 不重置, 失败不返还
+        self._admission_auto_used = False
+        self._overflow_retry_used = False
+
+    def set_auto_compact(self, auto_compact: Callable[[AutoCompactQuota], Any] | None) -> None:
+        """装配期注入自动压缩回调 (open_application: 会话构造后绑定, D7 接缝)."""
+        if auto_compact is not None and not callable(auto_compact):
+            raise TypeError("auto_compact must be a callable or None")
+        self._auto_compact = auto_compact
+
+    def try_consume_admission_auto_attempt(self) -> bool:
+        """消费本次 execute 的准入自动压缩额度 (至多一次, 失败不返还)."""
+        if self._admission_auto_used:
+            return False
+        self._admission_auto_used = True
+        return True
+
+    def try_consume_overflow_retry(self) -> bool:
+        """消费本次 execute 的 overflow 重试额度 (独立于准入额度, 失败不返还)."""
+        if self._overflow_retry_used:
+            return False
+        self._overflow_retry_used = True
+        return True
 
     def note_request_start(self, committed_count: int) -> None:
         """请求边界接缝 (D1/PA02): 应用在准入通过后、首次预估前调用一次.
 
         参数为该时刻规范历史消息数; 它建立本次 execute 尝试的预算状态范围。
-        committed_count == 0 视为代次重置 (clear) 丢弃锚; 计数语义由 03 消费。
+        committed_count == 0 视为代次重置 (clear) 丢弃锚; 同时重置两项额度,
+        跨请求/跨预估不残留 (A09)。
         """
         if isinstance(committed_count, bool) or not isinstance(committed_count, int):
             raise ValueError("committed_count must be an int")
         if committed_count < 0:
             raise ValueError("committed_count must be nonnegative")
         self._last_committed_count = committed_count
+        self._admission_auto_used = False
+        self._overflow_retry_used = False
         if committed_count == 0:
             # 代次重置 (clear): 锚随历史一起失效; 恢复/压缩等其余失效面经前缀失配
             self._anchor = None
@@ -295,23 +337,97 @@ class BudgetPolicy:
             return
         # D4: 投影替换发生在 RunPolicy 核对之后 (上游已全量扫描/证明), 本策略把
         # 消息替换为 [摘要块] + 保留后缀; 无块时原样透传同一请求对象
+        projected = self._project(request)
+        report = self._assess(projected)
+        self._last_report = report
+        if report.total_estimate > self.config.num_ctx:
+            # 权威准入失败: 先尝试本次 execute 至多一次的自动压缩 (D7), 对有效
+            # 投影重估; 仍超限零发送, 由内核既有错误路径收尾 (D7 下道口)
+            if await self._attempt_admission_auto_compact(cancel):
+                projected = self._project(request)
+                report = self._assess(projected)
+                self._last_report = report
+            if report.total_estimate > self.config.num_ctx:
+                if cancel.cancelled:
+                    # begin 后取消按 aborted 收尾 (D7), 不把压缩期取消伪装成 error
+                    yield StreamDone("aborted")
+                    return
+                yield StreamDone("error", budget_exceeded_text(report))
+                return
+        # 发送 (含至多一次 overflow 重试, PA06): 见 _send_with_overflow_retry
+        async for event in self._send_with_overflow_retry(request, projected, report, cancel):
+            yield event
+
+    def _project(self, request: ModelRequest) -> ModelRequest:
+        """按投影容器替换请求消息; 无块时返回原请求对象 (02 语义不变)."""
         if self._projection.blocks:
-            projected = ModelRequest(
+            return ModelRequest(
                 messages=self._projection.project(request.messages),
                 tools=request.tools,
                 system_prompt=request.system_prompt,
             )
-        else:
-            projected = request
-        report = self._assess(projected)
-        self._last_report = report
-        if report.total_estimate > self.config.num_ctx:
-            # 权威准入失败: 该轮零发送, 由内核既有错误路径收尾 (D7)
-            yield StreamDone("error", budget_exceeded_text(report))
-            return
+        return request
+
+    async def _attempt_admission_auto_compact(self, cancel: CancelToken) -> bool:
+        """准入失败的自动压缩尝试: 至多一次, 条件判定与额度消费在回调内 (D7)."""
+        if self._admission_auto_used or self._auto_compact is None:
+            return False
+        return bool(await self._auto_compact("admission"))
+
+    def _overflow_retry_eligible(self, done: StreamDone, seen_output: bool) -> bool:
+        """PA06 重试资格: 分类超限 + 该发送零输出 + 重试额度未用 + 回调已接线."""
+        return (
+            done.stop_reason == "error"
+            and not seen_output
+            and not self._overflow_retry_used
+            and self._classify_overflow is not None
+            and self._auto_compact is not None
+            and self._classify_overflow(done.error or "")
+        )
+
+    async def _send_with_overflow_retry(
+        self,
+        original: ModelRequest,
+        projected: ModelRequest,
+        report: BudgetReport,
+        cancel: CancelToken,
+    ) -> AsyncIterator[StreamEvent]:
+        """一次发送 + 至多一次有界 overflow 重试 (PA06/A10).
+
+        分类终结错误先在策略内暂存 (不发布): 资格全满足且回调压缩成功才重发;
+        重试发送的终结是唯一向上游发布的终结, 首次错误要么被重试取代要么原样
+        发布, 绝不先发布 error 再继续流。零输出判定固定在该发送点: 任何
+        TextDelta (含空片段) 或 ToolCallEvent 都禁止透明重发; 发送点后无工具
+        副作用由本层结构性保证 (工具只在内核终结交付后派发)。
+        """
+        seen_output = False
         async for event in self.inner.stream(projected, cancel):
             if isinstance(event, StreamDone):
+                if self._overflow_retry_eligible(event, seen_output):
+                    if await self._auto_compact("overflow"):
+                        retried = self._project(original)
+                        retried_report = self._assess(retried)
+                        self._last_report = retried_report
+                        if retried_report.total_estimate > self.config.num_ctx:
+                            if cancel.cancelled:
+                                yield StreamDone("aborted")
+                                return
+                            # 压缩后二次准入仍超限: 按每轮权威口径拒绝 (D7/D8)
+                            yield StreamDone("error", budget_exceeded_text(retried_report))
+                            return
+                        async for retry_event in self.inner.stream(retried, cancel):
+                            if isinstance(retry_event, StreamDone):
+                                self._consider_anchor(retried, retried_report, retry_event)
+                            yield retry_event
+                        return
+                    if cancel.cancelled:
+                        yield StreamDone("aborted")
+                        return
                 self._consider_anchor(projected, report, event)
+                yield event
+                return
+            if isinstance(event, (TextDelta, ToolCallEvent)):
+                seen_output = True
             yield event
 
     def _assess(self, request: ModelRequest) -> BudgetReport:

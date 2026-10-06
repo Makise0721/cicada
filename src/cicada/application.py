@@ -89,6 +89,7 @@ from cicada.run_policy import (
     verification_policy,
 )
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
+from cicada.plugins.ollama import OllamaModel, classify_context_overflow
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.process import process_plugin
 from cicada.plugins.coding.tool_check import check_plugin
@@ -605,12 +606,18 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a compaction is in progress; new requests are refused until it settles"
                 )
-            # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
-            # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
-            if self._budget_policy is not None:
-                self._budget_policy.note_request_start(len(self._history))
-            # 请求前预估 (D7 上道口): 超限零 begin/零模型调用, 不锁存 storage_failed
-            self._refuse_overbudget_request(prompt)
+        # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
+        # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
+        if self._budget_policy is not None:
+            self._budget_policy.note_request_start(len(self._history))
+        # 03: 请求 token 提前到接缝处建立——begin 前自动压缩期间 session.cancel()
+        # 即取消本次尝试 (零 begin/零模型调用); begin 后取消语义不变
+        token = CancelToken()
+        self._cancel_token = token
+        # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
+        # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
+        await self._refuse_overbudget_or_auto_compact(prompt)
+        if self._store is not None:
             begin_task = asyncio.ensure_future(
                 self._store.begin_request(self._epoch_id or "", prompt)
             )
@@ -644,15 +651,13 @@ class ApplicationSession:
                     f"cannot start a persisted request: {begin_error}"
                 ) from begin_error
         else:
-            # 非持久会话: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用 (D9)
-            if self._budget_policy is not None:
-                self._budget_policy.note_request_start(len(self._history))
-            self._refuse_overbudget_request(prompt)
+            # 非持久会话: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用 (D9);
+            # 自动压缩需持久会话, 回调内判定后原样拒绝
+            pass
         loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
-        token = CancelToken()
-        self._cancel_token = token
+        # token 已在接缝处建立 (03): 覆盖预估/自动压缩/begin/全部轮次
         self._active_done = loop.create_future()
         self._notify(RequestPhaseChanged(None, "executing"))
         try:
@@ -775,6 +780,24 @@ class ApplicationSession:
         )
         if report.total_estimate > config.num_ctx:
             raise RuntimeError(f"request refused before start: {budget_exceeded_text(report)}")
+
+    async def _refuse_overbudget_or_auto_compact(self, prompt: str) -> None:
+        """请求前预估 + 本次 execute 至多一次的自动压缩 (D7, 03).
+
+        预估超限先经 _auto_compact_for_request 尝试压缩 (条件与额度在回调内
+        判定), 成功后对有效投影重估走同一预估接缝 (审查 01-F10); 仍超限按
+        begin 前口径拒绝 (PA01: 无 begin/无 intent/无 finalized, 不锁存)。
+        自动压缩期间取消 (session.cancel/close) 结束本次尝试: 零 begin/零
+        模型调用, 抛 CancelledError 而不伪装成预算拒绝 (D7)。
+        """
+        try:
+            self._refuse_overbudget_request(prompt)
+        except RuntimeError:
+            if self._budget_policy is None or not await self._auto_compact_for_request("admission"):
+                if self._cancel_token is not None and self._cancel_token.cancelled:
+                    raise asyncio.CancelledError() from None
+                raise
+            self._refuse_overbudget_request(prompt)
 
     async def _finalize_request(self, result: RunResult) -> RequestOutcome:
         """验证收尾: 扫描末次终结事实 -> refresh -> finalize -> 工件核对 -> 交付判定.
@@ -1069,100 +1092,170 @@ class ApplicationSession:
         self._compact_token = CancelToken()
         self._notify(OperationBusy(operation="compact"))
         try:
-            outcome = await generate_summary(channel, plan.messages, self._compact_token)
-            if not outcome.ok:
-                if outcome.failure == "aborted" and self._compact_sealed:
-                    # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)
-                    return None
-                # D5/PA03: 摘要失败不派发提交, 投影不变, 无摘要记录落库
+            return await self._run_compaction(
+                plan, reason="manual", cancel_token=self._compact_token
+            )
+        finally:
+            self._compacting = False
+            self._compact_token = None
+            if self._compact_done is not None and not self._compact_done.done():
+                self._compact_done.set_result(None)
+
+    async def _run_compaction(
+        self, plan: _CompactionPlan, *, reason: str, cancel_token: CancelToken
+    ) -> ContextCompacted | None:
+        """压缩核心协议 (D4-D6, PA03/PA05): 手动与自动共用同一实现 (03).
+
+        摘要生成 → 响应校验 → 封口核对且未取消 → store 接受 → 明确成功 →
+        切换投影 + ContextCompacted 事件。close 封口先于接受时返回 None
+        (归关闭取消, 零写入, 旧投影不变); 摘要失败/提交失败抛 RuntimeError
+        (投影不变; 锁存按 begin 同一白名单); store 接受后取消不取消事务,
+        成功先切换再传播外层 CancelledError。
+        """
+        channel = self._budget_policy.summarize_channel
+        outcome = await generate_summary(channel, plan.messages, cancel_token)
+        if not outcome.ok:
+            if outcome.failure == "aborted" and self._compact_sealed:
+                # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)
+                return None
+            # D5/PA03: 摘要失败不派发提交, 投影不变, 无摘要记录落库
+            raise RuntimeError(
+                f"summary generation failed ({outcome.failure}); the model projection "
+                "is unchanged" + (f": {outcome.detail}" if outcome.detail else "")
+            )
+        persistence = self._config.persistence
+        identity_launch = persistence.identity.launch if persistence is not None else None
+        record = SummaryRecord(
+            summary_id=str(uuid.uuid4()),
+            epoch_id=self._epoch_id or "",
+            context_generation=self._context_generation,
+            first_request_seq=plan.first_request_seq,
+            last_request_seq=plan.last_request_seq,
+            message_count=plan.message_count,
+            end_message_index=plan.end_index,
+            prefix_sha256=canonical_prefix_sha256(self._history[: plan.end_index]),
+            text=outcome.text,
+            provider=(
+                identity_launch.provider
+                if identity_launch is not None
+                else (self._config.model_label or "unknown")
+            ),
+            model=(
+                identity_launch.model
+                if identity_launch is not None
+                else (self._config.model_label or "unknown")
+            ),
+            prompt_version=SUMMARY_PROMPT_VERSION,
+            prompt_sha256=SUMMARY_PROMPT_SHA256,
+            metrics=outcome.metrics,
+            reason=reason,
+            created_at=time.time(),
+            previous_projection_identity=canonical_prefix_sha256(
+                self._context_projection.project(self._history)
+            ),
+        )
+        commit_task = asyncio.ensure_future(self._commit_summary_dispatch(record))
+        commit_cancelled = False
+        while True:
+            try:
+                await asyncio.shield(commit_task)
+                break
+            except asyncio.CancelledError:
+                # PA03: 派发后取消不取消事务; 重复取消也等明确结果
+                commit_cancelled = True
+            except CompactionSealedError:
+                # PA05: 封口先于接受 → 零写入; 归关闭取消, 旧投影不变,
+                # 不锁存 storage_failed, 迟到响应丢弃
+                return None
+            except PersistenceError as exc:
+                # 提交失败: 旧投影不变。锁存面与 begin 路径同一白名单 (审查
+                # 02-F12): 真实落盘故障才锁存 storage_failed; 关系冲突
+                # (代次/seq/重复) 是状态问题, 存储健康, 误锁存会不可逆拒绝
+                # 本进程后续请求
+                if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                    self._latch_storage_failed(str(exc))
                 raise RuntimeError(
-                    f"summary generation failed ({outcome.failure}); the model projection "
-                    "is unchanged" + (f": {outcome.detail}" if outcome.detail else "")
-                )
-            persistence = self._config.persistence
-            identity_launch = persistence.identity.launch if persistence is not None else None
-            record = SummaryRecord(
-                summary_id=str(uuid.uuid4()),
-                epoch_id=self._epoch_id or "",
-                context_generation=self._context_generation,
+                    "compaction failed to persist; the model projection is unchanged: "
+                    f"{exc}"
+                ) from exc
+        # 明确成功 → 切换投影 + 事件; 已被取消时先落定再传播 (PA03)
+        block = SummaryBlock(
+            message=summary_block_message(
                 first_request_seq=plan.first_request_seq,
                 last_request_seq=plan.last_request_seq,
                 message_count=plan.message_count,
-                end_message_index=plan.end_index,
-                prefix_sha256=canonical_prefix_sha256(self._history[: plan.end_index]),
-                text=outcome.text,
-                provider=(
-                    identity_launch.provider
-                    if identity_launch is not None
-                    else (self._config.model_label or "unknown")
-                ),
-                model=(
-                    identity_launch.model
-                    if identity_launch is not None
-                    else (self._config.model_label or "unknown")
-                ),
-                prompt_version=SUMMARY_PROMPT_VERSION,
-                prompt_sha256=SUMMARY_PROMPT_SHA256,
-                metrics=outcome.metrics,
-                reason="manual",
-                created_at=time.time(),
-                previous_projection_identity=canonical_prefix_sha256(
-                    self._context_projection.project(self._history)
-                ),
-            )
-            commit_task = asyncio.ensure_future(self._commit_summary_dispatch(record))
-            commit_cancelled = False
-            while True:
-                try:
-                    await asyncio.shield(commit_task)
-                    break
-                except asyncio.CancelledError:
-                    # PA03: 派发后取消不取消事务; 重复取消也等明确结果
-                    commit_cancelled = True
-                except CompactionSealedError:
-                    # PA05: 封口先于接受 → 零写入; 归关闭取消, 旧投影不变,
-                    # 不锁存 storage_failed, 迟到响应丢弃
-                    return None
-                except PersistenceError as exc:
-                    # 提交失败: 旧投影不变。锁存面与 begin 路径同一白名单 (审查
-                    # 02-F12): 真实落盘故障才锁存 storage_failed; 关系冲突
-                    # (代次/seq/重复) 是状态问题, 存储健康, 误锁存会不可逆拒绝
-                    # 本进程后续请求
-                    if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
-                        self._latch_storage_failed(str(exc))
-                    raise RuntimeError(
-                        "compaction failed to persist; the model projection is unchanged: "
-                        f"{exc}"
-                    ) from exc
-            # 明确成功 → 切换投影 + 事件; 已被取消时先落定再传播 (PA03)
-            block = SummaryBlock(
-                message=summary_block_message(
-                    first_request_seq=plan.first_request_seq,
-                    last_request_seq=plan.last_request_seq,
-                    message_count=plan.message_count,
-                    text=record.text,
-                ),
-                end_message_index=plan.end_index,
-                first_request_seq=plan.first_request_seq,
-                last_request_seq=plan.last_request_seq,
-                message_count=plan.message_count,
-                prefix_sha256=record.prefix_sha256,
-            )
-            self._context_projection.apply_summary(
-                block, canonical_length=len(self._history)
-            )
-            compacted = ContextCompacted(
-                summary_id=record.summary_id,
-                first_request_seq=record.first_request_seq,
-                last_request_seq=record.last_request_seq,
-                message_count=record.message_count,
-                end_message_index=record.end_message_index,
-                reason="manual",
-            )
-            self._notify(compacted)
-            if commit_cancelled:
-                raise asyncio.CancelledError()
-            return compacted
+                text=record.text,
+            ),
+            end_message_index=plan.end_index,
+            first_request_seq=plan.first_request_seq,
+            last_request_seq=plan.last_request_seq,
+            message_count=plan.message_count,
+            prefix_sha256=record.prefix_sha256,
+        )
+        self._context_projection.apply_summary(
+            block, canonical_length=len(self._history)
+        )
+        compacted = ContextCompacted(
+            summary_id=record.summary_id,
+            first_request_seq=record.first_request_seq,
+            last_request_seq=record.last_request_seq,
+            message_count=record.message_count,
+            end_message_index=record.end_message_index,
+            reason=reason,
+        )
+        self._notify(compacted)
+        if commit_cancelled:
+            raise asyncio.CancelledError()
+        return compacted
+
+    async def _auto_compact_for_request(self, quota: str) -> bool:
+        """自动压缩回调 (D7, 03): 准入自动尝试与 overflow 重试共用的应用侧实现.
+
+        属于已有 execute, 不重复获取会自锁的互斥 (execute 已排除并发
+        compact/clear; 本方法置位同一屏障供 close 监督与封口)。全部准入条件
+        (锁存/互斥/可压缩区间) 通过后才消费对应额度, 失败不返还; 成功返回
+        True (投影已切换, 调用方对有效投影重估), 其余返回 False, 压缩失败不
+        中断请求 (按原准入/重试路径收尾)。不发 OperationBusy: 自动属于请求
+        生命周期, UI 反馈随请求事件。
+        """
+        if self._store is None:
+            return False
+        policy = self._budget_policy
+        if policy is None or self._config.budget is None or policy.summarize_channel is None:
+            return False
+        if self._closing or self._closed or self._compact_sealed:
+            return False
+        if self._compacting or self._clearing:
+            return False
+        if self._view_only_reason is not None:
+            # 两种锁存状态下零摘要调用 (D9): view-only 不把历史发往模型
+            return False
+        if self._storage_failed is not None:
+            # storage_failed 锁存 (含请求中途由活动包装器锁存): 零摘要调用
+            return False
+        try:
+            plan = self._compaction_plan()
+        except RuntimeError:
+            return False
+        if quota == "admission":
+            if not policy.try_consume_admission_auto_attempt():
+                return False
+        elif quota == "overflow":
+            if not policy.try_consume_overflow_retry():
+                return False
+        else:
+            raise ValueError(f"unknown auto-compaction quota: {quota!r}")
+        token = self._cancel_token
+        assert token is not None, "auto compaction belongs to an execute attempt"
+        self._compacting = True
+        self._compact_done = asyncio.get_running_loop().create_future()
+        self._compact_token = token
+        try:
+            compacted = await self._run_compaction(plan, reason="auto", cancel_token=token)
+            return compacted is not None
+        except RuntimeError:
+            # 摘要失败/提交失败: 投影不变; 真实落盘故障已在 _run_compaction 锁存
+            return False
         finally:
             self._compacting = False
             self._compact_token = None
@@ -1602,6 +1695,11 @@ async def open_application(
             budget_config,
             # D5: 摘要通道注入同一无状态适配器实例; 仅持久会话可压缩 (D9)
             summarize=model if store is not None else None,
+            # 03/D7: overflow 分类器只接 ollama 形态的适配器——分类按上游
+            # 版本化错误文本形态匹配, 其他适配器接线属误配 (不匹配即不重试)
+            classify_overflow=(
+                classify_context_overflow if isinstance(model, OllamaModel) else None
+            ),
             projection=context_projection,
         )
         policy_state["budget_policy"] = budget
@@ -1750,6 +1848,11 @@ async def open_application(
                 budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
                 context_projection=context_projection,
             )
+            # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
+            # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
+            _wired = policy_state.get("budget_policy")
+            if _wired is not None:
+                _wired.set_auto_compact(session._auto_compact_for_request)
             coordinator.bind(session)
         except ApplicationOpenError:
             await app.aclose()
