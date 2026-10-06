@@ -21,6 +21,7 @@ from test_conversation_view import (
 )
 
 from cicada.application import PersistenceConfig, open_application
+from cicada.budget import BudgetConfig
 from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.persistence.contracts import LaunchIdentity
 
@@ -177,6 +178,61 @@ async def test_status_persistence_section_after_save(tmp_path):
     finally:
         await session.aclose()
         harness.close()
+
+
+async def test_compacted_session_restore_shows_boundary_and_rebuilds_summary_facts(tmp_path):
+    """04/A12: 压缩后保存→恢复: 原始消息仍成条 + 压缩边界程序条目 +
+    摘要计量/压缩事实从摘要记录一次重建 (不随显示重复累计)."""
+    root = _repo(tmp_path)
+    script = _script(
+        {"text": "答一", "stop": True},
+        {"text": "答二", "stop": True},
+        {"text": "较早请求的摘要正文", "stop": True},  # 摘要通道复用同一 fake 适配器
+    )
+    session = await open_application(dc_replace(
+        _persistence_config(root, script, session_id=None),
+        budget=BudgetConfig(num_ctx=1_000_000, num_predict=2048),
+    ))
+    harness = Harness(session)
+    try:
+        session_id = session.persistence.session_id
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+        assert harness.submit("第二问")
+        await harness.wait_request_done()
+        assert harness.submit("/compact")
+        assert await _wait_until(lambda: not harness.view._gate.compacting)
+        assert len(session.summary_records) == 1
+        coverage = (
+            session.summary_records[0].first_request_seq,
+            session.summary_records[0].last_request_seq,
+        )
+    finally:
+        await session.aclose()
+        harness.close()
+
+    resumed_session = await open_application(dc_replace(
+        _persistence_config(root, _script(), session_id=session_id),
+        budget=BudgetConfig(num_ctx=1_000_000, num_predict=2048),
+    ))
+    resumed = Harness(resumed_session)
+    try:
+        rendered = strip_terminal_sequences(chr(10).join(resumed.lines(90)))
+        assert f"覆盖 seq {coverage[0]}..{coverage[1]}" in rendered
+        assert "压缩边界" in rendered
+        assert "模型所见为该摘要而非本段原文" in rendered
+        for text in ("第一问", "答一", "第二问", "答二"):
+            assert text in rendered, "原始消息全部仍成条, 不清空不隐藏"
+        records = resumed_session.summary_records
+        assert len(records) == 1, "恢复重建摘要事实"
+        assert records[0].last_request_seq == resumed_session.restored_requests[0].seq
+        assert resumed.submit("/status")
+        status = strip_terminal_sequences(chr(10).join(resumed.lines(90)))
+        assert "压缩: 1 次 · 最近原因 manual" in status
+        assert "摘要计量: 1 次 · 累计输入 不可得" in status, "记录 None 计量如实不可得"
+    finally:
+        await resumed_session.aclose()
+        resumed.close()
 
 
 async def test_clear_failure_shows_error_and_releases_barrier(tmp_path, monkeypatch):

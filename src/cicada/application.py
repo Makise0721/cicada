@@ -398,6 +398,7 @@ class ApplicationSession:
         restored_context_generation: int = 0,
         restored_interrupted: tuple[InterruptedRequest, ...] = (),
         restored_receipts: tuple[StoredReceipt, ...] = (),
+        restored_summaries: tuple[SummaryRecord, ...] = (),
         view_only_reason: str | None = None,
         projection: HistoricalProjection | None = None,
         budget_policy: BudgetPolicy | None = None,
@@ -425,6 +426,10 @@ class ApplicationSession:
         self._projection = projection                    # 前缀证明容器; 清空成功后重置 (03)
         self._restored_receipts = restored_receipts
         self._persisted_receipt_ids = {r.receipt_id for r in restored_receipts}
+        # 04: 恢复的当前代次摘要记录 (store 恢复视图同口径) + 本进程已提交记录;
+        # 只读出口 summary_records 供显示摘要计量/压缩事实与 05 校准取数
+        self._restored_summaries = restored_summaries
+        self._summary_records: list[SummaryRecord] = []
         self._context_generation = restored_context_generation
         self._request_id: str | None = None
         self._saved_request_count = 0
@@ -537,6 +542,25 @@ class ApplicationSession:
         if self._budget_policy is None:
             return None
         return self._budget_policy.snapshot()
+
+    @property
+    def summary_records(self) -> tuple[SummaryRecord, ...]:
+        """当前代次的已提交摘要记录 (04 显示/摘要计量出口; 05 校准机器取数).
+
+        恢复的当前代次记录在前、本进程已提交记录按提交序在后; clear 推进代次后
+        旧代次记录退出视图 (与 store 恢复视图同一口径, 存档留底不受影响)。
+        摘要计量/压缩次数/最近原因/保留边界据此派生, 不另设累计器。
+        """
+        generation = self._context_generation
+        restored = tuple(
+            record for record in self._restored_summaries
+            if record.context_generation == generation
+        )
+        committed = tuple(
+            record for record in self._summary_records
+            if record.context_generation == generation
+        )
+        return restored + committed
 
     def latch_storage_failure(self, detail: str) -> None:
         """活动包装器等生产者的公开锁存入口; 幂等, 首次失败固定原因."""
@@ -1123,8 +1147,9 @@ class ApplicationSession:
                 f"summary generation failed ({outcome.failure}); the model projection "
                 "is unchanged" + (f": {outcome.detail}" if outcome.detail else "")
             )
-        persistence = self._config.persistence
-        identity_launch = persistence.identity.launch if persistence is not None else None
+        # D6: 摘要模型身份取启动层有效身份 (PersistenceConfig.identity 本就是
+        # LaunchIdentity; 审查修复: 此前误取 .launch 使真实持久组合的压缩必失败)
+        identity_launch = self._config.persistence.identity if self._config.persistence is not None else None
         record = SummaryRecord(
             summary_id=str(uuid.uuid4()),
             epoch_id=self._epoch_id or "",
@@ -1179,6 +1204,8 @@ class ApplicationSession:
                     f"{exc}"
                 ) from exc
         # 明确成功 → 切换投影 + 事件; 已被取消时先落定再传播 (PA03)
+        # 04: store 已接受即已提交摘要事实, 进入只读出口 (摘要计量/压缩次数取数)
+        self._summary_records.append(record)
         block = SummaryBlock(
             message=summary_block_message(
                 first_request_seq=plan.first_request_seq,
@@ -1843,6 +1870,7 @@ async def open_application(
                 restored_context_generation=snapshot.context_generation,
                 restored_interrupted=snapshot.interrupted,
                 restored_receipts=snapshot.restored_receipts,
+                restored_summaries=snapshot.summaries,
                 view_only_reason=view_only_reason,
                 projection=history_projection,
                 budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]

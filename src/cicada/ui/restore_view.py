@@ -1,4 +1,4 @@
-"""恢复历史的只读显示投影 (票据 05; 契约 §7).
+"""恢复历史的只读显示投影 (票据 05; 契约 §7; 04 补压缩边界条目).
 
 从 ApplicationSession 的只读恢复事实 (restored_requests/restored_interrupted)
 直接重建显示文档条目: 不调用 execute、不重新发布 ToolStarted/ToolCompleted、
@@ -7,19 +7,39 @@
 call_id 不碰撞 (A13); 历史计量经 transcript.add_metrics 一次重建, None 保持
 不可得; 历史失败只成显示条目, 不冒充本进程最后请求 (退出码仍由本进程
 RequestCompleted 决定)。
+
+04 (A12): 压缩边界插入程序条目——当前代次摘要记录覆盖的请求序列末尾处,
+声明覆盖范围与"模型所见为该摘要而非本段原文"语义, 附代次/时间/原因事实;
+原始消息全部仍成条, 不清空不隐藏。摘要调用计量不进累计计量 (与显示重建
+分开, 由 /status 摘要段从摘要记录派生)。
 """
 
 from __future__ import annotations
 
+import time
+
 from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage, UserMessage
-from cicada.persistence.contracts import InterruptedRequest, RestoredRequest
+from cicada.persistence.contracts import InterruptedRequest, RestoredRequest, SummaryRecord
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
 
 RESTORED_RUN_PREFIX = "restored"
 CLEAR_BOUNDARY_TEXT = "（此处历史上已清空上下文）"
+COMPACT_BOUNDARY_HEAD = "── 压缩边界"
 INTERRUPTED_PROMPT_MAX_CHARS = 80
 _HISTORICAL_CHECK_NOTE = "历史检查回执 {receipt}（运行 {run}）· 不适用于当前验证运行"
+
+
+def _compaction_boundary_text(record: SummaryRecord) -> str:
+    """压缩边界程序条目 (04/A12): 覆盖范围 + 模型所见语义 + 时间/代次/原因事实."""
+    committed = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(record.created_at))
+    return (
+        f"{COMPACT_BOUNDARY_HEAD} · 覆盖 seq {record.first_request_seq}.."
+        f"{record.last_request_seq}（{record.message_count} 条消息）──\n"
+        "此处之前的较早内容已摘要：恢复后模型所见为该摘要而非本段原文；"
+        "原始记录保留可回看。\n"
+        f"代次 {record.context_generation} · 摘要提交于 {committed} · 原因 {record.reason}"
+    )
 
 
 def project_restored_history(
@@ -28,20 +48,32 @@ def project_restored_history(
     *,
     requests: tuple[RestoredRequest, ...],
     interrupted: tuple[InterruptedRequest, ...],
+    summaries: tuple[SummaryRecord, ...] = (),
 ) -> None:
-    """把恢复快照投影进显示文档; 无恢复事实时不产生任何条目。"""
+    """把恢复快照投影进显示文档; 无恢复事实时不产生任何条目.
+
+    summaries 是当前代次的已提交摘要记录 (调用方保证与投影口径一致, 见
+    ApplicationSession.summary_records); 边界条目插在其覆盖的末请求之后。
+    """
     if not requests and not interrupted:
         return
     header = f"已恢复历史：{len(requests)} 条请求"
     if interrupted:
         header += f"，{len(interrupted)} 条未完成"
     transcript.append_system(header)
+    boundaries: dict[tuple[int, int], list[SummaryRecord]] = {}
+    for record in summaries:
+        boundaries.setdefault(
+            (record.context_generation, record.last_request_seq), []
+        ).append(record)
     last_generation: int | None = None
     for request in requests:
         if last_generation is not None and request.context_generation != last_generation:
             transcript.append_system(CLEAR_BOUNDARY_TEXT)
         last_generation = request.context_generation
         _project_request(transcript, tools, request)
+        for record in boundaries.get((request.context_generation, request.seq), ()):
+            transcript.append_system(_compaction_boundary_text(record))
     for item in interrupted:
         prompt = item.prompt if len(item.prompt) <= INTERRUPTED_PROMPT_MAX_CHARS else (
             item.prompt[: INTERRUPTED_PROMPT_MAX_CHARS - 1] + "…"
@@ -136,4 +168,9 @@ def _add_tool_card(
     transcript.add_entry(ToolCardEntry(tools, index))
 
 
-__all__ = ["CLEAR_BOUNDARY_TEXT", "RESTORED_RUN_PREFIX", "project_restored_history"]
+__all__ = [
+    "CLEAR_BOUNDARY_TEXT",
+    "COMPACT_BOUNDARY_HEAD",
+    "RESTORED_RUN_PREFIX",
+    "project_restored_history",
+]

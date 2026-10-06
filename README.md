@@ -32,7 +32,7 @@ uv run --frozen python -m cicada --workspace .\sandbox --script .\demo-script.js
 
 ## 带指定检查的编码任务
 
-`--check-command`（可重复，最多 8 条）固定"必须通过什么检查"：模型只能用 `check` 工具运行启动者声明的命令，不能替换命令或超时。程序独立维护验证事实——基线快照、检查回执（最近一次尝试取代旧 PASS，任何文件变化使旧回执过时）、独立变更证据——并给出交付判定：全部条件满足退出码 `0`；模型正常 stop 但条件不满足为 `3`，不依赖模型自然语言汇报。超时/取消/输出未 EOF 永久锁存 `process_uncertain`，后续新 PASS 不能清除。检查模式要求 `--workspace` 是 Git 工作树根目录，最多 25 轮。
+`--check-command`（可重复，最多 8 条）固定"必须通过什么检查"：模型只能用 `check` 工具运行启动者声明的命令，不能替换命令或超时。程序独立维护验证事实——基线快照、检查回执（最近一次尝试取代旧 PASS，任何文件变化使旧回执过时）、独立变更证据——并给出交付判定：全部条件满足退出码 `0`；模型正常 stop 但条件不满足为 `3`，不依赖模型自然语言汇报。超时/取消/输出未 EOF 永久锁存 `process_uncertain`，后续新 PASS 不能清除。检查模式要求 `--workspace` 是 Git 工作树根目录、`--num-ctx` ≥ 32768，最多 25 轮；单次请求体另受 65536 字节上限（wire 字节守卫，独立于 token 预算）。
 
 ```powershell
 uv run --frozen python -m cicada --workspace .\repo --check-command 'python check.py' '修复失败的测试并通过检查'
@@ -54,12 +54,16 @@ uv run --frozen python -m cicada --tui --workspace .\sandbox
 - `--list-sessions` 只读分页列表，无需模型探测；标注占用/恢复阻断/坏档。
 - 恢复的会话存在未证终结进程活动时为 view-only：新请求零执行，TUI 无新请求关闭后退出码 3。两个进程不能同时续写同一会话（Windows 文件锁独占）。
 
+## 发送预算与上下文压缩
+
+真实模型（Ollama）发送前做预算准入：完整输入按启发式估计（非精确 token），超过有效 `--num-ctx`（请求值）即拒绝发送并说明原因；`max_request_bytes`（检查模式固定 65536）是独立的请求体字节守卫，不充当 token 预算。持久会话可用 `/compact` 手动压缩较早请求（原始记录保留）；请求超限时先自动压缩至多一次再重估，服务端确认上下文超限且该次无可见输出时压缩后重发至多一次。非持久会话只有预算准入，无压缩。
+
 ## 常用参数
 
 | 参数 | 说明 |
 |---|---|
 | `--workspace` | 工作区根目录，默认当前目录 |
-| `--model` / `--ollama-url` / `--think` / `--num-ctx` | 模型与服务配置；`--num-ctx` 默认 32768（请求级，非分配保证） |
+| `--model` / `--ollama-url` / `--think` / `--num-ctx` | 模型与服务配置；`--num-ctx` 默认 32768（请求级，非分配保证），也是真实模型发送前预算准入的上限来源 |
 | `--instructions-file` | 追加到系统提示的项目指令文件（≤16 KiB UTF-8） |
 | `--script` | JSON 剧本文件；与真实模型参数互斥 |
 | `--check-command` / `--check-timeout` | 检查模式；timeout 默认 120 秒，范围 (0, 300] |
@@ -80,4 +84,4 @@ uv run --frozen python -m pytest -q                  # 完整套件
 
 ## 当前范围
 
-工具顺序执行；普通模式最多 50 轮、检查模式最多 25 轮模型循环。尚未提供精确 token 预算、上下文压缩或插件热替换。扩展：新模型实现 `ModelPort`、新工具实现 `Tool`（[src/cicada/core/ports.py](src/cicada/core/ports.py)），经 [PluginDefinition](src/cicada/runtime/plugin.py) 声明依赖后由 [boot.py](src/cicada/boot.py) 装配。
+工具顺序执行；普通模式最多 50 轮、检查模式最多 25 轮模型循环。预算估计为启发式（无精确 tokenizer），尚未提供插件热替换。扩展：新模型实现 `ModelPort`、新工具实现 `Tool`（[src/cicada/core/ports.py](src/cicada/core/ports.py)），经 [PluginDefinition](src/cicada/runtime/plugin.py) 声明依赖后由 [boot.py](src/cicada/boot.py) 装配。

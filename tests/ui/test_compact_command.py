@@ -20,6 +20,8 @@ from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
 from cicada.persistence.contracts import LaunchIdentity, StoredIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.session_store import open_session_store
+from cicada.ui.commands import SLASH_COMMANDS
+from cicada.ui.main_screen import strip_terminal_sequences
 
 
 def _identity() -> LaunchIdentity:
@@ -178,6 +180,23 @@ async def test_compact_guidance_for_non_persistent_and_no_budget(tmp_path):
         await session2.aclose()
         if store2 is not None:
             await store2.aclose()
+
+
+async def test_help_and_menu_list_compact_with_accurate_description(tmp_path):
+    """04: /help 与斜线菜单含 /compact, 描述与实际准入行为一致 (需持久会话)."""
+    assert any(
+        item.command == "/compact" and "持久会话" in item.description
+        for item in SLASH_COMMANDS
+    )
+    session, _m, _c, _s = await _manual_session(tmp_path, script=[[StreamDone("stop")]])
+    harness = Harness(session)
+    try:
+        assert harness.submit("/help")
+        rendered = strip_terminal_sequences(chr(10).join(harness.lines(90)))
+        assert "/compact" in rendered
+        assert "摘要较早对话以释放上下文（需持久会话）" in rendered
+    finally:
+        await session.aclose()
 
 
 async def test_compact_failure_shows_error_and_releases_barrier(tmp_path):
