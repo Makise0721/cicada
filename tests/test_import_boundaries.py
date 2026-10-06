@@ -11,6 +11,11 @@ FORBIDDEN = {
     "plugins": {"cicada.boot"},
     # 纯持久化契约 (会话保存恢复 v1): 只依赖内核类型, 不执行 SQL, 不碰插件/boot
     "persistence": {"cicada.runtime", "cicada.plugins", "cicada.boot"},
+    # 中立预算契约 (上下文预算 01): 只依赖内核类型, 不碰契约层/插件/启动
+    "budget": {"cicada.persistence", "cicada.runtime", "cicada.plugins", "cicada.boot"},
+    # 应用层预算策略 (01): 摘要通道/overflow 分类器经构造注入, 接线在应用层,
+    # 本模块不得导入 plugins; persistence 依赖留给 02 的提交协议
+    "context_policy": {"cicada.plugins", "cicada.boot"},
 }
 
 
@@ -47,10 +52,19 @@ def imports_of(path: Path) -> set[str]:
     return module_imports(path.read_text(encoding="utf-8"), package)
 
 
+def _layer_files(layer: str) -> list[Path]:
+    """层可以是包目录 (core/) 或顶层模块 (budget.py); 两者都纳入边界检查."""
+    target = SRC / layer
+    if target.is_dir():
+        return sorted(target.rglob("*.py"))
+    module = SRC / f"{layer}.py"
+    return [module] if module.exists() else []
+
+
 def layer_violations() -> list[str]:
     offenders = []
     for layer, banned in FORBIDDEN.items():
-        for file in sorted((SRC / layer).rglob("*.py")):
+        for file in _layer_files(layer):
             for module in imports_of(file):
                 root = ".".join(module.split(".")[:2])
                 if root in banned:
