@@ -26,6 +26,7 @@ from cicada.budget import BudgetConfig
 from cicada.context_policy import (
     BudgetPolicy,
     ContextProjection,
+    SUMMARY_TURN_TEXT,
     canonical_prefix_sha256,
     summary_block_message,
 )
@@ -151,7 +152,14 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
         record = snapshot.summaries[0]
         assert record.reason == "manual"
         assert record.metrics is not None and record.metrics.input_tokens == 9
-        assert record.prompt_version == "1" and len(record.prompt_sha256) == 64
+        assert record.prompt_version == "2" and len(record.prompt_sha256) == 64
+        # 摘要请求整形 (05 收口修正): 末尾是固定 user 指令, 不以 assistant 结尾;
+        # 覆盖范围仍只数规范历史消息, 追加的整形消息不入档
+        summary_request = summary_channel.requests[-1]
+        assert summary_request.messages[-1].role == "user"
+        assert summary_request.messages[-1].text == SUMMARY_TURN_TEXT
+        assert summary_request.messages[:-1] == history_before[:2]
+        assert compacted.message_count == 2
         # 前一投影身份 = 切换前的恒等投影 (完整规范历史) 指纹
         assert record.previous_projection_identity == canonical_prefix_sha256(history_before)
         # 投影切换: 有效消息 = [摘要块] + 保留后缀; 结构合法 (切点不切工具组)
@@ -252,7 +260,7 @@ async def test_compaction_refusals_view_only_storage_failed_and_no_channel(tmp_p
 async def test_compaction_shrinks_range_to_fit_summary_budget(tmp_path):
     """摘要输入自身须满足预算: 最长最旧前缀区间; 收缩从新端开始 (D4)."""
     from cicada.budget import assemble_report, estimate_input_components
-    from cicada.context_policy import summary_prompt_text
+    from cicada.context_policy import summary_input_messages, summary_prompt_text
 
     # 三个请求; num_ctx 卡在"覆盖前两个请求装不下、单个请求可装"的窗口内
     canonical_two = (
@@ -262,7 +270,7 @@ async def test_compaction_shrinks_range_to_fit_summary_budget(tmp_path):
 
     def _total(messages):
         input_estimate, _components = estimate_input_components(
-            summary_prompt_text(), (), messages, _budget(1)
+            summary_prompt_text(), (), summary_input_messages(messages), _budget(1)
         )
         return input_estimate + 2048 + max(256, math.ceil(0.10 * input_estimate))
 

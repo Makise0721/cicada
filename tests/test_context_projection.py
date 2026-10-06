@@ -130,9 +130,22 @@ def test_canonical_prefix_sha256_matches_canonical_encoding():
 
 
 def test_summary_prompt_is_versioned_and_stable():
-    assert SUMMARY_PROMPT_VERSION == "1"
+    assert SUMMARY_PROMPT_VERSION == "2"  # v2: 请求末尾追加固定 user 指令 (05 收口修正)
     assert len(SUMMARY_PROMPT_SHA256) == 64
     assert summary_prompt_text() == summary_prompt_text()
+
+
+def test_summary_input_messages_appends_fixed_user_turn():
+    """摘要请求整形 (05 收口修正): 对话切片以 assistant 结尾时模型立即终结
+    (实测 qwen3.5/ollama 0.20.7: stop + content 空 + eval_count=1)——固定 user
+    结尾保证摘要请求有生成起点; 追加消息不属规范历史 (调用方不计覆盖范围)."""
+    from cicada.context_policy import SUMMARY_TURN_TEXT, summary_input_messages
+
+    slice_messages = (UserMessage(text="问"), AssistantMessage(text="答"))
+    shaped = summary_input_messages(slice_messages)
+    assert shaped[:2] == slice_messages, "原始切片逐位保留"
+    assert shaped[-1].role == "user" and shaped[-1].text == SUMMARY_TURN_TEXT
+    assert shaped == summary_input_messages(list(slice_messages)), "确定性输出"
 
 
 # --- 摘要生成协议 (D5) -------------------------------------------------------------------

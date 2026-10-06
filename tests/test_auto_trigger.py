@@ -37,6 +37,7 @@ from cicada.context_policy import (
     SummaryBlock,
     canonical_prefix_sha256,
     summary_block_message,
+    summary_input_messages,
     summary_prompt_text,
 )
 from cicada.core.cancel import CancelToken
@@ -602,7 +603,7 @@ def _window_config_auto() -> tuple[BudgetConfig, tuple, tuple]:
         first_request_seq=1, last_request_seq=1, message_count=len(req1),
         text="较早请求的摘要正文",
     )
-    summary_input = _app_total(summary_prompt_text(), req1, base)
+    summary_input = _app_total(summary_prompt_text(), summary_input_messages(req1), base)
     full = _app_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), base)
     assert summary_input < full, "摘要输入窗口必须窄于预估失败的完整请求"
     config = _config_for(summary_input + (full - summary_input) // 2)
@@ -637,7 +638,7 @@ def _window_config_per_turn() -> tuple[BudgetConfig, tuple, tuple]:
             is_error=True,
         )),
     )
-    summary_input = _app_total(summary_prompt_text(), req1, base)
+    summary_input = _app_total(summary_prompt_text(), summary_input_messages(req1), base)
     admitted = _app_total("test system prompt", (*req1, *req2, prompt), base)
     next_turn = _app_total("test system prompt", (*req1, *req2, prompt, *turn0), base)
     assert summary_input <= admitted < next_turn, "预估通过而下一轮超限的窗口必须存在"

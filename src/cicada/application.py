@@ -44,6 +44,7 @@ from cicada.context_policy import (
     canonical_prefix_sha256,
     generate_summary,
     summary_block_message,
+    summary_input_messages,
     summary_prompt_text,
 )
 from cicada.core.agent import RunResult
@@ -1344,7 +1345,9 @@ class ApplicationSession:
         summary_system = summary_prompt_text()
         chosen_span: tuple[int, int, int] | None = None
         for span in reversed(eligible):
-            range_messages = tuple(self._history[start : span[2]])
+            range_messages = summary_input_messages(
+                tuple(self._history[start : span[2]])
+            )
             input_estimate, components = estimate_input_components(
                 summary_system, (), range_messages, config
             )
@@ -1361,7 +1364,9 @@ class ApplicationSession:
                 "the summary request budget"
             )
         return _CompactionPlan(
-            messages=tuple(self._history[start : chosen_span[2]]),
+            messages=summary_input_messages(
+                tuple(self._history[start : chosen_span[2]])
+            ),
             first_request_seq=eligible[0][0],
             last_request_seq=chosen_span[0],
             message_count=chosen_span[2] - start,

@@ -65,7 +65,22 @@ from cicada.core.ports import (
 )
 from cicada.persistence.codec import CodecError, encode_messages
 
-SUMMARY_PROMPT_VERSION = "1"
+SUMMARY_PROMPT_VERSION = "2"  # v2: 摘要请求末尾追加固定 user 指令 (05 收口修正)
+
+# 摘要请求的结尾 user 指令 (summary_input_messages 追加): 对话切片以 assistant
+# 消息结尾时, 模板紧跟的生成提示使模型立即终结 (实测 qwen3.5/ollama 0.20.7:
+# stop + content 空 + eval_count=1, 人工核对 M2 复现)——固定 user 结尾保证摘要
+# 有生成起点。该消息是请求整形, 不属规范历史、不计入压缩覆盖范围。
+SUMMARY_TURN_TEXT = "以上是需要摘要的较早对话记录。请现在输出摘要正文。"
+
+
+def summary_input_messages(messages: Sequence[Message]) -> tuple[Message, ...]:
+    """摘要请求的完整输入 (D5): 原始对话切片 + 结尾固定 user 指令.
+
+    压缩计划的消息构造与摘要输入预算估计共用本函数, 保证估计面与实际发送
+    逐消息一致; 调用方 (generate_summary) 原样发送, 不再自行整形。
+    """
+    return tuple(messages) + (UserMessage(text=SUMMARY_TURN_TEXT),)
 
 # auto_compact 回调的额度种类: admission=准入自动压缩, overflow=overflow 重试压缩;
 # 两种额度独立, 同属本次 execute 状态 (D7)
