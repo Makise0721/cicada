@@ -7,15 +7,17 @@ StreamDone("error").error 文本。
 fixture 逐字段出处
 ------------------
 context-overflow-input-length.ndjson
-  - `{"error": "the input length exceeds the context length"}` (无 status 字段):
+  - `{"error": "the input length exceeds the context length", "status": 400}`:
     error 文本 = ollama v0.12.9 `runner/ollamarunner/runner.go:114`
     `var errorInputTooLong = errors.New("the input length exceeds the context length")`
     (llamarunner 同文 :104); runner 以 HTTP 400 纯文本回给 server
-    (`http.Error(w, err.Error(), http.StatusBadRequest)`, runner.go:857), server
-    ChatHandler 把 `err.Error()` 作为 NDJSON error 行转发 (`ch <- gin.H{"error":
-    err.Error()}`, server/routes.go)。ollama v0.35.1 `llm/llama_server.go:2550`
-    (normalizeEmbeddingError) 复用同一规范文案。错误行不带 status 字段是 v0.12.x
-    非 StatusError 转发分支的形态。
+    (`http.Error(w, err.Error(), http.StatusBadRequest)`, runner.go:857-858),
+    server 侧 `llm/server.go:1480-1486` 把 >=400 响应包成
+    `api.StatusError{StatusCode, ErrorMessage}`, ChatHandler 经
+    `errors.As(err, &serr)` 命中 StatusError 分支
+    (`ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}`,
+    server/routes.go:2196-2200) 写出带 status 的流式错误行。ollama v0.35.1
+    `llm/llama_server.go:2550` (normalizeEmbeddingError) 复用同一规范文案。
 context-overflow-prompt-longer.ndjson
   - `{"error": "the prompt is longer than the context length currently available "
     "to the model; shorten the prompt, adjust the context length in settings, or "
@@ -134,7 +136,7 @@ async def test_overflow_fixture_http_body_form_classifies_true(fixture: str):
         "ollama request failed: [Errno None] Cannot connect to host ollama.test:11434",
         # 超时 (httpx.TimeoutException 归一, model.py:53/68)
         "ollama request failed: The read operation timed out",
-        # 其他服务端错误: HTTP 500/404 与 runner 崩溃 (model.py:91 / llama_server.go:1773)
+        # 其他服务端错误: HTTP 500/404 与 runner 崩溃 (model.py:91 / v0.35.1 llama_server.go:1748-1750)
         "ollama http 500: backend failed",
         "ollama http 404: model 'qwen3.5:9b' not found",
         "ollama protocol error: model runner has unexpectedly stopped, this may be due to "
@@ -171,7 +173,7 @@ def test_fixture_bytes_match_annotated_error_field(fixture: str):
     expected = {
         "context-overflow-input-length": (
             "the input length exceeds the context length",
-            None,
+            400,
         ),
         "context-overflow-prompt-longer": (
             "the prompt is longer than the context length currently available to the "

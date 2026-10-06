@@ -10,9 +10,12 @@
 
 1. "the input length exceeds the context length"
    - ollama v0.12.9 runner/ollamarunner/runner.go:114
-     `var errorInputTooLong = errors.New("the input length exceeds the context length")`,
-     runner 回 400, server ChatHandler 把 err.Error() 作为 NDJSON error 行转发
-     (server/routes.go `ch <- gin.H{"error": err.Error()}`)。
+     `var errorInputTooLong = errors.New("the input length exceeds the context length")`;
+     runner 以 HTTP 400 纯文本回给 server (runner.go:857-858), server 把 >=400
+     响应包成 api.StatusError (llm/server.go:1480-1486), ChatHandler 经
+     errors.As 命中 StatusError 分支, 客户端收到带 status 的 NDJSON 错误行
+     (`ch <- gin.H{"error": serr.ErrorMessage, "status": serr.StatusCode}`,
+     server/routes.go:2196-2200)。
    - ollama v0.35.1 llm/llama_server.go:2550 (normalizeEmbeddingError) 复用同一
      规范文案, 并在 isEmbeddingInputLimitError 中把 llama.cpp 各上下文形态归一到它。
 

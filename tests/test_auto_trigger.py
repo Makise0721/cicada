@@ -376,6 +376,30 @@ async def test_transparent_resend_banned_after_any_output(prefix_events):
     assert done.stop_reason == "error" and OVERFLOW_ERROR in done.error, "保留原错误"
 
 
+async def test_prior_turn_output_does_not_block_retry():
+    """判定范围固定在该发送点: 先前轮次的可见输出不影响本轮零输出重试资格 (A10)."""
+    request, config = _server_overflow_request()
+    model = _CountingModel([
+        [TextDelta("轮 0 的可见输出"), StreamDone("stop")],
+        [StreamDone("error", OVERFLOW_ERROR)],
+        [StreamDone("stop")],
+    ])
+    policy = BudgetPolicy(
+        model, config,
+        classify_overflow=lambda text: "exceeds the available context size" in text,
+    )
+    stub = _AutoCompactStub(policy)
+    policy.set_auto_compact(stub)
+    policy.note_request_start(2)
+    first, _token = await _collect(policy, request)
+    assert _done(first).stop_reason == "stop"
+    second, _token = await _collect(policy, request)
+    assert stub.calls == ["overflow"], "先前轮次输出不泄漏进本轮判定"
+    dones = [event for event in second if isinstance(event, StreamDone)]
+    assert len(dones) == 1 and dones[0].stop_reason == "stop"
+    assert len(model.requests) == 3
+
+
 async def test_overflow_not_classified_passthrough_without_retry():
     """取消/网络/其他服务端错误形态: 原样发布, 不消费额度."""
     request, config = _server_overflow_request()
@@ -431,11 +455,33 @@ async def test_overflow_cancel_during_retry_compaction_ends_aborted():
     assert _done(events).stop_reason == "aborted"
 
 
-async def test_retry_success_considers_anchor_on_retried_request():
-    """重发成功的实测计量在重发请求上立锚 (D3: 基准=策略实际所见的投影后请求)."""
+async def test_overflow_without_classifier_keeps_original_error():
+    """未接分类器 (非 ollama 适配器): 分类形态的超限错误也原样发布, 不重试."""
     request, config = _server_overflow_request()
-    from cicada.core.ports import ModelMetrics
+    model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
+    policy = BudgetPolicy(model, config)  # classify_overflow=None
+    stub = _AutoCompactStub(policy)
+    policy.set_auto_compact(stub)
+    policy.note_request_start(2)
+    events, _token = await _collect(policy, request)
+    assert stub.calls == []
+    assert len(model.requests) == 1
+    done = _done(events)
+    assert done.stop_reason == "error" and OVERFLOW_ERROR in done.error
 
+
+async def test_retry_success_considers_anchor_on_retried_request():
+    """重发成功的实测计量在重发请求上立锚 (D3: 基准=策略实际所见的投影后请求).
+
+    原请求 3 条消息、投影后 2 条 (块覆盖前 2 条): 锚 message_count==2 只在
+    「锚基准=重发请求」时成立 (锚到原请求会是 3); 后继与重发请求逐位相同的
+    请求按 measured 估计, 行为面复核锚命中。
+    """
+    big = UserMessage(text="x" * 4000)
+    mid = UserMessage(text="y" * 100)
+    prompt = UserMessage(text="please")
+    request = ModelRequest(messages=(big, mid, prompt), tools=(), system_prompt="sys")
+    config = _budget()
     model = _CountingModel([
         [StreamDone("error", OVERFLOW_ERROR)],
         [StreamDone("stop", metrics=ModelMetrics(input_tokens=77, output_tokens=1))],
@@ -444,19 +490,38 @@ async def test_retry_success_considers_anchor_on_retried_request():
         model, config,
         classify_overflow=lambda text: "exceeds the available context size" in text,
     )
-    stub = _AutoCompactStub(policy)
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
+
+    async def auto_compact(quota: str) -> bool:
+        assert quota == "overflow"
+        assert policy.try_consume_overflow_retry()
+        block = SummaryBlock(
+            message=summary_block_message(
+                first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
+            ),
+            end_message_index=2,
+            first_request_seq=1, last_request_seq=1, message_count=2,
+            prefix_sha256=canonical_prefix_sha256((big, mid)),
+        )
+        policy.projection.apply_summary(block, canonical_length=3)
+        return True
+
+    policy.set_auto_compact(auto_compact)
+    policy.note_request_start(3)
     events, _token = await _collect(policy, request)
     assert _done(events).stop_reason == "stop"
+    assert len(model.requests) == 2
     anchor = policy.anchor
     assert anchor is not None and anchor.measured_input_tokens == 77
-    assert anchor.message_count == 2, "锚基准 = 投影后重发请求 (块 + 当前请求)"
+    assert anchor.message_count == 2, "锚基准 = 投影后重发请求 (块 + 当前请求); 原请求为 3 条"
+    # 后继请求 = 原始 3 条消息形态: 经投影替换后与重发请求逐位相同 → 命中重发锚
+    await _collect(policy, request)
+    assert policy.last_report is not None and policy.last_report.source == "measured", (
+        "与重发请求逐位相同的后继请求命中重发锚 (measured)"
+    )
 
 
 # --- §2 持久会话组合 (A09/A11 + PA03/PA05 复验) ----------------------------------------------
 
-from cicada.context_policy import summary_prompt_text as _summary_prompt  # noqa: E402
 
 
 class _ScriptedSummary:
@@ -491,6 +556,22 @@ class _GatedSummary:
         yield StreamDone("stop")
 
 
+class _LatchingModel(FakeModel):
+    """首个模型请求前锁存 storage_failed (模拟活动包装器请求中途锁存)."""
+
+    def __init__(self, script) -> None:
+        super().__init__(script)
+        self.session: ApplicationSession | None = None
+        self._latched = False
+
+    async def stream(self, request, cancel):
+        if self.session is not None and not self._latched:
+            self._latched = True
+            self.session.latch_storage_failure("activity write failed mid-request")
+        async for event in super().stream(request, cancel):
+            yield event
+
+
 def _app_total(system: str, messages, config: BudgetConfig) -> int:
     raw, _components = estimate_input_components(system, (), tuple(messages), config)
     return raw + config.effective_output_reserve + max(
@@ -521,7 +602,7 @@ def _window_config_auto() -> tuple[BudgetConfig, tuple, tuple]:
         first_request_seq=1, last_request_seq=1, message_count=len(req1),
         text="较早请求的摘要正文",
     )
-    summary_input = _app_total(_summary_prompt(), req1, base)
+    summary_input = _app_total(summary_prompt_text(), req1, base)
     full = _app_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), base)
     assert summary_input < full, "摘要输入窗口必须窄于预估失败的完整请求"
     config = _config_for(summary_input + (full - summary_input) // 2)
@@ -556,7 +637,7 @@ def _window_config_per_turn() -> tuple[BudgetConfig, tuple, tuple]:
             is_error=True,
         )),
     )
-    summary_input = _app_total(_summary_prompt(), req1, base)
+    summary_input = _app_total(summary_prompt_text(), req1, base)
     admitted = _app_total("test system prompt", (*req1, *req2, prompt), base)
     next_turn = _app_total("test system prompt", (*req1, *req2, prompt, *turn0), base)
     assert summary_input <= admitted < next_turn, "预估通过而下一轮超限的窗口必须存在"
@@ -587,7 +668,7 @@ async def _seed_committed_requests(session: ApplicationSession, store, req1: tup
 
 
 async def _auto_session(
-    tmp_path, *, script, channel, num_ctx: int, classifier=None,
+    tmp_path, *, script, channel, num_ctx: int, classifier=None, model=None,
 ):
     """持久会话 + 手动组装 (open_application 无法注入独立通道, 02 同型);
     与 open_application 一致地绑定自动压缩回调."""
@@ -595,7 +676,7 @@ async def _auto_session(
         directory=tmp_path / ".cicada" / "sessions", session_id=None, workspace=tmp_path
     )
     epoch_id = await store.start_epoch(StoredIdentity(launch=_identity(), tool_fingerprint="fp"))
-    main_model = FakeModel(script)
+    main_model = model if model is not None else FakeModel(script)
     config = ApplicationConfig(
         workspace=tmp_path,
         system_prompt="test system prompt",
@@ -674,7 +755,10 @@ async def test_pre_estimate_still_over_refuses_but_keeps_auto_summary(tmp_path):
     session, main_model, channel, store, policy = await _auto_session(
         tmp_path,
         script=[],
-        channel=_ScriptedSummary(text="太长的摘要正文" + "s" * 3000),  # 摘要块自身超限
+        channel=_ScriptedSummary(
+            text="太长的摘要正文" + "s" * 3000,  # 摘要块自身超限
+            metrics=ModelMetrics(input_tokens=9, output_tokens=2),
+        ),
         num_ctx=config_seed.num_ctx,
     )
     await _seed_committed_requests(session, store, req1, req2)
@@ -701,14 +785,17 @@ async def test_pre_estimate_still_over_refuses_but_keeps_auto_summary(tmp_path):
         # D7: 已调用摘要通道, 摘要记录与计量按实际事实保留
         assert len(snapshot.summaries) == 1
         assert snapshot.summaries[0].reason == "auto"
-        assert snapshot.summaries[0].metrics is None or True
+        assert snapshot.summaries[0].metrics is not None
+        assert snapshot.summaries[0].metrics.input_tokens == 9, "摘要计量随记录保留 (D7)"
         assert len(session._context_projection.blocks) == 1
         # C: 新 execute 范围, 准入额度重置 → 对新区间再次自动压缩 (第二次摘要调用)
         with pytest.raises(RuntimeError, match="context budget exceeded"):
             await session.execute("第五问")
         summaries = store.recovery_snapshot().summaries
         assert len(summaries) == 2, "C 有自己的准入额度"
-        assert summaries[1].first_request_seq == summaries[0].last_request_seq + 1 or True
+        # C 只追加更晚的新区间 (不重写旧摘要); 容器对区间连续性结构性校验
+        assert summaries[1].first_request_seq > summaries[0].last_request_seq
+        assert summaries[1].end_message_index > summaries[0].end_message_index
         assert len(session._context_projection.blocks) == 2
     finally:
         await session.aclose()
@@ -931,6 +1018,57 @@ async def test_operations_refused_while_auto_compaction_in_flight(tmp_path):
         channel.gate.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=10)
+    finally:
+        await session.aclose()
+        await store.aclose()
+
+
+async def test_mid_request_storage_failed_latch_blocks_auto_summary(tmp_path):
+    """请求中途锁存 storage_failed 后, 后续轮次准入失败零摘要调用, 按每轮口径
+    拒绝 (D9; 中途锁存入口 process_activity.latch_storage_failure 可达)."""
+    config_seed, req1, req2 = _window_config_per_turn()
+    model = _LatchingModel([_tool_turn()])
+    session, main_model, channel, store, policy = await _auto_session(
+        tmp_path, script=[_tool_turn()], channel=_ScriptedSummary(),
+        num_ctx=config_seed.num_ctx, model=model,
+    )
+    model.session = session
+    await _seed_committed_requests(session, store, req1, req2)
+    try:
+        outcome = await session.execute("第三问")
+        assert outcome.result.stop_reason == "error"
+        assert "context budget exceeded" in (outcome.result.error or "")
+        assert channel.requests == [], "storage_failed 锁存下零摘要调用"
+        assert len(main_model.requests) == 1, "轮 1 拒绝零发送"
+        assert session.persistence.storage_failed is not None
+        assert store.recovery_snapshot().summaries == ()
+    finally:
+        await session.aclose()
+        await store.aclose()
+
+
+async def test_latched_states_yield_zero_summary_calls_in_auto_callback(tmp_path):
+    """自动回调的条件顺序: 两种锁存状态直接返回 False 且零摘要调用, 额度不被
+    无谓消费; 锁存解除后同一额度仍可用并正常压缩 (A09 条件在消费之前)."""
+    config_seed, req1, req2 = _window_config_auto()
+    session, main_model, channel, store, policy = await _auto_session(
+        tmp_path, script=[], channel=_ScriptedSummary(), num_ctx=config_seed.num_ctx,
+    )
+    await _seed_committed_requests(session, store, req1, req2)
+    try:
+        session._view_only_reason = "restored session has unproven activity (probe)"
+        assert await session._auto_compact_for_request("admission") is False
+        assert channel.requests == []
+        session._view_only_reason = None
+        session.latch_storage_failure("store closed")
+        assert await session._auto_compact_for_request("admission") is False
+        assert channel.requests == []
+        session._storage_failed = None
+        # 直接探针不在 execute 内: 补一个请求 token 满足屏障归属断言
+        session._cancel_token = CancelToken()
+        assert await session._auto_compact_for_request("admission") is True
+        assert len(channel.requests) == 1
+        assert len(session._context_projection.blocks) == 1
     finally:
         await session.aclose()
         await store.aclose()
