@@ -67,6 +67,8 @@ from cicada.persistence.contracts import (
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
 from cicada.run_policy import (
     CONTROL_SECTION_MAX_BYTES,
+    FRESHNESS_MARKER_MAX_BYTES,
+    FRESHNESS_TOOLS,
     HistoricalPrefixProof,
     HistoricalProjection,
     PrefixEntry,
@@ -575,11 +577,12 @@ class ApplicationSession:
         self._cancel_token = token
         self._active_done = loop.create_future()
         self._notify(RequestPhaseChanged(None, "executing"))
-        if self._budget_policy is not None:
-            # 请求边界接缝 (D1): begin 成功之后、agent.run 之前每请求一次,
-            # 参数为调用时规范历史长度; 计数语义由 03 消费
-            self._budget_policy.note_request_start(len(self._history))
         try:
+            if self._budget_policy is not None:
+                # 请求边界接缝 (D1): begin 成功之后、agent.run 之前每请求一次,
+                # 参数为调用时规范历史长度; 计数语义由 03 消费。调用在 try 内:
+                # 接缝异常按请求异常路径收尾, 不悬挂 _active_done (审查 01-F11)
+                self._budget_policy.note_request_start(len(self._history))
             result = await self._app.agent.run(prompt, token, history=tuple(self._history))
             # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07);
             # closed 是终态, close 监督超时后的迟到完成不得改写它 (02-R-F1)
@@ -626,9 +629,12 @@ class ApplicationSession:
         return outcome
 
     def _request_tool_specs(self) -> tuple[ToolSpec, ...]:
-        """当前组装解析后的实际工具声明 (与 _tool_fingerprint 同一取数面)."""
-        tools = getattr(self._app.agent, "_tools", {})
-        return tuple(tool.spec for tool in tools.values())
+        """当前组装解析后的实际工具声明 (与 _tool_fingerprint 同一取数面).
+
+        直接访问 Agent._tools, 缺失即 AttributeError (fail-loud): 预估口静默
+        漏计工具 schema 会系统性低估 (审查 01-F1), 不做 getattr 缺省回退。
+        """
+        return tuple(tool.spec for tool in self._app.agent._tools.values())
 
     def _refuse_overbudget_request(self, prompt: str) -> None:
         """请求前预估准入 (D7 两道口之一): 超限在 begin_request 之前拒绝.
@@ -658,6 +664,24 @@ class ApplicationSession:
                 ),
             )
             input_estimate += allowance
+            # RunPolicy 还对每条 check/powershell 工具结果在投影中追加 freshness
+            # 标记 (单条上限 FRESHNESS_MARKER_MAX_BYTES 字节); 规范历史不含标记,
+            # 逐条按上限补足, 使预估成为投影后请求的保守上界 (审查 01-F9/F13)
+            fresh_count = sum(
+                1 for m in messages
+                if isinstance(m, ToolResultMessage) and m.result.name in FRESHNESS_TOOLS
+            )
+            if fresh_count:
+                fresh_allowance = fresh_count * math.ceil(FRESHNESS_MARKER_MAX_BYTES / 3)
+                components = components + (
+                    ComponentEstimate(
+                        "verification_freshness_allowance",
+                        fresh_allowance,
+                        "estimated",
+                        note="upper bound of per-result freshness markers appended before send",
+                    ),
+                )
+                input_estimate += fresh_allowance
         report = assemble_report(
             config, input_estimate=input_estimate, input_components=components, source="estimated"
         )

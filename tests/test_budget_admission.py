@@ -8,9 +8,11 @@ BudgetPolicy 每轮权威准入 (零发送 + 既有错误路径收尾 + 持久�
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
 from cicada.application import (
@@ -29,11 +31,13 @@ from cicada.budget import (
 )
 from cicada.context_policy import BudgetPolicy
 from cicada.core.messages import UserMessage
-from cicada.core.ports import ModelMetrics, StreamDone, ToolCallEvent
-from cicada.persistence.contracts import StoredIdentity
+from cicada.core.ports import ModelMetrics, ModelRequest, StreamDone, ToolCallEvent
+from cicada.persistence.contracts import StorageUnavailableError, StoredIdentity
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.plugins.ollama.model import OllamaModel
+from cicada.plugins.ollama.protocol import OllamaConfig
 from cicada.plugins.session_store import open_session_store
 
 from test_application import _prompt_info, _repo
@@ -43,7 +47,8 @@ STOP_WITH_METRICS = [StreamDone("stop", metrics=ModelMetrics(input_tokens=42, ou
 
 
 def _config(root: Path, model: FakeModel, *, budget: BudgetConfig | None = None,
-            plan: VerificationPlan | None = None) -> ApplicationConfig:
+            plan: VerificationPlan | None = None,
+            persistence: PersistenceConfig | None = None) -> ApplicationConfig:
     return ApplicationConfig(
         workspace=root,
         system_prompt="test system prompt",
@@ -52,6 +57,7 @@ def _config(root: Path, model: FakeModel, *, budget: BudgetConfig | None = None,
         plan=plan,
         max_turns=6,
         model_label="fake",
+        persistence=persistence,
         budget=budget,
     )
 
@@ -393,3 +399,133 @@ def test_budget_rejection_distinct_from_wire_byte_guard():
     assert "num_ctx" in text
     # wire 守卫是 adapter 级另一条信息 (ollama request too large ...), 不在预算文本中
     assert "ollama request too large" not in text
+
+
+# --- 审查处置 (01 独立审查 2026-10-06) --------------------------------------------------
+
+
+class _FailingBeginStore(_BeginSpyStore):
+    """begin_request 恒抛 StorageUnavailableError: 验证 storage_failed 锁存面."""
+
+    async def begin_request(self, epoch_id, prompt):
+        raise StorageUnavailableError("store closed")
+
+
+async def test_storage_failed_latch_precedes_budget_pre_estimate(tmp_path):
+    """锁存 storage_failed 的会话: 超大 prompt 仍先报 storage_failed, 不被预算文本覆盖 (01-F4)."""
+    model = FakeModel([])
+    config = _config(tmp_path, model, budget=_generous())
+    policy = BudgetPolicy(model, config.budget)
+    app = await bootstrap(
+        [fake_model_plugin(model)], tool_capabilities=(),
+        system_prompt="test system prompt", model_policy=lambda inner, runtime: policy,
+    )
+    session = ApplicationSession(
+        app=app, config=config, service=None, policy=None,
+        store=_FailingBeginStore(), epoch_id="epoch-1", persistence_mode="save",
+        budget_policy=policy,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="session save failed before the request started"):
+            await session.execute("q")
+        assert session.persistence.storage_failed is not None
+        # 锁存后即使超大 prompt 也走 storage_failed 门 (先于预算预估)
+        with pytest.raises(RuntimeError, match="storage_failed: earlier session save failed") as exc_info:
+            await session.execute("x" * 1_000_000)
+        assert "context budget" not in str(exc_info.value)
+        assert model.requests == []
+    finally:
+        await session.aclose()
+
+
+async def test_check_mode_per_turn_rejection_model_stopped_false(tmp_path):
+    """检查模式每轮准入拒绝: 既有错误路径收尾, 交付判定 model_stopped=False (A02, 01-F8/F12)."""
+    root = _repo(tmp_path)
+    (root / "big.txt").write_text("x" * 20_000, encoding="utf-8")
+    plan = _plan(root)
+    # 开一次 (不执行请求) 取实际工具声明, 据此精确算出请求前预估门槛
+    warm = await open_application(_config(root, FakeModel([]), budget=_generous(), plan=plan))
+    try:
+        tools = tuple(tool.spec for tool in warm._app.agent._tools.values())
+    finally:
+        await warm.aclose()
+    shape = BudgetConfig(num_ctx=1, num_predict=2048)
+    raw, _components = estimate_input_components(
+        "test system prompt", tools, (UserMessage(text="q"),), shape
+    )
+    input_pre = raw + math.ceil(4096 / 3)  # verification_control_allowance
+    threshold = input_pre + 2048 + max(256, math.ceil(0.10 * input_pre))
+    # num_ctx 恰在预估门槛之上: 预估与首轮都放行; 首轮 read 20KB 结果使次轮必超
+    model = FakeModel([
+        [ToolCallEvent(id="c1", name="read", arguments_json='{"path": "big.txt"}'),
+         StreamDone("tool_use")],
+    ])
+    session = await open_application(
+        _config(root, model, budget=BudgetConfig(num_ctx=threshold + 50, num_predict=2048), plan=plan)
+    )
+    try:
+        outcome = await session.execute("q")
+        assert outcome.result.stop_reason == "error"
+        assert "context budget exceeded" in outcome.result.error
+        assert len(model.requests) == 1, "次轮被拦, 适配器只见首轮请求"
+        assert outcome.decision is not None
+        assert outcome.decision.model_stopped is False, "预算拒绝不是模型 stop"
+        assert outcome.exit_code == 1
+    finally:
+        await session.aclose()
+
+
+async def test_restored_session_starts_without_anchor(tmp_path):
+    """恢复后首轮: 新策略实例无锚, 恢复首请求纯启发式 (A03 矩阵, 01-F7)."""
+    model1 = FakeModel([list(STOP_WITH_METRICS)])
+    config1 = _config(
+        tmp_path, model1, budget=_generous(),
+        persistence=PersistenceConfig(session_id=None, identity=_identity()),
+    )
+    session1 = await open_application(config1)
+    await session1.execute("q1")
+    assert session1.budget.anchor is not None
+    saved_id = session1.persistence.session_id
+    await session1.aclose()
+
+    model2 = FakeModel([[StreamDone("stop")]])
+    config2 = _config(
+        tmp_path, model2, budget=_generous(),
+        persistence=PersistenceConfig(session_id=saved_id, identity=_identity()),
+    )
+    session2 = await open_application(config2)
+    try:
+        assert session2.budget is not None
+        assert session2.budget.anchor is None, "恢复打开新策略实例, 不继承旧锚"
+        await session2.execute("q2")
+        assert session2.budget.report.source == "estimated", "恢复首请求无锚可用"
+    finally:
+        await session2.aclose()
+
+
+def _wire_model(limit: int | None) -> OllamaModel:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("transport must not be reached: guards fire before send")
+
+    config = OllamaConfig(base_url="http://test", model="m", max_request_bytes=limit)
+    return OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), config)
+
+
+async def test_budget_and_wire_guards_coexist_and_stay_distinct():
+    """预算启用组合下两道守卫共存且信息可区分 (A04, 01-F5): 预算在策略层, wire 在适配层."""
+    from cicada.core.cancel import CancelToken
+
+    request = ModelRequest(messages=(UserMessage(text="x" * 3000),), tools=(), system_prompt="sys")
+    token = CancelToken()
+
+    tight = BudgetPolicy(_wire_model(None), BudgetConfig(num_ctx=100, num_predict=1))
+    events = [event async for event in tight.stream(request, token)]
+    assert events[-1].stop_reason == "error"
+    assert events[-1].error is not None and "context budget exceeded" in events[-1].error
+    assert "ollama request too large" not in events[-1].error
+
+    loose = BudgetPolicy(_wire_model(10), BudgetConfig(num_ctx=1_000_000, num_predict=1))
+    events = [event async for event in loose.stream(request, token)]
+    assert events[-1].stop_reason == "error"
+    assert events[-1].error is not None and events[-1].error.startswith("ollama request too large")
+    assert "context budget" not in events[-1].error
