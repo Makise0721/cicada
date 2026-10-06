@@ -9,7 +9,7 @@ session.summary_records。
 
 from __future__ import annotations
 
-from test_compact_command import _manual_session
+from test_compact_command import _ScriptedSummary, _manual_session
 from test_conversation_view import Harness, _wait_until
 
 from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
@@ -26,6 +26,11 @@ def _status_render(harness: Harness, width: int = 90) -> str:
 def _status_sections(harness: Harness) -> list[tuple[str, list[str]]]:
     entries = [e for e in harness.entries() if isinstance(e, InformationEntry)]
     return entries[-1].sections
+
+
+def _status_rows(harness: Harness) -> list[str]:
+    """最新一次 /status 的事实行 (显示文档保留历史条目, 整页渲染会含旧状态页)."""
+    return [row for _, rows in _status_sections(harness) for row in rows]
 
 
 async def _wait_compact_settled(harness: Harness) -> bool:
@@ -69,7 +74,7 @@ async def test_status_budget_before_first_request_and_empty_compaction_facts(tmp
         rendered = _status_render(harness)
         assert "预算: 上限 1000000 · 占用估计不可得（本进程尚未发送请求）" in rendered
         assert "压缩: 0 次 · 摘要边界: 无（未压缩）" in rendered
-        assert "摘要计量: 不可得（本代次尚无摘要调用）" in rendered
+        assert "摘要计量: 不可得（本代次尚无已提交摘要）" in rendered
         # 占用 (当前窗口) 与 计量 (跨调用累计) 分行分区, 文字不混用
         assert "占用估计" in rendered and "计量: " in rendered
         assert session.budget is not None, "预算快照机器出口可用"
@@ -145,6 +150,59 @@ async def test_status_summary_metrics_single_listed_after_manual_compact(tmp_pat
         assert len(records) == 1 and records[0].reason == "manual"
         assert records[0].metrics is not None
         assert records[0].metrics.provider_duration_s == 1.5
+    finally:
+        await session.aclose()
+        if store is not None:
+            await store.aclose()
+
+
+async def test_status_budget_stale_after_clear_labeled_until_next_request(tmp_path):
+    """审查 04-F1: /clear 后预算段如实标注旧代次时效, 下一请求执行后恢复当前口径."""
+    script = [
+        [TextDelta("答一"), StreamDone("stop", metrics=ModelMetrics(input_tokens=500, output_tokens=10))],
+        [TextDelta("答二"), StreamDone("stop", metrics=ModelMetrics(input_tokens=640, output_tokens=10))],
+    ]
+    session, _m, _c, store = await _manual_session(tmp_path, script=script)
+    harness = Harness(session)
+    try:
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+        assert harness.submit("/status")
+        assert "提示:" not in " ".join(_status_rows(harness)), "正常窗口无时效标注"
+        assert harness.submit("/clear")
+        assert await _wait_until(lambda: not harness.view._gate.clearing), "清空落定"
+        assert harness.submit("/status")
+        rows = " ".join(_status_rows(harness))
+        assert "提示: /clear 后尚无新请求，以下为清空前旧代次的最后估计" in rows
+        assert "占用估计" in rows, "旧估计保留显示但已被标注"
+        assert "压缩: 0 次" in rows, "与同页摘要段一致"
+        assert harness.submit("第二问")
+        await harness.wait_request_done()
+        assert harness.submit("/status")
+        assert "提示:" not in " ".join(_status_rows(harness)), "新请求后按当前代次重估"
+    finally:
+        await session.aclose()
+        if store is not None:
+            await store.aclose()
+
+
+async def test_status_summary_duration_unknown_without_unit(tmp_path):
+    """审查 04-F2: 摘要计量字段全缺时显示'不可得', 单位不拼在'不可得'之后."""
+    session, _m, _c, store = await _manual_session(
+        tmp_path, script=[[StreamDone("stop")], [StreamDone("stop")]],
+        channel=_ScriptedSummary(),  # metrics 无 provider_duration_s
+    )
+    harness = Harness(session)
+    try:
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+        assert harness.submit("第二问")
+        await harness.wait_request_done()
+        assert harness.submit("/compact")
+        assert await _wait_compact_settled(harness)
+        rendered = _status_render(harness)
+        assert "累计输入 9 · 累计输出 2 · 累计时长 不可得" in rendered
+        assert "不可得s" not in rendered
     finally:
         await session.aclose()
         if store is not None:

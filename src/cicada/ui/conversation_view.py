@@ -99,6 +99,9 @@ class ConversationView:
         self._checks = CheckProjection(session)
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
+        # 04 (审查 04-F1): /clear 后到下一请求执行前, 预算快照仍是旧代次的最后
+        # 估计 (clear 不触碰 budget policy); 置位时 /status 预算段如实标注时效
+        self._budget_stale = False
         # 票据 05: 建立订阅前注入只读恢复显示; 查看状态原因如实成条。
         # 04: 预算启用时传当前代次摘要记录 (压缩边界程序条目); 未启用时模型
         # 看到完整原文, 不得声称"模型所见为摘要"
@@ -141,6 +144,9 @@ class ConversationView:
         elif isinstance(update, RequestPhaseChanged):
             self._checks.note_phase(update.run_id, update.phase)
             self._gate.note_phase(update.phase)
+            if update.phase == "executing":
+                # 04 (审查 04-F1): 新请求已开始执行, 预算段随后按当前请求重估
+                self._budget_stale = False
         elif isinstance(update, RequestCompleted):
             outcome = update.outcome
             self.transcript.record_request_result(outcome.result.stop_reason, outcome.result.error)
@@ -173,6 +179,8 @@ class ConversationView:
         elif isinstance(update, HistoryCleared):
             # /clear 只清模型历史: 显示文档保留, 追加系统条目说明
             self.transcript.append_system("已清空模型历史（已显示记录与验证状态保留）。")
+            # 04 (审查 04-F1): 当前窗口已释放, 既有预算快照自此时效待重估
+            self._budget_stale = True
             if self._session.has_process_uncertain():
                 self.transcript.append_system(f"{PROCESS_UNCERTAIN_LABEL}：清空历史不解锁。")
         elif isinstance(update, ApplicationClosed):
@@ -442,6 +450,9 @@ class ConversationView:
         if report is None:
             lines.append(f"预算: 上限 {snapshot.limit} · 占用估计不可得（本进程尚未发送请求）")
         else:
+            if self._budget_stale:
+                # 04 (审查 04-F1): clear 不重置预算策略, 此处数字描述清空前旧代次
+                lines.append("提示: /clear 后尚无新请求，以下为清空前旧代次的最后估计")
             lines.append(
                 f"预算: 上限 {report.limit} · 占用估计 {report.total_estimate}"
                 f" · 余量 {report.margin_remaining}"
@@ -515,7 +526,7 @@ class ConversationView:
         else:
             lines.append("压缩: 0 次 · 摘要边界: 无（未压缩）")
         if not records:
-            lines.append("摘要计量: 不可得（本代次尚无摘要调用）")
+            lines.append("摘要计量: 不可得（本代次尚无已提交摘要）")
             return lines
         inputs = [r.metrics.input_tokens for r in records if r.metrics is not None and r.metrics.input_tokens is not None]
         outputs = [r.metrics.output_tokens for r in records if r.metrics is not None and r.metrics.output_tokens is not None]
@@ -523,7 +534,7 @@ class ConversationView:
 
         def fmt(values: list, partial: bool, unit: str = "") -> str:
             if not values:
-                return f"不可得{unit}"
+                return "不可得"
             text = f"{sum(values):.1f}{unit}" if unit else str(sum(values))
             return f"{text}（部分调用不可得）" if partial else text
 
