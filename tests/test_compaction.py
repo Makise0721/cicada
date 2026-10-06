@@ -154,7 +154,7 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
         assert record.prompt_version == "1" and len(record.prompt_sha256) == 64
         # 前一投影身份 = 切换前的恒等投影 (完整规范历史) 指纹
         assert record.previous_projection_identity == canonical_prefix_sha256(history_before)
-        # 投影切换: 有效消息 = [摘要块] + 保留后缀
+        # 投影切换: 有效消息 = [摘要块] + 保留后缀; 结构合法 (切点不切工具组)
         blocks = session._context_projection.blocks
         assert len(blocks) == 1
         expected_block = summary_block_message(
@@ -167,6 +167,9 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
         effective = session._context_projection.project(session._history)
         assert effective[0] == expected_block
         assert effective[1:] == session.history[2:]
+        from cicada.core.messages import validate_history_structure
+
+        validate_history_structure(effective)  # 切点落在请求边界, 工具组零切断
         # 摘要请求形态: 无工具 + 专用系统提示 (D5)
         summary_request = summary_channel.requests[0]
         assert summary_request.tools == ()
@@ -611,3 +614,60 @@ async def test_restore_rebuilds_identical_projection_and_rejects_tamper(tmp_path
             await open_application(config)
     finally:
         pass
+
+
+async def test_terminal_scan_still_covers_canonical_after_projection(tmp_path):
+    """A11 预备: 压缩投影替换发生在 RunPolicy 下游, 终结扫描仍针对完整规范历史.
+
+    被摘要覆盖的未证终结 powershell 结果仍触发保守锁存; 下游 BudgetPolicy 所见
+    请求首条已是摘要块 (替换真实发生), 证明扫描面不随投影收缩。
+    """
+    from cicada.core.messages import ToolResult, ToolResultMessage
+    from cicada.core.ports import ModelRequest
+    from cicada.plugins.coding.verification_contracts import VerificationView
+    from cicada.run_policy import verification_policy
+
+    class _RecordingService:
+        def __init__(self, view) -> None:
+            self._view = view
+            self.reasons: list[str] = []
+
+        def mark_process_uncertain(self, reason: str) -> None:
+            self.reasons.append(reason)
+
+        async def refresh(self, cancel):
+            return self._view
+
+    view = VerificationView(
+        verification_run_id="run-1", snapshot_ref=None, scope_id=None,
+        checks=(), receipts=(), process_uncertain=False, blocking_reasons=(),
+    )
+    service = _RecordingService(view)
+    inner = FakeModel([])
+    policy = BudgetPolicy(inner, _budget())
+    canonical = (
+        UserMessage(text="第一问"),
+        ToolResultMessage(result=ToolResult(
+            call_id="c1", name="powershell", content="超时被杀", is_error=True, details=None,
+        )),
+        UserMessage(text="第二问"),  # 保留后缀起点 (第二请求)
+    )
+    from cicada.context_policy import SummaryBlock
+
+    policy.projection.apply_summary(
+        SummaryBlock(
+            message=summary_block_message(
+                first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
+            ),
+            end_message_index=2, first_request_seq=1, last_request_seq=1, message_count=2,
+            prefix_sha256=canonical_prefix_sha256(canonical[:2]),
+        ),
+        canonical_length=len(canonical),
+    )
+    wrapped = verification_policy(policy, service)
+    request = ModelRequest(messages=canonical, tools=(), system_prompt="sys")
+    from cicada.core.cancel import CancelToken
+    _ = [event async for event in wrapped.stream(request, CancelToken())]
+    assert service.reasons, "被摘要覆盖的未证终结事实仍被扫描锁存 (A11)"
+    assert inner.requests, "请求已发出 (投影替换后正常放行)"
+    assert inner.requests[0].messages[0].text.startswith("[程序生成的对话摘要]")
