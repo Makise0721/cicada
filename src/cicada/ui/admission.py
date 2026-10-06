@@ -34,6 +34,9 @@ class AdmissionGate:
         # 票据 05: 持久清空提交中 (OperationBusy("clear") -> HistoryCleared/失败落定);
         # 期间 Enter/斜线命令/退出屏障, 草稿保持可编辑
         self._clearing = False
+        # 票据 02: 持久压缩提交中 (OperationBusy("compact") -> ContextCompacted/
+        # 失败落定); 屏障语义与清空同型
+        self._compacting = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
         self.on_error: Callable[[str], None] | None = None
 
@@ -47,6 +50,11 @@ class AdmissionGate:
     def clearing(self) -> bool:
         """持久清空提交进行中 (输入屏障; 与请求 reservation 独立)。"""
         return self._clearing
+
+    @property
+    def compacting(self) -> bool:
+        """持久压缩提交进行中 (输入屏障; 与请求 reservation 独立)。"""
+        return self._compacting
 
     def busy(self) -> bool:
         """reservation 存在即忙 (含 execute 任务尚未起跑的同步窗口)。"""
@@ -62,7 +70,7 @@ class AdmissionGate:
         """
         if self._reservation_open:
             return None
-        if self._clearing:
+        if self._clearing or self._compacting:
             return None
         if self._session.state != "idle":
             return None
@@ -118,6 +126,14 @@ class AdmissionGate:
         """清空提交落定 (成功由 HistoryCleared 投影, 失败由等待任务释放); 幂等。"""
         self._clearing = False
 
+    def note_compact_started(self) -> None:
+        """压缩提交开始 (命令处置时同步置位, 先于任务起跑窗口); 幂等 (02)。"""
+        self._compacting = True
+
+    def note_compact_settled(self) -> None:
+        """压缩提交落定 (成功由 ContextCompacted 投影, 失败/放弃由等待任务释放); 幂等。"""
+        self._compacting = False
+
     def note_phase(self, phase: str) -> None:
         """阶段通知: reservation 窗口记录的取消意图在任务实际执行时交给公共 cancel。"""
         if self._pending_cancel and phase == "executing":
@@ -131,6 +147,7 @@ class AdmissionGate:
         self._reservation_open = False
         self._task = None
         self._clearing = False
+        self._compacting = False
 
     # --- 取消意图 ----------------------------------------------------------------------
 
@@ -153,12 +170,12 @@ def cancel_if_active(session: ApplicationSession) -> bool:
 def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """Enter 屏障: 屏障内 Enter 无动作 (不排队、不执行命令、不提示)。
 
-    覆盖 reservation 未起跑窗口、持久清空提交 (05) 与
+    覆盖 reservation 未起跑窗口、持久清空提交 (05)、持久压缩提交 (02) 与
     executing/cancelling/finalizing/closing/closed。
     """
     if gate.busy():
         return True
-    if gate.clearing:
+    if gate.clearing or gate.compacting:
         return True
     return session.state in (
         "executing",

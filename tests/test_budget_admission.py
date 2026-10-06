@@ -529,3 +529,97 @@ async def test_budget_and_wire_guards_coexist_and_stay_distinct():
     assert events[-1].stop_reason == "error"
     assert events[-1].error is not None and events[-1].error.startswith("ollama request too large")
     assert "context budget" not in events[-1].error
+
+
+# --- PA02: 接缝生命周期 (02 迁移: 准入后、首次预估前) ------------------------------------
+
+
+class _OrderSeamPolicy(BudgetPolicy):
+    """记录接缝调用的策略; 与 store 的 begin 记录共享同一事件列表."""
+
+    def __init__(self, inner, config, events):
+        super().__init__(inner, config)
+        self._events = events
+
+    def note_request_start(self, committed_count: int) -> None:
+        self._events.append(("seam", committed_count))
+        super().note_request_start(committed_count)
+
+
+class _OrderSpyStore(_BeginSpyStore):
+    def __init__(self, events):
+        super().__init__()
+        self._events = events
+
+    async def begin_request(self, epoch_id, prompt):
+        self._events.append(("begin", prompt))
+        return await super().begin_request(epoch_id, prompt)
+
+
+async def _order_session(tmp_path, events, *, script=None, budget=None):
+    model = FakeModel(script if script is not None else [list(STOP_WITH_METRICS)])
+    config = _config(tmp_path, model, budget=budget or _generous())
+    policy = _OrderSeamPolicy(model, config.budget, events)
+    store = _OrderSpyStore(events)
+    app = await bootstrap(
+        [fake_model_plugin(model)], tool_capabilities=(),
+        system_prompt="test system prompt", model_policy=lambda inner, runtime: policy,
+    )
+    session = ApplicationSession(
+        app=app, config=config, service=None, policy=None,
+        store=store, epoch_id="epoch-1", persistence_mode="save", budget_policy=policy,
+    )
+    return session, model, store
+
+
+async def test_seam_precedes_begin_and_recurs_per_attempt(tmp_path):
+    """PA02: 接缝在首次预估前建立范围 (begin 之前), 每次尝试重新建立, begin 不再调用."""
+    events: list = []
+    session, _model, _store = await _order_session(tmp_path, events)
+    try:
+        await session.execute("q1")
+        await session.execute("q2")
+        assert events[:4] == [("seam", 0), ("begin", "q1"), ("seam", 2), ("begin", "q2")], (
+            "接缝先于 begin, 参数=该时刻规范历史消息数 (含 user prompt 与 assistant 回答)"
+        )
+        # 预估拒绝的尝试同样先建立范围; 下一次请求重新建立 (PA02)
+        events.clear()
+        tight = await _order_session(tmp_path, events, budget=BudgetConfig(num_ctx=1, num_predict=1))
+        try:
+            with pytest.raises(RuntimeError, match="context budget exceeded"):
+                await tight[0].execute("x" * 500)
+            assert [kind for kind, _value in events] == ["seam"], "拒绝尝试只建立范围, 不 begin"
+            assert tight[0]._budget_policy._last_committed_count == 0
+        finally:
+            await tight[0].aclose()
+    finally:
+        await session.aclose()
+
+
+async def test_seam_exception_rejects_request_and_next_attempt_recovers(tmp_path):
+    events: list = []
+    session, _model, store = await _order_session(tmp_path, events)
+    try:
+        # 首次接缝调用抛异常: execute 失败, 零 begin, 会话保持可用
+        policy = session._budget_policy
+        original = policy.note_request_start
+        calls = {"n": 0}
+
+        def flaky_seam(count: int) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("seam exploded")
+            original(count)
+
+        policy.note_request_start = flaky_seam  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="seam exploded"):
+            await session.execute("q1")
+        assert store.begins == [], "接缝异常在 begin 之前, 无 intent"
+        assert session.state == "idle"
+        assert session.persistence.storage_failed is None
+        # 下一次请求重新建立并成功
+        outcome = await session.execute("q1")
+        assert outcome.result.stop_reason == "stop"
+        assert ("seam", 0) in events and ("begin", "q1") in events
+    finally:
+        await session.aclose()

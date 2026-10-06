@@ -33,6 +33,7 @@ from cicada.application import (
     ApplicationClosed,
     ApplicationSession,
     ApplicationUpdate,
+    ContextCompacted,
     HistoryCleared,
     OperationBusy,
     RequestCompleted,
@@ -84,6 +85,8 @@ class ConversationView:
         self.transcript = Transcript()
         self._gate = AdmissionGate(session)
         self._gate.on_error = self._on_gate_error
+        # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
+        self._compact_task: asyncio.Task | None = None
         # 票据 05 组合钩子: 会话进入 closing/closed 且 execute 异常到达时由宿主
         # 决定退出前端 (避免 barrier 内界面失去退出路径); 默认无动作
         self.on_unrecoverable: Callable[[], None] | None = None
@@ -145,9 +148,21 @@ class ConversationView:
                 )
             self._gate.note_request_completed()
         elif isinstance(update, OperationBusy):
-            # 05: 持久清空提交中 (屏障在命令处置时已同步置位, 此处兜底)
-            self._gate.note_clear_started()
-            self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
+            # 05/02: 持久清空/压缩提交中 (屏障在命令处置时已同步置位, 此处兜底)
+            if update.operation == "compact":
+                self._gate.note_compact_started()
+                self.transcript.append_system("正在提交压缩（摘要较早请求，原始记录保留）…")
+            else:
+                self._gate.note_clear_started()
+                self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
+        elif isinstance(update, ContextCompacted):
+            # 02: 压缩切换成功; 确认条目 + 兜底释放屏障 (主释放由等待任务 finally)
+            self._gate.note_compact_settled()
+            self.transcript.append_system(
+                "已完成压缩：较早请求已摘要（覆盖 "
+                f"seq {update.first_request_seq}..{update.last_request_seq}，"
+                f"{update.message_count} 条消息），原始记录保留可回看。"
+            )
         elif isinstance(update, HistoryCleared):
             # /clear 只清模型历史: 显示文档保留, 追加系统条目说明
             self.transcript.append_system("已清空模型历史（已显示记录与验证状态保留）。")
@@ -212,8 +227,8 @@ class ConversationView:
 
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
-        取消意图; 持久清空提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
-        if self._gate.clearing:
+        取消意图; 持久清空/压缩提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self._gate.clearing or self._gate.compacting:
             return
         if cancel_if_active(self._session):
             return
@@ -226,8 +241,8 @@ class ConversationView:
 
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
-        持久清空提交中与空闲均无动作; finalizing/closing/closed 静默。"""
-        if self._gate.clearing:
+        持久清空/压缩提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self._gate.clearing or self._gate.compacting:
             return
         if cancel_if_active(self._session):
             return
@@ -278,6 +293,24 @@ class ConversationView:
                 return True
             # 确认条目由 HistoryCleared 事件投影追加
             return True
+        if command == "/compact":
+            if self._session.persistence is None:
+                self.transcript.append_system(
+                    "压缩需要持久会话（启动时带 --save-session/--tui/--resume）；"
+                    "非持久会话只有预算准入，无压缩。"
+                )
+                return True
+            if self._session.budget is None:
+                self.transcript.append_system(
+                    "压缩需要启用预算（真实模型按 --num-ctx 自动启用；fake 模式无预算）。"
+                )
+                return True
+            # 02: 持久压缩经共享 async compact_context() 可靠提交; 屏障与清空同型
+            self._gate.note_compact_started()
+            self._compact_task = asyncio.get_running_loop().create_task(
+                self._run_persistent_compact()
+            )
+            return True
         if command == "/exit":
             self.handle_exit()
             return True
@@ -304,6 +337,25 @@ class ConversationView:
             self._gate.note_clear_settled()
             raise
         self._gate.note_clear_settled()
+
+    async def _run_persistent_compact(self) -> None:
+        """等待持久压缩提交落定 (02); 成功确认条目由 ContextCompacted 投影追加。
+
+        落定 (成功/失败/取消/放弃) 都释放屏障; 取消如实传播; 失败如实成条。
+        close 封口放弃 (返回 None) 不是失败: 静默结束, 投影由应用保证不变。
+        """
+        try:
+            await self._session.compact_context()
+        except Exception as exc:
+            self._gate.note_compact_settled()
+            self.transcript.append_error(f"压缩失败: {exc}")
+            if self._on_update is not None:
+                self._on_update()
+            return
+        except BaseException:
+            self._gate.note_compact_settled()
+            raise
+        self._gate.note_compact_settled()
 
     def _status_sections(self) -> list[tuple[str, list[str]]]:
         """/status: 已发布状态 + 持久化事实 + 检查事实 + 计量口径 + 注入诊断; 有界 (P12)。"""

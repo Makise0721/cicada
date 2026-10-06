@@ -22,6 +22,10 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
         assert h.find("→ help")
         h.terminal.emit(text_keys("c"))
         await h.settle()
+        # 02: /c 前缀现有 compact/clear 两个候选, 选中首个
+        assert h.find("→ compact")
+        h.terminal.emit([DOWN])
+        await h.settle()
         assert h.find("→ clear")
         assert not h.find("显示状态与计量")
         h.terminal.emit([ENTER])

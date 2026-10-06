@@ -20,6 +20,7 @@ import inspect
 import json
 import math
 import time
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal
@@ -33,7 +34,18 @@ from cicada.budget import (
     budget_exceeded_text,
     estimate_input_components,
 )
-from cicada.context_policy import BudgetPolicy
+from cicada.context_policy import (
+    SUMMARY_PROMPT_SHA256,
+    SUMMARY_PROMPT_VERSION,
+    BudgetPolicy,
+    ContextProjection,
+    ProjectionRelationError,
+    SummaryBlock,
+    canonical_prefix_sha256,
+    generate_summary,
+    summary_block_message,
+    summary_prompt_text,
+)
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
@@ -61,6 +73,7 @@ from cicada.persistence.contracts import (
     StorageWriteError,
     StoredIdentity,
     StoredReceipt,
+    SummaryRecord,
     conflicting_launch_fields,
     receipt_terminal_trustworthy,
 )
@@ -263,13 +276,30 @@ class HistoryCleared:
 
 @dataclass(frozen=True)
 class OperationBusy:
-    """非请求操作进行中 (当前: 持久清空提交).
+    """非请求操作进行中 (当前: 持久清空/压缩提交).
 
-    只读补充原请求 phase: 请求生命周期已有 RequestPhaseChanged, 清空等操作
-    经本事件让 UI 输入屏障可消费 (05 接线); 完成由 HistoryCleared 标记.
+    只读补充原请求 phase: 请求生命周期已有 RequestPhaseChanged, 清空/压缩等
+    操作经本事件让 UI 输入屏障可消费 (05/02 接线); 完成分别由 HistoryCleared
+    与 ContextCompacted 标记.
     """
 
-    operation: Literal["clear"]
+    operation: Literal["clear", "compact"]
+
+
+@dataclass(frozen=True)
+class ContextCompacted:
+    """压缩切换成功 (02, D6): 摘要已持久并成为模型可见投影的一部分.
+
+    payload 携带覆盖范围与保留边界 (规范历史下标); 原始记录不变, UI 据此
+    追加确认条目并释放屏障。失败/取消不产生本事件。
+    """
+
+    summary_id: str
+    first_request_seq: int
+    last_request_seq: int
+    message_count: int
+    end_message_index: int
+    reason: str  # manual / auto
 
 
 @dataclass(frozen=True)
@@ -281,12 +311,28 @@ class ApplicationClosed:
 
 ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
-    | OperationBusy | ApplicationClosed
+    | OperationBusy | ContextCompacted | ApplicationClosed
 )
 
 
 class ApplicationOpenError(RuntimeError):
     """启动组装或检查基线建立失败; 显示文本即异常文本."""
+
+
+class CompactionSealedError(RuntimeError):
+    """close 已封住未接受的摘要提交 (PA05); 归关闭取消, 非存储故障."""
+
+
+@dataclass(frozen=True)
+class _CompactionPlan:
+    """一次手动压缩的切点计划 (D4): 覆盖区间与保留边界."""
+
+    messages: tuple[Message, ...]     # 摘要输入: 原始规范历史区间 (不经投影)
+    first_request_seq: int
+    last_request_seq: int
+    message_count: int                # 本块覆盖消息数 (end - start)
+    start_index: int                  # 覆盖起点 (= 投影保留起点)
+    end_index: int                    # 覆盖前缀终点 = 保留边界
 
 
 def _isolate_event(event: Event) -> Event:
@@ -354,12 +400,16 @@ class ApplicationSession:
         view_only_reason: str | None = None,
         projection: HistoricalProjection | None = None,
         budget_policy: BudgetPolicy | None = None,
+        context_projection: ContextProjection | None = None,
     ) -> None:
         self._app = app
         self._config = config
         self._service = service
         self._policy = policy
         self._budget_policy = budget_policy
+        # 模型可见投影容器 (02, D4): 压缩成功后追加摘要块, clear 重置, 恢复重建;
+        # 与 BudgetPolicy 持同一实例
+        self._context_projection = context_projection if context_projection is not None else ContextProjection()
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
         self._epoch_id = epoch_id
@@ -378,6 +428,17 @@ class ApplicationSession:
         self._request_id: str | None = None
         self._saved_request_count = 0
         self._last_committed_seq: int | None = None
+        # 当前代次已提交完整请求的消息区间 (start,end) 与 seq, 按提交序; 压缩切点
+        # 与覆盖范围取数 (D4)。恢复时按当前代次请求重建, 提交成功后追加, clear 清空
+        self._committed_spans: list[tuple[int, int, int]] = []
+        span_start = 0
+        for request in restored_requests:
+            if request.context_generation != restored_context_generation:
+                continue
+            self._committed_spans.append(
+                (request.seq, span_start, span_start + len(request.messages))
+            )
+            span_start += len(request.messages)
         self._storage_failed: str | None = None
         self._state: SessionStateName = "idle"
         self._run_id: str | None = None
@@ -387,6 +448,11 @@ class ApplicationSession:
         self._active_done: asyncio.Future | None = None
         self._clear_done: asyncio.Future | None = None  # 清空生产者完成标记 (close 监督对象)
         self._clearing = False  # 持久清空进行中: 与 execute 互斥 (契约 §3)
+        # 02: 手动压缩生产者 (D6/PA05); close 封住未接受提交并协作取消生成
+        self._compacting = False
+        self._compact_done: asyncio.Future | None = None
+        self._compact_token: CancelToken | None = None
+        self._compact_sealed = False
         self._process_uncertain = False
         self._closing = False
         self._closed = False
@@ -533,7 +599,11 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a persistent clear is in progress; new requests are refused until it settles"
                 )
-            # 01 请求前预估 (D7 两道口之一): 超限零 begin/零模型调用, 不锁存 storage_failed
+            # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
+            # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
+            if self._budget_policy is not None:
+                self._budget_policy.note_request_start(len(self._history))
+            # 请求前预估 (D7 上道口): 超限零 begin/零模型调用, 不锁存 storage_failed
             self._refuse_overbudget_request(prompt)
             begin_task = asyncio.ensure_future(
                 self._store.begin_request(self._epoch_id or "", prompt)
@@ -568,7 +638,9 @@ class ApplicationSession:
                     f"cannot start a persisted request: {begin_error}"
                 ) from begin_error
         else:
-            # 非持久会话同样请求前预估: 零副作用拒绝 (D9)
+            # 非持久会话: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用 (D9)
+            if self._budget_policy is not None:
+                self._budget_policy.note_request_start(len(self._history))
             self._refuse_overbudget_request(prompt)
         loop = asyncio.get_running_loop()
         self._state = "executing"
@@ -578,11 +650,6 @@ class ApplicationSession:
         self._active_done = loop.create_future()
         self._notify(RequestPhaseChanged(None, "executing"))
         try:
-            if self._budget_policy is not None:
-                # 请求边界接缝 (D1): begin 成功之后、agent.run 之前每请求一次,
-                # 参数为调用时规范历史长度; 计数语义由 03 消费。调用在 try 内:
-                # 接缝异常按请求异常路径收尾, 不悬挂 _active_done (审查 01-F11)
-                self._budget_policy.note_request_start(len(self._history))
             result = await self._app.agent.run(prompt, token, history=tuple(self._history))
             # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07);
             # closed 是终态, close 监督超时后的迟到完成不得改写它 (02-R-F1)
@@ -614,6 +681,15 @@ class ApplicationSession:
                 persistence=persisted,
                 exit_code=1 if not persisted.saved else outcome.exit_code,
             )
+            if persisted.saved:
+                # 提交成功: 当前代次新增一个完整请求区间 (压缩切点/覆盖范围取数, D4)
+                self._committed_spans.append(
+                    (
+                        persisted.seq or 0,
+                        len(self._history),
+                        len(self._history) + len(result.messages),
+                    )
+                )
         self._history.extend(isolate_message(m) for m in result.messages)
         if outcome.view is not None and outcome.view.process_uncertain:
             self._process_uncertain = True
@@ -649,7 +725,13 @@ class ApplicationSession:
         config = self._config.budget
         if policy is None or config is None:
             return
-        messages = (*self._history, UserMessage(text=prompt))
+        # 01-F10/PA02: 预估计量面 = 当前 ContextProjection 的有效消息
+        # ([摘要块] + 保留后缀) + 本次 prompt; 旧规范历史不再参与 (压缩后重估
+        # 必须能回到限内)。控制段/freshness 允许量仍覆盖最终发送形态 (01 裁决)。
+        messages = (
+            *self._context_projection.project(self._history),
+            UserMessage(text=prompt),
+        )
         input_estimate, components = estimate_input_components(
             self._config.system_prompt, self._request_tool_specs(), messages, config
         )
@@ -913,12 +995,228 @@ class ApplicationSession:
             if self._projection is not None:
                 # 前缀证明与内存历史同步重置; 失败路径不会到达这里 (契约 §5)
                 self._projection.reset()
+            if self._context_projection is not None:
+                # 02: 新代次投影为空 (D8); 旧代次摘要记录保留在档为历史事实
+                self._context_projection.reset()
+            self._committed_spans.clear()
             if clear_cancelled:
                 raise asyncio.CancelledError()
         finally:
             self._clearing = False
             if self._clear_done is not None and not self._clear_done.done():
                 self._clear_done.set_result(None)
+
+    # --- 手动压缩 (02, D4-D6) ---------------------------------------------------------
+
+    async def compact_context(self) -> ContextCompacted | None:
+        """手动压缩: 摘要当前代次较早已提交完整请求, 先持久后切换 (D4-D6).
+
+        成功返回覆盖事实并发布 ContextCompacted; close 封口先于接受时返回
+        None (归关闭取消, 零写入, 旧投影不变)。其余拒绝/失败抛 RuntimeError。
+        协议 (PA03): 响应校验 → 封口核对且未取消 → store 接受 → 明确成功 →
+        切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
+        先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
+        """
+        if self._store is None:
+            raise RuntimeError(
+                "compaction requires a persistent session (start with --save-session, "
+                "--tui or --resume); non-persistent sessions have no compaction"
+            )
+        if self._closing or self._closed or self._state != "idle":
+            raise RuntimeError(
+                f"history can only be compacted while idle and open (state={self._state})"
+            )
+        if self._view_only_reason is not None:
+            raise RuntimeError(
+                f"session is view-only after restore ({self._view_only_reason}); "
+                "compaction is refused"
+            )
+        if self._storage_failed is not None:
+            raise RuntimeError(
+                f"storage_failed: earlier session save failed ({self._storage_failed}); "
+                "compaction is refused because the projection switch relies on reliable commit"
+            )
+        policy = self._budget_policy
+        channel = policy.summarize_channel if policy is not None else None
+        if policy is None or self._config.budget is None or channel is None:
+            raise RuntimeError(
+                "compaction requires an enabled budget with a summary channel "
+                "(a persistent session with a real model provider)"
+            )
+        if self._compacting:
+            raise RuntimeError("a compaction is already in progress")
+        if self._compact_sealed:
+            raise RuntimeError("application is closing; compaction is sealed")
+        # 可压缩区间与摘要输入预算在置位屏障前判定: 拒绝不留下 busy/屏障 (D1)
+        plan = self._compaction_plan()
+        self._compacting = True
+        self._compact_done = asyncio.get_running_loop().create_future()
+        self._compact_token = CancelToken()
+        self._notify(OperationBusy(operation="compact"))
+        try:
+            outcome = await generate_summary(channel, plan.messages, self._compact_token)
+            if not outcome.ok:
+                if outcome.failure == "aborted" and self._compact_sealed:
+                    # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)
+                    return None
+                # D5/PA03: 摘要失败不派发提交, 投影不变, 无摘要记录落库
+                raise RuntimeError(
+                    f"summary generation failed ({outcome.failure}); the model projection "
+                    "is unchanged" + (f": {outcome.detail}" if outcome.detail else "")
+                )
+            persistence = self._config.persistence
+            identity_launch = persistence.identity.launch if persistence is not None else None
+            record = SummaryRecord(
+                summary_id=str(uuid.uuid4()),
+                epoch_id=self._epoch_id or "",
+                context_generation=self._context_generation,
+                first_request_seq=plan.first_request_seq,
+                last_request_seq=plan.last_request_seq,
+                message_count=plan.message_count,
+                end_message_index=plan.end_index,
+                prefix_sha256=canonical_prefix_sha256(self._history[: plan.end_index]),
+                text=outcome.text,
+                provider=(
+                    identity_launch.provider
+                    if identity_launch is not None
+                    else (self._config.model_label or "unknown")
+                ),
+                model=(
+                    identity_launch.model
+                    if identity_launch is not None
+                    else (self._config.model_label or "unknown")
+                ),
+                prompt_version=SUMMARY_PROMPT_VERSION,
+                prompt_sha256=SUMMARY_PROMPT_SHA256,
+                metrics=outcome.metrics,
+                reason="manual",
+                created_at=time.time(),
+                previous_projection_identity=canonical_prefix_sha256(
+                    self._context_projection.project(self._history)
+                ),
+            )
+            commit_task = asyncio.ensure_future(self._commit_summary_dispatch(record))
+            commit_cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(commit_task)
+                    break
+                except asyncio.CancelledError:
+                    # PA03: 派发后取消不取消事务; 重复取消也等明确结果
+                    commit_cancelled = True
+                except CompactionSealedError:
+                    # PA05: 封口先于接受 → 零写入; 归关闭取消, 旧投影不变,
+                    # 不锁存 storage_failed, 迟到响应丢弃
+                    return None
+                except PersistenceError as exc:
+                    # 提交失败: 旧投影不变; 真实存储故障按 commit_request 同面锁存
+                    self._latch_storage_failed(str(exc))
+                    raise RuntimeError(
+                        "compaction failed to persist; the model projection is unchanged: "
+                        f"{exc}"
+                    ) from exc
+            # 明确成功 → 切换投影 + 事件; 已被取消时先落定再传播 (PA03)
+            block = SummaryBlock(
+                message=summary_block_message(
+                    first_request_seq=plan.first_request_seq,
+                    last_request_seq=plan.last_request_seq,
+                    message_count=plan.message_count,
+                    text=record.text,
+                ),
+                end_message_index=plan.end_index,
+                first_request_seq=plan.first_request_seq,
+                last_request_seq=plan.last_request_seq,
+                message_count=plan.message_count,
+                prefix_sha256=record.prefix_sha256,
+            )
+            self._context_projection.apply_summary(
+                block, canonical_length=len(self._history)
+            )
+            compacted = ContextCompacted(
+                summary_id=record.summary_id,
+                first_request_seq=record.first_request_seq,
+                last_request_seq=record.last_request_seq,
+                message_count=record.message_count,
+                end_message_index=record.end_message_index,
+                reason="manual",
+            )
+            self._notify(compacted)
+            if commit_cancelled:
+                raise asyncio.CancelledError()
+            return compacted
+        finally:
+            self._compacting = False
+            self._compact_token = None
+            if self._compact_done is not None and not self._compact_done.done():
+                self._compact_done.set_result(None)
+
+    def _compaction_plan(self) -> _CompactionPlan:
+        """D4: 当前代次、已提交完整请求、保留最近 1 个; 摘要输入自身须满足预算.
+
+        覆盖起点 = 当前投影保留起点 (再次压缩只追加新区间, 不重写旧摘要);
+        区间按请求边界收缩 (最长最旧前缀), 最旧单个请求也装不下时明确拒绝。
+        摘要输入是原始规范历史 (D5: 不经 RunPolicy/BudgetPolicy 投影)。
+        """
+        config = self._config.budget
+        assert config is not None
+        spans = self._committed_spans
+        if len(spans) < 2:
+            raise RuntimeError(
+                "nothing to compact: at least two committed full requests are required "
+                "(the most recent one is always retained)"
+            )
+        start = self._context_projection.retained_start
+        eligible = [span for span in spans[:-1] if span[2] > start]
+        if not eligible:
+            raise RuntimeError(
+                "nothing to compact: the committed requests before the retained "
+                "boundary are already summarized"
+            )
+        for span in eligible:
+            if span[1] < start:
+                raise RuntimeError(
+                    "compaction bookkeeping is inconsistent with the projection"
+                )
+        summary_system = summary_prompt_text()
+        chosen_span: tuple[int, int, int] | None = None
+        for span in reversed(eligible):
+            range_messages = tuple(self._history[start : span[2]])
+            input_estimate, components = estimate_input_components(
+                summary_system, (), range_messages, config
+            )
+            report = assemble_report(
+                config, input_estimate=input_estimate, input_components=components,
+                source="estimated",
+            )
+            if report.total_estimate <= config.num_ctx:
+                chosen_span = span
+                break
+        if chosen_span is None:
+            raise RuntimeError(
+                "compaction unavailable: even the oldest single request does not fit "
+                "the summary request budget"
+            )
+        return _CompactionPlan(
+            messages=tuple(self._history[start : chosen_span[2]]),
+            first_request_seq=eligible[0][0],
+            last_request_seq=chosen_span[0],
+            message_count=chosen_span[2] - start,
+            start_index=start,
+            end_index=chosen_span[2],
+        )
+
+    async def _commit_summary_dispatch(self, record: SummaryRecord) -> None:
+        """PA05 接受落定点: 封口核对与 store 派发之间无 await, 不可交错.
+
+        store._dispatch 的 closing 检查与入队同为同步前缀, 因此"封口先 → 零
+        写入 / 接受先 → 等明确结果"在本协程首个执行块内一次判定;
+        create_task 不越过核对 (任务未起跑时封口先生效即零提交)。
+        """
+        if self._compact_sealed:
+            raise CompactionSealedError(
+                "compaction is sealed by close; the summary commit was not sent"
+            )
+        await self._store.commit_summary(record)
 
     # --- 关闭 ----------------------------------------------------------------------
 
@@ -936,10 +1234,15 @@ class ApplicationSession:
         deadline = time.monotonic() + CLOSE_SUPERVISION_S
         self._close_deadline = deadline
         self._close_latch.set()
-        # 取消活动请求并等待现有请求/清空生产者终结 (含持久提交与活动写入),
-        # 共享同一截止时间; execute 与 clear 互斥, 至多一个在途
+        # 02/PA05: 永久封住未接受的摘要提交并协作取消摘要生成;
+        # 已被 store 接受的提交由其生产者等明确结果 (PA03), 不被取消掩盖
+        self._compact_sealed = True
+        if self._compact_token is not None:
+            self._compact_token.cancel()
+        # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
+        # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
         producers = [
-            done for done in (self._active_done, self._clear_done)
+            done for done in (self._active_done, self._clear_done, self._compact_done)
             if done is not None and not done.done()
         ]
         if producers and self._cancel_token is not None:
@@ -1106,6 +1409,59 @@ def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
     return HistoricalProjection(HistoricalPrefixProof(entries=tuple(entries)))
 
 
+def _rebuild_context_projection(snapshot: RecoverySnapshot) -> tuple[SummaryBlock, ...]:
+    """按摘要记录确定性重建投影块 (02, D6/A08); 关系/指纹不符属恢复错误, 模型零请求.
+
+    逐块核对: generation 与当前代次一致、seq 引用当前代次已提交完整请求、
+    覆盖前缀 [0:end) 的规范编码 sha256 与规范历史逐位一致。块消息由
+    summary_block_message 程序生成, 与压缩时字节逐位一致。
+    """
+    generation_messages = snapshot.canonical_history
+    seqs = {
+        request.seq
+        for request in snapshot.requests
+        if request.context_generation == snapshot.context_generation
+    }
+    blocks: list[SummaryBlock] = []
+    for record in snapshot.summaries:
+        if record.context_generation != snapshot.context_generation:
+            raise ApplicationOpenError(
+                f"restored summary {record.summary_id} belongs to generation "
+                f"{record.context_generation}, not the current {snapshot.context_generation}"
+            )
+        for seq in (record.first_request_seq, record.last_request_seq):
+            if seq not in seqs:
+                raise ApplicationOpenError(
+                    f"restored summary {record.summary_id} references request {seq} "
+                    "outside the current generation (relation error)"
+                )
+        if record.end_message_index > len(generation_messages):
+            raise ApplicationOpenError(
+                f"restored summary {record.summary_id} coverage end exceeds the "
+                "canonical history (relation error)"
+            )
+        observed = canonical_prefix_sha256(generation_messages[: record.end_message_index])
+        if observed != record.prefix_sha256:
+            raise ApplicationOpenError(
+                f"restored summary {record.summary_id} coverage does not match the "
+                "canonical history (relation error)"
+            )
+        blocks.append(SummaryBlock(
+            message=summary_block_message(
+                first_request_seq=record.first_request_seq,
+                last_request_seq=record.last_request_seq,
+                message_count=record.message_count,
+                text=record.text,
+            ),
+            end_message_index=record.end_message_index,
+            first_request_seq=record.first_request_seq,
+            last_request_seq=record.last_request_seq,
+            message_count=record.message_count,
+            prefix_sha256=record.prefix_sha256,
+        ))
+    return tuple(blocks)
+
+
 def _bind_store_last_cleanup(
     definitions: list[PluginDefinition],
 ) -> list[PluginDefinition]:
@@ -1213,11 +1569,22 @@ async def open_application(
     policy_state: dict[str, object] = {}
     # 恢复前缀证明容器 (03): 检查模式 + 持久会话时由 RunPolicy 每次发送前核对
     history_projection: HistoricalProjection | None = None
+    # 模型可见投影容器 (02, D4): 预算启用即存在 (空 = 恒等投影); 压缩/clear/恢复
+    # 由应用驱动, BudgetPolicy 与会话持同一实例
+    context_projection: ContextProjection | None = None
+    if budget_config is not None:
+        context_projection = ContextProjection()
 
     def _make_budget_policy(model):
         # D1 次序: BudgetPolicy 在 RunPolicy 下游、适配器上游;
         # 计量因此覆盖验证投影 (控制段/freshness 标记) 的最终形态
-        budget = BudgetPolicy(model, budget_config)
+        budget = BudgetPolicy(
+            model,
+            budget_config,
+            # D5: 摘要通道注入同一无状态适配器实例; 仅持久会话可压缩 (D9)
+            summarize=model if store is not None else None,
+            projection=context_projection,
+        )
         policy_state["budget_policy"] = budget
         return budget
 
@@ -1335,6 +1702,17 @@ async def open_application(
                         f"restored prefix proof build failed: {exc}"
                     ) from exc
                 history_projection.proof = built.proof
+            if context_projection is not None:
+                # 02/A08: 按摘要记录确定性重建投影; 覆盖/指纹不符属恢复关系错误
+                try:
+                    rebuilt_blocks = _rebuild_context_projection(snapshot)
+                except ApplicationOpenError:
+                    raise
+                except Exception as exc:
+                    raise ApplicationOpenError(
+                        f"restored context projection rebuild failed: {exc}"
+                    ) from exc
+                context_projection.adopt(rebuilt_blocks)
             session = ApplicationSession(
                 app=app,
                 config=config,
@@ -1351,6 +1729,7 @@ async def open_application(
                 view_only_reason=view_only_reason,
                 projection=history_projection,
                 budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
+                context_projection=context_projection,
             )
             coordinator.bind(session)
         except ApplicationOpenError:
@@ -1368,6 +1747,7 @@ async def open_application(
             service=policy_state.get("service"),  # type: ignore[arg-type]
             policy=policy_state.get("policy"),  # type: ignore[arg-type]
             budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
+            context_projection=context_projection,
         )
     if plan is None:
         return session
