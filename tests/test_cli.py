@@ -1216,3 +1216,57 @@ def test_list_cursor_without_list_sessions_rejected(tmp_path):
                    "--list-cursor", "3", "任务")
     assert proc.returncode == 2
     assert "--list-cursor 只能与 --list-sessions" in proc.stderr
+
+
+# --- 01: 预算启用条件的 CLI 叉 (D9/C-F1): ollama 路径实填预算, fake 默认不装 ---
+
+
+def test_budget_rejects_oversized_prompt_with_zero_model_post(tmp_path):
+    """--num-ctx 实填预算: 请求前预估拒绝 -> exit 1, 只有 preflight GET 无 POST."""
+    stub = _OllamaStub()
+    try:
+        proc = run_cli(
+            "--workspace", str(tmp_path), "--ollama-url", stub.url,
+            "--num-ctx", "64", "任务" * 300,
+        )
+        assert proc.returncode == 1, (proc.stdout, proc.stderr)
+        assert "context budget exceeded" in proc.stderr
+        assert stub.requests == ["GET /api/version"], "预算拒绝零模型 POST"
+    finally:
+        stub.stop()
+
+
+def test_cli_fills_budget_from_archive_num_ctx(tmp_path, monkeypatch):
+    """resume 不带 --num-ctx: 预算由存档继承的 num_ctx 实填 (来源 archive, D9)."""
+    import cicada.__main__ as m
+
+    from cicada.application import ApplicationOpenError
+
+    stub = _OllamaStub()
+    try:
+        saved = run_cli(
+            "--workspace", str(tmp_path), "--save-session", "--ollama-url", stub.url,
+            "--num-ctx", "100000", "保存一轮",
+        )
+        assert saved.returncode == 0, (saved.stdout, saved.stderr)
+        assert "POST /api/chat" in stub.requests
+        session_id = saved.stdout.split("[session id=")[1].split(" ")[0]
+    finally:
+        stub.stop()
+
+    captured = {}
+
+    async def spy_open(config, *, preflight=None):
+        captured["budget"] = config.budget
+        raise ApplicationOpenError("captured")
+
+    monkeypatch.setattr(m, "open_application", spy_open)
+    code, err = _run_main(
+        monkeypatch,
+        ["--workspace", str(tmp_path), "--resume", session_id, "恢复一问"],
+    )
+    assert code == 2, err.value  # spy 拒开: 只为捕获配置
+    budget = captured["budget"]
+    assert budget is not None, "ollama 恢复路径必须实填预算"
+    assert budget.num_ctx == 100000, "继承存档 num_ctx (source=archive)"
+    assert budget.num_predict is None

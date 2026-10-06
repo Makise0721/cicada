@@ -18,16 +18,33 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Literal
 
 from cicada.boot import App, BootError, bootstrap
+from cicada.budget import (
+    BudgetConfig,
+    BudgetSnapshot,
+    ComponentEstimate,
+    assemble_report,
+    budget_exceeded_text,
+    estimate_input_components,
+)
+from cicada.context_policy import BudgetPolicy
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
 from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
-from cicada.core.messages import Message, ToolResultMessage, isolate_message, isolate_tool_result
+from cicada.core.messages import (
+    Message,
+    ToolResultMessage,
+    UserMessage,
+    isolate_message,
+    isolate_tool_result,
+)
+from cicada.core.ports import ToolSpec
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
     ArchiveLimitError,
@@ -49,6 +66,7 @@ from cicada.persistence.contracts import (
 )
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
 from cicada.run_policy import (
+    CONTROL_SECTION_MAX_BYTES,
     HistoricalPrefixProof,
     HistoricalProjection,
     PrefixEntry,
@@ -159,6 +177,8 @@ class ApplicationConfig:
     max_turns: int = 50
     model_label: str = ""
     persistence: PersistenceConfig | None = None
+    # 01 尾随扩展: 显式预算配置才启用预算层 (D9); fake 默认 None, CLI 由 num_ctx 实填
+    budget: BudgetConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -173,6 +193,8 @@ class ApplicationConfig:
             if not isinstance(self.persistence, PersistenceConfig):
                 raise ValueError("persistence must be a PersistenceConfig or None")
             # 03 起检查模式 + 持久会话组合放开 (票据 03); 恢复要求 checks_signature 一致
+        if self.budget is not None and not isinstance(self.budget, BudgetConfig):
+            raise ValueError("budget must be a BudgetConfig or None")
 
 
 @dataclass(frozen=True)
@@ -329,11 +351,13 @@ class ApplicationSession:
         restored_receipts: tuple[StoredReceipt, ...] = (),
         view_only_reason: str | None = None,
         projection: HistoricalProjection | None = None,
+        budget_policy: BudgetPolicy | None = None,
     ) -> None:
         self._app = app
         self._config = config
         self._service = service
         self._policy = policy
+        self._budget_policy = budget_policy
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
         self._epoch_id = epoch_id
@@ -438,6 +462,13 @@ class ApplicationSession:
         """当前 (或最近一次) 请求的持久 ID; 活动包装器经协调器读取."""
         return self._request_id
 
+    @property
+    def budget(self) -> BudgetSnapshot | None:
+        """最新预算报告与锚状态的只读快照 (04 显示消费); 未启用预算层为 None."""
+        if self._budget_policy is None:
+            return None
+        return self._budget_policy.snapshot()
+
     def latch_storage_failure(self, detail: str) -> None:
         """活动包装器等生产者的公开锁存入口; 幂等, 首次失败固定原因."""
         self._latch_storage_failed(detail)
@@ -500,6 +531,8 @@ class ApplicationSession:
                 raise RuntimeError(
                     "a persistent clear is in progress; new requests are refused until it settles"
                 )
+            # 01 请求前预估 (D7 两道口之一): 超限零 begin/零模型调用, 不锁存 storage_failed
+            self._refuse_overbudget_request(prompt)
             begin_task = asyncio.ensure_future(
                 self._store.begin_request(self._epoch_id or "", prompt)
             )
@@ -532,6 +565,9 @@ class ApplicationSession:
                 raise RuntimeError(
                     f"cannot start a persisted request: {begin_error}"
                 ) from begin_error
+        else:
+            # 非持久会话同样请求前预估: 零副作用拒绝 (D9)
+            self._refuse_overbudget_request(prompt)
         loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
@@ -539,6 +575,10 @@ class ApplicationSession:
         self._cancel_token = token
         self._active_done = loop.create_future()
         self._notify(RequestPhaseChanged(None, "executing"))
+        if self._budget_policy is not None:
+            # 请求边界接缝 (D1): begin 成功之后、agent.run 之前每请求一次,
+            # 参数为调用时规范历史长度; 计数语义由 03 消费
+            self._budget_policy.note_request_start(len(self._history))
         try:
             result = await self._app.agent.run(prompt, token, history=tuple(self._history))
             # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07);
@@ -584,6 +624,45 @@ class ApplicationSession:
             self._notify(RequestPhaseChanged(result.run_id, "idle"))
         self._notify(RequestCompleted(outcome))
         return outcome
+
+    def _request_tool_specs(self) -> tuple[ToolSpec, ...]:
+        """当前组装解析后的实际工具声明 (与 _tool_fingerprint 同一取数面)."""
+        tools = getattr(self._app.agent, "_tools", {})
+        return tuple(tool.spec for tool in tools.values())
+
+    def _refuse_overbudget_request(self, prompt: str) -> None:
+        """请求前预估准入 (D7 两道口之一): 超限在 begin_request 之前拒绝.
+
+        零 begin、零模型调用; 预算拒绝不是存储故障, 不锁存 storage_failed。
+        持久模式预估拒绝不落库 (无 intent; 01 裁决, 完成回执钉住"无 intent"断言);
+        每轮权威准入 (BudgetPolicy) 发生在 begin 之后, 按既有错误路径收尾并落
+        finalized 错误记录。预估不含锚 (锚状态在 BudgetPolicy), 检查模式另加
+        RunPolicy 控制段字节上限的允许量, 保持保守方向。
+        """
+        policy = self._budget_policy
+        config = self._config.budget
+        if policy is None or config is None:
+            return
+        messages = (*self._history, UserMessage(text=prompt))
+        input_estimate, components = estimate_input_components(
+            self._config.system_prompt, self._request_tool_specs(), messages, config
+        )
+        if self._config.plan is not None:
+            allowance = math.ceil(CONTROL_SECTION_MAX_BYTES / 3)
+            components = components + (
+                ComponentEstimate(
+                    "verification_control_allowance",
+                    allowance,
+                    "estimated",
+                    note="upper bound of the RunPolicy control section appended before send",
+                ),
+            )
+            input_estimate += allowance
+        report = assemble_report(
+            config, input_estimate=input_estimate, input_components=components, source="estimated"
+        )
+        if report.total_estimate > config.num_ctx:
+            raise RuntimeError(f"request refused before start: {budget_exceeded_text(report)}")
 
     async def _finalize_request(self, result: RunResult) -> RequestOutcome:
         """验证收尾: 扫描末次终结事实 -> refresh -> finalize -> 工件核对 -> 交付判定.
@@ -1106,16 +1185,32 @@ async def open_application(
     shared-boundary-handoff.md §4.
     """
     plan = config.plan
+    budget_config = config.budget
     policy_state: dict[str, object] = {}
     # 恢复前缀证明容器 (03): 检查模式 + 持久会话时由 RunPolicy 每次发送前核对
     history_projection: HistoricalProjection | None = None
 
+    def _make_budget_policy(model):
+        # D1 次序: BudgetPolicy 在 RunPolicy 下游、适配器上游;
+        # 计量因此覆盖验证投影 (控制段/freshness 标记) 的最终形态
+        budget = BudgetPolicy(model, budget_config)
+        policy_state["budget_policy"] = budget
+        return budget
+
     def _model_policy(model, runtime):
-        service = runtime.capability(VERIFICATION_CAPABILITY)
-        wrapped = verification_policy(model, service, history=history_projection)
-        policy_state["policy"] = wrapped
-        policy_state["service"] = service
-        return wrapped
+        if budget_config is not None:
+            model = _make_budget_policy(model)
+        if plan is not None:
+            service = runtime.capability(VERIFICATION_CAPABILITY)
+            model = verification_policy(model, service, history=history_projection)
+            policy_state["policy"] = model
+            policy_state["service"] = service
+        return model
+
+    # D1 四态: 检查+预算 = verification_policy(budget_policy(inner));
+    # 非检查+预算 = 仅 budget_policy(inner) (无 RunPolicy、不取 verification capability);
+    # 仅检查 = 现状; 皆无 = 不装 model_policy
+    model_policy = _model_policy if (plan is not None or budget_config is not None) else None
 
     store: SQLiteSessionStore | None = None
     snapshot: RecoverySnapshot | None = None
@@ -1151,7 +1246,7 @@ async def open_application(
                 definitions,
                 tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
                 system_prompt=config.system_prompt,
-                model_policy=_model_policy if plan is not None else None,
+                model_policy=model_policy,
                 tool_policy=tool_policy,
                 max_turns=config.max_turns,
             )
@@ -1167,7 +1262,7 @@ async def open_application(
                 definitions,
                 tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
                 system_prompt=config.system_prompt,
-                model_policy=_model_policy if plan is not None else None,
+                model_policy=model_policy,
                 max_turns=config.max_turns,
             )
         except BootError as exc:
@@ -1231,6 +1326,7 @@ async def open_application(
                 restored_receipts=snapshot.restored_receipts,
                 view_only_reason=view_only_reason,
                 projection=history_projection,
+                budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
             )
             coordinator.bind(session)
         except ApplicationOpenError:
@@ -1247,6 +1343,7 @@ async def open_application(
             config=config,
             service=policy_state.get("service"),  # type: ignore[arg-type]
             policy=policy_state.get("policy"),  # type: ignore[arg-type]
+            budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
         )
     if plan is None:
         return session

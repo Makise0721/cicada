@@ -60,6 +60,7 @@ from cicada.application import (
     open_application,
     verification_checks_signature,
 )
+from cicada.budget import BudgetConfig
 from cicada.core.events import (
     AssistantCompleted,
     Event,
@@ -505,6 +506,8 @@ async def _run(args: argparse.Namespace) -> int:
             if option_error is not None:
                 print(f"--resume: {option_error}", file=sys.stderr)
                 return 2
+    # 01: 预算配置只由 ollama 路径实填; fake 默认 None = 预算层不安装 (D9)
+    budget_config: BudgetConfig | None = None
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -557,6 +560,17 @@ async def _run(args: argparse.Namespace) -> int:
         if checks:
             options["num_predict"] = CHECK_MODE_NUM_PREDICT
             request_limit = CHECK_MODE_MAX_REQUEST_BYTES
+        # 01: 预算由有效 num_ctx 实填 (D9, 含 archive 继承来源); 输出预留取配置的
+        # num_predict (检查模式 2048), 否则用 BudgetConfig 缺省。fake 路径保持 None
+        num_predict = options.get("num_predict")
+        budget_config = BudgetConfig(
+            num_ctx=num_ctx,
+            num_predict=(
+                num_predict
+                if isinstance(num_predict, int) and not isinstance(num_predict, bool) and num_predict > 0
+                else None
+            ),
+        )
         config = OllamaConfig(
             base_url=eff_base_url,
             model=eff_model,
@@ -622,6 +636,7 @@ async def _run(args: argparse.Namespace) -> int:
         max_turns=max_turns,
         model_label=model_label,
         persistence=persistence_config,
+        budget=budget_config,
     )
     if args.tui:
         assert run_tui_session_fn is not None
