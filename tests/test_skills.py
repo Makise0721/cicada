@@ -313,7 +313,7 @@ def test_compose_system_prompt_skills_enabled_and_unchanged_disabled(tmp_path):
     assert none_prompt == base_prompt and none_info.version == base_info.version == "builtin:p4-v1"
 
 
-async def test_load_skill_tool_success_errors_and_details(tmp_path):
+async def test_load_skill_tool_success_errors_and_details(tmp_path, monkeypatch):
     from cicada.core.cancel import CancelToken
     from cicada.core.ports import ToolContext
 
@@ -336,14 +336,9 @@ async def test_load_skill_tool_success_errors_and_details(tmp_path):
     manual = await tool.execute({"name": "manual"}, ToolContext("c3", CancelToken()))
     assert manual.is_error and "manual-only" in manual.content
 
-    monkey_limit = 32
-    original = tool_module.MAX_SKILL_TOOL_CONTENT_BYTES
-    tool_module.MAX_SKILL_TOOL_CONTENT_BYTES = monkey_limit
-    try:
-        limited = await tool.execute({"name": "alpha"}, ToolContext("c4", CancelToken()))
-        assert limited.is_error and "content limit" in limited.content
-    finally:
-        tool_module.MAX_SKILL_TOOL_CONTENT_BYTES = original
+    monkeypatch.setattr(tool_module, "MAX_SKILL_TOOL_CONTENT_BYTES", 32)
+    limited = await tool.execute({"name": "alpha"}, ToolContext("c4", CancelToken()))
+    assert limited.is_error and "content limit" in limited.content
 
     cancelled = CancelToken()
     cancelled.cancel()

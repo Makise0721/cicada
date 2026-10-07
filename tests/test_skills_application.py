@@ -305,6 +305,56 @@ async def test_resume_rejects_modified_body_and_adopt_uses_current_identity(tmp_
         await resumed.aclose()
 
 
+async def test_resume_rejects_path_change_and_adopt_keeps_latch(tmp_path):
+    """A09 补证: 路径变化拒绝; adopt 当前配置保留历史与未证终结锁存."""
+    import asyncio as _asyncio
+
+    from cicada.__main__ import parse_script
+
+    root = tmp_path / "ws"
+    skills_dir = root / "skills"
+    write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
+    snapshot = make_snapshot(skills_dir)
+    # 留下未证终结活动: powershell 长命令在途时取消
+    script = parse_script(
+        '[{"tool_calls": [{"id": "c1", "name": "powershell",'
+        ' "arguments": {"command": "Start-Sleep -Seconds 30", "timeout": 30}}]},'
+        ' {"text": "完成", "stop": true}]'
+    )
+    config, _p, _i = make_config(root, script, snapshot, persist=True)
+    session = await open_application(config)
+    session_id = session.persistence.session_id
+    task = _asyncio.create_task(session.execute("会留下未证终结"))
+    await _asyncio.sleep(0.3)
+    session.cancel()
+    await _asyncio.wait_for(task, timeout=15)
+    await session.aclose()
+
+    # 路径变化 (新目录 + 当前身份): prompt hash 随 root 变化, 默认恢复冲突拒绝
+    skills_moved = root / "skills-moved"
+    write_skill(skills_moved, "alpha", SKILL_BODY_ALPHA)
+    moved_snapshot = make_snapshot(skills_moved)
+    moved_config, _p2, _i2 = make_config(
+        root, [STOP], moved_snapshot, session_id=session_id
+    )
+    with pytest.raises(ApplicationOpenError, match="config conflicts"):
+        await open_application(moved_config)
+
+    # adopt 当前配置 (同目录重载): 保留历史、保留 view-only 未证终结锁存
+    adopt_config, _p3, _i3 = make_config(
+        root, [STOP], snapshot, session_id=session_id, adopt=True
+    )
+    resumed = await open_application(adopt_config)
+    try:
+        assert resumed.persistence.mode == "resume"
+        assert resumed.view_only_reason is not None
+        assert "powershell" in resumed.view_only_reason
+        assert resumed.history and "会留下未证终结" in resumed.history[0].text
+        assert resumed.skills.manifest_sha256 == snapshot.manifest_sha256
+    finally:
+        await resumed.aclose()
+
+
 async def test_f1_identity_prompt_mismatch_rejected_before_store_io(tmp_path):
     """F1 负例: B 快照的实际提示 + A 快照的持久身份, 普通/adopt 均在零存储 I/O 前拒绝."""
     root = tmp_path / "ws"

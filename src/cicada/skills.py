@@ -199,7 +199,7 @@ def catalog_prompt_section(snapshot: SkillCatalogSnapshot) -> str:
             {
                 "name": info.name,
                 "description": info.description,
-                "source": info.source_path,
+                "source_path": info.source_path,
                 "base_dir": info.base_dir,
                 "source_sha256": info.source_sha256,
             },
