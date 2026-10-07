@@ -299,7 +299,10 @@ def decode_skill_request(text: str) -> SkillInvocation | None:
     try:
         decoder = json.JSONDecoder(object_pairs_hook=_object_without_duplicate_keys)
         obj, end = decoder.raw_decode(payload_text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError: 64 KiB 内可构造深嵌套 JSON (递归下降解析栈溢出),
+        # 与格式错误同等按原始用户文本显示, 不逃出解码 (审查处置 F1;
+        # 显示解码是 fail-soft, 与 persistence 列表的 fail-loud 裁决语义不同)
         return None
     if payload_text[end:].strip():
         return None  # 前缀后只接受一个完整对象

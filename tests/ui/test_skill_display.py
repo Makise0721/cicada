@@ -303,6 +303,32 @@ async def test_skill_submit_while_busy_and_double_submit_are_silent(tmp_path):
         await session.aclose()
 
 
+async def test_skill_silent_during_clear_and_compact_barriers(tmp_path):
+    """审查处置 F4 (D8): 清空/压缩提交屏障内 /skill 静默无动作, 落定后恢复."""
+    root = tmp_path / "ws"
+    skills_dir = root / "skills"
+    write_skill(skills_dir, "alpha")
+    session = await open_application(make_config(root, HeldModel(), make_snapshot(root, skills_dir)))
+    h = Harness(session)
+    try:
+        h.view._gate.note_clear_started()
+        before = len(h.entries())
+        assert h.submit("/skill alpha 任务") is False
+        assert h.submit("/skill") is False
+        assert len(h.entries()) == before
+        h.view._gate.note_clear_settled()
+        h.view._gate.note_compact_started()
+        assert h.submit("/skill alpha 任务") is False
+        assert h.submit("/skill") is False
+        assert len(h.entries()) == before
+        h.view._gate.note_compact_settled()
+        assert h.submit("/skill") is True  # 落定后恢复可用
+        assert h.user_entries() == []
+    finally:
+        h.view.close()
+        await session.aclose()
+
+
 # --- 显示条目: 收起/展开、窄窗、控制字符、坏封装回退 ----------------------------------------------
 
 
@@ -379,6 +405,40 @@ def test_bad_envelope_falls_back_to_raw_user_entry():
         assert entry.text == variant
     rendered = "\n".join(transcript.render(80))
     assert "{not json" in rendered
+
+
+def test_deep_nested_envelope_falls_back_instead_of_crashing():
+    """审查处置 F1: 深嵌套封装在显示入口同样按原始文本回退, 不抛 RecursionError."""
+    transcript = Transcript()
+    entry = transcript.append_user(SKILL_REQUEST_PREFIX + "\n" + "[" * 60_000)
+    assert type(entry) is UserEntry
+    assert entry.text.startswith(SKILL_REQUEST_PREFIX)
+    assert transcript.render(80)  # 渲染有界, 不抛异常
+
+
+def test_skill_header_source_path_control_chars_sanitized():
+    """审查处置 F2: 标题行整体显示清理——记录文本中的 ANSI 不得进入渲染输出."""
+    import hashlib as _hashlib
+
+    info = SkillInfo(
+        name="alpha", description="d",
+        source_path="C:/s/\x1b[31malpha\x1b[0m/SKILL.md\x1b[48;2;255;0;0m",
+        base_dir="C:/s/alpha", source_sha256="a" * 64,
+    )
+    body = "clean body"
+    document = SkillDocument(
+        info=info, body=body,
+        body_sha256=_hashlib.sha256(body.encode("utf-8")).hexdigest(),
+    )
+    entry = Transcript().append_user(build_skill_request(document, "任务"))
+    assert isinstance(entry, SkillRequestEntry)
+    for expanded in (False, True):
+        if expanded:
+            entry._expand_getter = lambda: True  # 展开态标题含 sha256 段, 同样受清理约束
+        rendered = "\n".join(entry.render(80))
+        assert "\x1b[31m" not in rendered
+        assert "\x1b[48;2;255;0;0m" not in rendered
+        assert "SKILL.md" in rendered
 
 
 # --- 恢复: 解码来自记录, 不读当前目录 -------------------------------------------------------------

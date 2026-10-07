@@ -7,6 +7,7 @@ A11 工具路径 (Skill 文本不产生检查回执) 与设计审查 F1 的错�
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -643,5 +644,53 @@ async def test_explicit_request_respects_process_uncertain(tmp_path):
             await session.execute(prepared)
         assert session.has_process_uncertain(), "显式 Skill 请求不解锁锁存"
         assert len(captured_requests(session)) == 2  # check 轮 + 完成轮, 无第三轮
+    finally:
+        await session.aclose()
+
+
+class _HeldModel:
+    """stream 挂起直到 release(): 在途取消窗口的可控驱动 (审查处置 F4)."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+        self._release = asyncio.Event()
+
+    def release(self) -> None:
+        self._release.set()
+
+    async def stream(self, request, cancel):
+        from cicada.core.ports import StreamDone
+
+        self.requests.append(request)
+        await self._release.wait()
+        if cancel.cancelled:
+            yield StreamDone("aborted")
+            return
+        yield StreamDone("stop")
+
+
+async def test_explicit_request_cancel_rides_normal_abortion(tmp_path):
+    """A08 (审查处置 F4): 在途显式请求取消走既有 aborted 生命周期, 无伪记录."""
+    root = tmp_path / "ws"
+    skills_dir = root / "skills"
+    write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
+    snapshot = make_snapshot(skills_dir)
+    held = _HeldModel()
+    config, _p, _i = make_config(root, [], snapshot)
+    config = replace(config, model_plugin=fake_model_plugin(held))
+    session = await open_application(config)
+    try:
+        prepared = session.prepare_skill_request("alpha", "在途任务")
+        task = asyncio.create_task(session.execute(prepared))
+        await asyncio.sleep(0.05)
+        assert session.state == "executing"
+        session.cancel()
+        outcome = await asyncio.wait_for(task, timeout=10)
+        assert outcome.result.stop_reason == "aborted"
+        # 真实用户记录保留, 无伪 assistant/tool 记录
+        user_texts = [m.text for m in session.history if isinstance(m, UserMessage)]
+        assert user_texts == [prepared]
+        assert not any(isinstance(m, ToolResultMessage) for m in session.history)
+        assert len(held.requests) == 1
     finally:
         await session.aclose()

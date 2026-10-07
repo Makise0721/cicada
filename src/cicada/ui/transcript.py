@@ -113,9 +113,12 @@ class SkillRequestEntry(UserEntry):
         invocation = self.invocation
         # 用户任务部分: 与普通用户消息同一背景盒样式
         lines = ["", *theme.user_message_lines(invocation.task, width)]
-        header = f"Skill 文档 {invocation.name}（{invocation.source_path}）"
-        if expanded:
-            header += f" · sha256:{invocation.body_sha256[:12]}"
+        # 标题整体显示清理后才换行 (wrap_text_ansi 契约要求调用方先剥 ANSI):
+        # source_path 是记录文本, 存档/粘贴可携带任意控制序列 (审查处置 F2)
+        header = sanitize_display(
+            f"Skill 文档 {invocation.name}（{invocation.source_path}）"
+            + (f" · sha256:{invocation.body_sha256[:12]}" if expanded else "")
+        )
         for chunk in wrap_text_ansi(header, max(1, width)):
             lines.append(theme.fg(theme.MD_CODE, chunk))
         if not expanded:

@@ -689,3 +689,67 @@ def test_cli_skill_rejected_with_list_sessions(tmp_path):
     )
     assert proc.returncode == 2
     assert "只读列表入口" in proc.stderr
+
+
+def test_decode_deep_nesting_returns_none_instead_of_recursion_error():
+    """审查处置 F1: 64 KiB 内深嵌套 JSON 的 RecursionError 不得逃出解码."""
+    assert decode_skill_request(SKILL_REQUEST_PREFIX + "\n" + "[" * 60_000) is None
+    assert decode_skill_request(
+        SKILL_REQUEST_PREFIX + "\n" + '{"a":' * 20_000 + "1" + "}" * 20_000
+    ) is None
+
+
+def test_cli_skill_envelope_reaches_committed_archive(tmp_path):
+    """A06 (审查处置 F3): CLI --skill 接线直接证据——封装文本进入完整提交存档."""
+    import asyncio
+
+    from cicada.plugins.session_store import open_session_store
+
+    root = tmp_path / "skills"
+    write_skill(root, "alpha", body="Wired body.")
+    script = _script_file(tmp_path)
+    saved = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skills-dir", str(root), "--skill", "alpha", "CLI 任务",
+        "--save-session",
+    )
+    assert saved.returncode == 0, saved.stderr
+    session_id = next(
+        line.split("id=")[1].split()[0]
+        for line in saved.stdout.splitlines() if line.startswith("[session id=")
+    )
+    store = open_session_store(
+        directory=tmp_path / ".cicada" / "sessions", session_id=session_id, workspace=tmp_path
+    )
+    try:
+        snapshot = store.recovery_snapshot()
+        assert len(snapshot.requests) == 1
+        first = snapshot.requests[0].messages[0]
+        assert first.text.startswith(SKILL_REQUEST_PREFIX + "\n")
+        decoded = decode_skill_request(first.text)
+        assert decoded is not None
+        assert decoded.name == "alpha" and decoded.task == "CLI 任务"
+        assert "Wired body." in decoded.body
+    finally:
+        asyncio.run(store.aclose())
+    # 无位置 prompt: 固定指令作为任务进入同一封装路径
+    saved_default = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skills-dir", str(root), "--skill", "alpha", "--save-session",
+    )
+    assert saved_default.returncode == 0, saved_default.stderr
+    session_id_default = next(
+        line.split("id=")[1].split()[0]
+        for line in saved_default.stdout.splitlines() if line.startswith("[session id=")
+    )
+    store_default = open_session_store(
+        directory=tmp_path / ".cicada" / "sessions", session_id=session_id_default,
+        workspace=tmp_path,
+    )
+    try:
+        first_default = store_default.recovery_snapshot().requests[0].messages[0]
+        decoded_default = decode_skill_request(first_default.text)
+        assert decoded_default is not None
+        assert decoded_default.task == DEFAULT_SKILL_TASK
+    finally:
+        asyncio.run(store_default.aclose())
