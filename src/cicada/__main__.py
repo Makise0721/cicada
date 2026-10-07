@@ -87,6 +87,7 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
 from cicada.plugins.session_store import list_sessions, open_session_store
 from cicada.plugins.session_store.store import validate_session_id
+from cicada.plugins.skills import load_skill_catalog
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
@@ -95,6 +96,7 @@ from cicada.prompting import (
     compose_system_prompt,
 )
 from cicada.reporting import build_delivery_section, build_run_summary
+from cicada.skills import SKILLS_PROMPT_VERSION, SkillCatalogError, SkillsError
 
 DEFAULT_CONFIG = OllamaConfig()
 DEFAULT_NUM_CTX = 32768  # CLI 请求级默认值; 消除服务端默认 4K 依赖. 仅是请求值, 非实际分配保证
@@ -442,20 +444,43 @@ async def _run(args: argparse.Namespace) -> int:
         )
         return 2
     workspace = Path(args.workspace)
-    # 指令文件错误先于 preflight/bootstrap (P3 §4.2)
+    # 指令文件错误先于 preflight/bootstrap (P3 §4.2); Skills 目录错误同为启动输入
+    # 错误, 在存档身份预读与 provider 探测之前 (D8)
+    skills_snapshot = None
+    if args.skills_dir is not None:
+        try:
+            skills_snapshot = load_skill_catalog(args.skills_dir, workspace)
+        except SkillCatalogError as exc:
+            print(f"invalid skills directory: {exc}", file=sys.stderr)
+            return 2
     check_prompts = tuple(
         CheckPrompt(check.check_id, check.command, check.timeout_s) for check in checks
     )
+    prompt_tools = (DEFAULT_TOOLS + ("check",)) if checks else DEFAULT_TOOLS
+    if skills_snapshot is not None:
+        prompt_tools = prompt_tools + ("load_skill",)
     try:
         prompt, prompt_info = compose_system_prompt(
             workspace,
             args.instructions_file,
-            tools=DEFAULT_TOOLS + ("check",) if checks else DEFAULT_TOOLS,
+            tools=prompt_tools,
             checks=check_prompts,
+            skills=skills_snapshot,
         )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
         return 2
+    except SkillsError as exc:
+        print(f"invalid skills input: {exc}", file=sys.stderr)
+        return 2
+    if skills_snapshot is not None and not args.tui:
+        print(
+            f"[skills root={skills_snapshot.root} skills={len(skills_snapshot.documents)} "
+            f"manifest_sha256={skills_snapshot.manifest_sha256[:12]}]"
+        )
+        if skills_snapshot.diagnostics:
+            for diagnostic in skills_snapshot.diagnostics:
+                print(f"[skills diagnostic: {diagnostic}]")
     if not args.tui:  # TUI 静默: prompt 身份进 /status (P12)
         _print_prompt_info(prompt_info)
     plan: VerificationPlan | None = None
@@ -496,6 +521,14 @@ async def _run(args: argparse.Namespace) -> int:
             print(
                 "--resume: 存档为检查模式会话, 检查定义不保存在存档中, 无法省略继承; "
                 "请显式给出与保存时相同的 --check-command, "
+                "或用 --resume-with-current-config 以当前配置恢复",
+                file=sys.stderr,
+            )
+            return 2
+        if saved_stored.launch.prompt_version == SKILLS_PROMPT_VERSION and args.skills_dir is None:
+            print(
+                "--resume: 存档为 Skills 会话, --skills-dir 不从存档继承; "
+                "请重传与保存时相同的 --skills-dir, "
                 "或用 --resume-with-current-config 以当前配置恢复",
                 file=sys.stderr,
             )
@@ -637,6 +670,7 @@ async def _run(args: argparse.Namespace) -> int:
         model_label=model_label,
         persistence=persistence_config,
         budget=budget_config,
+        skills=skills_snapshot,
     )
     if args.tui:
         assert run_tui_session_fn is not None
@@ -753,6 +787,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"
+    )
+    parser.add_argument(
+        "--skills-dir",
+        help=(
+            "启用本地 Skills 的目录 (相对 workspace; 直接子目录各含一份 SKILL.md)。"
+            "恢复会话不从存档继承, 须显式重传同一目录"
+        ),
     )
     parser.add_argument(
         "--check-command", action="append", default=None, metavar="POWERSHELL",

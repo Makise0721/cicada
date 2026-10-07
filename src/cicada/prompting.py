@@ -16,6 +16,8 @@ import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
+from cicada.skills import SKILLS_PROMPT_VERSION, SkillCatalogSnapshot, catalog_prompt_section
+
 PROMPT_VERSION = "builtin:p4-v1"
 MAX_INSTRUCTIONS_BYTES = 16 * 1024
 
@@ -132,13 +134,20 @@ def compose_system_prompt(
     *,
     tools: tuple[str, ...] = DEFAULT_TOOLS,
     checks: tuple[CheckPrompt, ...] = (),
+    skills: SkillCatalogSnapshot | None = None,
 ) -> tuple[str, PromptInfo]:
-    """组装系统提示: 内置提示在前, 项目指令以明确来源标记追加在后.
+    """组装系统提示: 内置提示在前, Skills 目录段紧随, 项目指令以明确来源标记追加在后.
 
     空/纯空白指令文件不追加空 section。返回 (提示文本, 来源信息)。
     `tools`/`checks` 来自启动层实际注册的插件配置; 默认等于普通模式。
+    `skills` 为启用 Skills 的冻结快照: 版本切换为 SKILLS_PROMPT_VERSION, 目录段
+    由快照纯构造 (超限抛 SkillPromptError); None 时输出与未启用逐位一致。
     """
     prompt = build_builtin_prompt(workspace, tools, checks)
+    version = PROMPT_VERSION
+    if skills is not None:
+        prompt += "\n" + catalog_prompt_section(skills)
+        version = SKILLS_PROMPT_VERSION
     resolved: Path | None = None
     raw_hash: str | None = None
     if instructions_path is not None:
@@ -149,7 +158,7 @@ def compose_system_prompt(
                 f"{text.rstrip()}\n"
             )
     info = PromptInfo(
-        version=PROMPT_VERSION,
+        version=version,
         workspace=workspace.resolve(),
         instructions_path=resolved,
         instructions_sha256=raw_hash,

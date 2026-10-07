@@ -65,6 +65,7 @@ uv run --frozen python -m cicada --tui --workspace .\sandbox
 | `--workspace` | 工作区根目录，默认当前目录 |
 | `--model` / `--ollama-url` / `--think` / `--num-ctx` | 模型与服务配置；`--num-ctx` 默认 32768（请求级，非分配保证），也是真实模型发送前预算准入的上限来源 |
 | `--instructions-file` | 追加到系统提示的项目指令文件（≤16 KiB UTF-8） |
+| `--skills-dir` | 启用本地 Skills 的目录（相对 workspace；每个直接子目录一份 `SKILL.md`，Markdown + YAML frontmatter 基本格式）。启动只把目录元数据加入系统提示，模型经 `load_skill` 工具按名称取冻结正文；恢复不从存档继承，须重传同一目录 |
 | `--script` | JSON 剧本文件；与真实模型参数互斥 |
 | `--check-command` / `--check-timeout` | 检查模式；timeout 默认 120 秒，范围 (0, 300] |
 | `--save-session` / `--resume` / `--resume-with-current-config` / `--list-sessions` | 持久会话，语义见上节 |

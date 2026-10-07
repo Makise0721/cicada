@@ -16,6 +16,17 @@ FORBIDDEN = {
     # 应用层预算策略 (01): 摘要通道/overflow 分类器经构造注入, 接线在应用层,
     # 本模块不得导入 plugins; persistence 依赖留给 02 的提交协议
     "context_policy": {"cicada.plugins", "cicada.boot"},
+    # 中立 Skills 契约 (local-skills-v1 02): 纯数据/纯构造, 不依赖任何内部层
+    "skills": {
+        "cicada.core", "cicada.persistence", "cicada.budget", "cicada.context_policy",
+        "cicada.prompting", "cicada.application", "cicada.runtime", "cicada.plugins",
+        "cicada.boot",
+    },
+    # 提示构造 (纯文本): 唯一允许的内部依赖是中立 skills 契约
+    "prompting": {
+        "cicada.core", "cicada.persistence", "cicada.budget", "cicada.context_policy",
+        "cicada.application", "cicada.runtime", "cicada.plugins", "cicada.boot",
+    },
 }
 
 

@@ -108,9 +108,17 @@ from cicada.plugins.coding.verification_contracts import (
     VerificationView,
 )
 from cicada.plugins.coding.workspace import workspace_plugin
+from cicada.plugins.skills import CATALOG_CAPABILITY, skills_plugin
 from cicada.prompting import PromptInfo
 from cicada.reporting import DeliveryDecision, decide_delivery
 from cicada.runtime.plugin import PluginDefinition
+from cicada.skills import (
+    LOAD_SKILL_TOOL_NAME,
+    SKILLS_PROMPT_VERSION,
+    SkillCatalogSnapshot,
+    SkillCatalogView,
+    catalog_prompt_section,
+)
 
 ApplicationPhase = Literal["executing", "cancelling", "finalizing", "idle"]
 SessionStateName = Literal[
@@ -129,9 +137,14 @@ _UNDEAD_GRACE_S = 2.0
 
 
 def default_definitions(
-    workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None
+    workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None,
+    *, skills: SkillCatalogSnapshot | None = None
 ) -> list[PluginDefinition]:
-    """内置 Coding 能力 + 模型插件 (+ 检查模式验证服务) 的启动名单."""
+    """内置 Coding 能力 + 模型插件 (+ 检查模式验证服务 + Skills 能力) 的启动名单.
+
+    skills 为启用 Skills 的冻结快照: 追加目录能力与 load_skill 工具插件;
+    None 时名单与未启用逐位一致。
+    """
     definitions: list[PluginDefinition] = [
         workspace_plugin(workspace),
         inventory_plugin(),
@@ -146,6 +159,10 @@ def default_definitions(
     if plan is not None:
         definitions.append(verification_plugin(plan))
         definitions.append(check_plugin())
+    if skills is not None:
+        if not isinstance(skills, SkillCatalogSnapshot):
+            raise ValueError("skills must be a SkillCatalogSnapshot or None")
+        definitions.append(skills_plugin(skills))
     definitions.append(model_plugin)
     return definitions
 
@@ -196,6 +213,8 @@ class ApplicationConfig:
     persistence: PersistenceConfig | None = None
     # 01 尾随扩展: 显式预算配置才启用预算层 (D9); fake 默认 None, CLI 由 num_ctx 实填
     budget: BudgetConfig | None = None
+    # 02 尾随扩展: 启用 Skills 的冻结快照; None = 旧行为逐位保持
+    skills: SkillCatalogSnapshot | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -212,6 +231,8 @@ class ApplicationConfig:
             # 03 起检查模式 + 持久会话组合放开 (票据 03); 恢复要求 checks_signature 一致
         if self.budget is not None and not isinstance(self.budget, BudgetConfig):
             raise ValueError("budget must be a BudgetConfig or None")
+        if self.skills is not None and not isinstance(self.skills, SkillCatalogSnapshot):
+            raise ValueError("skills must be a SkillCatalogSnapshot or None")
 
 
 @dataclass(frozen=True)
@@ -526,6 +547,12 @@ class ApplicationSession:
     def restored_receipts(self) -> tuple[StoredReceipt, ...]:
         """打开时恢复的历史检查回执事实 (05 显示消费的取数入口; 只读)."""
         return self._restored_receipts
+
+    @property
+    def skills(self) -> SkillCatalogView | None:
+        """启用 Skills 时的只读目录视图 (元数据/root/manifest, 不含正文); 未启用 None."""
+        snapshot = self._config.skills
+        return None if snapshot is None else snapshot.view()
 
     @property
     def view_only_reason(self) -> str | None:
@@ -1484,6 +1511,61 @@ def _tool_fingerprint(app: App) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _validate_skills_prompt_identity(config: "ApplicationConfig") -> None:
+    """Skills 启用时的纯配置一致性校验 (F1 处置; 不做任何 I/O).
+
+    实际 system_prompt 的 hash 必须对应 prompt_info, 目录段必须由同一快照构造,
+    版本必须是 Skills 版本; 有 PersistenceConfig 时持久身份的 prompt 字段必须与
+    实际 PromptInfo 相等 (adopt_current_config 不豁免)。错配 = 启动错误。
+    """
+    info = config.prompt_info
+    if info.version != SKILLS_PROMPT_VERSION:
+        raise ValueError(
+            f"skills enabled requires prompt version {SKILLS_PROMPT_VERSION}, got {info.version}"
+        )
+    actual = hashlib.sha256(config.system_prompt.encode("utf-8")).hexdigest()
+    if actual != info.prompt_sha256:
+        raise ValueError("prompt_info.prompt_sha256 does not match the actual system_prompt")
+    if catalog_prompt_section(config.skills) not in config.system_prompt:
+        raise ValueError(
+            "system_prompt does not contain the catalog section of the configured skills snapshot"
+        )
+    persistence = config.persistence
+    if persistence is None:
+        return
+    identity = persistence.identity
+    mismatches = []
+    if identity.prompt_version != info.version:
+        mismatches.append("prompt_version")
+    if identity.prompt_sha256 != info.prompt_sha256:
+        mismatches.append("prompt_sha256")
+    if identity.instructions_sha256 != info.instructions_sha256:
+        mismatches.append("instructions_sha256")
+    if mismatches:
+        raise ValueError(
+            "persistence identity prompt fields do not match the actual PromptInfo: "
+            + ", ".join(mismatches)
+        )
+
+
+def _verify_skills_assembly(app: App, config: "ApplicationConfig") -> None:
+    """bootstrap 后核对实际装配: 同一快照/工具注册/指纹含 load_skill (契约 §5)."""
+    try:
+        catalog = app.runtime.capability(CATALOG_CAPABILITY)
+    except Exception as exc:
+        raise ApplicationOpenError(f"skills catalog capability missing: {exc}") from exc
+    if catalog != config.skills:
+        raise ApplicationOpenError(
+            "actual skills catalog capability does not match the configured snapshot "
+            "(root/manifest/content identity)"
+        )
+    tools = getattr(app.agent, "_tools", {})
+    if LOAD_SKILL_TOOL_NAME not in tools:
+        raise ApplicationOpenError(
+            f"the {LOAD_SKILL_TOOL_NAME} tool is not registered while skills are enabled"
+        )
+
+
 def verification_checks_signature(checks) -> str:
     """检查定义的稳定摘要; 进入 LaunchIdentity.checks_signature 参与恢复比对 (03)."""
     payload = [
@@ -1736,6 +1818,12 @@ async def open_application(
     plan = config.plan
     budget_config = config.budget
     policy_state: dict[str, object] = {}
+    # 02/F1: Skills 启用时的纯配置一致性校验 (提示/身份绑定) 先于一切应用发起 I/O
+    if config.skills is not None:
+        try:
+            _validate_skills_prompt_identity(config)
+        except ValueError as exc:
+            raise ApplicationOpenError(f"skills config invalid: {exc}") from exc
     # 恢复前缀证明容器 (03): 检查模式 + 持久会话时由 RunPolicy 每次发送前核对
     history_projection: HistoricalProjection | None = None
     # 模型可见投影容器 (02, D4): 预算启用即存在 (空 = 恒等投影); 压缩/clear/恢复
@@ -1793,14 +1881,23 @@ async def open_application(
         def tool_policy(tool, runtime, _store=store, _coordinator=coordinator):
             return ProcessActivityWrapper(tool, _store, _coordinator)
 
+    # 02: Skills 启用时实际注册工具在既有名单上追加 load_skill
+    tool_capabilities: tuple[str, ...] = (
+        CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES
+    )
+    if config.skills is not None:
+        tool_capabilities = tool_capabilities + ("tool.load_skill",)
+
     definitions: list[PluginDefinition] = []
     if store is not None:
         definitions.append(session_store_plugin(store))
         definitions.extend(_bind_store_last_cleanup(
-            default_definitions(config.workspace, config.model_plugin, plan)
+            default_definitions(config.workspace, config.model_plugin, plan, skills=config.skills)
         ))
     else:
-        definitions.extend(default_definitions(config.workspace, config.model_plugin, plan))
+        definitions.extend(
+            default_definitions(config.workspace, config.model_plugin, plan, skills=config.skills)
+        )
 
     if store is not None:
         assert snapshot is not None and config.persistence is not None
@@ -1809,7 +1906,7 @@ async def open_application(
             await _run_preflight(preflight)
             app: App = await bootstrap(
                 definitions,
-                tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
+                tool_capabilities=tool_capabilities,
                 system_prompt=config.system_prompt,
                 model_policy=model_policy,
                 tool_policy=tool_policy,
@@ -1825,13 +1922,20 @@ async def open_application(
         try:
             app = await bootstrap(
                 definitions,
-                tool_capabilities=CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES,
+                tool_capabilities=tool_capabilities,
                 system_prompt=config.system_prompt,
                 model_policy=model_policy,
                 max_turns=config.max_turns,
             )
         except BootError as exc:
             raise ApplicationOpenError(f"boot failed: {exc}") from exc
+    if config.skills is not None:
+        # 02/契约 §5: 实际装配核对 — 同一快照/工具注册/工具指纹含 load_skill
+        try:
+            _verify_skills_assembly(app, config)
+        except ApplicationOpenError:
+            await app.aclose()
+            raise
 
     if store is not None and snapshot is not None and config.persistence is not None:
         # 指纹核对/启动代次/会话构造的每条失败路径都必须释放 app (store 随 runtime 清理)
