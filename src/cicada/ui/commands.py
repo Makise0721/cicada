@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from cicada.ui import theme
-from cicada.ui.main_screen import truncate_to_width
+from cicada.ui.main_screen import truncate_to_width, visible_width
 
 
 @dataclass(frozen=True)
@@ -79,11 +79,22 @@ class SlashCommandMenu:
         for index in range(start, start + count):
             item = self._matches[index]
             name = item.command[1:].ljust(name_width)
-            label = f"→ {name}" if index == self._index else f"  {name}"
+            # 描述先按剩余宽度截断再套样式 (truncate_to_width 会剥离 SGR)
+            desc = truncate_to_width(item.description, max(0, width - 2 - name_width - 2))
             if index == self._index:
-                label = theme.fg(theme.MD_LINK, label)
-            line = label + "  " + theme.fg(theme.MUTED_GRAY, item.description)
-            lines.append(truncate_to_width(line, width))
+                # 选中行整行背景高亮 (tui-aesthetics 规格 §D):
+                # 行内只用只开序列换色, 末尾一次复位 (内层复位会清掉背景)
+                used = 2 + name_width + 2 + visible_width(desc)
+                pad = " " * max(0, width - used)
+                lines.append(
+                    theme.bg_open(theme.MENU_SEL_BG)
+                    + theme.fg_open(theme.EDITOR_BORDER) + "→ "
+                    + theme.fg_open(theme.MD_LINK) + name
+                    + theme.fg_open(theme.MUTED_GRAY) + "  " + desc
+                    + pad + "\x1b[0m"
+                )
+            else:
+                lines.append(f"  {name}  " + theme.fg(theme.MUTED_GRAY, desc))
         if show_count:
             lines.append(theme.fg(theme.FOOTER_DIM, truncate_to_width(
                 f"  ({self._index + 1}/{len(self._matches)})", width

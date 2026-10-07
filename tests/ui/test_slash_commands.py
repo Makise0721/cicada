@@ -4,6 +4,8 @@ import pytest
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
+from cicada.ui.commands import SlashCommandMenu
+from cicada.ui.main_screen import strip_terminal_sequences, visible_width
 from tests.ui.test_frontend_headless import BACKSPACE, ENTER, ESCAPE, Harness, text_keys
 
 UP = KeyPress(Keys.Up, "\x1b[A")
@@ -141,3 +143,35 @@ async def test_menu_fits_window_and_keeps_hardware_cursor_in_editor(columns, row
         assert h.frontend.ui_failures == []
     finally:
         await h.stop()
+
+
+# --- tui-aesthetics 04: 选中行整行高亮 (规格 §D, 字面量断言) ------------------------------------
+
+SEL_BG = "\x1b[48;2;45;45;61m"       # MENU_SEL_BG #2d2d3d
+ARROW_FG = "\x1b[38;2;178;148;187m"  # #b294bb
+NAME_FG = "\x1b[38;2;129;162;190m"   # #81a2be
+DESC_FG = "\x1b[38;2;128;128;128m"   # #808080
+
+
+def test_v2_selected_row_full_width_highlight():
+    menu = SlashCommandMenu()
+    menu.sync("/", at_end=True)
+    lines = menu.render(60, 4)
+    selected = lines[0]
+    assert strip_terminal_sequences(selected).startswith("→ help")
+    assert selected.startswith(SEL_BG) and selected.endswith("\x1b[0m")
+    assert ARROW_FG in selected and NAME_FG in selected and DESC_FG in selected
+    assert visible_width(strip_terminal_sequences(selected)) == 60  # 整行背景补齐
+    # 选中行内部不出现复位 (内层 \x1b[0m 会清掉整行背景)
+    assert selected[:-4].count("\x1b[0m") == 0
+    for line in lines[1:]:
+        if "(" in strip_terminal_sequences(line):
+            continue  # 分页指示行
+        assert not line.startswith(SEL_BG)  # 未选中行无背景
+
+
+def test_v2_selected_row_narrow_width_truncates_description():
+    menu = SlashCommandMenu()
+    menu.sync("/", at_end=True)
+    for line in menu.render(12, 3):
+        assert visible_width(strip_terminal_sequences(line)) <= 12
