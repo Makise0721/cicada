@@ -22,17 +22,28 @@ from cicada.plugins.skills import loader as loader_module
 from cicada.plugins.skills import tool as tool_module
 from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
 from cicada.skills import (
+    DEFAULT_SKILL_TASK,
     MANIFEST_VERSION,
     MAX_SKILL_CATALOG_PROMPT_BYTES,
+    MAX_SKILL_FILE_BYTES,
+    MAX_SKILL_REQUEST_BYTES,
     SKILLS_PROMPT_VERSION,
+    SKILL_REQUEST_PREFIX,
     SkillCatalogError,
     SkillCatalogSnapshot,
+    SkillDocument,
+    SkillInfo,
     SkillPromptError,
+    SkillRequestError,
     SkillSelectionError,
+    build_skill_invocation,
+    build_skill_request,
     catalog_prompt_section,
+    decode_skill_request,
     find_skill,
     manifest_json,
     manifest_sha256,
+    render_skill_request,
 )
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -423,3 +434,258 @@ def test_cli_resume_requires_skills_dir_retransmission(tmp_path):
         "--skills-dir", str(root), "--resume", session_id, "任务",
     )
     assert again.returncode == 0, again.stderr
+
+
+# --- 显式请求封装 (票据 03, 契约 §4): 纯构造与有界解码 ------------------------------------------
+
+
+def _document(body: str, *, manual: bool = False) -> SkillDocument:
+    info = SkillInfo(
+        name="alpha", description="The alpha skill.",
+        source_path="C:/skills/alpha/SKILL.md", base_dir="C:/skills/alpha",
+        source_sha256="a" * 64, disable_model_invocation=manual,
+    )
+    return SkillDocument(
+        info=info, body=body, body_sha256=hashlib.sha256(body.encode("utf-8")).hexdigest()
+    )
+
+
+def _envelope(payload: dict) -> str:
+    return SKILL_REQUEST_PREFIX + "\n" + json.dumps(payload, ensure_ascii=False)
+
+
+def _valid_payload(**overrides) -> dict:
+    body = overrides.pop("body", "Body text.")
+    skill = overrides.pop("skill", None)
+    if skill is None:
+        skill = {
+            "name": "alpha",
+            "source_path": "C:/skills/alpha/SKILL.md",
+            "base_dir": "C:/skills/alpha",
+            "source_sha256": "a" * 64,
+            "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+            "body": body,
+        }
+    payload = {"version": 1, "skill": skill, "task": "任务"}
+    payload.update(overrides)
+    return payload
+
+
+def _skill_with_name(name: str) -> dict:
+    return {
+        "name": name,
+        "source_path": "p",
+        "base_dir": "b",
+        "source_sha256": "a" * 64,
+        "body_sha256": hashlib.sha256(b"x").hexdigest(),
+        "body": "x",
+    }
+
+
+def test_explicit_request_roundtrip_preserves_task_and_body():
+    body = (
+        'Body with "quotes", ' + chr(92) + "backslash, --- frontmatter 樣分隔符 and {json:like}\n"
+        "第二行 CICADA_SKILL_REQUEST_V1 出现在正文中间\n\t含控制字面与 unicode ✓"
+    )
+    task = '修复登录 bug\n第二行任务 "带引号" 与 ' + chr(92) + "反斜杠"
+    text = build_skill_request(_document(body), task)
+    assert text.startswith(SKILL_REQUEST_PREFIX + "\n")
+    # JSON 对象占前缀后的完整余文; 封装字符不出现在首行之外的结构位
+    decoded = decode_skill_request(text)
+    assert decoded is not None
+    assert decoded.version == 1
+    assert decoded.name == "alpha"
+    assert decoded.body == body and decoded.task == task
+    assert decoded.body_sha256 == _document(body).body_sha256
+
+
+def test_explicit_request_default_task_and_manual_only_build():
+    default_text = build_skill_request(_document("Body."), "")
+    decoded = decode_skill_request(default_text)
+    assert decoded is not None and decoded.task == DEFAULT_SKILL_TASK
+    # 手动专用 Skill 允许显式选择构造 (模型路由拒绝是 find_skill 的 allow_manual 职责)
+    manual = build_skill_request(_document("Manual body.", manual=True), "任务")
+    assert decode_skill_request(manual) is not None
+
+
+def test_decode_rejects_malformed_variants():
+    baseline = _envelope(_valid_payload())
+    assert decode_skill_request(baseline) is not None
+    body = "Body text."
+    variants = [
+        pytest.param("plain text without prefix", id="no-prefix"),
+        pytest.param(SKILL_REQUEST_PREFIX, id="prefix-without-newline"),
+        pytest.param(
+            SKILL_REQUEST_PREFIX + "\n" + json.dumps(_valid_payload()) + "\n尾部垃圾",
+            id="trailing-garbage",
+        ),
+        pytest.param(
+            SKILL_REQUEST_PREFIX + "\n" + json.dumps(_valid_payload())
+            + "\n" + json.dumps(_valid_payload()),
+            id="second-object",
+        ),
+        pytest.param(
+            SKILL_REQUEST_PREFIX + "\n"
+            + '{"version":1,"task":"t","skill":{"name":"a","body_sha256":"x"},'
+            + '"skill":{"name":"a","body_sha256":"x"}}',
+            id="duplicate-top-key",
+        ),
+        pytest.param(_envelope(_valid_payload(extra="x")), id="extra-top-key"),
+        pytest.param(
+            _envelope({k: v for k, v in _valid_payload().items() if k != "task"}),
+            id="missing-task",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "description": "d"}}),
+            id="extra-skill-key",
+        ),
+        pytest.param(_envelope(_valid_payload(version="1")), id="version-string"),
+        pytest.param(_envelope(_valid_payload(version=2)), id="version-2"),
+        pytest.param(_envelope(_valid_payload(version=True)), id="version-bool"),
+        pytest.param(_envelope(_valid_payload(task=7)), id="task-int"),
+        pytest.param(
+            _envelope({**_valid_payload(), "skill": ["not", "a", "dict"]}),
+            id="skill-list",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "body": 5}}),
+            id="body-int",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "body_sha256": "0" * 64}}),
+            id="body-hash-mismatch",
+        ),
+        pytest.param(_envelope(_valid_payload(body="   \n\t ")), id="whitespace-body"),
+        pytest.param(_envelope(_valid_payload(body="")), id="empty-body"),
+        pytest.param(
+            _envelope(_valid_payload(skill=_skill_with_name("ABC"))),
+            id="uppercase-name",
+        ),
+        pytest.param(
+            _envelope(_valid_payload(skill=_skill_with_name("alpha\n"))),
+            id="name-trailing-newline",
+        ),
+        pytest.param(
+            _envelope(_valid_payload(skill=_skill_with_name("a" * 65))),
+            id="name-too-long",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "source_sha256": "A" * 64}}),
+            id="sha-uppercase",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "source_sha256": "short"}}),
+            id="sha-short",
+        ),
+        pytest.param(
+            _envelope({**_valid_payload(),
+                       "skill": {**_valid_payload()["skill"], "base_dir": ""}}),
+            id="empty-base-dir",
+        ),
+    ]
+    for param in variants:
+        assert decode_skill_request(param.values[0]) is None, param.id
+
+
+def test_decode_rejects_oversized_fields_and_total():
+    # 任务超限 → 总体超 64 KiB; 字段超限独立生效 (正文 > 16 KiB, hash 自洽也拒绝)
+    huge_task = _envelope(_valid_payload(task="x" * 70_000))
+    assert decode_skill_request(huge_task) is None
+    assert len(huge_task.encode("utf-8")) > MAX_SKILL_REQUEST_BYTES
+    big_body = "y" * (MAX_SKILL_FILE_BYTES + 1)
+    big = _envelope(_valid_payload(skill={
+        "name": "alpha", "source_path": "p", "base_dir": "b",
+        "source_sha256": "a" * 64,
+        "body_sha256": hashlib.sha256(big_body.encode("utf-8")).hexdigest(),
+        "body": big_body,
+    }))
+    assert decode_skill_request(big) is None
+    assert decode_skill_request(
+        SKILL_REQUEST_PREFIX + "\n" + "z" * (MAX_SKILL_REQUEST_BYTES + 1)
+    ) is None
+
+
+def test_render_skill_request_over_limit_raises():
+    invocation = build_skill_invocation(_document("Body."), "x" * 70_000)
+    with pytest.raises(SkillRequestError):
+        render_skill_request(invocation)
+
+
+def test_explicit_request_from_loaded_snapshot_roundtrips(tmp_path):
+    root = tmp_path / "skills"
+    write_skill(root, "alpha", body="Loader body with CRLF check.",
+                description="从真实快照构造", crlf=True)
+    snapshot = load(root)
+    document = find_skill(snapshot, "alpha", allow_manual=True)
+    text = build_skill_request(document, "任务 X")
+    decoded = decode_skill_request(text)
+    assert decoded is not None
+    assert decoded.body == document.body
+    assert decoded.source_path == document.info.source_path
+    assert decoded.base_dir == document.info.base_dir
+    assert decoded.source_sha256 == document.info.source_sha256
+    assert decoded.body_sha256 == document.body_sha256
+    assert decoded.task == "任务 X"
+
+
+# --- CLI --skill (票据 03, D8) ----------------------------------------------------------------
+
+
+def test_cli_skill_runs_without_prompt_and_selects_manual(tmp_path):
+    root = tmp_path / "skills"
+    write_skill(root, "alpha", body="Explicit body.")
+    write_skill(root, "manual", body="Manual body.",
+                extra_frontmatter="disable-model-invocation: true\n")
+    script = _script_file(tmp_path)
+    # 无位置 prompt: 任务用固定指令
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skills-dir", str(root), "--skill", "manual",
+    )
+    assert proc.returncode == 0, proc.stderr
+    # 位置 prompt 作为任务
+    proc_task = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skills-dir", str(root), "--skill", "alpha", "修复登录",
+    )
+    assert proc_task.returncode == 0, proc_task.stderr
+    assert "[skills root=" in proc_task.stdout
+
+
+def test_cli_skill_requires_skills_dir(tmp_path):
+    script = _script_file(tmp_path)
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skill", "alpha",
+    )
+    assert proc.returncode == 2
+    assert "--skill 需要 --skills-dir" in proc.stderr
+
+
+def test_cli_skill_unknown_rejected_before_provider_probe(tmp_path):
+    root = tmp_path / "skills"
+    write_skill(root, "alpha")
+    dead = "http://127.0.0.1:1"
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--ollama-url", dead,
+        "--skills-dir", str(root), "--skill", "nope",
+    )
+    assert proc.returncode == 2
+    assert "invalid --skill" in proc.stderr and "unknown skill" in proc.stderr
+    assert "Ollama 不可达" not in proc.stderr
+
+
+def test_cli_skill_rejected_with_list_sessions(tmp_path):
+    root = tmp_path / "skills"
+    write_skill(root, "alpha")
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--list-sessions",
+        "--skills-dir", str(root), "--skill", "alpha",
+    )
+    assert proc.returncode == 2
+    assert "只读列表入口" in proc.stderr

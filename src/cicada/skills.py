@@ -1,9 +1,9 @@
-"""本地 Skills 中立契约: 不可变 DTO、manifest/目录提示段纯构造与有界查找.
+"""本地 Skills 中立契约: 不可变 DTO、manifest/目录提示段/显式请求封装的纯构造与有界解码.
 
 只依赖标准库; 不读磁盘、不导入内核/runtime/插件/应用, 不持有历史。
 目录发现、YAML 解析、冻结快照与真实 load_skill 工具在 plugins.skills;
-提示组装在 prompting; 显式请求封装与应用接缝在 application (票据 03)。
-上限与格式契约: .scratch/local-skills-v1/contracts.md §1/§2 (r1)。
+提示组装在 prompting; 应用接缝 (prepare_skill_request) 在 application。
+上限与格式契约: .scratch/local-skills-v1/contracts.md §1/§2/§4 (r1)。
 """
 
 from __future__ import annotations
@@ -30,6 +30,14 @@ MAX_SKILL_PATH_BYTES = 2048
 MAX_SKILL_CATALOG_PROMPT_BYTES = 16 * 1024
 MAX_SKILL_TOOL_CONTENT_BYTES = 24 * 1024
 MAX_SKILL_REQUEST_BYTES = 64 * 1024
+# TUI 目录展示 (契约 §2): 输出 20 行 / 8 KiB, 裁剪带省略计数, 不解释成不存在
+MAX_SKILL_LIST_LINES = 20
+MAX_SKILL_LIST_BYTES = 8 * 1024
+
+# 显式请求封装 (契约 §4): 固定首行 + 一个确定性 JSON 对象; 解码只做显示
+SKILL_REQUEST_PREFIX = "CICADA_SKILL_REQUEST_V1"
+SKILL_REQUEST_VERSION = 1
+DEFAULT_SKILL_TASK = "请按此 Skill 处理当前对话任务；信息不足时先询问用户"
 
 
 class SkillsError(ValueError):
@@ -52,6 +60,10 @@ class SkillPromptError(SkillsError):
 
 class SkillSelectionError(SkillsError):
     """按名称查找失败: 未知名称, 或模型读取拒绝手动专用 Skill."""
+
+
+class SkillRequestError(SkillsError):
+    """显式请求文本超过 MAX_SKILL_REQUEST_BYTES; 准备阶段整体拒绝, 不截断发送."""
 
 
 @dataclass(frozen=True)
@@ -102,6 +114,24 @@ class SkillCatalogView:
     root: str
     manifest_sha256: str
     infos: tuple[SkillInfo, ...]
+
+
+@dataclass(frozen=True)
+class SkillInvocation:
+    """显式选择的普通请求数据 (契约 §1/§4): 冻结正文的来源字段 + 正文 + 用户任务.
+
+    只作为普通 UserMessage 内容与显示数据; 不设置长期激活状态, 不伪造
+    assistant/tool 记录。解码侧的实例由 decode_skill_request 构造。
+    """
+
+    version: int
+    name: str
+    source_path: str
+    base_dir: str
+    source_sha256: str
+    body: str
+    body_sha256: str
+    task: str
 
 
 def validate_skill_name(name: str, directory_name: str) -> None:
@@ -176,6 +206,145 @@ def render_skill_content(document: SkillDocument) -> str:
         f"source_sha256={info.source_sha256}]"
     )
     return f"{header}\n{document.body}"
+
+
+# --- 显式请求封装 (契约 §4): 纯构造与有界解码, 与 load_skill 工具返回无关 --------------
+
+_ENVELOPE_KEYS = frozenset({"version", "skill", "task"})
+_ENVELOPE_SKILL_KEYS = frozenset(
+    {"name", "source_path", "base_dir", "source_sha256", "body_sha256", "body"}
+)
+_SHA256_HEX_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+
+
+def build_skill_invocation(document: SkillDocument, task: str = "") -> SkillInvocation:
+    """从冻结文档构造显式请求数据; 任务未给出 (空串) 时填 spec D5 的固定指令."""
+    if not isinstance(task, str):
+        raise ValueError("task must be a string")
+    info = document.info
+    return SkillInvocation(
+        version=SKILL_REQUEST_VERSION,
+        name=info.name,
+        source_path=info.source_path,
+        base_dir=info.base_dir,
+        source_sha256=info.source_sha256,
+        body=document.body,
+        body_sha256=document.body_sha256,
+        task=task if task else DEFAULT_SKILL_TASK,
+    )
+
+
+def render_skill_request(invocation: SkillInvocation) -> str:
+    """版本化严格封装: 前缀行 + 一个确定性 JSON 对象 (字段仅 version/skill/task).
+
+    正文与任务在 JSON 内分别转义, 文档中的分隔符或用户字符串不会切出控制段;
+    该文本仍是普通用户输入。总长超过 MAX_SKILL_REQUEST_BYTES 抛 SkillRequestError,
+    不截断发送。
+    """
+    payload = {
+        "version": invocation.version,
+        "skill": {
+            "name": invocation.name,
+            "source_path": invocation.source_path,
+            "base_dir": invocation.base_dir,
+            "source_sha256": invocation.source_sha256,
+            "body_sha256": invocation.body_sha256,
+            "body": invocation.body,
+        },
+        "task": invocation.task,
+    }
+    text = (
+        SKILL_REQUEST_PREFIX
+        + "\n"
+        + json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    )
+    size = len(text.encode("utf-8"))
+    if size > MAX_SKILL_REQUEST_BYTES:
+        raise SkillRequestError(
+            f"explicit skill request is {size} bytes, exceeding the "
+            f"{MAX_SKILL_REQUEST_BYTES} byte limit"
+        )
+    return text
+
+
+def build_skill_request(document: SkillDocument, task: str = "") -> str:
+    """冻结文档 -> 完整显式请求文本 (查找用 find_skill; 执行仍走原 execute)."""
+    return render_skill_request(build_skill_invocation(document, task))
+
+
+def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate object key")
+    return dict(pairs)
+
+
+def decode_skill_request(text: str) -> SkillInvocation | None:
+    """纯解码 (仅显示用): 完整前缀 + 一个完整合法对象才返回 SkillInvocation.
+
+    拒绝重复键、额外键、错误类型、未知版本、字段超限和正文 hash 不符; 任何
+    不匹配返回 None, 调用者按原始用户文本显示, 不修补或丢弃内容。解码不证明
+    文档受信、配置相同或文件当前身份; source_sha256 只是记录中的来源标识。
+    """
+    if not isinstance(text, str):
+        return None
+    prefix_line = SKILL_REQUEST_PREFIX + "\n"
+    if not text.startswith(prefix_line):
+        return None
+    if len(text.encode("utf-8")) > MAX_SKILL_REQUEST_BYTES:
+        return None
+    payload_text = text[len(prefix_line):]
+    try:
+        decoder = json.JSONDecoder(object_pairs_hook=_object_without_duplicate_keys)
+        obj, end = decoder.raw_decode(payload_text)
+    except ValueError:
+        return None
+    if payload_text[end:].strip():
+        return None  # 前缀后只接受一个完整对象
+    if not isinstance(obj, dict) or set(obj) != _ENVELOPE_KEYS:
+        return None
+    version = obj["version"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != SKILL_REQUEST_VERSION:
+        return None
+    task, skill = obj["task"], obj["skill"]
+    if not isinstance(task, str) or not isinstance(skill, dict):
+        return None
+    if set(skill) != _ENVELOPE_SKILL_KEYS or any(
+        not isinstance(skill[key], str) for key in _ENVELOPE_SKILL_KEYS
+    ):
+        return None
+    name = skill["name"]
+    # fullmatch 而非 match+$: "$" 会匹配尾随换行, 解码输入是任意 JSON 字符串
+    if not name or len(name) > MAX_SKILL_NAME_CHARS or SKILL_NAME_PATTERN.fullmatch(name) is None:
+        return None
+    source_path, base_dir = skill["source_path"], skill["base_dir"]
+    if not source_path or not base_dir:
+        return None
+    if (
+        len(source_path.encode("utf-8")) > MAX_SKILL_PATH_BYTES
+        or len(base_dir.encode("utf-8")) > MAX_SKILL_PATH_BYTES
+    ):
+        return None
+    # fullmatch 而非 match+$: "$" 会匹配尾随换行, 解码输入是任意 JSON 字符串
+    if _SHA256_HEX_PATTERN.fullmatch(skill["source_sha256"]) is None:
+        return None
+    body = skill["body"]
+    if not body.strip() or len(body.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
+        return None
+    if hashlib.sha256(body.encode("utf-8")).hexdigest() != skill["body_sha256"]:
+        return None
+    return SkillInvocation(
+        version=SKILL_REQUEST_VERSION,
+        name=name,
+        source_path=source_path,
+        base_dir=base_dir,
+        source_sha256=skill["source_sha256"],
+        body=body,
+        body_sha256=skill["body_sha256"],
+        task=task,
+    )
 
 
 def catalog_prompt_section(snapshot: SkillCatalogSnapshot) -> str:

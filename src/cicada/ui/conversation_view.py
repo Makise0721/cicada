@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Callable
 
@@ -44,6 +45,7 @@ from cicada.application import (
     RequestPhaseChanged,
 )
 from cicada.budget import BudgetReport, BudgetSnapshot
+from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
     AssistantTextDelta,
@@ -102,7 +104,10 @@ class ConversationView:
         self._on_exit = on_exit
         self._on_update = on_update
         self._diagnostics = diagnostics
-        self.transcript = Transcript()
+        # 票据 05: 工具卡文档片段与检查事实投影 (先于显示文档: 展开标志注入)
+        self.tools = ToolDocument()
+        # local-skills-v1 票据 03: Skill 正文展开与工具输出共用全局展开标志
+        self.transcript = Transcript(expand_getter=lambda: self.tools.expanded)
         self._gate = AdmissionGate(session)
         self._gate.on_error = self._on_gate_error
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
@@ -113,8 +118,6 @@ class ConversationView:
         # 票据 05 组合钩子: 会话进入 closing/closed 且 execute 异常到达时由宿主
         # 决定退出前端 (避免 barrier 内界面失去退出路径); 默认无动作
         self.on_unrecoverable: Callable[[], None] | None = None
-        # 票据 05: 工具卡文档片段与检查事实投影
-        self.tools = ToolDocument()
         self._checks = CheckProjection(session)
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
@@ -414,8 +417,61 @@ class ConversationView:
         if command == "/exit":
             self.handle_exit()
             return True
+        if command.startswith("/skill") and (len(command) == 6 or command[6].isspace()):
+            return self._handle_skill_command(command)
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
+
+    def _handle_skill_command(self, command: str) -> bool:
+        """/skill (local-skills-v1 票据 03, spec D5/D8).
+
+        裸命令显示有界目录与用法; 带名称经 session 纯准备封装为一次普通请求,
+        再走原 _admit_coding 准入 (屏障由 _handle_command 与闸门双重检查)。
+        名称后第一个空白串是分隔符, 任务余文原样保留 (不解释 shell 引号);
+        未启用/未知名称/超限显示原因并保留草稿 (返回 False, 无伪用户条目)。
+        """
+        payload = command[len("/skill"):].strip()
+        if not payload:
+            if self._session.skills is None:
+                self.transcript.append_system(
+                    "未启用 Skills：启动时用 --skills-dir 指定目录后可用。"
+                )
+                return False  # 无目录是拒绝: 显示原因并保留草稿 (A07)
+            self.transcript.append_information("Skills 目录", self._skill_catalog_sections())
+            return True
+        match = re.match(r"(\S+)(?:\s+(.*))?$", payload, re.DOTALL)
+        name = match.group(1)
+        task = match.group(2) or ""
+        try:
+            prompt = self._session.prepare_skill_request(name, task)
+        except SkillsError as exc:
+            self.transcript.append_system(str(exc))
+            return False  # 未知名称/超限: 显示原因并保留草稿 (D8)
+        return self._admit_coding(prompt)
+
+    def _skill_catalog_sections(self) -> list[tuple[str, list[str]]]:
+        """裸 /skill 的有界目录 (D8): 全部条目 + 用法; 裁剪带省略计数。
+
+        manual-only 条目照常列出 (用户可显式选择), 标注模型不可自行加载。
+        """
+        skills = self._session.skills
+        if skills is None:  # 防御: 调用方已拦截未启用
+            return [("Skills", ["未启用 Skills：启动时用 --skills-dir 指定目录后可用。"])]
+        rows = [
+            f"root: {skills.root}",
+            f"manifest sha256:{skills.manifest_sha256[:12]} · 共 {len(skills.infos)} 个 Skill",
+        ]
+        for info in skills.infos:
+            marker = "（手动专用，模型不可自行加载）" if info.disable_model_invocation else ""
+            rows.append(f"/skill {info.name}{marker}  {info.description}")
+        rows.append("用法: /skill <名称> [任务] — 将该 Skill 正文作为下一条请求发送。")
+        fields = [clip_status_field(row) for row in rows]
+        total = "\n".join(fields)
+        kept, original_lines, original_bytes, truncated = clip_lines(
+            total, MAX_SKILL_LIST_LINES, MAX_SKILL_LIST_BYTES
+        )
+        lines = [*kept, *truncation_note(kept, original_lines, original_bytes, truncated)]
+        return [("Skills", lines)]
 
     async def _run_persistent_clear(self) -> None:
         """等待持久清空提交落定; 成功的确认条目由 HistoryCleared 投影追加。

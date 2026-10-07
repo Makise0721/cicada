@@ -109,8 +109,9 @@ async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("/"))
         assert await wait_until(lambda: stage.contains("→ help")), "输入斜杠后列出可用命令"
-        assert all(stage.contains(name) for name in ("help", "status", "compact")), (
-            "02 起 /compact 加入菜单; 小窗口内可见项以选中位置为中心"
+        assert all(stage.contains(name) for name in ("help", "status", "skill")), (
+            "02 起 /compact、03 起 /skill 加入菜单; 小窗口内可见项以选中位置为中心, "
+            "6 项菜单默认窗不含 compact, 由 /skill 代占该断言位"
         )
         stage.emit([KeyPress(Keys.Down, "\x1b[B")])
         assert await wait_until(lambda: stage.contains("→ status"))

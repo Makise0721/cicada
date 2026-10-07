@@ -22,6 +22,7 @@ class SlashCommand:
 SLASH_COMMANDS = (
     SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
+    SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill"),
     SlashCommand("/compact", "摘要较早对话以释放上下文（需持久会话）"),
     SlashCommand("/clear", "清空模型历史（已显示记录保留）"),
     SlashCommand("/exit", "退出程序"),

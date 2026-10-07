@@ -96,7 +96,13 @@ from cicada.prompting import (
     compose_system_prompt,
 )
 from cicada.reporting import build_delivery_section, build_run_summary
-from cicada.skills import SKILLS_PROMPT_VERSION, SkillCatalogError, SkillsError
+from cicada.skills import (
+    SKILLS_PROMPT_VERSION,
+    SkillCatalogError,
+    SkillsError,
+    build_skill_request,
+    find_skill,
+)
 
 DEFAULT_CONFIG = OllamaConfig()
 DEFAULT_NUM_CTX = 32768  # CLI 请求级默认值; 消除服务端默认 4K 依赖. 仅是请求值, 非实际分配保证
@@ -212,10 +218,10 @@ def _run_list_sessions(args: argparse.Namespace) -> int:
     """--list-sessions: 本 workspace 只读分页列表; 无 prompt/TUI/模型探测 (契约 §6)."""
     if (
         args.save_session or args.resume is not None or args.resume_with_current_config
-        or args.tui
+        or args.tui or args.skill is not None
     ):
         print(
-            "--list-sessions 是只读列表入口, 不能与 --save-session/--resume/--tui 组合",
+            "--list-sessions 是只读列表入口, 不能与 --save-session/--resume/--tui/--skill 组合",
             file=sys.stderr,
         )
         return 2
@@ -399,7 +405,8 @@ async def _run(args: argparse.Namespace) -> int:
             print(f"{exc}", file=sys.stderr)
             return 2
     # 05: --tui 默认持久保存; --save-session 允许组合但不改变行为 (契约 §6)
-    if not args.tui and args.prompt is None:
+    # 03: --skill 使位置 prompt 成为可选任务 (省略时用固定指令)
+    if not args.tui and args.prompt is None and args.skill is None:
         print("缺少 prompt: 单次模式需要位置参数 prompt (交互入口用 --tui)", file=sys.stderr)
         return 2
     run_tui_session_fn = None
@@ -452,6 +459,23 @@ async def _run(args: argparse.Namespace) -> int:
             skills_snapshot = load_skill_catalog(args.skills_dir, workspace)
         except SkillCatalogError as exc:
             print(f"invalid skills directory: {exc}", file=sys.stderr)
+            return 2
+    if args.skill is not None:
+        # 03 (D8): --skill 需要 --skills-dir; 名称/限额错误在 provider 探测与
+        # 应用 open 之前退出码 2。位置 prompt 是任务, 省略时 helper 填固定指令
+        if skills_snapshot is None:
+            print(
+                "--skill 需要 --skills-dir: 显式选择从启用目录的冻结快照取正文",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            args.prompt = build_skill_request(
+                find_skill(skills_snapshot, args.skill, allow_manual=True),
+                args.prompt or "",
+            )
+        except SkillsError as exc:
+            print(f"invalid --skill: {exc}", file=sys.stderr)
             return 2
     check_prompts = tuple(
         CheckPrompt(check.check_id, check.command, check.timeout_s) for check in checks
@@ -793,6 +817,13 @@ def main() -> int:
         help=(
             "启用本地 Skills 的目录 (相对 workspace; 直接子目录各含一份 SKILL.md)。"
             "恢复会话不从存档继承, 须显式重传同一目录"
+        ),
+    )
+    parser.add_argument(
+        "--skill",
+        help=(
+            "显式发送一个 Skill 的正文作为首条请求 (名称须在 --skills-dir 目录中; "
+            "位置 prompt 作为任务, 省略时用固定指令; 手动专用 Skill 也允许显式选择)"
         ),
     )
     parser.add_argument(

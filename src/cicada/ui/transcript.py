@@ -10,16 +10,21 @@
   visible_width <= width, 超宽即本模块缺陷 (renderer 只做防御截断)。
 - 文档不是规范历史, 不参与模型请求; 工具条目 (票据 03) 可经 add_entry
   挂载本文档, 条目协议只有 render(width) -> list[str] 一个方法。
+- Skill 显式请求 (local-skills-v1 票据 03): append_user 用中立解码器识别
+  封装, 成功时挂 SkillRequestEntry (UserEntry 显示实现, text 保留完整
+  原文本); 展开状态经构造时注入的只读 getter 读全局展开标志 (Ctrl+O 与
+  工具输出共享), 未注入时完整显示正文。解码失败保持原 UserEntry。
 - ModelCallCompleted 计量在此累计: None 字段显示"不可得", 不当作 0;
   展示出口 (底栏) 由票据 04 组装, 本模块只提供口径文本。
 """
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Callable, Protocol
 
 from cicada.core.messages import AssistantMessage
 from cicada.core.ports import ModelMetrics
+from cicada.skills import SkillInvocation, decode_skill_request
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
@@ -75,6 +80,54 @@ class UserEntry:
 
     def render(self, width: int) -> list[str]:
         return ["", *theme.user_message_lines(self.text, width)]
+
+
+class SkillRequestEntry(UserEntry):
+    """Skill 显式请求条目 (local-skills-v1 票据 03): 用户任务 + 独立 Skill 文档部分.
+
+    只在 append_user 解码成功时使用; text 保留完整封装原文本 (UserEntry 契约),
+    显示派生自记录数据, 不读当前 Skill 文件 (恢复共用同一条目)。默认收起正文,
+    展开状态经只读 getter 取全局展开标志 (与工具输出共用 Ctrl+O); 未注入
+    getter 时完整显示正文, 避免无展开手段的调用者看不到内容。
+    """
+
+    def __init__(
+        self, text: str, invocation: SkillInvocation,
+        expand_getter: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(text)
+        self.invocation = invocation
+        self._expand_getter = expand_getter
+        self._render_cache: tuple[int, bool, list[str]] | None = None
+
+    def render(self, width: int) -> list[str]:
+        expanded = True if self._expand_getter is None else bool(self._expand_getter())
+        cached = self._render_cache
+        if cached is not None and cached[0] == width and cached[1] == expanded:
+            return list(cached[2])
+        lines = self._render_lines(width, expanded)
+        self._render_cache = (width, expanded, list(lines))
+        return lines
+
+    def _render_lines(self, width: int, expanded: bool) -> list[str]:
+        invocation = self.invocation
+        # 用户任务部分: 与普通用户消息同一背景盒样式
+        lines = ["", *theme.user_message_lines(invocation.task, width)]
+        header = f"Skill 文档 {invocation.name}（{invocation.source_path}）"
+        if expanded:
+            header += f" · sha256:{invocation.body_sha256[:12]}"
+        for chunk in wrap_text_ansi(header, max(1, width)):
+            lines.append(theme.fg(theme.MD_CODE, chunk))
+        if not expanded:
+            for chunk in wrap_text_ansi("正文已收起 · Ctrl+O 展开完整文档", max(1, width)):
+                lines.append(theme.fg(theme.MUTED_GRAY, chunk))
+            return lines
+        # 正文来自记录: 规范换行后显示清理, 与工具输出同一纪律 (不执行外部序列)
+        body = sanitize_display(
+            invocation.body.replace("\r\n", "\n").replace("\r", "\n")
+        )
+        lines.extend(_wrap_with_prefix("  ", body, width))
+        return lines
 
 
 class AssistantEntry:
@@ -154,11 +207,17 @@ class CancelledEntry:
 
 
 class Transcript:
-    """显示文档: 条目有序集合 + 助手条目定位索引 + 计量累计。"""
+    """显示文档: 条目有序集合 + 助手条目定位索引 + 计量累计。
 
-    def __init__(self) -> None:
+    expand_getter (local-skills-v1 票据 03): 只读展开标志 getter, 生产组合注入
+    工具文档的全局展开状态 (Ctrl+O 同时影响工具输出与 Skill 正文); 未注入时
+    SkillRequestEntry 完整显示正文。
+    """
+
+    def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
         self._entries: list[TranscriptEntry] = []
         self._assistant_index: dict[tuple[str, int], AssistantEntry] = {}
+        self._expand_getter = expand_getter
         # 计量累计: None = 尚无任何数值 (显示不可得); unknown = 有调用但该字段缺失
         self._input_total: int | None = None
         self._output_total: int | None = None
@@ -176,7 +235,17 @@ class Transcript:
         self._entries.append(entry)
 
     def append_user(self, text: str) -> UserEntry:
-        entry = UserEntry(text)
+        """用户条目: 中立解码器识别 Skill 显式请求封装 (local-skills-v1 票据 03)。
+
+        解码成功挂 SkillRequestEntry (UserEntry 显示实现), 解码失败 (含全部
+        普通文本) 保持原 UserEntry; 返回契约与完整原 text 不变。
+        """
+        invocation = decode_skill_request(text)
+        entry: UserEntry
+        if invocation is not None:
+            entry = SkillRequestEntry(text, invocation, expand_getter=self._expand_getter)
+        else:
+            entry = UserEntry(text)
         self._entries.append(entry)
         return entry
 
@@ -310,6 +379,7 @@ __all__ = [
     "CancelledEntry",
     "ErrorEntry",
     "InformationEntry",
+    "SkillRequestEntry",
     "SystemEntry",
     "Transcript",
     "TranscriptEntry",

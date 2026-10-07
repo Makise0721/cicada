@@ -117,7 +117,10 @@ from cicada.skills import (
     SKILLS_PROMPT_VERSION,
     SkillCatalogSnapshot,
     SkillCatalogView,
+    SkillSelectionError,
+    build_skill_request,
     catalog_prompt_section,
+    find_skill,
 )
 
 ApplicationPhase = Literal["executing", "cancelling", "finalizing", "idle"]
@@ -553,6 +556,22 @@ class ApplicationSession:
         """启用 Skills 时的只读目录视图 (元数据/root/manifest, 不含正文); 未启用 None."""
         snapshot = self._config.skills
         return None if snapshot is None else snapshot.view()
+
+    def prepare_skill_request(self, name: str, task: str = "") -> str:
+        """显式一次请求的普通 prompt 文本 (契约 §3/§4): 同步纯准备, 不创建请求.
+
+        从启动冻结快照查找 (手动专用 Skill 允许显式选择), 封装为带来源/正文/
+        任务的用户文本。未启用 Skills、未知名称抛 SkillSelectionError, 超过
+        MAX_SKILL_REQUEST_BYTES 抛 SkillRequestError。本方法无历史追加、无
+        存储、无模型调用; 准备成功不等于应用已接受或保存, 执行仍必须走原
+        execute。
+        """
+        snapshot = self._config.skills
+        if snapshot is None:
+            raise SkillSelectionError(
+                "skills are not enabled for this session; start with --skills-dir to enable them"
+            )
+        return build_skill_request(find_skill(snapshot, name, allow_manual=True), task)
 
     @property
     def view_only_reason(self) -> str | None:
