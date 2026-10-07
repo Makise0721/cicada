@@ -2,10 +2,11 @@
 
 来源: pi-mono@1a584a7a packages/coding-agent/src/modes/interactive/components/tool-execution.ts
 (MIT, Copyright (c) 2025 Mario Zechner); 本文件移植其单条目原位更新、
-partial/success/error 背景 (Pi dark.json: #282832/#283228/#3c2828 真彩 SGR)、
-fallback 前 10 行预览 + "... (N more lines)" 折叠提示, 以及 Ctrl+O 全局
-展开标志 (Pi setToolsExpanded 遍历全部条目切换)。kitty 图片、鼠标区域与
-按工具自定义 renderer 不移植; diff/代码高亮排版归票据 04, 输出先按纯文本行。
+partial/success/error 状态背景语义、fallback 前 10 行预览 + "... (N more lines)"
+折叠提示, 以及 Ctrl+O 全局展开标志 (Pi setToolsExpanded 遍历全部条目切换)。
+卡面外观 (状态符号、强调条、配色) 2026-10-07 起为本项目自有设计, 权威为
+.scratch/tui-aesthetics/spec.md §B, 不再回引 Pi dark.json。kitty 图片、鼠标
+区域与按工具自定义 renderer 不移植; diff/代码高亮排版归票据 04, 输出先按纯文本行。
 
 边界 (见 shared-boundary-handoff 与票据 03):
 - 纯状态 + 排版: apply() 接收 ApplicationUpdate / 内核事件更新条目,
@@ -39,21 +40,22 @@ from cicada.core.events import (
     ToolStarted,
     TurnStarted,
 )
+from cicada.ui import theme
 from cicada.ui.checks import artifact_line as _artifact_line_from_details
-from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
+from cicada.ui.main_screen import truncate_to_width, visible_width, word_wrap_line
 from cicada.ui.rendering import sanitize_display
 
 # Pi FALLBACK_PREVIEW_LINES: 工具输出默认预览行数
 PREVIEW_LINES = 10
 
-# Pi dark.json 工具状态背景 (真彩 SGR): pending #282832 / success #283228 / error #3c2828
-TOOL_BG_PENDING = "\x1b[48;2;40;40;50m"
-TOOL_BG_SUCCESS = "\x1b[48;2;40;50;40m"
-TOOL_BG_ERROR = "\x1b[48;2;60;40;40m"
+# 卡背景 SGR (tui-aesthetics 规格 §B 取值, theme.py 为唯一来源)
+TOOL_BG_PENDING = theme.bg_open(theme.TOOL_BG_PENDING)
+TOOL_BG_SUCCESS = theme.bg_open(theme.TOOL_BG_SUCCESS)
+TOOL_BG_ERROR = theme.bg_open(theme.TOOL_BG_ERROR)
 
 BOLD = "\x1b[1m"
 BOLD_OFF = "\x1b[22m"
-MUTED = "\x1b[90m"  # Pi dark.json muted -> gray
+MUTED = "\x1b[90m"  # Pi dark.json muted -> gray (遗留导出, 卡内已用 TOOL_HINT_FG)
 RESET = "\x1b[0m"
 
 # 内核取消路径固定哨兵前缀 (core/agent.py _dispatch / _finish_pending_calls)
@@ -81,6 +83,21 @@ _STATUS_BG: dict[str, str] = {
     "success": TOOL_BG_SUCCESS,
     "error": TOOL_BG_ERROR,
 }
+
+# v2 卡面 (规格 §B): 状态符号 / 强调条与标题色 / 状态背景
+_STATUS_GLYPH: dict[str, str] = {"running": "●", "success": "✓", "error": "✗"}
+_STATUS_ACCENT: dict[str, str] = {
+    "running": theme.TOOL_ACCENT_RUNNING,
+    "success": theme.TOOL_ACCENT_SUCCESS,
+    "error": theme.TOOL_ACCENT_ERROR,
+}
+_STATUS_BG_HEX: dict[str, str] = {
+    "running": theme.TOOL_BG_PENDING,
+    "success": theme.TOOL_BG_SUCCESS,
+    "error": theme.TOOL_BG_ERROR,
+}
+
+_BAR_MIN_WIDTH = 6  # 窄于此宽度省略强调条 (保留整行背景)
 
 
 def _clean_text(text: str) -> str:
@@ -322,63 +339,72 @@ class ToolDocument:
         return lines
 
     def _render_card(self, card: _ToolCard, width: int) -> list[str]:
-        """单卡布局 (Pi ToolExecutionComponent 子集): 前置空行 + Box(1,1) 背景 +
-        标题 (粗体工具名/参数摘要) + 输出预览区 (10 行折叠与展开提示)。"""
-        bg = _STATUS_BG[card.status]
-        # Pi Text 窄窗规则: 边距放不下时收窄, 保证每行可见宽度不超限
-        pad_x = min(1, max(0, (width - 1) // 2))
-        content_w = max(1, width - pad_x * 2)
+        """单卡布局 (tui-aesthetics 规格 §B): 前置空行 + 状态符号标题 +
+        左侧 2 列状态强调条 + 整行状态背景 + 输出预览 (10 行折叠与展开提示)。
 
-        def row(text: str) -> str:
-            return self._bg_row(bg, text, width, pad_x)
+        样式纪律: 行内只用"只开不复位"序列换色, 末尾一次 RESET; 内层
+        \\x1b[0m 会连带清掉卡片背景, 不得出现。窄窗 (<6 列) 省略强调条。
+        """
+        status = card.status
+        bg = _STATUS_BG[status]
+        bar_on = width >= _BAR_MIN_WIDTH
+        content_w = max(1, width - 3) if bar_on else width
+
+        def row(text: str = "") -> str:
+            if visible_width(text) > content_w:
+                # 防御: 换行后仍超宽 (如 1 列窗里的双列字符); 截断保版式并记录
+                self._record_failure(f"tool card row exceeds width ({visible_width(text)} > {content_w}); truncated")
+                text = truncate_to_width(text, content_w)
+            pad = " " * max(0, content_w - visible_width(text))
+            if bar_on:
+                return theme.bg_open(_STATUS_ACCENT[status]) + "  " + bg + " " + text + pad + RESET
+            return bg + text + pad + RESET
 
         # Pi 组件先 addChild(Spacer(1)): 卡片之间隔一个无背景空行
         lines: list[str] = [""]
-        lines.append(row(""))  # Box paddingY=1 顶部背景行
+        lines.append(row())  # Box paddingY=1 顶部背景行
 
-        title_text = f"{card.name} {card.args_summary}".strip()
-        pos = 0
-        for chunk in wrap_text_ansi(title_text, content_w):
-            lines.append(row(self._bold_name_span(chunk, pos, card.name)))
-            pos += len(chunk)
+        glyph = _STATUS_GLYPH[status]
+        name_part = f"{glyph} {card.name}"
+        title_plain = name_part + (f"  {card.args_summary}" if card.args_summary else "")
+        for chunk in word_wrap_line(title_plain, content_w):
+            lines.append(row(self._title_span(chunk.text, chunk.start_index, len(name_part), status)))
 
         # 回执输出工件 (路径 + hash): 只显示来源事实, 不读入内容
         if card.artifact:
-            for chunk in wrap_text_ansi(card.artifact, content_w):
-                lines.append(row(MUTED + chunk))
+            for chunk in word_wrap_line(card.artifact, content_w):
+                lines.append(row(theme.fg_open(theme.TOOL_HINT_FG) + chunk.text))
 
         if card.terminal and card.content:
             output_lines = card.content.split("\n")
             shown = output_lines if self._expanded else output_lines[:PREVIEW_LINES]
             for line in shown:
-                for chunk in wrap_text_ansi(line, content_w):
-                    lines.append(row(chunk))
+                for chunk in word_wrap_line(line, content_w):
+                    lines.append(row(theme.fg_open(theme.TOOL_OUTPUT_FG) + chunk.text))
             remaining = len(output_lines) - len(shown)
             if remaining > 0:
                 hint = f"... 还有 {remaining} 行 (Ctrl+O 展开)"
-                for chunk in wrap_text_ansi(hint, content_w):
-                    lines.append(row(MUTED + chunk))
+                for chunk in word_wrap_line(hint, content_w):
+                    lines.append(row(theme.fg_open(theme.TOOL_HINT_FG) + chunk.text))
 
-        lines.append(row(""))  # Box paddingY=1 底部背景行
+        lines.append(row())  # Box paddingY=1 底部背景行
         return lines
 
     @staticmethod
-    def _bold_name_span(chunk: str, chunk_start: int, name: str) -> str:
-        """对换行块中与工具名区间 [0, len(name)) 重叠的部分套粗体。
+    def _title_span(chunk: str, chunk_start: int, prefix_len: int, status: str) -> str:
+        """标题换行块两色: 前缀区间 [0, prefix_len) 状态色加粗, 其余提示灰。
 
         样式在纯文本换行之后按区间补齐 (word_wrap_line 不感知 ANSI),
-        名字被换行截断时各块分别开合粗体; 样式序列零可见宽度。
+        前缀被换行截断时各块分别开合; 只用只开序列, 不换背景 (行纪律见上)。
         """
-        if not name:
-            return chunk
-        overlap_start = max(0, chunk_start)
-        overlap_end = min(len(name), chunk_start + len(chunk))
-        if overlap_start >= overlap_end:
-            return chunk
-        left = chunk[: overlap_start - chunk_start]
-        mid = chunk[overlap_start - chunk_start : overlap_end - chunk_start]
-        right = chunk[overlap_end - chunk_start :]
-        return f"{left}{BOLD}{mid}{BOLD_OFF}{right}"
+        split_at = max(0, min(len(chunk), prefix_len - chunk_start))
+        left, right = chunk[:split_at], chunk[split_at:]
+        styled = ""
+        if left:
+            styled += theme.fg_open(_STATUS_ACCENT[status]) + BOLD + left + BOLD_OFF
+        if right:
+            styled += theme.fg_open(theme.TOOL_HINT_FG) + right
+        return styled
 
     # --- 内部 -------------------------------------------------------------------
 
@@ -413,16 +439,6 @@ class ToolDocument:
         if len(summary) <= _ARGS_SUMMARY_MAX_CHARS:
             return summary
         return summary[:_ARGS_SUMMARY_MAX_CHARS] + "…"
-
-    def _bg_row(self, bg: str, text: str, width: int, pad_x: int) -> str:
-        """背景行: 状态背景 + 左边距 + 内容 + 填充到整行; 每行可见宽度 <= width。"""
-        available = width - pad_x
-        if visible_width(text) > available:
-            # 防御: 换行后仍超宽 (如 1 列窗里的双列字符); 截断保版式并记录
-            self._record_failure(f"tool card row exceeds width ({visible_width(text)} > {available}); truncated")
-            text = truncate_to_width(text, available)
-        pad = max(0, available - visible_width(text))
-        return bg + " " * pad_x + text + " " * pad + RESET
 
     def _append(self, card: _ToolCard) -> None:
         self._cards.append(card)

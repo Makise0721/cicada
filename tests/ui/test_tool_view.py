@@ -273,8 +273,98 @@ def test_external_ansi_in_output_is_sanitized():
     assert any("red text" in line for line in plain_lines(doc, 80))
 
 
-# --- 相关 P11: 可见列宽不破版 ------------------------------------------------------------------
+# --- tui-aesthetics 02: 状态符号 / 强调条 / 层次 (规格 §B, 字面量断言不复算实现) --------------
 
+# 规格 §B 配色 (独立字面量来源: spec.md)
+ACCENT_RUNNING = "\x1b[38;2;129;162;190m"  # #81a2be
+ACCENT_SUCCESS = "\x1b[38;2;181;189;104m"  # #b5bd68
+ACCENT_ERROR = "\x1b[38;2;204;102;102m"    # #cc6666
+BAR_RUNNING = "\x1b[48;2;129;162;190m"
+BAR_SUCCESS = "\x1b[48;2;181;189;104m"
+BAR_ERROR = "\x1b[48;2;204;102;102m"
+CARD_BG_RUNNING = "\x1b[48;2;34;34;44m"    # #22222c
+CARD_BG_SUCCESS = "\x1b[48;2;31;36;25m"    # #1f2419
+CARD_BG_ERROR = "\x1b[48;2;43;28;28m"      # #2b1c1c
+OUTPUT_FG = "\x1b[38;2;168;168;168m"       # #a8a8a8
+HINT_FG = "\x1b[38;2;127;127;127m"         # #7f7f7f
+
+
+def completed_card(doc: ToolDocument, *, name: str = "read", content: str = "ok", is_error: bool = False,
+                   with_args: bool = True) -> None:
+    events: list[object] = [RunStarted(RUN), TurnStarted(RUN, 0)]
+    if with_args:
+        events.append(AssistantCompleted(RUN, AssistantMessage(
+            text="",
+            tool_calls=(ToolCall(id="t1", name=name, arguments_json=json.dumps({"path": "src/app.py"})),),
+        )))
+    events += [
+        ToolStarted(RUN, "t1", name),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name=name, content=content, is_error=is_error)),
+    ]
+    feed(doc, *events)
+
+
+def test_success_card_title_glyph_accent_and_bar():
+    doc = ToolDocument()
+    completed_card(doc)
+    lines = doc.render_lines(80)
+    assert lines[0] == ""  # 卡前分隔空行不变
+    title = strip_terminal_sequences(lines[2])
+    assert title.startswith("   ✓ read") and "src/app.py" in title  # 强调条 2 列 + 1 空格
+    assert ACCENT_SUCCESS in lines[2] and "\x1b[1m" in lines[2]  # 标题状态色加粗
+    assert HINT_FG in lines[2]  # 参数摘要降灰
+    # 全部卡片行 (含上下背景填充行) 以成功色强调条 + 卡背景开头
+    for line in lines[1:]:
+        assert line.startswith(BAR_SUCCESS + "  " + CARD_BG_SUCCESS)
+
+
+def test_error_and_running_card_variants():
+    doc = ToolDocument()
+    completed_card(doc, name="powershell", content="boom", is_error=True)
+    lines = doc.render_lines(80)
+    assert "✗ powershell" in strip_terminal_sequences(lines[2])
+    assert ACCENT_ERROR in lines[2]
+    assert lines[1].startswith(BAR_ERROR + "  " + CARD_BG_ERROR)
+
+    pending = ToolDocument()
+    started_card(pending, name="glob")
+    running_lines = pending.render_lines(80)
+    assert "● glob" in strip_terminal_sequences(running_lines[2])
+    assert ACCENT_RUNNING in running_lines[2]
+    assert running_lines[1].startswith(BAR_RUNNING + "  " + CARD_BG_RUNNING)
+
+
+def test_output_dimmed_and_fold_hint_darker():
+    doc = ToolDocument()
+    body = "\n".join(f"line-{i}" for i in range(20))
+    completed_card(doc, content=body)
+    lines = doc.render_lines(80)
+    output_rows = [line for line in lines if "line-0" in strip_terminal_sequences(line)]
+    assert output_rows and all(OUTPUT_FG in line for line in output_rows)
+    hint_rows = [line for line in lines if "Ctrl+O" in strip_terminal_sequences(line)]
+    assert len(hint_rows) == 1 and HINT_FG in hint_rows[0]
+
+
+def test_card_rows_have_single_terminal_reset():
+    """卡行只在末尾复位: 内部 \\x1b[0m 会连带清掉卡片背景 (嵌套样式纪律, 规格 §B)。"""
+    doc = ToolDocument()
+    completed_card(doc)
+    for line in doc.render_lines(80)[1:]:
+        assert line.count("\x1b[0m") == 1 and line.endswith("\x1b[0m")
+
+
+def test_narrow_card_drops_bar_but_keeps_background():
+    doc = ToolDocument()
+    completed_card(doc, with_args=False)
+    for width in (1, 2, 3, 5):
+        lines = doc.render_lines(width)
+        assert all(visible_width(line) <= width for line in lines)
+        body = [line for line in lines if line]
+        assert body and all(BAR_SUCCESS not in line for line in body)
+        assert all(CARD_BG_SUCCESS in line for line in body)
+
+
+# --- 相关 P11: 可见列宽不破版 ------------------------------------------------------------------
 
 @pytest.mark.parametrize("width", [1, 2, 3, 8, 40, 80, 120, 160])
 def test_every_rendered_line_within_width(width: int):

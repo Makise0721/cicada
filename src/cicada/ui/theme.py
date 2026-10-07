@@ -31,9 +31,6 @@ ASSISTANT_TEXT = "#d4d4d4"
 EDITOR_BORDER = "#b294bb"  # 用户截图固定的外观色 (dark.json thinkingHigh 同值, 语义无关)
 FOOTER_DIM = "#666666"
 MUTED_GRAY = "#808080"
-TOOL_BG_PENDING = "#282832"
-TOOL_BG_SUCCESS = "#283228"
-TOOL_BG_ERROR = "#3c2828"
 MD_HEADING = "#f0c674"
 MD_LINK = "#81a2be"
 MD_LINK_URL = "#666666"
@@ -41,6 +38,17 @@ MD_CODE = "#8abeb7"
 MD_CODE_BLOCK = "#b5bd68"
 DIFF_ADDED = "#b5bd68"
 DIFF_REMOVED = "#cc6666"
+
+# --- 工具卡 v2 (tui-aesthetics 规格 §B, 2026-10-07 起为本项目自有外观, 不再回引 dark.json) -----
+
+TOOL_ACCENT_RUNNING = MD_LINK        # #81a2be
+TOOL_ACCENT_SUCCESS = MD_CODE_BLOCK  # #b5bd68
+TOOL_ACCENT_ERROR = DIFF_REMOVED     # #cc6666
+TOOL_BG_PENDING = "#22222c"
+TOOL_BG_SUCCESS = "#1f2419"
+TOOL_BG_ERROR = "#2b1c1c"
+TOOL_OUTPUT_FG = "#a8a8a8"
+TOOL_HINT_FG = "#7f7f7f"
 
 
 def _rgb(hex_color: str) -> tuple[int, int, int]:
@@ -58,6 +66,18 @@ def bg(hex_color: str, text: str) -> str:
     """真彩背景 SGR 包裹。"""
     r, g, b = _rgb(hex_color)
     return f"\x1b[48;2;{r};{g};{b}m{text}\x1b[0m"
+
+
+def fg_open(hex_color: str) -> str:
+    """只开不复位的前景序列: 背景行内部换色用 (内层 \\x1b[0m 会连带清掉外层背景)。"""
+    r, g, b = _rgb(hex_color)
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+
+def bg_open(hex_color: str) -> str:
+    """只开不复位的背景序列。"""
+    r, g, b = _rgb(hex_color)
+    return f"\x1b[48;2;{r};{g};{b}m"
 
 
 def editor_border() -> Callable[[str], str]:
@@ -314,15 +334,22 @@ __all__ = [
     "MD_LINK",
     "MD_LINK_URL",
     "MUTED_GRAY",
+    "TOOL_ACCENT_ERROR",
+    "TOOL_ACCENT_RUNNING",
+    "TOOL_ACCENT_SUCCESS",
     "TOOL_BG_ERROR",
     "TOOL_BG_PENDING",
     "TOOL_BG_SUCCESS",
+    "TOOL_HINT_FG",
+    "TOOL_OUTPUT_FG",
     "USER_MESSAGE_BG",
     "USER_MESSAGE_TEXT",
     "assistant_markdown_lines",
     "bg",
+    "bg_open",
     "editor_border",
     "fg",
+    "fg_open",
     "format_tokens",
     "format_workspace",
     "information_lines",
