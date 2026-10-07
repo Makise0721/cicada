@@ -92,11 +92,6 @@ _STATUS_ACCENT: dict[str, str] = {
     "success": theme.TOOL_ACCENT_SUCCESS,
     "error": theme.TOOL_ACCENT_ERROR,
 }
-_STATUS_BG_HEX: dict[str, str] = {
-    "running": theme.TOOL_BG_PENDING,
-    "success": theme.TOOL_BG_SUCCESS,
-    "error": theme.TOOL_BG_ERROR,
-}
 
 _BAR_MIN_WIDTH = 6  # 窄于此宽度省略强调条 (保留整行背景)
 

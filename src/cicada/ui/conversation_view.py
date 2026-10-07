@@ -148,8 +148,11 @@ class ConversationView:
     # --- 生命周期 -----------------------------------------------------------------
 
     def close(self) -> None:
-        """退订应用事件 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
+        """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
         self._unsubscribe()
+        if self._spinner_task is not None:  # 防御: 宿主"关 view 不关 session"时不泄漏
+            self._spinner_task.cancel()
+            self._spinner_task = None
 
     @property
     def editor(self) -> Editor:
@@ -247,9 +250,12 @@ class ConversationView:
     # --- 状态行 (tui-aesthetics 规格 §F) ---------------------------------------------
 
     def status_lines(self, width: int) -> list[str]:
-        """输入框上方状态行: 忙时 1 行 (spinner + 真实状态文案), 空闲 0 行。"""
+        """输入框上方状态行: 忙时 1 行 (spinner + 真实状态文案), 空闲 0 行。
+
+        宽度 < 4 放不下 spinner + 空格 + 1 列文案, 不占行 (防御截断无噪音)。
+        """
         text = self._status_text()
-        if text is None:
+        if text is None or width < 4:
             return []
         frame = SPINNER_FRAMES[int(self._clock() / SPINNER_INTERVAL_S) % len(SPINNER_FRAMES)]
         text = truncate_to_width(text, max(1, width - 2))
@@ -267,6 +273,8 @@ class ConversationView:
             return "正在压缩…"
         if self._session.state == "cancelling":
             return "正在取消…"
+        if self._session.state == "finalizing":
+            return "正在收尾…"  # 模型已停笔, 持久化/检查收尾中 (审查 06-3)
         if self._session.state == "executing" or self._gate.busy():
             return "正在输出…"
         return None

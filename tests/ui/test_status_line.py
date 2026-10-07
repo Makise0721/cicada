@@ -64,6 +64,19 @@ async def test_idle_has_no_status_line(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_status_line_extreme_narrow_width_takes_no_row(tmp_path):
+    """审查 06-2: 宽度 < 4 时状态行不占行 (不产生防御截断噪音)。"""
+    session, bundle, _ = await _open_view(tmp_path, _Clock())
+    try:
+        assert bundle["on_submit"]("你好") is True
+        for width in (1, 2, 3):
+            assert bundle["status_lines"](width) == []
+        assert bundle["status_lines"](4) != []
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.asyncio
 async def test_executing_shows_spinner_and_frame_follows_clock(tmp_path):
     session, bundle, _ = await _open_view(tmp_path, clock := _Clock())
     try:
