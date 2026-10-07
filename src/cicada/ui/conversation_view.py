@@ -60,7 +60,7 @@ from cicada.ui.checks import (
     clip_status_field,
     truncation_note,
 )
-from cicada.ui.editor import Editor
+from cicada.ui.editor import Editor, EditorStyle
 from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
 from cicada.ui.restore_view import project_restored_history
@@ -82,7 +82,17 @@ class ConversationView:
         diagnostics: Callable[[], list[str]] | None = None,
     ) -> None:
         self._session = session
-        self._editor = editor if editor is not None else Editor(border_color=theme.editor_border())
+        self._editor = editor if editor is not None else Editor(
+            border_color=theme.editor_border(),
+            padding_x=2,
+            style=EditorStyle(
+                line_bg=theme.EDITOR_BG,
+                prompt_glyph="›",
+                prompt_color=theme.EDITOR_BORDER,
+                placeholder="输入消息… Enter 发送, Shift+Enter 换行",
+                placeholder_color=theme.EDITOR_PLACEHOLDER,
+            ),
+        )
         self._on_exit = on_exit
         self._on_update = on_update
         self._diagnostics = diagnostics

@@ -14,17 +14,34 @@ Copyright (c) 2025 Mario Zechner); 只移植 01 所需子集: 横线几何、按
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable
 
+from cicada.ui import theme
 from cicada.ui.main_screen import (
     CURSOR_MARKER,
     WrapChunk,
     iter_graphemes,
+    truncate_to_width,
     visible_width,
     word_wrap_line,
 )
 
 UNDO_LIMIT = 200
+
+
+@dataclass(frozen=True)
+class EditorStyle:
+    """v2 视觉样式 (tui-aesthetics 规格 §C): None = 关闭全部装饰 (兼容旧外观)。
+
+    取值由组合层从 theme 注入; 本模块不硬编码颜色。
+    """
+
+    line_bg: str | None = None
+    prompt_glyph: str | None = None
+    prompt_color: str | None = None
+    placeholder: str | None = None
+    placeholder_color: str | None = None
 
 
 class _EditorState:
@@ -97,11 +114,13 @@ class Editor:
         *,
         padding_x: int = 0,
         border_color: Callable[[str], str] | None = None,
+        style: EditorStyle | None = None,
     ) -> None:
         self.state = _EditorState([""], 0, 0)
         self.focused = False
         self.padding_x = max(0, padding_x)
         self.border_color = border_color if border_color is not None else (lambda s: s)
+        self.style = style
         self.on_submit: Callable[[str], None] | None = None
         self.on_change: Callable[[str], None] | None = None
         self.disable_submit = False
@@ -380,7 +399,7 @@ class Editor:
         result.append(self.border_color(create_scroll_border("↑", self._scroll_offset, width) if self._scroll_offset else "─" * width))
 
         emit_marker = self.focused
-        for text, has_cursor, cursor_pos in visible:
+        for row_index, (text, has_cursor, cursor_pos) in enumerate(visible):
             display = text
             line_width = visible_width(text)
             cursor_in_padding = False
@@ -391,19 +410,51 @@ class Editor:
                     graphemes = iter_graphemes(after)
                     first = graphemes[0] if graphemes else ""
                     rest = after[len(first) :]
-                    display = before + marker + f"\x1b[7m{first}\x1b[0m" + rest
+                    display = before + marker + f"\x1b[7m{first}\x1b[27m" + rest
                 else:
-                    display = before + marker + "\x1b[7m \x1b[0m"
+                    display = before + marker + "\x1b[7m \x1b[27m"
                     line_width += 1
                     if line_width > content_width and padding_x > 0:
                         cursor_in_padding = True
             padding = " " * max(0, content_width - line_width)
             right_pad = left_pad[1:] if cursor_in_padding else left_pad
-            result.append(f"{left_pad}{display}{padding}{right_pad}")
+            result.append(self._style_line(left_pad, display, padding, right_pad, first=row_index == 0))
 
         lines_below = len(layout) - (self._scroll_offset + len(visible))
         result.append(self.border_color(create_scroll_border("↓", lines_below, width) if lines_below else "─" * width))
         return result
+
+    def _style_line(self, left_pad: str, display: str, padding: str, right_pad: str, *, first: bool) -> str:
+        """v2 装饰 (规格 §C): 首可视行提示符、空态占位、整行底色; 无 style 原样。
+
+        样式纪律: 行内只用只开序列 (fg_open/\\x1b[39m/\\x1b[27m), 末尾一次 RESET;
+        内层 \\x1b[0m 会连带清掉底色, 不得出现。
+        """
+        style = self.style
+        if style is None or style.line_bg is None:
+            return f"{left_pad}{display}{padding}{right_pad}"
+        left = left_pad
+        if first and style.prompt_glyph:
+            glyph_w = visible_width(style.prompt_glyph)
+            if visible_width(left_pad) >= glyph_w:
+                left = (
+                    theme.fg_open(style.prompt_color or theme.EDITOR_BORDER)
+                    + style.prompt_glyph
+                    + "\x1b[39m"
+                    + left_pad[glyph_w:]
+                )
+        if self.is_empty() and style.placeholder:
+            segment = " " + style.placeholder
+            if visible_width(segment) > len(padding):
+                segment = truncate_to_width(segment, len(padding))
+            segment_w = visible_width(segment)
+            padding = (
+                theme.fg_open(style.placeholder_color or theme.MUTED_GRAY)
+                + segment
+                + "\x1b[39m"
+                + padding[segment_w:]
+            )
+        return theme.bg_open(style.line_bg) + left + display + padding + right_pad + "\x1b[0m"
 
     def _layout_text(self, content_width: int) -> list[tuple[str, bool, int | None]]:
         """逻辑行 -> 换行块列表; 返回 (text, has_cursor, cursor_pos) 元组。"""

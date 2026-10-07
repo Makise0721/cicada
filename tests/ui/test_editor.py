@@ -21,9 +21,10 @@ def test_render_geometry_borders_and_padding():
     assert len(lines) == 3  # 上横线 + 1 正文 + 下横线
     assert stripped_lines([lines[0]])[0] == "─" * 20
     assert stripped_lines([lines[2]])[0] == "─" * 20
-    # 光标在行尾: 反显空格 + 聚焦时硬件光标标记
+    # 光标在行尾: 反显空格 + 聚焦时硬件光标标记; 反显用 \x1b[27m 收尾,
+    # 不复位全部属性 (背景行内嵌套光标时 \x1b[0m 会连带清掉外层背景)
     assert CURSOR_MARKER in lines[1]
-    assert "\x1b[7m \x1b[0m" in lines[1]
+    assert "\x1b[7m \x1b[27m" in lines[1]
 
 
 def test_cursor_marker_only_when_focused():
@@ -130,3 +131,79 @@ def test_editor_shrink_clears_with_clear_on_shrink_source():
     editor.backspace()
     editor.backspace()
     assert len(editor.render(10)) == 3  # 空编辑器: 上下横线 + 1 空正文
+
+
+# --- tui-aesthetics 03: 编辑器 v2 (规格 §C, 字面量断言不复算实现) -----------------------------
+
+V2_BG = "\x1b[48;2;31;31;40m"       # EDITOR_BG #1f1f28
+V2_PROMPT_FG = "\x1b[38;2;178;148;187m"  # 提示符 #b294bb
+V2_PLACEHOLDER_FG = "\x1b[38;2;106;106;106m"  # 占位 #6a6a6a
+
+
+def v2_editor() -> Editor:
+    from cicada.ui.editor import EditorStyle
+
+    return Editor(
+        padding_x=2,
+        style=EditorStyle(
+            line_bg="#1f1f28",
+            prompt_glyph="›",
+            prompt_color="#b294bb",
+            placeholder="输入消息… Enter 发送, Shift+Enter 换行",
+            placeholder_color="#6a6a6a",
+        ),
+    )
+
+
+def test_v2_empty_editor_prompt_cursor_and_placeholder():
+    editor = v2_editor()
+    editor.focused = True
+    lines = editor.render(60)
+    body = lines[1]
+    assert body.startswith(V2_BG) and body.endswith("\x1b[0m")  # 整行底色
+    plain = strip_terminal_sequences_local(body)
+    assert plain.startswith("› ")  # 提示符占左边距
+    assert "输入消息… Enter 发送, Shift+Enter 换行" in plain  # 空态占位
+    assert "\x1b[7m \x1b[27m" in body  # 光标仍在行首
+    assert V2_PROMPT_FG in body and V2_PLACEHOLDER_FG in body
+    assert visible_width(strip_terminal_sequences_local(body)) == 60
+
+
+def test_v2_draft_hides_placeholder_and_keeps_prompt():
+    editor = v2_editor()
+    editor.focused = True
+    editor.insert_text("你好")
+    body = editor.render(40)[1]
+    plain = strip_terminal_sequences_local(body)
+    assert plain.startswith("› 你好")
+    assert "输入消息" not in plain
+    assert V2_PLACEHOLDER_FG not in body
+
+
+def test_v2_multiline_only_first_line_has_prompt():
+    editor = v2_editor()
+    editor.focused = True
+    editor.insert_text("第一行")
+    editor.insert_newline()
+    editor.insert_text("第二行")
+    lines = editor.render(40)
+    first, second = strip_terminal_sequences_local(lines[1]), strip_terminal_sequences_local(lines[2])
+    assert first.startswith("› 第一行")
+    assert second.startswith("  第二行")  # 其余行左边距留空对齐
+    for line in lines[1:3]:
+        assert line.startswith(V2_BG) and line.endswith("\x1b[0m")
+
+
+def test_default_editor_without_style_unchanged():
+    """无 style 的编辑器不产生底色/提示符/占位 (兼容既有调用方)。"""
+    editor = Editor()
+    editor.focused = True
+    lines = editor.render(20)
+    assert not lines[1].startswith("\x1b[48;2;")
+    assert "›" not in strip_terminal_sequences_local(lines[1])
+
+
+def strip_terminal_sequences_local(line: str) -> str:
+    from cicada.ui.main_screen import strip_terminal_sequences
+
+    return strip_terminal_sequences(line).replace(CURSOR_MARKER, "")
