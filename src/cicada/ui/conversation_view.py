@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Callable
 
 from cicada.application import (
@@ -63,10 +64,15 @@ from cicada.ui.checks import (
 from cicada.ui.editor import Editor, EditorStyle
 from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
+from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
+
+# 状态行 (规格 §F): braille spinner 与节奏; 帧由可注入时钟决定 (测试可冻结)
+SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+SPINNER_INTERVAL_S = 0.1
 
 
 class ConversationView:
@@ -80,6 +86,7 @@ class ConversationView:
         on_exit: Callable[[], None] | None = None,
         on_update: Callable[[], None] | None = None,
         diagnostics: Callable[[], list[str]] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._session = session
         self._editor = editor if editor is not None else Editor(
@@ -101,6 +108,9 @@ class ConversationView:
         self._gate.on_error = self._on_gate_error
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
         self._compact_task: asyncio.Task | None = None
+        # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停
+        self._clock = clock if clock is not None else time.monotonic
+        self._spinner_task: asyncio.Task | None = None
         # 票据 05 组合钩子: 会话进入 closing/closed 且 execute 异常到达时由宿主
         # 决定退出前端 (避免 barrier 内界面失去退出路径); 默认无动作
         self.on_unrecoverable: Callable[[], None] | None = None
@@ -195,6 +205,7 @@ class ConversationView:
                 self.transcript.append_system(f"{PROCESS_UNCERTAIN_LABEL}：清空历史不解锁。")
         elif isinstance(update, ApplicationClosed):
             self._gate.note_closed()
+        self._sync_spinner()  # 状态行跟随最近一次应用状态 (规格 §F)
         if self._on_update is not None:
             self._on_update()
 
@@ -233,6 +244,60 @@ class ConversationView:
         """01 冻结的显示文档替换点: 整份文档按当前宽度排版。"""
         return self.transcript.render(width)
 
+    # --- 状态行 (tui-aesthetics 规格 §F) ---------------------------------------------
+
+    def status_lines(self, width: int) -> list[str]:
+        """输入框上方状态行: 忙时 1 行 (spinner + 真实状态文案), 空闲 0 行。"""
+        text = self._status_text()
+        if text is None:
+            return []
+        frame = SPINNER_FRAMES[int(self._clock() / SPINNER_INTERVAL_S) % len(SPINNER_FRAMES)]
+        text = truncate_to_width(text, max(1, width - 2))
+        return [
+            theme.fg_open(theme.EDITOR_BORDER) + frame
+            + theme.fg_open(theme.MUTED_GRAY) + " " + text
+            + "\x1b[0m"
+        ]
+
+    def _status_text(self) -> str | None:
+        """状态文案只取真实状态: 屏障/取消/执行/reservation 窗口, 空闲 None。"""
+        if self._gate.clearing:
+            return "正在清空…"
+        if self._gate.compacting:
+            return "正在压缩…"
+        if self._session.state == "cancelling":
+            return "正在取消…"
+        if self._session.state == "executing" or self._gate.busy():
+            return "正在输出…"
+        return None
+
+    def _sync_spinner(self) -> None:
+        """忙时确保动画任务在跑, 转闲即停; 无 on_update 宿主或无事件循环不起任务。"""
+        active = self._status_text() is not None
+        if active and self._spinner_task is None and self._on_update is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._spinner_task = loop.create_task(self._spin())
+            self._spinner_task.add_done_callback(self._spin_done)
+        elif not active and self._spinner_task is not None:
+            self._spinner_task.cancel()
+            self._spinner_task = None
+
+    def _spin_done(self, task: asyncio.Task) -> None:
+        if self._spinner_task is task:
+            self._spinner_task = None
+
+    async def _spin(self) -> None:
+        try:
+            while self._status_text() is not None:
+                await asyncio.sleep(SPINNER_INTERVAL_S)
+                if self._on_update is not None:
+                    self._on_update()
+        except asyncio.CancelledError:
+            pass
+
     def on_submit(self, text: str) -> bool:
         """受理制提交: 返回 False = 拒绝 (草稿保留); True = 接受 (前端清草稿)。"""
         if text.startswith("//"):
@@ -248,6 +313,7 @@ class ConversationView:
             return False
         # 应用准入事实已取得 (reservation 已占, 任务已建): 此时才创建用户条目
         self.transcript.append_user(prompt)
+        self._sync_spinner()  # reservation 窗口即忙: 状态行与动画立即上线
         return True
 
     def handle_ctrl_c(self) -> None:
@@ -309,6 +375,7 @@ class ConversationView:
                 # 05: 持久清空经共享 async clear_context() 可靠提交; 命令处置时
                 # 同步置屏障 (先于任务起跑窗口), 落定 (成功/失败) 后释放
                 self._gate.note_clear_started()
+                self._sync_spinner()
                 asyncio.get_running_loop().create_task(self._run_persistent_clear())
                 return True
             try:
@@ -332,6 +399,7 @@ class ConversationView:
                 return True
             # 02: 持久压缩经共享 async compact_context() 可靠提交; 屏障与清空同型
             self._gate.note_compact_started()
+            self._sync_spinner()
             self._compact_task = asyncio.get_running_loop().create_task(
                 self._run_persistent_compact()
             )
@@ -565,6 +633,7 @@ def build(
     on_exit: Callable[[], None] | None = None,
     on_update: Callable[[], None] | None = None,
     diagnostics: Callable[[], list[str]] | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> dict:
     """开发组合入口: 返回可直接注入 MainScreenFrontend 的回调集合。
 
@@ -579,6 +648,7 @@ def build(
         on_exit=on_exit,
         on_update=on_update,
         diagnostics=diagnostics,
+        clock=clock,
     )
     return {
         "document_lines": view.document_lines,
@@ -589,6 +659,7 @@ def build(
         "editor": view.editor,
         "view": view,
         "footer_lines": view.footer.render,  # (width, rows) -> 底栏行
+        "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
     }
 
 

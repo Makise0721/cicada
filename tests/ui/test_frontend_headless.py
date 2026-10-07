@@ -16,6 +16,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPress
 from cicada.ui.editor import Editor
 from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.frontend import ESCAPE_PREFIX_TIMEOUT_S, MainScreenFrontend
+from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.ui.terminal_io import FakeTerminal
 from tests.ui.vt_screen import VtScreen
 
@@ -33,7 +34,7 @@ def text_keys(text: str) -> list[KeyPress]:
 class Harness:
     """headless 前端驱动: FakeTerminal + VtScreen 镜像 + 可控文档。"""
 
-    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12, commands=False, on_submit=None):
+    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12, commands=False, on_submit=None, status_lines=None):
         self.terminal = FakeTerminal(columns, rows)
         self.vt = VtScreen(columns, rows)
         self.terminal.feed_screen = self.vt.feed
@@ -54,6 +55,7 @@ class Harness:
             on_exit=self._on_exit,
             escape_prefix_timeout=escape_timeout,
             command_menu=SlashCommandMenu() if commands else None,
+            status_lines=status_lines,
         )
         self.runner: asyncio.Task | None = None
 
@@ -604,3 +606,46 @@ async def test_run_async_cancel_still_restores_terminal():
         await asyncio.wait_for(h.runner, timeout=5)
     assert h.terminal.stopped, "取消路径不跳过终端模式恢复"
     assert h.frontend._stopped
+
+
+# --- tui-aesthetics 06: status_lines 接缝 (规格 §F) ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_status_line_sits_between_document_and_editor():
+    h = Harness(columns=40, rows=12, status_lines=lambda width: ["⠋ 正在输出…"])
+    try:
+        await h.start()
+        h.doc_lines = ["回答正文"]
+        h.frontend.request_render()
+        await h.settle()
+        screen = h.screen()
+        border_row = next(i for i, line in enumerate(screen) if set(line) == {"─"})
+        assert "正在输出" in screen[border_row - 1]  # 编辑器上边框正上方
+        assert screen[border_row - 2] == ""
+        assert "回答正文" in screen[border_row - 3]
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_status_line_deducts_editor_budget():
+    """rows=6 + 底栏 1 行: 状态行使编辑器正文从 3 行降到 2 行 (菜单未打开)。"""
+
+    def editor_body_rows(h: Harness) -> int:
+        h.frontend._frame_rows = 6
+        lines = h.frontend._render_frame_lines(40)
+        # 编辑器滚动视口只保留末尾正文行; 数可见 "bbbb" 行即正文行数
+        return sum("bbbb" in strip_terminal_sequences(line) for line in lines)
+
+    common = dict(columns=40, rows=6)
+    without = Harness(**common)
+    with_status = Harness(**common, status_lines=lambda width: ["⠋ 正在输出…"])
+    for h in (without, with_status):
+        h.frontend._footer_lines = lambda width, rows: ["底栏"]
+        h.editor.insert_text("aaaa")
+        for _ in range(3):
+            h.editor.insert_newline()
+            h.editor.insert_text("bbbb")
+    assert editor_body_rows(without) == 3
+    assert editor_body_rows(with_status) == 2

@@ -49,6 +49,7 @@ class MainScreenFrontend:
         escape_prefix_timeout: float = ESCAPE_PREFIX_TIMEOUT_S,
         footer_lines: Callable[[int, int], list[str]] | None = None,
         command_menu: SlashCommandMenu | None = None,
+        status_lines: Callable[[int], list[str]] | None = None,
     ) -> None:
         self._terminal = terminal
         self._editor = editor
@@ -60,6 +61,7 @@ class MainScreenFrontend:
         self._on_exit = on_exit
         self._footer_lines = footer_lines
         self._command_menu = command_menu
+        self._status_lines = status_lines
         self.ui_failures: list[str] = []
         self.terminal_failed = False
         self._screen = MainScreen(self._render_frame_lines, terminal.write)
@@ -81,6 +83,8 @@ class MainScreenFrontend:
         lines = list(self._document_lines(width))
         if lines and strip_terminal_sequences(lines[-1]).strip():
             lines.append("")  # 输出与编辑器上边框之间留一行。
+        status = self._status_lines(width) if self._status_lines is not None else []
+        lines.extend(status)  # 状态行: 文档与编辑器之间 (规格 §F), 空闲时 0 行
         # 帧内不重读终端尺寸: rows 用本帧 render_once 前的快照, 避免一帧内
         # viewport 用旧尺寸而编辑器/底栏行数用新尺寸 (缩放恰落排版期间)
         rows = self._frame_rows
@@ -92,9 +96,9 @@ class MainScreenFrontend:
             self._command_menu.render(width, min(4, max(0, rows - len(footer) - 3)))
             if self._command_menu is not None else []
         )
-        if menu:
-            # 菜单与底栏先留空间，低窗口仍保留编辑光标所在的正文行。
-            max_rows = max(1, min(max_rows, rows - len(menu) - len(footer) - 2))
+        if menu or status:
+            # 菜单/状态行与底栏先留空间，低窗口仍保留编辑光标所在的正文行。
+            max_rows = max(1, min(max_rows, rows - len(menu) - len(footer) - len(status) - 2))
         lines.extend(self._editor.render(width, max_rows))
         lines.extend(menu)
         lines.extend(footer)
