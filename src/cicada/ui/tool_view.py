@@ -85,7 +85,8 @@ _STATUS_BG: dict[str, str] = {
 }
 
 # v2 卡面 (规格 §B): 状态符号 / 强调条与标题色 / 状态背景
-_STATUS_GLYPH: dict[str, str] = {"running": "●", "success": "✓", "error": "✗"}
+# 符号取列宽 1 的字符 (√×●; ✓✗❯ 落在 emoji 保守判定区间按 2 列计, 会破行宽)
+_STATUS_GLYPH: dict[str, str] = {"running": "●", "success": "√", "error": "×"}
 _STATUS_ACCENT: dict[str, str] = {
     "running": theme.TOOL_ACCENT_RUNNING,
     "success": theme.TOOL_ACCENT_SUCCESS,

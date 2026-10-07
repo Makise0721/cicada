@@ -310,7 +310,7 @@ def test_success_card_title_glyph_accent_and_bar():
     lines = doc.render_lines(80)
     assert lines[0] == ""  # 卡前分隔空行不变
     title = strip_terminal_sequences(lines[2])
-    assert title.startswith("   ✓ read") and "src/app.py" in title  # 强调条 2 列 + 1 空格
+    assert title.startswith("   √ read") and "src/app.py" in title  # 强调条 2 列 + 1 空格
     assert ACCENT_SUCCESS in lines[2] and "\x1b[1m" in lines[2]  # 标题状态色加粗
     assert HINT_FG in lines[2]  # 参数摘要降灰
     # 全部卡片行 (含上下背景填充行) 以成功色强调条 + 卡背景开头
@@ -322,7 +322,7 @@ def test_error_and_running_card_variants():
     doc = ToolDocument()
     completed_card(doc, name="powershell", content="boom", is_error=True)
     lines = doc.render_lines(80)
-    assert "✗ powershell" in strip_terminal_sequences(lines[2])
+    assert "× powershell" in strip_terminal_sequences(lines[2])
     assert ACCENT_ERROR in lines[2]
     assert lines[1].startswith(BAR_ERROR + "  " + CARD_BG_ERROR)
 
