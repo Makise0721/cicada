@@ -93,7 +93,6 @@ class ConversationView:
             border_color=theme.editor_border(),
             padding_x=2,
             style=EditorStyle(
-                line_bg=theme.EDITOR_BG,
                 prompt_glyph="›",
                 prompt_color=theme.EDITOR_BORDER,
                 placeholder="输入消息… Enter 发送, Shift+Enter 换行",

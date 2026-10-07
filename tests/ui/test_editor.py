@@ -135,7 +135,7 @@ def test_editor_shrink_clears_with_clear_on_shrink_source():
 
 # --- tui-aesthetics 03: 编辑器 v2 (规格 §C, 字面量断言不复算实现) -----------------------------
 
-V2_BG = "\x1b[48;2;31;31;40m"       # EDITOR_BG #1f1f28
+V2_BG = "\x1b[48;2;31;31;40m"       # 已移除的输入区底色 (#1f1f28), 用于断言"不再出现"
 V2_PROMPT_FG = "\x1b[38;2;178;148;187m"  # 提示符 #b294bb
 V2_PLACEHOLDER_FG = "\x1b[38;2;106;106;106m"  # 占位 #6a6a6a
 
@@ -146,7 +146,6 @@ def v2_editor() -> Editor:
     return Editor(
         padding_x=2,
         style=EditorStyle(
-            line_bg="#1f1f28",
             prompt_glyph="›",
             prompt_color="#b294bb",
             placeholder="输入消息… Enter 发送, Shift+Enter 换行",
@@ -160,7 +159,7 @@ def test_v2_empty_editor_prompt_cursor_and_placeholder():
     editor.focused = True
     lines = editor.render(60)
     body = lines[1]
-    assert body.startswith(V2_BG) and body.endswith("\x1b[0m")  # 整行底色
+    assert "\x1b[48;2;" not in body  # 输入区无底色 (2026-10-07 用户裁决)
     plain = strip_terminal_sequences_local(body)
     assert plain.startswith("› ")  # 提示符占左边距
     assert "输入消息… Enter 发送, Shift+Enter 换行" in plain  # 空态占位
@@ -191,7 +190,7 @@ def test_v2_multiline_only_first_line_has_prompt():
     assert first.startswith("› 第一行")
     assert second.startswith("  第二行")  # 其余行左边距留空对齐
     for line in lines[1:3]:
-        assert line.startswith(V2_BG) and line.endswith("\x1b[0m")
+        assert "\x1b[48;2;" not in line  # 无底色
 
 
 def test_default_editor_without_style_unchanged():

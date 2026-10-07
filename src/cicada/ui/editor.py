@@ -34,10 +34,10 @@ UNDO_LIMIT = 200
 class EditorStyle:
     """v2 视觉样式 (tui-aesthetics 规格 §C): None = 关闭全部装饰 (兼容旧外观)。
 
-    取值由组合层从 theme 注入; 本模块不硬编码颜色。
+    取值由组合层从 theme 注入; 本模块不硬编码颜色。输入区底色曾试行
+    (#1f1f28), 2026-10-07 用户裁决撤除, 不保留该字段。
     """
 
-    line_bg: str | None = None
     prompt_glyph: str | None = None
     prompt_color: str | None = None
     placeholder: str | None = None
@@ -425,13 +425,13 @@ class Editor:
         return result
 
     def _style_line(self, left_pad: str, display: str, padding: str, right_pad: str, *, first: bool) -> str:
-        """v2 装饰 (规格 §C): 首可视行提示符、空态占位、整行底色; 无 style 原样。
+        """v2 装饰 (规格 §C): 首可视行提示符与空态占位; 无 style 原样。
 
-        样式纪律: 行内只用只开序列 (fg_open/\\x1b[39m/\\x1b[27m), 末尾一次 RESET;
-        内层 \\x1b[0m 会连带清掉底色, 不得出现。
+        输入区不设底色 (2026-10-07 用户裁决); 装饰段各自用 \\x1b[39m/\\x1b[27m
+        收尾, 不影响行外样式。
         """
         style = self.style
-        if style is None or style.line_bg is None:
+        if style is None:
             return f"{left_pad}{display}{padding}{right_pad}"
         left = left_pad
         if first and style.prompt_glyph:
@@ -454,7 +454,7 @@ class Editor:
                 + "\x1b[39m"
                 + padding[segment_w:]
             )
-        return theme.bg_open(style.line_bg) + left + display + padding + right_pad + "\x1b[0m"
+        return left + display + padding + right_pad
 
     def _layout_text(self, content_width: int) -> list[tuple[str, bool, int | None]]:
         """逻辑行 -> 换行块列表; 返回 (text, has_cursor, cursor_pos) 元组。"""

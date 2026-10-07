@@ -29,7 +29,6 @@ USER_MESSAGE_BG = "#343541"
 USER_MESSAGE_TEXT = "#d4d4d4"
 ASSISTANT_TEXT = "#d4d4d4"
 EDITOR_BORDER = "#b294bb"  # 用户截图固定的外观色 (dark.json thinkingHigh 同值, 语义无关)
-EDITOR_BG = "#1f1f28"          # 输入区底色 (tui-aesthetics 规格 §C)
 EDITOR_PLACEHOLDER = "#6a6a6a"  # 空态占位提示 (规格 §C)
 MENU_SEL_BG = "#2d2d3d"         # 斜线菜单选中行背景 (规格 §D)
 FOOTER_DIM = "#808080"  # 底栏低亮 (tui-aesthetics 规格 §E 提亮, 原 #666666)
@@ -328,7 +327,6 @@ __all__ = [
     "ASSISTANT_TEXT",
     "DIFF_ADDED",
     "DIFF_REMOVED",
-    "EDITOR_BG",
     "EDITOR_BORDER",
     "EDITOR_PLACEHOLDER",
     "FOOTER_DIM",
