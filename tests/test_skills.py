@@ -74,6 +74,70 @@ def load(root: Path) -> SkillCatalogSnapshot:
 # --- 发现与元数据 (A02) ---------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("field", ["source_path", "base_dir", "body", "task"])
+def test_decode_surrogate_fields_fall_back(field):
+    payload = {"version": 1, "task": "task", "skill": _skill_with_name("alpha")}
+    if field == "task":
+        payload[field] = "\ud800"
+    else:
+        payload["skill"][field] = "\ud800"
+    text = SKILL_REQUEST_PREFIX + "\n" + json.dumps(payload, ensure_ascii=True)
+    assert decode_skill_request(text) is None
+    assert decode_skill_request(SKILL_REQUEST_PREFIX + "\n" + "\ud800") is None
+
+
+def test_candidate_lstat_permission_error_rejects_whole_catalog(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    write_skill(root, "alpha")
+    original = Path.lstat
+
+    def denied(path):
+        if path.name == "SKILL.md":
+            raise PermissionError("denied candidate")
+        return original(path)
+
+    monkeypatch.setattr(Path, "lstat", denied)
+    with pytest.raises(SkillCatalogError) as error:
+        load(root)
+    assert error.value.kind == "read" and "SKILL.md" in error.value.path
+
+
+def test_deep_yaml_is_classified_and_cli_exits_two(tmp_path):
+    root = tmp_path / "skills"
+    nested = "[" * 600 + "0" + "]" * 600
+    raw = f"---\nname: alpha\ndescription: desc\nextra: {nested}\n---\nbody".encode()
+    write_skill(root, "alpha", raw=raw)
+    with pytest.raises(SkillCatalogError) as error:
+        load(root)
+    assert error.value.kind == "yaml"
+    proc = run_cli("--workspace", str(tmp_path), "--skills-dir", str(root),
+                   "--ollama-url", "http://127.0.0.1:1", "task")
+    assert proc.returncode == 2
+    assert "invalid skills directory" in proc.stderr and "Traceback" not in proc.stderr
+
+
+@pytest.mark.parametrize("field", ["description", "unknown-key"])
+def test_yaml_surrogate_metadata_rejects_before_manifest_and_provider(tmp_path, field):
+    root = tmp_path / "skills"
+    metadata = ('description: "\\uD800"' if field == "description"
+                else 'description: desc\n"\\uD800": ignored')
+    raw = f"---\nname: alpha\n{metadata}\n---\nbody".encode()
+    write_skill(root, "alpha", raw=raw)
+    with pytest.raises(SkillCatalogError):
+        load(root)
+    proc = run_cli("--workspace", str(tmp_path), "--skills-dir", str(root),
+                   "--ollama-url", "http://127.0.0.1:1", "task")
+    assert proc.returncode == 2
+    assert "invalid skills directory" in proc.stderr and "Traceback" not in proc.stderr
+
+
+def test_skill_name_rejects_trailing_newline_at_pure_boundary():
+    from cicada.skills import validate_skill_name
+
+    with pytest.raises(ValueError):
+        validate_skill_name("alpha\n", "alpha\n")
+
+
 def test_discovers_sorted_documents_with_normalized_body(tmp_path):
     root = tmp_path / "skills"
     write_skill(root, "beta", body="Beta body\r\nsecond line.")

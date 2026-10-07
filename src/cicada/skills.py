@@ -140,7 +140,7 @@ def validate_skill_name(name: str, directory_name: str) -> None:
         raise ValueError("name must be a nonempty string")
     if len(name) > MAX_SKILL_NAME_CHARS:
         raise ValueError(f"name exceeds {MAX_SKILL_NAME_CHARS} characters")
-    if SKILL_NAME_PATTERN.match(name) is None:
+    if SKILL_NAME_PATTERN.fullmatch(name) is None:
         raise ValueError("name must be lowercase letters/digits joined by single hyphens")
     if name != directory_name:
         raise ValueError("name must equal the skill subdirectory name")
@@ -293,7 +293,10 @@ def decode_skill_request(text: str) -> SkillInvocation | None:
     prefix_line = SKILL_REQUEST_PREFIX + "\n"
     if not text.startswith(prefix_line):
         return None
-    if len(text.encode("utf-8")) > MAX_SKILL_REQUEST_BYTES:
+    try:
+        if len(text.encode("utf-8")) > MAX_SKILL_REQUEST_BYTES:
+            return None
+    except UnicodeEncodeError:
         return None
     payload_text = text[len(prefix_line):]
     try:
@@ -317,6 +320,12 @@ def decode_skill_request(text: str) -> SkillInvocation | None:
     if set(skill) != _ENVELOPE_SKILL_KEYS or any(
         not isinstance(skill[key], str) for key in _ENVELOPE_SKILL_KEYS
     ):
+        return None
+    try:
+        # JSON 的 ASCII 转义可解码成孤立 surrogate；它不是可编码的 UTF-8 字段。
+        for value in (*skill.values(), task):
+            value.encode("utf-8")
+    except UnicodeEncodeError:
         return None
     name = skill["name"]
     # fullmatch 而非 match+$: "$" 会匹配尾随换行, 解码输入是任意 JSON 字符串

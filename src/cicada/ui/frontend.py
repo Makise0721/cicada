@@ -287,11 +287,18 @@ class MainScreenFrontend:
             return
         self._sync_command_menu()
         selected = self._command_menu.selected if self._command_menu is not None else None
-        stripped = selected.command if selected is not None else text.strip()
+        # /skill 的任务后缀是用户原文，保留尾随空白和换行直到请求封装。
+        command_text = text.lstrip()
+        skill_command = command_text.startswith("/skill") and (
+            len(command_text) == 6 or command_text[6].isspace()
+        )
+        submitted = selected.command if selected is not None else (
+            command_text if skill_command else text.strip()
+        )
         if self._on_submit is None:
             self._editor.clear()
             return
-        result = self._on_submit(stripped)
+        result = self._on_submit(submitted)
         if result is False:
             return  # 拒绝: 草稿保留 (实际接受前不伪造用户条目)
         self._editor.clear()

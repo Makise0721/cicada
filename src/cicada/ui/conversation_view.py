@@ -418,7 +418,7 @@ class ConversationView:
             self.handle_exit()
             return True
         if command.startswith("/skill") and (len(command) == 6 or command[6].isspace()):
-            return self._handle_skill_command(command)
+            return self._handle_skill_command(text.lstrip())
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
 
@@ -430,7 +430,7 @@ class ConversationView:
         名称后第一个空白串是分隔符, 任务余文原样保留 (不解释 shell 引号);
         未启用/未知名称/超限显示原因并保留草稿 (返回 False, 无伪用户条目)。
         """
-        payload = command[len("/skill"):].strip()
+        payload = command[len("/skill"):].lstrip()
         if not payload:
             if self._session.skills is None:
                 self.transcript.append_system(

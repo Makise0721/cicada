@@ -125,28 +125,35 @@ def _parse_frontmatter_text(raw_text: str, path_text: str) -> tuple[dict, str, t
                 raise SkillCatalogError(
                     "yaml", path_text, "anchors and aliases are not allowed"
                 )
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
         raise SkillCatalogError("yaml", path_text, str(exc)) from exc
     try:
         nodes = list(yaml.compose_all(yaml_text, Loader=_StrictSafeLoader))
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
         raise SkillCatalogError("yaml", path_text, str(exc)) from exc
     if len(nodes) != 1:
         raise SkillCatalogError("yaml", path_text, f"expected one YAML document, got {len(nodes)}")
     root_node = nodes[0]
-    _reject_composition(root_node, path_text)
+    try:
+        _reject_composition(root_node, path_text)
+    except RecursionError as exc:
+        raise SkillCatalogError("yaml", path_text, "frontmatter nesting is too deep") from exc
     if not isinstance(root_node, yaml.MappingNode):
         raise SkillCatalogError("yaml", path_text, "frontmatter must be a single YAML mapping")
 
     try:
         data = yaml.load(yaml_text, Loader=_StrictSafeLoader)
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, RecursionError) as exc:
         raise SkillCatalogError("yaml", path_text, str(exc)) from exc
     if not isinstance(data, dict):
         raise SkillCatalogError("yaml", path_text, "frontmatter must be a single YAML mapping")
     for key in data:
         if not isinstance(key, str):
             raise SkillCatalogError("yaml", path_text, f"non-string key {key!r}")
+        try:
+            key.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise SkillCatalogError("yaml", path_text, "frontmatter key is not valid UTF-8 text") from exc
     known = {"name", "description", "disable-model-invocation"}
     unsupported = sorted(set(data) - known)
     diagnostics = (
@@ -181,6 +188,7 @@ def _parse_skill_document(raw: bytes, source_path: Path, base_dir: Path,
         raise SkillCatalogError("format", path_text, str(exc)) from exc
     try:
         description = validate_skill_description(description_raw)
+        description.encode("utf-8")
     except ValueError as exc:
         raise SkillCatalogError("format", path_text, str(exc)) from exc
 
@@ -260,8 +268,10 @@ def load_skill_catalog(root_str: str, workspace: Path) -> SkillCatalogSnapshot:
         skill_md = Path(entry.path) / SKILL_FILE_NAME
         try:
             md_lstat = skill_md.lstat()
-        except OSError:
+        except FileNotFoundError:
             continue  # 没有主文档的子目录跳过
+        except OSError as exc:
+            raise SkillCatalogError("read", str(skill_md), str(exc)) from exc
         if md_lstat.st_file_attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
             raise SkillCatalogError(
                 "reparse_point", str(skill_md),

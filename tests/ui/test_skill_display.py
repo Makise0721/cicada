@@ -138,6 +138,59 @@ class Harness:
 # --- /skill 命令: 目录、用法与有界裁剪 ----------------------------------------------------------
 
 
+async def test_skill_task_suffix_survives_frontend_model_and_archive(tmp_path):
+    from dataclasses import replace
+
+    from cicada.plugins.fake_model import FakeModel
+    from cicada.plugins.session_store import open_session_store
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.terminal_io import FakeTerminal
+
+    root = tmp_path / "ws"
+    skills_dir = root / "skills"
+    write_skill(skills_dir, "alpha")
+    model = FakeModel([STOP])
+    config = make_config(root, model, make_snapshot(root, skills_dir))
+    config = replace(config, persistence=PersistenceConfig(
+        session_id=None, identity=identity_for(config.prompt_info)))
+    session = await open_application(config)
+    h = Harness(session)
+    try:
+        session_id = session.persistence.session_id
+        frontend = MainScreenFrontend(FakeTerminal(60, 20), editor=h.view.editor,
+                                      document_lines=h.view.document_lines, on_submit=h.submit)
+        h.view.editor.insert_text("/skill alpha task \n第二行\n\n  ")
+        frontend._handle_enter()
+        await h.wait_idle()
+        text = model.requests[0].messages[0].text
+        assert decode_skill_request(text).task == "task \n第二行\n\n  "
+        assert session.history[0].text == text
+    finally:
+        h.view.close()
+        await session.aclose()
+    store = open_session_store(directory=root / ".cicada" / "sessions",
+                               session_id=session_id, workspace=root)
+    try:
+        assert store.recovery_snapshot().canonical_history[0].text == text
+    finally:
+        await store.aclose()
+
+
+def test_surrogate_envelope_displays_as_original_user_text():
+    import json
+
+    payload = {"version": 1, "task": "task", "skill": {
+        "name": "alpha", "source_path": "\ud800", "base_dir": "base",
+        "source_sha256": "a" * 64, "body": "body", "body_sha256": "b" * 64,
+    }}
+    text = SKILL_REQUEST_PREFIX + "\n" + json.dumps(payload, ensure_ascii=True)
+    transcript = Transcript()
+    transcript.append_user(text)
+    assert type(transcript.entries()[0]) is UserEntry
+    assert transcript.entries()[0].text == text
+    assert transcript.render(40)
+
+
 async def test_bare_skill_shows_catalog_usage_and_manual_marker(tmp_path):
     root = tmp_path / "ws"
     skills_dir = root / "skills"
