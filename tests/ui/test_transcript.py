@@ -129,7 +129,31 @@ def test_error_assistant_entry_without_text_renders_nothing():
 
 def test_streaming_placeholder_before_first_delta():
     entry = AssistantEntry("run-1", 0)
-    assert entry.render(80) == ["…"]
+    # 条目统一自带 1 行前导空行 (规格 A): 占位期间与完成时间距一致
+    assert entry.render(80) == ["", "…"]
+
+
+def test_entries_have_uniform_one_blank_separator():
+    """规格 A: 任意相邻条目之间恰好 1 行透明空行 (assistant→user 不再紧贴)。"""
+    t = Transcript()
+    t.complete_assistant("run-1", 0, AssistantMessage(text="回答", stop_reason="stop"))
+    t.append_user("追问")
+    t.record_request_result("error", "炸了")
+    t.record_request_result("aborted", None)
+    lines = [strip_terminal_sequences(line) for line in t.render(80)]
+    text_rows = [i for i, line in enumerate(lines) if line.strip()]
+    for left, right in zip(text_rows, text_rows[1:]):
+        assert right - left >= 2, f"条目间缺透明空行: {lines[left]!r} -> {lines[right]!r}"
+
+
+def test_document_start_has_no_leading_blank():
+    """规格 A: 文档起始处的前导空行被丢弃, 首屏顶部不留白行。"""
+    t = Transcript()
+    t.append_user("首个消息")
+    assert t.render(80)[0] != ""
+    t2 = Transcript()
+    t2.complete_assistant("run-1", 0, AssistantMessage(text="回答", stop_reason="stop"))
+    assert t2.render(80)[0] != ""
 
 
 def test_record_request_result_error_and_cancel_and_normal():

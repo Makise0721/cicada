@@ -65,13 +65,16 @@ def _fit(lines: list[str], width: int) -> list[str]:
 
 
 class UserEntry:
-    """用户消息条目: Pi 样式背景盒 (上下 1 行、左右 1 列), 原文换行保留。"""
+    """用户消息条目: Pi 样式背景盒 (上下 1 行、左右 1 列), 原文换行保留。
+
+    与所有条目一致自带 1 行前导空行 (间距与条目类型无关)。
+    """
 
     def __init__(self, text: str) -> None:
         self.text = text
 
     def render(self, width: int) -> list[str]:
-        return theme.user_message_lines(self.text, width)
+        return ["", *theme.user_message_lines(self.text, width)]
 
 
 class AssistantEntry:
@@ -102,7 +105,7 @@ class AssistantEntry:
                 self._render_cache = (cleaned, width, list(lines))
             lines = ["", *lines]  # Pi assistant 前置空行
         elif not self.finalized:
-            lines = [STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量
+            lines = ["", STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量 (统一前导空行)
         else:
             lines = []  # 完成但无正文 (如错误路径): 事实由错误/取消条目表达
         if self.finalized and self.stop_reason == "length":
@@ -140,14 +143,14 @@ class ErrorEntry:
         self.text = text
 
     def render(self, width: int) -> list[str]:
-        return _wrap_with_prefix(ERROR_PREFIX, sanitize_display(self.text), width)
+        return ["", *_wrap_with_prefix(ERROR_PREFIX, sanitize_display(self.text), width)]
 
 
 class CancelledEntry:
     """取消条目: 本次请求被用户中止的事实。"""
 
     def render(self, width: int) -> list[str]:
-        return _wrap_lines(CANCELLED_TEXT, width)
+        return ["", *_wrap_lines(CANCELLED_TEXT, width)]
 
 
 class Transcript:
@@ -286,10 +289,15 @@ class Transcript:
     # --- 渲染 ----------------------------------------------------------------------
 
     def render(self, width: int) -> list[str]:
-        """整份文档按当前宽度排版; 每行可见列宽 <= width。"""
+        """整份文档按当前宽度排版; 每行可见列宽 <= width。
+
+        条目自带 1 行前导空行; 文档起始处的前导空行丢弃 (首屏顶部不留白)。
+        """
         lines: list[str] = []
         for entry in self._entries:
             lines.extend(entry.render(width))
+        while lines and lines[0] == "":
+            lines.pop(0)
         return _fit(lines, width)
 
 
