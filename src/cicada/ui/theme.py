@@ -32,7 +32,7 @@ EDITOR_BORDER = "#b294bb"  # 用户截图固定的外观色 (dark.json thinkingH
 EDITOR_BG = "#1f1f28"          # 输入区底色 (tui-aesthetics 规格 §C)
 EDITOR_PLACEHOLDER = "#6a6a6a"  # 空态占位提示 (规格 §C)
 MENU_SEL_BG = "#2d2d3d"         # 斜线菜单选中行背景 (规格 §D)
-FOOTER_DIM = "#666666"
+FOOTER_DIM = "#808080"  # 底栏低亮 (tui-aesthetics 规格 §E 提亮, 原 #666666)
 MUTED_GRAY = "#808080"
 MD_HEADING = "#f0c674"
 MD_LINK = "#81a2be"
@@ -287,7 +287,7 @@ class FooterComponent:
             parts.append(f"↓{format_tokens(output_total)}" + ("(部分)" if output_unknown else ""))
         elif output_unknown:
             parts.append("↓不可得")
-        joined = " ".join(parts)
+        joined = " · ".join(parts)  # 规格 §E: 计量多段 · 分隔
         if joined:
             joined = f"累计 {joined}"
         return joined

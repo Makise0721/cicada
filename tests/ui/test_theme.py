@@ -103,10 +103,10 @@ def test_footer_two_lines_workspace_and_right_aligned_model():
     footer = FooterComponent(r"C:\repo\demo", "qwen3.5:9b", lambda: (1500, False, 300, False))
     lines = footer.render(40, 24)
     assert len(lines) == 2
-    assert "累计 ↑1.5k ↓300" in strip_terminal_sequences(lines[1])
+    assert "累计 ↑1.5k · ↓300" in strip_terminal_sequences(lines[1])  # 规格 §E: · 分隔
     # 模型右对齐 (去掉 dim 样式后行尾是模型名)
     assert strip_terminal_sequences(lines[1]).endswith("qwen3.5:9b")
-    assert "\x1b[38;2;102;102;102m" in lines[0]  # dim #666666
+    assert "\x1b[38;2;128;128;128m" in lines[0]  # dim 提亮 #808080 (规格 §E)
     # 工作区行含工作区路径
     assert "demo" in strip_terminal_sequences(lines[0])
 
@@ -203,7 +203,7 @@ async def test_layout_composition_document_editor_footer():
         joined = "\n".join(screen)
         assert "用户问题在背景盒中" in joined  # P01: 用户背景盒
         assert "回答正文第一行" in joined
-        assert "累计 ↑1.2k ↓300" in joined  # P13: 计量底栏
+        assert "累计 ↑1.2k · ↓300" in joined  # P13: 计量底栏 (规格 §E: · 分隔)
         assert any("test-model" in line for line in screen)  # 模型右对齐
         # 编辑器上下细线存在 (P01)
         assert any(set(strip_terminal_sequences(line)) == {"─"} for line in screen)
