@@ -70,7 +70,8 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         assert "a" * 64 in compact, "窄窗换行保留完整 hash"
         assert not re.search(r"\[[0-9;]+m", stage.text()), "不能显示被拆开的 SGR 碎片"
         cursor_row = stage.vt.cursor_row
-        assert not stage.vt.screen_text()[cursor_row].strip(), "硬件光标仍在空输入行"
+        # 输入行现在有 › 提示符与空态占位 (tui-aesthetics §C); 光标仍在该行
+        assert "›" in stage.vt.screen_text()[cursor_row], "硬件光标仍在输入行"
         # 同一文档在宽窗口重新排版，检查实际屏幕而非渲染器内部状态。
         stage.set_size(100, 45)
         assert await wait_until(lambda: stage.contains("命令帮助"))
@@ -143,7 +144,7 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path):
         assert not stage.contains("状态: idle")
         assert len(model_of(session).requests) == 1
         assert "→ status" in "\n".join(stage.vt.screen_text())
-        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "/"
+        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /"  # 提示符 + 草稿 (§C)
         stage.emit([ENTER])
         assert await wait_until(lambda: stage.contains("状态: idle"))
         assert len(model_of(session).requests) == 1

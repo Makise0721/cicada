@@ -45,7 +45,7 @@ async def test_stage_acceptance_full_interaction(tmp_path):
         # 1) 首问: 工具卡(powershell/edit/check) + 长流式回答同一条目原位更新 (P02/P04)
         stage.emit(text_keys("改好 sample.py 并运行检查"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("edit sample.py")), "edit 工具卡可见"
+        assert await wait_until(lambda: stage.contains("edit  sample.py")), "edit 工具卡可见"  # §B: 状态符号标题, 名称与参数两个空格
         assert await wait_until(lambda: stage.contains("检查报告")), "长回答开始流式"
         assert stage.count("检查报告") == 1, "流式期间同一条目原位更新, 无重复"
         assert await wait_until(lambda: len(model_of(session).requests) == 2), "首问 = 工具轮 + 文本轮"
