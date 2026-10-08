@@ -352,6 +352,41 @@ async def test_apply_after_model_change_prepares_from_latest_binding(tmp_path):
         await session.aclose()
 
 
+async def test_save_failure_with_apply_target_is_zero_application(tmp_path):
+    session, store = await open_session(tmp_path)
+    try:
+        before = (session.persistence.epoch_id, session._model_route.binding.identity)
+        request = submission(session.login_view(), think=False)
+        store.root.mkdir()
+        (store.root / 'config.toml').write_text('version=1\n', encoding='utf-8')
+        result = await session.configure_login(request)
+        assert not result.defaults_saved and not result.session_applied
+        assert result.application_outcome == 'failed' and result.error_code == 'configuration-changed'
+        assert session.persistence.epoch_id == before[0]
+        assert session._model_route.binding.identity == before[1]
+        assert session.persistence.storage_failed is None  # 用户文件失败不是会话存储故障
+        assert (await session.execute('旧绑定仍可续写')).exit_code == 0
+    finally:
+        await session.aclose()
+
+
+async def test_reasoning_effort_survives_apply_and_later_model_selection(tmp_path):
+    recorded = []
+    session, store = await open_session(tmp_path, transport=recorded_transport(recorded))
+    try:
+        result = await session.configure_login(submission(session.login_view(), effort='low'))
+        assert result.application_outcome == 'applied'
+        await session.execute('应用后请求')
+        assert recorded[-1][1]['reasoning_effort'] == 'low'
+        await session.select_model('deepseek-v4-pro')
+        await session.execute('选择后请求')
+        authorization, body = recorded[-1]
+        assert authorization == 'Bearer offline-test-key'
+        assert body['model'] == 'deepseek-v4-pro' and body['reasoning_effort'] == 'low'
+    finally:
+        await session.aclose()
+
+
 async def test_ephemeral_session_applies_without_epoch(tmp_path):
     recorded = []
     root = _repo(tmp_path)

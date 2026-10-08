@@ -1791,7 +1791,7 @@ class ApplicationSession:
         try:
             binding = configuration.prepare_configuration(
                 ConfigurationRequest(target, submission.credential_action, submission.credential))
-        except (ValueError, UserConfigError):
+        except ValueError:  # UserConfigError 同为 ValueError; 固定分类, 不回显细节
             return replace(saved, application_outcome='blocked', error_code='invalid-model-settings')
         try:
             # 当前有效投影的历史资格核对 (D7): 不兼容保留旧绑定, 不改写历史
