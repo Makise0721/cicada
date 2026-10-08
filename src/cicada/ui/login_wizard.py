@@ -10,7 +10,8 @@ from prompt_toolkit.keys import Keys
 from cicada.plugins.deepseek.protocol import REASONING_EFFORTS
 from cicada.ui.rendering import sanitize_display
 from cicada.ui.terminal_io import Terminal
-from cicada.ui.main_screen import truncate_to_width
+from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
+from cicada.ui import theme
 from cicada.user_config import (
     LoginResult, LoginSubmission, LoginView, SecretValue, UserConfigError,
     UserConfigStore, UserDefaults,
@@ -37,6 +38,8 @@ class LoginWizard:
         self.submitting = False
         self.cancelled = False
         self.target = view.actions[0]
+        self._viewport: tuple[int, int | None] | None = None
+        self._confirm_blocked = False
 
     @property
     def _thinking(self) -> tuple[str, ...]:
@@ -112,6 +115,11 @@ class LoginWizard:
             self.step = 'confirm'
             self.selection = 0
         elif self.step == 'confirm':
+            if self._viewport is not None:
+                # 同批按键也先按最近宿主尺寸计算，不能绕过未显示完整的确认信息。
+                self.render_lines(*self._viewport)
+                if self._confirm_blocked:
+                    return None
             self.target = self.view.actions[self.selection]
             self.submitting = True
             return 'submit'
@@ -124,50 +132,151 @@ class LoginWizard:
         return LoginSubmission(self.defaults, self.credential_action, self.view.revision,
                                self.target, self._credential)
 
-    def render_lines(self, columns: int) -> list[str]:
-        lines = [self.title or ('Cicada · 补齐凭据' if self.view.credentials_only else 'Cicada · 首次配置'),
-                 '↑/↓ 选择 · Enter 继续/保存 · Tab 返回 · Esc/Ctrl+C 取消', '']
+    def render_lines(self, columns: int, rows: int | None = None) -> list[str]:
+        """Pi 式对话框结构，沿用主屏主题；低窗口优先保留输入和选中动作。"""
+        width = max(1, columns)
+        self._viewport = (columns, rows)
+        self._confirm_blocked = self.step == 'confirm' and not self.submitting and width < 18
+        pad = '  ' if width >= 24 else ' ' if width > 4 else ''
+        content_width = max(1, width - len(pad) * 2)
+        items: list[tuple[int, str]] = []
+        required: set[int] = set()
+
+        def row(text: str, *, color: str = theme.ASSISTANT_TEXT, priority: int = 2,
+                wrap: bool = False, mandatory: bool = False) -> None:
+            clean = sanitize_display(text)
+            chunks = wrap_text_ansi(clean, content_width) if wrap else [truncate_to_width(clean, content_width)]
+            chunks = [truncate_to_width(chunk, content_width) for chunk in chunks]
+            if mandatory:
+                required.update(range(len(items), len(items) + len(chunks)))
+            items.extend((priority, pad + theme.fg(color, chunk)) for chunk in chunks)
+
+        def space() -> None:
+            items.append((5, ''))
+
+        def choice(index: int, label: str, description: str) -> None:
+            selected = index == self.selection
+            marker = ('→ ' if selected else '  ') if content_width >= 3 else ''
+            label = truncate_to_width(sanitize_display(label), max(1, content_width - len(marker)))
+            remaining = content_width - len(marker) - visible_width(label) - 3
+            detail = ('   ' + sanitize_display(description)
+                      if description and visible_width(description) <= remaining else '')
+            body = (pad + theme.fg_open(theme.EDITOR_BORDER) + marker
+                    + theme.fg_open(theme.MD_LINK if selected else theme.ASSISTANT_TEXT) + label
+                    + theme.fg_open(theme.MUTED_GRAY) + detail)
+            if selected:
+                body = theme.bg_open(theme.MENU_SEL_BG) + body
+                body += ' ' * max(0, width - visible_width(body))
+                if self.step == 'confirm':
+                    required.add(len(items))
+            items.append((-3 if selected else 1, body + '\x1b[0m'))
+
+        steps = ('provider', 'credential', 'confirm') if self.view.credentials_only else (
+            'provider', 'credential', 'thinking', 'confirm')
+        names = {'provider': '提供商', 'credential': '凭据', 'thinking': '思考', 'confirm': '确认'}
+        number = steps.index(self.step) + 1
+        title = self.title or ('Cicada · 补齐凭据' if self.view.credentials_only else 'Cicada · 首次配置')
+        compact = rows is not None and rows < 14
+        caption = (f'{names[self.step]} · {number}/{len(steps)}' if compact else title)
+        heading = pad + theme.fg(theme.EDITOR_BORDER, '\x1b[1m' + truncate_to_width(caption, content_width))
+        border = theme.fg(theme.EDITOR_BORDER, '─' * width)
+        progress = pad + '   '.join(theme.fg(
+            theme.EDITOR_BORDER if step == self.step else theme.MUTED_GRAY,
+            ('› ' if step == self.step else '') + names[step]) for step in steps)
+        header = [heading] if compact else [border, heading, progress, '']
+
         if self.submitting:
-            lines.append('正在可靠保存，请等待…')
+            row('● 正在可靠保存，请等待…', color=theme.EDITOR_BORDER, priority=-3, wrap=True)
         elif self.step == 'provider':
-            lines.append('> DeepSeek')
+            choice(0, 'DeepSeek', 'API key')
         elif self.step == 'credential':
             if self.view.credential_present:
                 labels = {'environment': '环境变量', 'file': '凭据文件', 'login': '本次登录'}
-                lines.append('凭据已配置 · 来源：' + labels.get(self.view.credential_source, '已配置'))
-                for index, text in enumerate(('保留凭据', '替换凭据')):
-                    lines.append(('> ' if index == self.selection else '  ') + text)
+                row('凭据已配置 · 来源：' + labels.get(self.view.credential_source, '已配置'),
+                    color=theme.MUTED_GRAY, priority=1)
+                space()
+                choice(0, '保留凭据', '')
+                choice(1, '替换凭据', '')
             if not self.view.credential_present or self.selection == 1:
-                lines.append('API key: ' + '*' * min(len(self._key), 32))
+                space()
+                masked = '*' * min(len(self._key), 32)
+                row('API key: ' + (masked or '输入或粘贴单行凭据'),
+                    color=theme.ASSISTANT_TEXT if masked else theme.MUTED_GRAY, priority=-3)
         elif self.step == 'thinking':
-            lines.append('本次内置模型：' + self.view.model)
+            row(self.view.model, color=theme.MUTED_GRAY)
+            space()
             for index, value in enumerate(self._thinking):
-                lines.append(('> ' if index == self.selection else '  ') +
-                             ('关闭思考' if value == 'off' else value))
+                choice(index, '关闭思考' if value == 'off' else value, '')
         else:
             d = self.defaults
-            lines.extend(('提供商：DeepSeek', '本次模型：' + self.view.model,
-                ('本次思考（存档只读）：' + (self.view.reasoning_effort if self.view.think else 'off')
+            row('模型：' + self.view.model, priority=1, wrap=True, mandatory=True)
+            row(('本次思考（存档只读）：' + (self.view.reasoning_effort if self.view.think else 'off')
                  if self.view.credentials_only else
-                 '保存思考：' + (d.reasoning_effort if d.think else 'off')),
-                '保存位置：' + str(self.view.save_path), self.view.effect))
+                 '思考：' + (d.reasoning_effort if d.think else 'off')),
+                priority=1, wrap=True, mandatory=True)
+            space()
+            row('保存位置：' + str(self.view.save_path), color=theme.MUTED_GRAY,
+                priority=3, wrap=True, mandatory=True)
             if self.view.credentials_only:
-                lines.append('仅补凭据；保留已有用户默认值与存档设置')
+                row('仅补凭据；存档设置不变', color=theme.MD_LINK,
+                    priority=-1, wrap=True, mandatory=True)
             else:
-                lines.append(f'保留窗口/输出上限：{d.num_ctx}/{d.max_output_tokens}')
                 actual = replace(d, **{k: v for k, v in self.explicit.items() if v is not None})
                 if actual != d:
-                    lines.append('本次 CLI 覆盖：' + actual.model + ' · 思考=' +
-                                 (actual.reasoning_effort if actual.think else 'off') +
-                                 f' · 窗口/输出={actual.num_ctx}/{actual.max_output_tokens}')
+                    row('本次 CLI 覆盖：' + actual.model + ' · 思考=' +
+                        (actual.reasoning_effort if actual.think else 'off') +
+                        f' · 窗口/输出={actual.num_ctx}/{actual.max_output_tokens}',
+                        color=theme.MD_LINK, priority=0, wrap=True, mandatory=True)
             if self.view.credential_source == 'environment':
-                lines.append('后续启动仍优先环境变量；保留不会复制环境凭据')
+                row('下次启动优先环境凭据',
+                    color=theme.MD_LINK, priority=0, wrap=True, mandatory=True)
+            space()
             for index, target in enumerate(self.view.actions):
-                lines.append(('> ' if index == self.selection else '  ') +
-                             ('保存并应用' if target == 'save-and-apply' else '确认保存'))
+                choice(index, '保存并应用' if target == 'save-and-apply' else
+                       '仅保存' if self.title else '确认保存',
+                       '后继请求生效' if target == 'save-and-apply' else
+                       '下次新会话生效' if self.title else '继续启动')
+            if self.title and not self.view.credentials_only:
+                scope = ('后继请求生效'
+                         if self.view.actions[self.selection] == 'save-and-apply' else
+                         '下次新会话生效')
+                selected_label = '保存并应用' if self.view.actions[self.selection] == 'save-and-apply' else '仅保存'
+                if content_width < 2 + visible_width(selected_label) + 3 + visible_width(scope):
+                    row(scope, color=theme.MUTED_GRAY, priority=-1, wrap=True, mandatory=True)
         if self.error:
-            lines.append(self.error)
-        return [truncate_to_width(sanitize_display(line), max(1, columns)) for line in lines]
+            row(self.error, color=theme.DIFF_REMOVED, priority=-2, wrap=True)
+
+        if rows is not None and rows <= 2:
+            self._confirm_blocked = self.step == 'confirm'
+            active = sorted(range(len(items)), key=lambda i: (items[i][0], i))[:max(1, rows)]
+            return [items[i][1] for i in sorted(active)]
+
+        hint = ('请等待保存完成' if self.submitting else
+                '↑↓ 选择 · Enter 确认 · Tab 返回 · Esc 取消')
+        if width < 52:
+            hint = '保存中…' if self.submitting else '↑↓ 选择 · Enter 确认 · Esc 取消'
+        footer = [pad + theme.fg(theme.MUTED_GRAY, truncate_to_width(hint, content_width))]
+        if not compact:
+            footer = ['', *footer, border]
+        if rows is not None:
+            budget = max(0, rows - len(header) - len(footer))
+            self._confirm_blocked = self._confirm_blocked or (
+                self.step == 'confirm' and not self.submitting and len(required) > budget)
+            if self._confirm_blocked:
+                row('窗口太小，请放大后确认', color=theme.DIFF_REMOVED, priority=-4, wrap=True)
+                retained = set(sorted(range(len(items)), key=lambda i: (items[i][0], i))[:budget])
+            else:
+                retained = set(required)
+                extra = sorted((i for i in range(len(items)) if i not in retained),
+                               key=lambda i: (items[i][0], i))[:max(0, budget - len(retained))]
+                retained.update(extra)
+            items = [item for i, item in enumerate(items) if i in retained]
+        lines = [*header, *(text for _, text in items), *footer]
+        # 纯文本先限宽，套 SGR 后不再截断（会剥掉颜色）；极窄窗的进度条单独限宽。
+        if not compact:
+            lines[2] = pad + theme.fg(theme.MUTED_GRAY, truncate_to_width(
+                ' · '.join(names[step] for step in steps), content_width)) if visible_width(progress) > width else progress
+        return lines[:max(1, rows)] if rows is not None else lines
 
 
 class LoginModal:
@@ -204,8 +313,7 @@ class LoginModal:
             self._on_submit(submission)
 
     def render(self, columns: int, rows: int) -> list[str]:
-        lines = self.wizard.render_lines(columns) if self.wizard else []
-        return lines[-max(1, rows):]
+        return self.wizard.render_lines(columns, max(1, rows)) if self.wizard else []
 
 
 async def run_startup_login(
@@ -222,11 +330,7 @@ async def run_startup_login(
     def render() -> None:
         nonlocal failed
         try:
-            lines = wizard.render_lines(terminal.columns)
-            # 小窗口保留当前操作行；resize 重新按实际尺寸绘制。
-            height = max(1, terminal.rows - 1)
-            if len(lines) > height:
-                lines = lines[-height:]
+            lines = wizard.render_lines(terminal.columns, max(1, terminal.rows - 1))
             terminal.write('\x1b[?25l\x1b[2J\x1b[H' + '\r\n'.join(lines))
         except Exception:
             failed = True

@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from dataclasses import replace
 import pytest
 
 from prompt_toolkit.key_binding.key_processor import KeyPress
@@ -9,12 +10,23 @@ from prompt_toolkit.keys import Keys
 
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.ui.login_wizard import run_startup_login
+from cicada.ui.login_wizard import LoginWizard
+from cicada.ui.main_screen import visible_width
 from cicada.ui.terminal_io import FakeTerminal
 from cicada.user_config import LoginSubmission, SecretValue
 from cicada.plugins.user_config import store as files
 from vt_screen import VtScreen
 
 ENTER = KeyPress(Keys.ControlM, '\r')
+
+
+def test_extremely_narrow_pages_stay_inside_terminal_columns(tmp_path):
+    view = FileUserConfigStore(tmp_path / 'user').read_view('width-sentinel')
+    wizard = LoginWizard(view)
+    for step in ('provider', 'credential', 'thinking', 'confirm'):
+        wizard.step = step
+        for width in (1, 2, 3):
+            assert all(visible_width(line) <= width for line in wizard.render_lines(width, 6))
 
 
 async def test_first_run_masks_secret_and_saves_once(tmp_path):
@@ -104,6 +116,57 @@ async def test_narrow_window_resize_restores_cursor_and_does_not_scroll_secret(t
     assert result is None and errors == [] and resized.cursor_visible
     assert 'narrow-sentinel' not in '\n'.join(screen.history_text() + resized.history_text())
     assert not store.root.exists()
+
+
+async def test_short_thinking_window_keeps_active_choice_visible(tmp_path):
+    terminal = FakeTerminal(columns=18, rows=6)
+    screen = VtScreen(columns=18, rows=6)
+    terminal.feed_screen = screen.feed
+    store = FileUserConfigStore(tmp_path / 'user')
+    task = await start(terminal, store)
+    try:
+        terminal.emit([ENTER, KeyPress(Keys.BracketedPaste, 'short-sentinel'), ENTER])
+        assert '→ high' in '\n'.join(screen.screen_text())
+        terminal.emit([KeyPress(Keys.Down, '\x1b[B')])
+        assert '→ max' in '\n'.join(screen.screen_text())
+        assert 'short-sentinel' not in terminal.output_text
+    finally:
+        terminal.emit([KeyPress(Keys.Escape, '\x1b')])
+        await task
+
+
+@pytest.mark.parametrize('mode', ['environment', 'credentials-only', 'cli-override'])
+async def test_narrow_confirmation_cannot_submit_hidden_required_information(tmp_path, mode):
+    store = FileUserConfigStore(tmp_path / 'user')
+    view = store.read_view('compact-env-sentinel')
+    explicit = {}
+    if mode == 'credentials-only':
+        view = replace(view, credentials_only=True, model='deepseek-v4-pro', think=False)
+    elif mode == 'cli-override':
+        explicit = {'model': 'deepseek-v4-pro', 'think': False, 'num_ctx': 65536,
+                    'max_output_tokens': 4096}
+    terminal = FakeTerminal(columns=18, rows=6)
+    screen = VtScreen(columns=18, rows=6)
+    terminal.feed_screen = screen.feed
+    task = asyncio.create_task(run_startup_login(terminal, store, view, explicit=explicit))
+    await asyncio.sleep(0)
+    terminal.emit([ENTER, ENTER, ENTER, ENTER])  # 同批确认也不能绕过尺寸保护。
+    assert not task.done() and not store.root.exists()
+    assert '窗口太小' in '\n'.join(screen.screen_text())
+    resized = VtScreen(columns=100, rows=28)
+    terminal.feed_screen = resized.feed
+    terminal.set_size(100, 28)
+    rendered = '\n'.join(resized.screen_text())
+    assert '下次启动优先环境凭据' in rendered
+    assert '窗口太小' not in rendered
+    if mode == 'credentials-only':
+        assert 'deepseek-v4-pro' in rendered and '存档只读' in rendered and 'off' in rendered
+    elif mode == 'cli-override':
+        assert '本次 CLI 覆盖' in rendered and 'deepseek-v4-pro' in rendered
+        assert '65536/4096' in rendered
+    terminal.emit([ENTER])
+    result, errors = await asyncio.wait_for(task, 5)
+    assert result.defaults_saved and errors == []
 
 
 @pytest.mark.parametrize('phase', ['start', 'edit', 'resize'])

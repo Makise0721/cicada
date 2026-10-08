@@ -58,8 +58,8 @@ async def test_real_vt_login_replace_masks_secret_saves_once_and_preserves_draft
         assert h.exit_requested == 0
         h.terminal.emit([ENTER, DOWN, ENTER])  # high -> max
         await h.settle()
-        assert h.find('下次新会话生效') and h.find('后续启动仍优先环境变量')
-        assert h.find('保存思考：max')
+        assert h.find('下次新会话生效') and h.find('下次启动优先环境凭据')
+        assert h.find('思考：max')
         h.terminal.emit([DOWN, ENTER, ENTER])  # 确认页先移到“仅保存”再提交
         await settled(h)
         snapshot = FileUserConfigStore(store.root).load()
@@ -191,6 +191,41 @@ async def test_narrow_resize_and_invalid_paste_stay_in_modal(tmp_path):
         assert 'secret' not in h.terminal.output_text
         h.terminal.emit([ESCAPE])
     finally:
+        await h.stop()
+        await session.aclose()
+        h.view.close()
+
+
+async def test_short_confirm_keeps_active_action_and_environment_priority_visible(tmp_path):
+    session, store = await open_session(tmp_path)
+    h = TUIHarness(session, columns=45, rows=8)
+    try:
+        await h.start()
+        h.view.on_submit('/login')
+        h.terminal.emit([ENTER, ENTER, ENTER])
+        await h.settle()
+        assert h.find('→ 保存并应用')
+        assert h.find('下次启动优先环境凭据')
+        h.terminal.emit([DOWN])
+        await h.settle()
+        assert h.find('→ 仅保存')
+        assert h.find('下次新会话生效')
+        h.terminal.emit([ENTER, ENTER])
+        await h.settle()
+        assert h.find('窗口太小') and not h.view.login_modal.wizard.submitting
+        assert all(visible_width(row) <= 45 for row in h.screen())
+        assert session.history == () and not store.root.exists()
+        h.vt = VtScreen(100, 28)
+        h.terminal.feed_screen = h.vt.feed
+        h.terminal.set_size(100, 28)
+        await h.settle()
+        assert h.find('保存位置') and h.find('下次启动优先环境凭据')
+        assert not h.find('窗口太小')
+        h.terminal.emit([ENTER])
+        await settled(h)
+        assert store.root.exists() and not session.login_busy
+    finally:
+        h.terminal.emit([ESCAPE])
         await h.stop()
         await session.aclose()
         h.view.close()
