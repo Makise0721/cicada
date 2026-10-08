@@ -25,6 +25,7 @@ from prompt_toolkit.keys import Keys
 from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
+from cicada.ui.model_menu import ModelMenu
 from cicada.ui.terminal_io import Terminal
 
 MIN_RENDER_INTERVAL_S = 1.0 / 60.0  # Pi MIN_RENDER_INTERVAL_MS = 16
@@ -50,6 +51,8 @@ class MainScreenFrontend:
         footer_lines: Callable[[int, int], list[str]] | None = None,
         command_menu: SlashCommandMenu | None = None,
         status_lines: Callable[[int], list[str]] | None = None,
+        model_menu: ModelMenu | None = None,
+        on_model_confirm: Callable[[str], None] | None = None,
     ) -> None:
         self._terminal = terminal
         self._editor = editor
@@ -62,6 +65,8 @@ class MainScreenFrontend:
         self._footer_lines = footer_lines
         self._command_menu = command_menu
         self._status_lines = status_lines
+        self._model_menu = model_menu
+        self._on_model_confirm = on_model_confirm
         self.ui_failures: list[str] = []
         self.terminal_failed = False
         self._screen = MainScreen(self._render_frame_lines, terminal.write)
@@ -92,10 +97,15 @@ class MainScreenFrontend:
         max_rows = min(5, max(3, int(rows * 0.3)))
         footer = self._footer_lines(width, rows) if self._footer_lines is not None else []
         self._sync_command_menu()
-        menu = (
-            self._command_menu.render(width, min(4, max(0, rows - len(footer) - 3)))
-            if self._command_menu is not None else []
-        )
+        menu_budget = min(4, max(0, rows - len(footer) - 3))
+        if self._model_menu_active():
+            # 模型菜单 (DeepSeek 04) 与斜线菜单共用编辑器下方槽位; 两者不会同时打开
+            menu = self._model_menu.render(width, menu_budget)
+        else:
+            menu = (
+                self._command_menu.render(width, menu_budget)
+                if self._command_menu is not None else []
+            )
         if menu or status:
             # 菜单/状态行与底栏先留空间，低窗口仍保留编辑光标所在的正文行。
             max_rows = max(1, min(max_rows, rows - len(menu) - len(footer) - len(status) - 2))
@@ -232,10 +242,25 @@ class MainScreenFrontend:
         if self._escape_pending:
             if key.key in (Keys.ControlM,) or data == "\r":
                 self._disarm_escape_prefix()
+                if self._model_menu_active():
+                    self._model_menu.dismiss()  # Alt+Enter 是编辑: 收起菜单后仅换行
                 self._editor.insert_newline()  # 完整 Alt+Enter: 仅换行
                 return
             self._disarm_escape_prefix()
             self._dispatch_escape()  # 前缀窗口内的其他键: Escape 先行派发
+        # 模型菜单优先键位 (契约 C7): 箭头/Enter 先于普通 editor 命令解释;
+        # 其余键先收起菜单再按原键继续 (编辑新草稿不丢字符)
+        if self._model_menu_active():
+            if key.key is Keys.Up:
+                self._model_menu.move(-1)
+                return
+            if key.key is Keys.Down:
+                self._model_menu.move(1)
+                return
+            if key.key in (Keys.ControlM,) or data == "\r":
+                self._confirm_model_menu()
+                return
+            self._model_menu.dismiss()
         if key.key is Keys.BracketedPaste:
             self._editor.insert_text(data)
             return
@@ -327,11 +352,27 @@ class MainScreenFrontend:
 
     def _dispatch_escape(self) -> None:
         self._sync_command_menu()
+        if self._model_menu_active() and self._model_menu.dismiss():
+            # 模型菜单 Esc 只收起菜单 (契约 C7), 不触发会话取消
+            self.request_render_now()
+            return
         if self._command_menu is not None and self._command_menu.dismiss():
             self.request_render_now()
             return
         if self._on_escape is not None:
             self._on_escape()
+
+    def _model_menu_active(self) -> bool:
+        return self._model_menu is not None and self._model_menu.is_open
+
+    def _confirm_model_menu(self) -> None:
+        """模型菜单 Enter: 收起并把 option ID 交回组合层 (屏障/任务归组合层与应用)。"""
+        if self._model_menu is None:
+            return
+        option = self._model_menu.selected
+        self._model_menu.dismiss()
+        if option is not None and self._on_model_confirm is not None:
+            self._on_model_confirm(option.id)
 
     # --- 生命周期 ---------------------------------------------------------------------
 

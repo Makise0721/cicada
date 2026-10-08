@@ -275,6 +275,10 @@ class FooterComponent:
         self._model_label = model_label
         self._metrics = metrics
 
+    def set_model_label(self, label: str | None) -> None:
+        """模型选择发布后更新底栏为有效配置 (DeepSeek 04/契约 C7); 启动诊断不受影响。"""
+        self._model_label = label
+
     def _stats_left(self) -> str:
         input_total, input_unknown, output_total, output_unknown = self._metrics()
         parts: list[str] = []

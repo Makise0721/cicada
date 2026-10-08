@@ -89,6 +89,8 @@ async def run_tui_session(
         footer_lines=view.footer.render,
         command_menu=SlashCommandMenu(),
         status_lines=view.status_lines,
+        model_menu=view.model_menu,
+        on_model_confirm=view.confirm_model_selection,
     )
     refs["frontend"] = frontend
 

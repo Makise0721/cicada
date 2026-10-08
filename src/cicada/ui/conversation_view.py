@@ -24,6 +24,10 @@
 - 票据 04: /status 新增预算段 (占用/上限/预留/余量/来源/锚/校准偏差) 与摘要段
   (压缩次数/边界/摘要计量单列), 只读出口为 session.budget 与
   session.summary_records; 恢复显示在压缩边界插入程序条目。
+- DeepSeek 阶段票据 04 (契约 C7): /model 打开模型菜单 (本地操作, 非 UserMessage);
+  菜单确认同步置 model 屏障 (先于任务创建), select_model 只提交 option ID;
+  ModelChanged 刷新底栏有效模型并追加确认条目, 失败有界成条, closing 不重开。
+  思考正文不进入普通答案/预览/恢复显示 (transcript 只渲染 message.text)。
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from cicada.application import (
     ApplicationUpdate,
     ContextCompacted,
     HistoryCleared,
+    ModelChanged,
     OperationBusy,
     RequestCompleted,
     RequestPhaseChanged,
@@ -67,6 +72,7 @@ from cicada.ui.editor import Editor, EditorStyle
 from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width
+from cicada.ui.model_menu import ModelMenu
 from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
@@ -112,6 +118,9 @@ class ConversationView:
         self._gate.on_error = self._on_gate_error
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
         self._compact_task: asyncio.Task | None = None
+        # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
+        self._model_task: asyncio.Task | None = None
+        self.model_menu = ModelMenu()
         # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停
         self._clock = clock if clock is not None else time.monotonic
         self._spinner_task: asyncio.Task | None = None
@@ -190,9 +199,20 @@ class ConversationView:
             if update.operation == "compact":
                 self._gate.note_compact_started()
                 self.transcript.append_system("正在提交压缩（摘要较早请求，原始记录保留）…")
-            else:
+            elif update.operation == "clear":
                 self._gate.note_clear_started()
                 self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
+            else:
+                # model: 屏障在菜单确认时已同步置位, 此处兜底; 进度由状态行表达
+                self._gate.note_model_started()
+        elif isinstance(update, ModelChanged):
+            # DeepSeek 04 (C7): 底栏从有效配置读取 (启动诊断仍是启动事实);
+            # 确认条目如实记录边界, 历史/摘要/验证状态由应用保留
+            self.footer.set_model_label(update.model_label)
+            self.transcript.append_system(
+                f"已切换模型：{update.previous_label} → {update.model_label}"
+                "（仅影响后继请求；对话、摘要与验证状态保留）。"
+            )
         elif isinstance(update, ContextCompacted):
             # 02: 压缩切换成功; 确认条目 + 兜底释放屏障 (主释放由等待任务 finally)
             self._gate.note_compact_settled()
@@ -273,6 +293,8 @@ class ConversationView:
             return "正在清空…"
         if self._gate.compacting:
             return "正在压缩…"
+        if self._gate.model_selecting:
+            return "正在切换模型…"
         if self._session.state == "cancelling":
             return "正在取消…"
         if self._session.state == "finalizing":
@@ -328,8 +350,8 @@ class ConversationView:
 
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
-        取消意图; 持久清空/压缩提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
-        if self._gate.clearing or self._gate.compacting:
+        取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting:
             return
         if cancel_if_active(self._session):
             return
@@ -342,8 +364,8 @@ class ConversationView:
 
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
-        持久清空/压缩提交中与空闲均无动作; finalizing/closing/closed 静默。"""
-        if self._gate.clearing or self._gate.compacting:
+        持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting:
             return
         if cancel_if_active(self._session):
             return
@@ -417,10 +439,66 @@ class ConversationView:
         if command == "/exit":
             self.handle_exit()
             return True
+        if command == "/model":
+            return self._open_model_menu()
         if command.startswith("/skill") and (len(command) == 6 or command[6].isspace()):
             return self._handle_skill_command(text.lstrip())
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
+
+    def _open_model_menu(self) -> bool:
+        """/model (DeepSeek 04, 契约 C7/D8): 打开模型目录的本地操作.
+
+        不是 UserMessage/模型请求/工具调用; 目录只读来自 session.model_options。
+        当前会话无选择能力 (Ollama/fake) 时给有界说明, 不触碰历史/存储。
+        view-only/storage_failed/process_uncertain 下仍可查看目录; 选择能否
+        提交由应用 select_model 双向核对 (失败有界成条, 不解除编码阻断)。
+        """
+        options = self._session.model_options
+        if not options:
+            self.transcript.append_system("当前会话不提供模型选择（无可用模型目录）。")
+            return True
+        self.model_menu.open(options, current_id=self._session.config.model_label)
+        if self._on_update is not None:
+            self._on_update()
+        return True
+
+    def confirm_model_selection(self, option_id: str) -> None:
+        """模型菜单 Enter 确认: UI 同步置 model 屏障先于 create_task (C7).
+
+        只提交 option ID 给应用 select_model; 不触碰 raw 模型/历史/存储, 不产生
+        UserMessage/intent/模型轮。忙碌/收尾/关闭屏障内静默 (菜单已被前端收起);
+        同选 no-op (应用层同选亦不写); closing 永不重开由闸门状态检查保证。
+        """
+        self.model_menu.dismiss()  # Enter 确认即收起 (幂等; 前端已收起时无动作)
+        if is_enter_barrier(self._session, self._gate):
+            return  # 忙碌/finalizing/closing/closed: Enter 静默无动作
+        if option_id == self._session.config.model_label:
+            return  # 同选 no-op: 不置屏障、不建任务、不发事件
+        self._gate.note_model_started()
+        self._sync_spinner()
+        self._model_task = asyncio.get_running_loop().create_task(
+            self._run_model_select(option_id)
+        )
+
+    async def _run_model_select(self, option_id: str) -> None:
+        """等待模型选择落定; 成功确认由 ModelChanged 投影追加 (底栏同时刷新).
+
+        落定 (成功/失败/取消) 都释放屏障 (finally 语义同清空/压缩路径);
+        失败显示有界原因 (ModelSelectionError 不含凭据/请求历史), 取消如实传播。
+        """
+        try:
+            await self._session.select_model(option_id)
+        except Exception as exc:
+            self._gate.note_model_settled()
+            self.transcript.append_error(f"模型选择失败: {exc}")
+            if self._on_update is not None:
+                self._on_update()
+            return
+        except BaseException:
+            self._gate.note_model_settled()
+            raise
+        self._gate.note_model_settled()
 
     def _handle_skill_command(self, command: str) -> bool:
         """/skill (local-skills-v1 票据 03, spec D5/D8).
@@ -723,6 +801,8 @@ def build(
         "view": view,
         "footer_lines": view.footer.render,  # (width, rows) -> 底栏行
         "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
+        "model_menu": view.model_menu,  # DeepSeek 04: /model 目录 (契约 C7)
+        "on_model_confirm": view.confirm_model_selection,
     }
 
 

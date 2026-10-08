@@ -37,6 +37,9 @@ class AdmissionGate:
         # 票据 02: 持久压缩提交中 (OperationBusy("compact") -> ContextCompacted/
         # 失败落定); 屏障语义与清空同型
         self._compacting = False
+        # DeepSeek 阶段票据 04: 模型选择提交中 (OperationBusy("model") ->
+        # ModelChanged/失败落定); 屏障语义与清空/压缩同型, 菜单确认时同步置位
+        self._model_selecting = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
         self.on_error: Callable[[str], None] | None = None
 
@@ -56,6 +59,11 @@ class AdmissionGate:
         """持久压缩提交进行中 (输入屏障; 与请求 reservation 独立)。"""
         return self._compacting
 
+    @property
+    def model_selecting(self) -> bool:
+        """模型选择提交进行中 (输入屏障; 与请求 reservation 独立, 04)。"""
+        return self._model_selecting
+
     def busy(self) -> bool:
         """reservation 存在即忙 (含 execute 任务尚未起跑的同步窗口)。"""
         return self._reservation_open
@@ -65,12 +73,12 @@ class AdmissionGate:
     def try_admit(self, prompt: str) -> asyncio.Task | None:
         """同步准入: 可执行则先占 reservation 再创建任务, 返回任务; 否则 None。
 
-        拒绝条件: 已有 reservation / 持久清空提交中 / session 非 idle
-        (含 closing/closed) / 空提示。返回 None 表示拒绝, 调用方不得伪造用户条目。
+        拒绝条件: 已有 reservation / 持久清空/压缩提交中 / 模型选择提交中 /
+        session 非 idle (含 closing/closed) / 空提示。返回 None 表示拒绝, 调用方不得伪造用户条目。
         """
         if self._reservation_open:
             return None
-        if self._clearing or self._compacting:
+        if self._clearing or self._compacting or self._model_selecting:
             return None
         if self._session.state != "idle":
             return None
@@ -134,6 +142,16 @@ class AdmissionGate:
         """压缩提交落定 (成功由 ContextCompacted 投影, 失败/放弃由等待任务释放); 幂等。"""
         self._compacting = False
 
+    # --- 模型选择屏障 (DeepSeek 阶段票据 04) -------------------------------------------
+
+    def note_model_started(self) -> None:
+        """模型选择提交开始 (菜单确认时同步置位, 先于任务创建); 幂等。"""
+        self._model_selecting = True
+
+    def note_model_settled(self) -> None:
+        """模型选择落定 (成功由 ModelChanged 投影, 失败/取消由等待任务释放); 幂等。"""
+        self._model_selecting = False
+
     def note_phase(self, phase: str) -> None:
         """阶段通知: reservation 窗口记录的取消意图在任务实际执行时交给公共 cancel。"""
         if self._pending_cancel and phase == "executing":
@@ -148,6 +166,7 @@ class AdmissionGate:
         self._task = None
         self._clearing = False
         self._compacting = False
+        self._model_selecting = False
 
     # --- 取消意图 ----------------------------------------------------------------------
 
@@ -170,12 +189,12 @@ def cancel_if_active(session: ApplicationSession) -> bool:
 def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """Enter 屏障: 屏障内 Enter 无动作 (不排队、不执行命令、不提示)。
 
-    覆盖 reservation 未起跑窗口、持久清空提交 (05)、持久压缩提交 (02) 与
-    executing/cancelling/finalizing/closing/closed。
+    覆盖 reservation 未起跑窗口、持久清空提交 (05)、持久压缩提交 (02)、
+    模型选择提交 (DeepSeek 04) 与 executing/cancelling/finalizing/closing/closed。
     """
     if gate.busy():
         return True
-    if gate.clearing or gate.compacting:
+    if gate.clearing or gate.compacting or gate.model_selecting:
         return True
     return session.state in (
         "executing",
