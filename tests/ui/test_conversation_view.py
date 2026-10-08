@@ -34,6 +34,7 @@ from cicada.ui.transcript import (
     SystemEntry,
     UserEntry,
 )
+from cicada.ui.welcome import WelcomeEntry
 
 
 # --- 夹具 (与 tests/test_application.py 同构; ChunkedFakeModel 与 e2e 夹具同构) ----------
@@ -221,7 +222,8 @@ async def test_two_questions_carry_full_history_and_update_entries_in_place(tmp_
         # 同一 assistant 条目原位更新: 每问各一条, 完成校准不二次追加
         assert h.assistant_texts() == ["第一轮回答", "第二轮回答"]
         kinds = [type(e) for e in h.entries()]
-        assert kinds == [UserEntry, AssistantEntry, UserEntry, AssistantEntry]
+        # welcome 01: 显示文档首条为启动欢迎, 其后才是会话条目
+        assert kinds == [WelcomeEntry, UserEntry, AssistantEntry, UserEntry, AssistantEntry]
         assert [(e.run_id, e.turn_index, e.finalized) for e in h.assistant_entries()] == [
             ("run-1", 0, True),
             ("run-2", 0, True),

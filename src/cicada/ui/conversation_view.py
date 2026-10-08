@@ -21,6 +21,9 @@
 - 票据 05: 订阅前先把恢复快照 (restored_requests/restored_interrupted) 投影
   成只读历史条目 (ui/restore_view), 查看状态原因如实成条; 保存失败显示真实
   未保存事实 (后继编码由应用 storage_failed 锁存拒绝)。
+- tui-startup-welcome 01: 订阅前在显示文档开头追加本视图唯一的启动欢迎条目
+  (ui/welcome.py, 启动事实一次捕获后冻结); 查看状态原因不依附"有恢复记录"
+  条件, 零记录恢复的查看状态同样如实成条。
 - 票据 04: /status 新增预算段 (占用/上限/预留/余量/来源/锚/校准偏差) 与摘要段
   (压缩次数/边界/摘要计量单列), 只读出口为 session.budget 与
   session.summary_records; 恢复显示在压缩边界插入程序条目。
@@ -81,6 +84,7 @@ from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
+from cicada.ui.welcome import build_welcome_entry
 
 # 状态行 (规格 §F): braille spinner 与节奏; 帧由可注入时钟决定 (测试可冻结)
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -139,7 +143,10 @@ class ConversationView:
         # 04 (审查 04-F1): /clear 后到下一请求执行前, 预算快照仍是旧代次的最后
         # 估计 (clear 不触碰 budget policy); 置位时 /status 预算段如实标注时效
         self._budget_stale = False
-        # 票据 05: 建立订阅前注入只读恢复显示; 查看状态原因如实成条。
+        # welcome 01: 建立订阅前追加本视图唯一欢迎条目 (启动快照一次捕获后冻结,
+        # 渲染/resize/模型切换/登录配置/clear/compact 都不重建; 与首条请求间无 await)
+        self.transcript.add_entry(build_welcome_entry(session))
+        # 票据 05: 建立订阅前注入只读恢复显示。
         # 04: 预算启用时传当前代次摘要记录 (压缩边界程序条目); 未启用时模型
         # 看到完整原文, 不得声称"模型所见为摘要"
         if session.restored_requests or session.restored_interrupted:
@@ -150,10 +157,11 @@ class ConversationView:
                 interrupted=session.restored_interrupted,
                 summaries=session.summary_records if session.budget is not None else (),
             )
-            if session.view_only_reason is not None:
-                self.transcript.append_system(
-                    f"恢复为查看状态（新请求被拒绝）：{session.view_only_reason}"
-                )
+        # welcome 01 (规格 D4): 查看状态原因移出"有恢复记录"条件, 零记录恢复同样可见
+        if session.view_only_reason is not None:
+            self.transcript.append_system(
+                f"恢复为查看状态（新请求被拒绝）：{session.view_only_reason}"
+            )
         self._unsubscribe = session.subscribe(self._on_application_update)
         # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计
         self.footer = FooterComponent(

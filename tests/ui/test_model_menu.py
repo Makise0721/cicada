@@ -448,7 +448,9 @@ async def test_status_and_diagnostics_after_selection(tmp_path):
         assert view.on_submit("/status")
         rendered = strip_terminal_sequences(chr(10).join(view.document_lines(90)))
         assert "模型: deepseek-v4-pro" in rendered  # 会话段: 有效模型
-        assert rendered.count("模型: deepseek-flash") == 1  # 启动诊断: 保留启动事实
+        # 启动事实两处保留 (welcome 01 启动快照行 + 启动诊断), 均不随切换改写
+        assert rendered.count("模型: deepseek-flash") == 2
+        assert "启动模型: deepseek-flash · 思考 high" in rendered
         assert "锚: 未立锚" in rendered or "占用估计不可得" in rendered  # 锚已失效
     finally:
         view.close()
