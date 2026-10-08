@@ -65,6 +65,7 @@ from cicada.core.ports import (
     ToolCallEvent,
 )
 from cicada.persistence.codec import CodecError, encode_messages
+from cicada.models import SafeModelIdentity
 
 SUMMARY_PROMPT_VERSION = "2"  # v2: 摘要请求末尾追加固定 user 指令 (05 收口修正)
 
@@ -244,6 +245,9 @@ class BudgetPolicy:
         classify_overflow: Callable[[str], bool] | None = None,
         auto_compact: Callable[[AutoCompactQuota], Any] | None = None,
         projection: ContextProjection | None = None,
+        summary_budget: BudgetConfig | None = None,
+        summary_identity: SafeModelIdentity | None = None,
+        validate_request: Callable[[ModelRequest], None] | None = None,
     ) -> None:
         if not callable(getattr(inner, "stream", None)):
             raise TypeError("inner must be a ModelPort")
@@ -257,6 +261,9 @@ class BudgetPolicy:
             raise TypeError("auto_compact must be a callable or None")
         self.inner = inner
         self.config = config
+        self.summary_budget = summary_budget or config
+        self.summary_identity = summary_identity
+        self.validate_request = validate_request or (lambda request: None)
         # 02/03 注入接缝: summarize 是摘要通道 (02 起为 ModelPort, 生产=同一无状态
         # 适配器实例); classify_overflow 与 auto_compact 03 接线。
         self._summarize = summarize
@@ -417,6 +424,11 @@ class BudgetPolicy:
         副作用由本层结构性保证 (工具只在内核终结交付后派发)。
         """
         seen_output = False
+        try:
+            self.validate_request(projected)
+        except ValueError as exc:
+            yield StreamDone("error", str(exc))
+            return
         async for event in self.inner.stream(projected, cancel):
             if isinstance(event, StreamDone):
                 if self._overflow_retry_eligible(event, seen_output):
@@ -544,6 +556,8 @@ async def generate_summary(
         async for event in channel.stream(request, cancel):
             if isinstance(event, TextDelta):
                 text_parts.append(event.text)
+            elif isinstance(event, ReasoningDelta) and event.text:
+                return SummaryOutcome(ok=False, failure="error", detail="non-thinking summary returned reasoning")
             elif isinstance(event, ToolCallEvent):
                 return SummaryOutcome(ok=False, failure="tool_use")
             elif isinstance(event, StreamDone):

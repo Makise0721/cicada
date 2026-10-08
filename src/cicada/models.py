@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
+
+from cicada.budget import BudgetConfig
+from cicada.core.ports import ModelPort, ModelRequest
 
 
 @dataclass(frozen=True)
@@ -50,3 +55,31 @@ class SafeModelIdentity:
                     raise ValueError("SafeModelIdentity.reasoning_effort is invalid")
             elif type(value) is not int or value <= 0:
                 raise ValueError(f"SafeModelIdentity.{key} must be positive int")
+
+
+@dataclass(frozen=True)
+class ModelOption:
+    id: str
+    label: str
+
+
+@dataclass(frozen=True)
+class ModelBinding:
+    model: ModelPort
+    summary_model: ModelPort
+    identity: SafeModelIdentity
+    summary_identity: SafeModelIdentity
+    budget: BudgetConfig
+    summary_budget: BudgetConfig
+    validate_request: Callable[[ModelRequest], None]
+
+
+@runtime_checkable
+class ModelSelectionPort(Protocol):
+    @property
+    def initial_binding(self) -> ModelBinding: ...
+
+    @property
+    def options(self) -> tuple[ModelOption, ...]: ...
+
+    def prepare_model(self, option_id: str) -> ModelBinding: ...

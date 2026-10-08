@@ -13,6 +13,7 @@ FORBIDDEN = {
     "persistence": {"cicada.runtime", "cicada.plugins", "cicada.boot"},
     # 中立预算契约 (上下文预算 01): 只依赖内核类型, 不碰契约层/插件/启动
     "budget": {"cicada.persistence", "cicada.runtime", "cicada.plugins", "cicada.boot"},
+    "models": {"cicada.persistence", "cicada.runtime", "cicada.plugins", "cicada.boot", "cicada.application"},
     # 应用层预算策略 (01): 摘要通道/overflow 分类器经构造注入, 接线在应用层,
     # 本模块不得导入 plugins; persistence 依赖留给 02 的提交协议
     "context_policy": {"cicada.plugins", "cicada.boot"},

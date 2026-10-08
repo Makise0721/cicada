@@ -111,7 +111,7 @@ def test_num_ctx_non_positive_rejected_before_preflight(tmp_path):
     # 死端口: 若先 preflight 会报 Ollama 不可达; 先报 num_ctx 证明校验时序
     dead = f"http://127.0.0.1:{_dead_port()}"
     for value in ("0", "-5"):
-        proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead, "--num-ctx", value, "任务")
+        proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "--num-ctx", value, "任务")
         assert proc.returncode == 2, value
         assert "--num-ctx 必须是正整数" in proc.stderr
         assert "Ollama 不可达" not in proc.stderr
@@ -127,13 +127,13 @@ def test_script_and_num_ctx_are_mutually_exclusive(tmp_path):
 
 def test_real_mode_displays_default_and_cli_num_ctx(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead, "任务")
+    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "任务")
     assert proc.returncode == 2
     assert "context_requested=32768 source=default" in proc.stdout
     assert "Ollama 不可达" in proc.stderr
 
     proc = run_cli(
-        "--workspace", str(tmp_path), "--ollama-url", dead, "--num-ctx", "8192", "任务"
+        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "--num-ctx", "8192", "任务"
     )
     assert proc.returncode == 2
     assert "context_requested=8192 source=cli" in proc.stdout
@@ -142,7 +142,7 @@ def test_real_mode_displays_default_and_cli_num_ctx(tmp_path):
 def test_instructions_file_error_precedes_preflight(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
         "--instructions-file", "missing.md", "任务",
     )
     assert proc.returncode == 2
@@ -154,7 +154,7 @@ def test_instructions_file_in_real_mode_displayed(tmp_path):
     (tmp_path / "RULES.md").write_text("先跑测试再汇报。", encoding="utf-8")
     dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
         "--instructions-file", "RULES.md", "任务",
     )
     assert proc.returncode == 2  # preflight 失败
@@ -231,7 +231,7 @@ def test_check_timeout_range_rejected(tmp_path):
 def test_check_mode_small_num_ctx_rejected_before_preflight(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
         "--check-command", "exit 0", "--num-ctx", "8192", "任务",
     )
     assert proc.returncode == 2
@@ -242,7 +242,7 @@ def test_check_mode_small_num_ctx_rejected_before_preflight(tmp_path):
 def test_check_mode_real_model_profile_displayed(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
         "--check-command", "exit 0", "任务",
     )
     assert proc.returncode == 2  # preflight 失败, 但先显示检查模式 profile
@@ -254,7 +254,7 @@ def test_check_mode_real_model_profile_displayed(tmp_path):
 
 def test_normal_mode_has_no_request_limit(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead, "任务")
+    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "任务")
     assert proc.returncode == 2
     assert "request_bytes_limit" not in proc.stdout  # 普通模式保持原语义
 
@@ -408,7 +408,7 @@ def test_save_and_resume_roundtrip_via_separate_processes(tmp_path):
 
 def test_resume_unknown_id_reports_not_found_before_preflight(tmp_path):
     dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--ollama-url", dead,
+    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
                    "--resume", "123e4567-e89b-42d3-a456-426614174000", "任务")
     assert proc.returncode == 2
     assert "session store open failed" in proc.stderr
@@ -575,7 +575,7 @@ def test_resume_config_conflict_names_field(tmp_path):
     assert first.returncode == 0, first.stderr
     session_id = first.stdout.split("[session id=")[1].split(" ")[0]
     dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(work), "--ollama-url", dead,
+    proc = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", dead,
                    "--resume", session_id, "任务")
     assert proc.returncode == 2
     assert "config conflicts" in proc.stderr
@@ -768,7 +768,7 @@ def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
     try:
         work = tmp_path / "ws"
         work.mkdir()
-        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                         "--model", "stub-model", "--think", "--num-ctx", "8192",
                         "--save-session", "第一问")
         assert first.returncode == 0, (first.stdout, first.stderr)
@@ -777,7 +777,7 @@ def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
         session_id = first.stdout.split("[session id=")[1].split(" ")[0]
         stub.requests.clear()
 
-        inherited = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        inherited = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                             "--resume", session_id, "第二问")
         assert inherited.returncode == 0, (inherited.stdout, inherited.stderr)
         # 省略 model/think/num-ctx 全部继承存档, 来源标记 archive
@@ -785,7 +785,7 @@ def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
         assert stub.requests == ["GET /api/version", "POST /api/chat"], "恰一次探测与一次调用"
         stub.requests.clear()
 
-        same = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        same = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                        "--resume", session_id,
                        "--model", "stub-model", "--think", "--num-ctx", "8192", "第三问")
         assert same.returncode == 0, (same.stdout, same.stderr)
@@ -798,7 +798,7 @@ def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
         assert stub.requests == ["GET /api/version", "POST /api/chat"], "base_url 继承存档"
         stub.requests.clear()
 
-        conflict = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        conflict = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                            "--resume", session_id, "--num-ctx", "4096", "第五问")
         assert conflict.returncode == 2
         assert "config conflicts" in conflict.stderr
@@ -816,7 +816,7 @@ def test_resume_unknown_saved_option_key_rejected(tmp_path):
     try:
         work = tmp_path / "ws"
         work.mkdir()
-        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                         "--num-ctx", "8192", "--save-session", "问")
         assert first.returncode == 0, first.stderr
         session_id = first.stdout.split("[session id=")[1].split(" ")[0]
@@ -836,7 +836,7 @@ def test_resume_unknown_saved_option_key_rejected(tmp_path):
         finally:
             connection.close()
         stub.requests.clear()
-        proc = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        proc = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                        "--resume", session_id, "问")
         assert proc.returncode == 2
         assert "未知配置键" in proc.stderr and "bogus_threads" in proc.stderr
@@ -866,13 +866,13 @@ def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path):
     try:
         work = tmp_path / "ws"
         work.mkdir()
-        first = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                         "--num-ctx", "8192", "--save-session", "第一问")
         assert first.returncode == 0, first.stderr
         session_id = first.stdout.split("[session id=")[1].split(" ")[0]
         stub.requests.clear()
 
-        adopted = run_cli("--workspace", str(work), "--ollama-url", stub.url,
+        adopted = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
                           "--resume", session_id, "--resume-with-current-config", "第二问")
         assert adopted.returncode == 0, (adopted.stdout, adopted.stderr)
         # 省略 --num-ctx 取当前默认 32768 (非存档 8192), 来源 default
@@ -1170,7 +1170,7 @@ def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
     stub = _OllamaStub()
     try:
         (tmp_path / ".cicada" / "sessions").mkdir(parents=True)
-        proc = run_cli("--workspace", str(tmp_path), "--ollama-url", stub.url, "--list-sessions")
+        proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", stub.url, "--list-sessions")
         assert proc.returncode == 0, proc.stderr
         assert stub.requests == [], "列表入口零模型探测"
     finally:
@@ -1226,7 +1226,7 @@ def test_budget_rejects_oversized_prompt_with_zero_model_post(tmp_path):
     stub = _OllamaStub()
     try:
         proc = run_cli(
-            "--workspace", str(tmp_path), "--ollama-url", stub.url,
+            "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", stub.url,
             "--num-ctx", "64", "任务" * 300,
         )
         assert proc.returncode == 1, (proc.stdout, proc.stderr)
@@ -1245,7 +1245,7 @@ def test_cli_fills_budget_from_archive_num_ctx(tmp_path, monkeypatch):
     stub = _OllamaStub()
     try:
         saved = run_cli(
-            "--workspace", str(tmp_path), "--save-session", "--ollama-url", stub.url,
+            "--workspace", str(tmp_path), "--save-session", "--provider", "ollama", "--ollama-url", stub.url,
             "--num-ctx", "100000", "保存一轮",
         )
         assert saved.returncode == 0, (saved.stdout, saved.stderr)

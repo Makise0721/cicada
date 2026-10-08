@@ -57,7 +57,8 @@ from cicada.core.messages import (
     isolate_message,
     isolate_tool_result,
 )
-from cicada.core.ports import ToolSpec
+from cicada.core.ports import ModelRequest, ToolSpec
+from cicada.models import ModelSelectionPort
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
     ArchiveLimitError,
@@ -701,6 +702,11 @@ class ApplicationSession:
             # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
             # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
             await self._refuse_overbudget_or_auto_compact(prompt)
+            if self._budget_policy is not None:
+                self._budget_policy.validate_request(ModelRequest(
+                    messages=(*self._context_projection.project(self._history), UserMessage(prompt)),
+                    tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
+                ))
             if self._store is not None:
                 begin_task = asyncio.ensure_future(
                     self._store.begin_request(self._epoch_id or "", prompt)
@@ -1222,6 +1228,7 @@ class ApplicationSession:
         # D6: 摘要模型身份取启动层有效身份 (PersistenceConfig.identity 本就是
         # LaunchIdentity; 审查修复: 此前误取 .launch 使真实持久组合的压缩必失败)
         identity_launch = self._config.persistence.identity if self._config.persistence is not None else None
+        summary_identity = self._budget_policy.summary_identity
         record = SummaryRecord(
             summary_id=str(uuid.uuid4()),
             epoch_id=self._epoch_id or "",
@@ -1233,20 +1240,25 @@ class ApplicationSession:
             prefix_sha256=canonical_prefix_sha256(self._history[: plan.end_index]),
             text=outcome.text,
             provider=(
+                summary_identity.provider if summary_identity is not None else (
                 identity_launch.provider
                 if identity_launch is not None
                 else (self._config.model_label or "unknown")
+                )
             ),
             model=(
+                summary_identity.model if summary_identity is not None else (
                 identity_launch.model
                 if identity_launch is not None
                 else (self._config.model_label or "unknown")
+                )
             ),
             prompt_version=SUMMARY_PROMPT_VERSION,
             prompt_sha256=SUMMARY_PROMPT_SHA256,
             metrics=outcome.metrics,
             reason=reason,
             created_at=time.time(),
+            call_identity=summary_identity,
             previous_projection_identity=canonical_prefix_sha256(
                 self._context_projection.project(self._history)
             ),
@@ -1368,7 +1380,7 @@ class ApplicationSession:
         区间按请求边界收缩 (最长最旧前缀), 最旧单个请求也装不下时明确拒绝。
         摘要输入是原始规范历史 (D5: 不经 RunPolicy/BudgetPolicy 投影)。
         """
-        config = self._config.budget
+        config = self._budget_policy.summary_budget
         assert config is not None
         spans = self._committed_spans
         if len(spans) < 2:
@@ -1851,14 +1863,17 @@ async def open_application(
     if budget_config is not None:
         context_projection = ContextProjection()
 
-    def _make_budget_policy(model):
+    def _make_budget_policy(model, binding=None):
         # D1 次序: BudgetPolicy 在 RunPolicy 下游、适配器上游;
         # 计量因此覆盖验证投影 (控制段/freshness 标记) 的最终形态
         budget = BudgetPolicy(
             model,
             budget_config,
             # D5: 摘要通道注入同一无状态适配器实例; 仅持久会话可压缩 (D9)
-            summarize=model if store is not None else None,
+            summarize=(binding.summary_model if binding is not None else model) if store is not None else None,
+            summary_budget=binding.summary_budget if binding is not None else None,
+            summary_identity=binding.summary_identity if binding is not None else None,
+            validate_request=binding.validate_request if binding is not None else None,
             # 03/D7: overflow 分类器只接 ollama 形态的适配器——分类按上游
             # 版本化错误文本形态匹配, 其他适配器接线属误配 (不匹配即不重试)
             classify_overflow=(
@@ -1870,8 +1885,16 @@ async def open_application(
         return budget
 
     def _model_policy(model, runtime):
+        nonlocal config, budget_config, context_projection
+        binding = model.initial_binding if isinstance(model, ModelSelectionPort) else None
+        if binding is not None:
+            budget_config = binding.budget
+            config = replace(config, budget=budget_config, model_label=binding.identity.model)
+            if context_projection is None:
+                context_projection = ContextProjection()
+            model = binding.model
         if budget_config is not None:
-            model = _make_budget_policy(model)
+            model = _make_budget_policy(model, binding)
         if plan is not None:
             service = runtime.capability(VERIFICATION_CAPABILITY)
             model = verification_policy(model, service, history=history_projection)
@@ -1882,7 +1905,7 @@ async def open_application(
     # D1 四态: 检查+预算 = verification_policy(budget_policy(inner));
     # 非检查+预算 = 仅 budget_policy(inner) (无 RunPolicy、不取 verification capability);
     # 仅检查 = 现状; 皆无 = 不装 model_policy
-    model_policy = _model_policy if (plan is not None or budget_config is not None) else None
+    model_policy = _model_policy
 
     store: SQLiteSessionStore | None = None
     snapshot: RecoverySnapshot | None = None

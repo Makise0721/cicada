@@ -7,7 +7,7 @@
 
 模型来源二选一:
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
-- 缺省: 真实模型 (本地 Ollama /api/chat), preflight GET /api/version 不可达即退出码 2.
+- 缺省: 真实模型默认 DeepSeek Flash thinking; 显式 --provider ollama 保留本地 preflight。
 --script 与真实模型旗标 (--model/--ollama-url/--think/--num-ctx) 互斥, 混用退出码 2.
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
@@ -26,7 +26,8 @@
 
 P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
 是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
-profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes. 运行结束后
+Ollama profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes;
+DeepSeek 普通/检查使用同一 max_tokens 与本地预留，摘要独立关闭 thinking。 运行结束后
 程序独立扫描终结事实、刷新检查视图、生成变更证据并判定交付 (不读模型文字):
 - 0: 模型 stop 且全部指定检查的最近回执 passed/current 且证据完整;
 - 3: 模型 stop 但检查或证据条件不满足;
@@ -85,6 +86,8 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
+from cicada.plugins.deepseek import DeepSeekConfig, deepseek_plugin
+from cicada.plugins.deepseek.protocol import BASE_URL as DEEPSEEK_BASE_URL, REQUEST_LIMIT
 from cicada.plugins.session_store import list_sessions, read_session_identity
 from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
@@ -425,11 +428,14 @@ async def _run(args: argparse.Namespace) -> int:
     if args.script is not None and (
         args.model is not None
         or args.ollama_url is not None
-        or args.think
+        or args.think is not None
         or args.num_ctx is not None
+        or args.provider is not None
+        or args.max_output_tokens is not None
+        or args.reasoning_effort is not None
     ):
         print(
-            "--script 与 --model/--ollama-url/--think/--num-ctx 互斥, 请只选一种模型来源",
+            "--script 与真实模型旗标互斥, 请只选一种模型来源",
             file=sys.stderr,
         )
         return 2
@@ -553,7 +559,25 @@ async def _run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        if saved_stored.launch.provider == "ollama":
+        if saved_stored.launch.provider not in ("ollama", "deepseek", "fake"):
+            print("--resume: 存档 provider 不受支持", file=sys.stderr)
+            return 2
+        if saved_stored.launch.provider == "deepseek":
+            saved_launch = saved_stored.launch
+            options = saved_launch.options
+            try:
+                if set(options) != {"num_ctx", "max_tokens", "reasoning_effort"}:
+                    raise ValueError("存档 DeepSeek options 白名单不匹配")
+                if saved_launch.base_url != DEEPSEEK_BASE_URL:
+                    raise ValueError("存档 DeepSeek endpoint 必须为官方 origin")
+                DeepSeekConfig(model=saved_launch.model, think=saved_launch.think,
+                    num_ctx=options["num_ctx"], max_tokens=options["max_tokens"],
+                    reasoning_effort=options["reasoning_effort"],
+                    max_request_bytes=saved_launch.max_request_bytes)
+            except ValueError as exc:
+                print(f"--resume: {exc}", file=sys.stderr)
+                return 2
+        elif saved_stored.launch.provider == "ollama":
             saved_launch = saved_stored.launch
             option_error = _validate_saved_options(dict(saved_launch.options))
             if option_error is not None:
@@ -583,92 +607,139 @@ async def _run(args: argparse.Namespace) -> int:
         )
         preflight = None
     else:
-        # 04: 省略的模型/服务地址/think/窗口继承存档 (来源记 archive); 显式值保持
-        # 原语义, 与存档的差异由恢复准入点名拒绝
-        sources: dict[str, str] = {}
-        eff_model = args.model or DEFAULT_CONFIG.model
-        eff_base_url = args.ollama_url or DEFAULT_CONFIG.base_url
-        eff_think: bool | None = bool(args.think)
-        num_ctx_source = "cli" if args.num_ctx is not None else "default"
-        if args.num_ctx is not None:
-            num_ctx = args.num_ctx
-        elif saved_launch is not None and saved_launch.options.get("num_ctx") is not None:
-            num_ctx = saved_launch.options["num_ctx"]
-            num_ctx_source = "archive"
-        else:
-            num_ctx = DEFAULT_NUM_CTX
-        if saved_launch is not None:
-            if args.model is None:
-                eff_model = saved_launch.model
-                sources["model"] = "archive"
-            if args.ollama_url is None and saved_launch.base_url is not None:
-                eff_base_url = saved_launch.base_url
-                sources["base_url"] = "archive"
-            if not args.think:
-                eff_think = saved_launch.think
-                sources["think"] = "archive"
-        sources["num_ctx"] = num_ctx_source
-        options: dict[str, object] = {"num_ctx": num_ctx}
-        request_limit: int | None = None
-        if checks:
-            options["num_predict"] = CHECK_MODE_NUM_PREDICT
-            request_limit = CHECK_MODE_MAX_REQUEST_BYTES
-        # 01: 预算由有效 num_ctx 实填 (D9, 含 archive 继承来源); 输出预留取配置的
-        # num_predict (检查模式 2048), 否则用 BudgetConfig 缺省。fake 路径保持 None
-        num_predict = options.get("num_predict")
-        budget_config = BudgetConfig(
-            num_ctx=num_ctx,
-            num_predict=(
-                num_predict
-                if isinstance(num_predict, int) and not isinstance(num_predict, bool) and num_predict > 0
-                else None
-            ),
-        )
-        config = OllamaConfig(
-            base_url=eff_base_url,
-            model=eff_model,
-            think=eff_think,
-            options=options,
-            max_request_bytes=request_limit,
-        )
-        if not args.tui:
-            policy_line = (
-                f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
-                if checks else ""
-            )
-            print(
-                f"[config model={config.model} context_requested={num_ctx} source={num_ctx_source} "
-                f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
-            )
-        identity = LaunchIdentity(
-            provider="ollama", model=config.model, base_url=config.base_url, think=config.think,
-            options=dict(config.options), max_request_bytes=config.max_request_bytes,
-            max_turns=max_turns,
-            prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
-            instructions_sha256=prompt_info.instructions_sha256,
-            checks_signature=(
-                verification_checks_signature(plan.checks) if plan is not None else None
-            ),
-            sources=sources,
-        )
-        if args.save_session or args.resume is not None or args.tui:
-            # 持久路径 (TUI 默认持久): 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
-            async def preflight() -> None:
-                if not await _ollama_reachable(config.base_url):
-                    raise ApplicationOpenError(
-                        f"Ollama 不可达: {config.base_url} "
-                        "(请先启动 Ollama, 或用 --script 走 fake model)"
-                    )
-        else:
-            preflight = None
-            if not await _ollama_reachable(config.base_url):
-                print(
-                    f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
-                    file=sys.stderr,
-                )
+        provider = args.provider or (saved_launch.provider if saved_launch is not None else "deepseek")
+        if saved_launch is not None and provider != saved_launch.provider:
+            print("--resume: provider 与存档不匹配; 使用 --resume-with-current-config 显式采用当前配置", file=sys.stderr)
+            return 2
+        if provider == "deepseek":
+            if args.ollama_url is not None:
+                print("--ollama-url 只对 --provider ollama 合法", file=sys.stderr)
                 return 2
-        model_plugin = ollama_plugin(config)
-        model_label = config.model
+            saved_options = saved_launch.options if saved_launch is not None else {}
+            sources = {}
+            def resolve(name, explicit, stored, default):
+                sources[name] = "cli" if explicit is not None else "archive" if stored is not None else "default"
+                return explicit if explicit is not None else stored if stored is not None else default
+            try:
+                config = DeepSeekConfig(
+                    model=resolve("model", args.model, saved_launch.model if saved_launch else None, "deepseek-flash"),
+                    think=resolve("think", args.think, saved_launch.think if saved_launch else None, True),
+                    num_ctx=resolve("num_ctx", args.num_ctx, saved_options.get("num_ctx"), 131072),
+                    max_tokens=resolve("max_tokens", args.max_output_tokens, saved_options.get("max_tokens"), 32768),
+                    reasoning_effort=resolve("reasoning_effort", args.reasoning_effort, saved_options.get("reasoning_effort"), "high"),
+                    max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT,
+                )
+            except ValueError as exc:
+                print(f"invalid DeepSeek config: {exc}", file=sys.stderr)
+                return 2
+            sources["provider"] = "cli" if args.provider is not None else "archive" if saved_launch else "default"
+            safe = config.identity
+            identity = LaunchIdentity(
+                provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
+                options=dict(safe.options), max_request_bytes=safe.max_request_bytes, max_turns=max_turns,
+                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+                instructions_sha256=prompt_info.instructions_sha256,
+                checks_signature=verification_checks_signature(plan.checks) if plan is not None else None,
+                sources=sources,
+            )
+            budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
+            model_plugin = deepseek_plugin(config)
+            model_label = config.model
+            preflight = None
+            if not args.tui:
+                print(f"[config provider=deepseek model={config.model} context_requested={config.num_ctx} "
+                      f"source={sources['num_ctx']} think={str(config.think).lower()} "
+                      f"max_tokens={config.max_tokens} reasoning_effort={config.reasoning_effort}]")
+        else:
+            if args.max_output_tokens is not None or args.reasoning_effort is not None:
+                print("--max-output-tokens/--reasoning-effort 只对 DeepSeek 合法", file=sys.stderr)
+                return 2
+            # 04: 省略的模型/服务地址/think/窗口继承存档 (来源记 archive); 显式值保持
+            # 原语义, 与存档的差异由恢复准入点名拒绝
+            sources: dict[str, str] = {}
+            eff_model = args.model or DEFAULT_CONFIG.model
+            eff_base_url = args.ollama_url or DEFAULT_CONFIG.base_url
+            eff_think: bool | None = bool(args.think)
+            num_ctx_source = "cli" if args.num_ctx is not None else "default"
+            if args.num_ctx is not None:
+                num_ctx = args.num_ctx
+            elif saved_launch is not None and saved_launch.options.get("num_ctx") is not None:
+                num_ctx = saved_launch.options["num_ctx"]
+                num_ctx_source = "archive"
+            else:
+                num_ctx = DEFAULT_NUM_CTX
+            if saved_launch is not None:
+                if args.model is None:
+                    eff_model = saved_launch.model
+                    sources["model"] = "archive"
+                if args.ollama_url is None and saved_launch.base_url is not None:
+                    eff_base_url = saved_launch.base_url
+                    sources["base_url"] = "archive"
+                if args.think is None:
+                    eff_think = saved_launch.think
+                    sources["think"] = "archive"
+            sources["num_ctx"] = num_ctx_source
+            options: dict[str, object] = {"num_ctx": num_ctx}
+            request_limit: int | None = None
+            if checks:
+                options["num_predict"] = CHECK_MODE_NUM_PREDICT
+                request_limit = CHECK_MODE_MAX_REQUEST_BYTES
+            # 01: 预算由有效 num_ctx 实填 (D9, 含 archive 继承来源); 输出预留取配置的
+            # num_predict (检查模式 2048), 否则用 BudgetConfig 缺省。fake 路径保持 None
+            num_predict = options.get("num_predict")
+            budget_config = BudgetConfig(
+                num_ctx=num_ctx,
+                num_predict=(
+                    num_predict
+                    if isinstance(num_predict, int) and not isinstance(num_predict, bool) and num_predict > 0
+                    else None
+                ),
+            )
+            config = OllamaConfig(
+                base_url=eff_base_url,
+                model=eff_model,
+                think=eff_think,
+                options=options,
+                max_request_bytes=request_limit,
+            )
+            if not args.tui:
+                policy_line = (
+                    f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
+                    if checks else ""
+                )
+                print(
+                    f"[config model={config.model} context_requested={num_ctx} source={num_ctx_source} "
+                    f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
+                )
+            identity = LaunchIdentity(
+                provider="ollama", model=config.model, base_url=config.base_url, think=config.think,
+                options=dict(config.options), max_request_bytes=config.max_request_bytes,
+                max_turns=max_turns,
+                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+                instructions_sha256=prompt_info.instructions_sha256,
+                checks_signature=(
+                    verification_checks_signature(plan.checks) if plan is not None else None
+                ),
+                sources=sources,
+            )
+            if args.save_session or args.resume is not None or args.tui:
+                # 持久路径 (TUI 默认持久): 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
+                async def preflight() -> None:
+                    if not await _ollama_reachable(config.base_url):
+                        raise ApplicationOpenError(
+                            f"Ollama 不可达: {config.base_url} "
+                            "(请先启动 Ollama, 或用 --script 走 fake model)"
+                        )
+            else:
+                preflight = None
+                if not await _ollama_reachable(config.base_url):
+                    print(
+                        f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
+                        file=sys.stderr,
+                    )
+                    return 2
+            model_plugin = ollama_plugin(config)
+            model_label = config.model
 
     resume_id = args.resume if isinstance(args.resume, str) else None
     if args.tui or args.save_session or args.resume is not None:
@@ -799,11 +870,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="cicada", description="Cicada coding agent")
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
-    parser.add_argument("--model", help=f"Ollama 模型名 (默认 {DEFAULT_CONFIG.model})")
+    parser.add_argument("--provider", choices=("deepseek", "ollama"), help="真实 provider (新会话默认 deepseek; 恢复继承存档)")
+    parser.add_argument("--model", help="DeepSeek: deepseek-flash (默认)/deepseek-v4-pro; Ollama: 本地模型名")
     parser.add_argument("--ollama-url", help=f"Ollama 服务地址 (默认 {DEFAULT_CONFIG.base_url})")
-    parser.add_argument("--think", action="store_true", help="开启模型思考 (思考增量不展示)")
+    parser.add_argument("--think", action=argparse.BooleanOptionalAction, default=None,
+                        help="开启/关闭思考 (DeepSeek 默认开启; Ollama 默认关闭; 思考不展示)")
+    parser.add_argument("--reasoning-effort", choices=("low", "high", "max"), help="DeepSeek 思考强度 (默认 high)")
+    parser.add_argument("--max-output-tokens", type=int, help="DeepSeek 思考+答案总输出上限 (默认 32768)")
     parser.add_argument(
-        "--num-ctx", type=int, help=f"Ollama 上下文窗口请求值 (默认 {DEFAULT_NUM_CTX}; 仅真实模型)"
+        "--num-ctx", type=int, help="本地窗口上限 (DeepSeek 默认 131072; Ollama 默认 32768)"
     )
     parser.add_argument(
         "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"
