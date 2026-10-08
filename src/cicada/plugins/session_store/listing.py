@@ -23,6 +23,7 @@ from cicada.persistence.codec import (
 )
 from cicada.persistence.contracts import (
     LIST_SESSIONS_PAGE_SIZE,
+    PersistenceError,
     SessionPage,
     SessionSummary,
     StoredReceipt,
@@ -76,10 +77,11 @@ def _summarize_archive(path: Path) -> SessionSummary:
         # as_uri 只接受绝对路径; CLI/选择器可传相对目录, URI 前先 resolve
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         try:
+            connection.execute("BEGIN")
             return _read_summary(connection, session_id, occupied)
         finally:
             connection.close()
-    except (sqlite3.Error, ValueError, TypeError, CodecError) as exc:
+    except (sqlite3.Error, ValueError, TypeError, PersistenceError) as exc:
         return SessionSummary(
             session_id=session_id, short_title="", created_at=0.0, updated_at=None,
             committed_requests=0, interrupted_requests=0, occupied=occupied,
@@ -88,6 +90,13 @@ def _summarize_archive(path: Path) -> SessionSummary:
 
 
 def _read_summary(connection: sqlite3.Connection, session_id: str, occupied: bool) -> SessionSummary:
+    from cicada.plugins.session_store.store import _check_identity, _load_epochs
+
+    version = _check_identity(connection)
+    schema = connection.execute("SELECT schema_version FROM session").fetchall()
+    if schema != [(version,)]:
+        raise ValueError("session schema version does not match user_version")
+    _load_epochs(connection, version)
     row = connection.execute(
         "SELECT session_id, short_title, created_at FROM session"
     ).fetchall()

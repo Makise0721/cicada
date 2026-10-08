@@ -13,10 +13,11 @@ from typing import Literal, Protocol, runtime_checkable
 from cicada.core.events import ModelCallCompleted
 from cicada.core.messages import Message, StopReason
 from cicada.core.ports import ModelMetrics
+from cicada.models import SafeModelIdentity
 
 # --- 版本与限额 (contracts §2; 调整须新版本, 不在同一版本默默改变语义) -----------------
 
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 # SQLite application_id: "CIC1" 的 32 位编码, 区分 Cicada 会话库
 SESSION_APPLICATION_ID = 0x43494331
 
@@ -389,8 +390,11 @@ class SummaryRecord:
     reason: Literal["manual", "auto"]
     created_at: float
     previous_projection_identity: str | None = None
+    call_identity: SafeModelIdentity | None = None
 
     def __post_init__(self) -> None:
+        if self.call_identity is not None and not isinstance(self.call_identity, SafeModelIdentity):
+            raise ValueError("SummaryRecord.call_identity must be SafeModelIdentity or None")
         for name in ("summary_id", "epoch_id", "provider", "model", "prompt_version", "prompt_sha256"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:

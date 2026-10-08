@@ -91,7 +91,8 @@ _SCHEMA_STATEMENTS = (
         session_id TEXT NOT NULL,
         canonical_workspace TEXT NOT NULL,
         created_at REAL NOT NULL,
-        short_title TEXT NOT NULL
+        short_title TEXT NOT NULL,
+        current_epoch_id TEXT REFERENCES epoch(epoch_id)
     )
     """,
     """
@@ -194,19 +195,27 @@ _V2_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
         """
     ),
     lambda connection: connection.execute(
-        "UPDATE session SET schema_version = ?", (SESSION_SCHEMA_VERSION,)
+        "UPDATE session SET schema_version = 2"
     ),
-    lambda connection: connection.execute(f"PRAGMA user_version = {SESSION_SCHEMA_VERSION}"),
+    lambda connection: connection.execute("PRAGMA user_version = 2"),
+)
+
+_V3_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    lambda connection: connection.execute(
+        "ALTER TABLE session ADD COLUMN current_epoch_id TEXT REFERENCES epoch(epoch_id)"
+    ),
+    lambda connection: connection.execute("UPDATE session SET schema_version = 3"),
+    lambda connection: connection.execute("PRAGMA user_version = 3"),
 )
 
 
 def _verify_v2_structure(connection: sqlite3.Connection) -> None:
     """迁移提交前的 v2 结构核对: 双版本标记与新表在位 (PA04, 提交前最后一道)."""
     row = connection.execute("PRAGMA user_version").fetchone()
-    if row is None or int(row[0]) != SESSION_SCHEMA_VERSION:
+    if row is None or int(row[0]) != 2:
         raise ArchiveFormatError("v2 migration did not confirm user_version")
     schema_row = connection.execute("SELECT schema_version FROM session").fetchone()
-    if schema_row is None or int(schema_row[0]) != SESSION_SCHEMA_VERSION:
+    if schema_row is None or int(schema_row[0]) != 2:
         raise ArchiveFormatError("v2 migration did not confirm session.schema_version")
     tables = {
         str(item[0])
@@ -352,6 +361,9 @@ class SQLiteSessionStore:
                 )
                 self._conn.execute(
                     "UPDATE request_intents SET status = 'interrupted' WHERE status = 'pending'"
+                )
+                self._conn.execute(
+                    "UPDATE session SET current_epoch_id = ?", (epoch_id,)
                 )
                 self._conn.execute("COMMIT")
             except BaseException:
@@ -1125,10 +1137,11 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
             # PA04: v1 的全部既有校验面 (工作区/载荷摘要/关系/限额) 在迁移提交之前
             # 完成——任何拒绝都发生在写入前, 原档不改写 (审查 02-F9); 迁移后补读新表
             state = _load_state(connection, session_id, canonical_workspace, archive_version)
-            if archive_version == 1:
-                _upgrade_v1_to_v2(connection)
+            if archive_version >= 2:
+                state.summaries = _load_summaries(connection, state)
+            if archive_version < SESSION_SCHEMA_VERSION:
+                _upgrade_to_v3(connection, state)
                 state.schema_version = SESSION_SCHEMA_VERSION
-            state.summaries = _load_summaries(connection, state)
         except sqlite3.OperationalError as exc:
             connection.close()
             text = str(exc).lower()
@@ -1156,6 +1169,34 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
         raise
 
 
+def read_session_identity(*, directory: Path, session_id: str, workspace: Path) -> StoredIdentity | None:
+    """默认恢复的只读配置预读; 与迁移共享载荷/关系和 epoch 解释, 不取写 lease."""
+    session_id = validate_session_id(session_id)
+    path = Path(directory) / f"{session_id}.sqlite3"
+    if not path.is_file():
+        raise SessionNotFoundError(f"no session archive for id {session_id}")
+    try:
+        if path.stat().st_size > MAX_DB_BYTES:
+            raise ArchiveLimitError("session database exceeds the size limit")
+    except OSError as exc:
+        raise StorageUnavailableError(f"cannot stat session archive: {exc}") from exc
+    try:
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            connection.execute("BEGIN")  # 一致只读快照; 活动写者不能使多表预读混代。
+            version = _check_identity(connection)
+            _quick_check(connection)
+            _check_schema_tables(connection, _V1_EXPECTED_TABLES if version == 1 else _EXPECTED_TABLES)
+            state = _load_state(connection, session_id, os.path.realpath(workspace), version)
+            if version >= 2:
+                _load_summaries(connection, state)
+            return state.identity
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise ArchiveFormatError(f"session archive is not readable: {exc}") from exc
+
+
 def _check_identity(connection: sqlite3.Connection) -> int:
     """校验 application_id 并返回存档 user_version; 版本路由迁移/拒绝 (PA04).
 
@@ -1170,7 +1211,7 @@ def _check_identity(connection: sqlite3.Connection) -> int:
     version = int(row[0]) if row is not None else 0
     if version == SESSION_SCHEMA_VERSION:
         return version
-    if version == 1 and SESSION_SCHEMA_VERSION > 1:
+    if version in (1, 2) and SESSION_SCHEMA_VERSION > version:
         return version  # 历史档: 原子升级路径 (PA04)
     if version > SESSION_SCHEMA_VERSION or version not in (0, 1):
         raise UnknownArchiveVersionError(
@@ -1207,23 +1248,68 @@ def _check_schema_tables(connection: sqlite3.Connection, expected: frozenset[str
         raise ArchiveFormatError(f"session archive is missing tables: {sorted(missing)}")
 
 
-def _upgrade_v1_to_v2(connection: sqlite3.Connection) -> None:
-    """v1 → v2 原子增量升级 (PA04/A07): 持 lease 且严格校验 v1 后调用.
-
-    单个显式事务内完成摘要表 DDL、session.schema_version 列与 PRAGMA user_version
-    更新及 v2 结构核对; 任一步失败整体回滚, 重开只能是完整 v1 (可重新升级) 或
-    完整 v2, 既有完整请求可恢复。故障注入面: monkeypatch 模块级
-    _V2_MIGRATION_STEPS / _verify_v2_structure。
-    """
+def _upgrade_to_v3(connection: sqlite3.Connection, state: _LoadedState) -> None:
+    """已验证 v1/v2 → v3 单事务升级; 不回写请求或摘要 JSON."""
     _immediate_txn(connection)
     try:
-        for step in _V2_MIGRATION_STEPS:
+        if state.schema_version == 1:
+            for step in _V2_MIGRATION_STEPS:
+                step(connection)
+            _verify_v2_structure(connection)
+        for step in _V3_MIGRATION_STEPS:
             step(connection)
-        _verify_v2_structure(connection)
+        connection.execute(
+            "UPDATE session SET current_epoch_id = ?", (state.current_epoch_id,)
+        )
+        if _check_identity(connection) != 3:
+            raise ArchiveFormatError("v3 migration did not confirm user_version")
+        row = connection.execute("SELECT schema_version, current_epoch_id FROM session").fetchone()
+        if row != (3, state.current_epoch_id):
+            raise ArchiveFormatError("v3 migration did not confirm session pointer")
         connection.execute("COMMIT")
     except BaseException:
         connection.execute("ROLLBACK")
         raise
+
+
+def _load_epochs(
+    connection: sqlite3.Connection, archive_version: int,
+) -> tuple[dict[str, StoredIdentity], str | None]:
+    """统一只读 epoch 解释: v3 指针, 旧档唯一 open 或 legacy 确定性顺序."""
+    current_epoch_id = None
+    open_epoch_id: str | None = None
+    identities: dict[str, StoredIdentity] = {}
+    for epoch_id, _opened_at, closed, identity_json, _run in connection.execute(
+        "SELECT epoch_id, opened_at, closed, identity_json, verification_run_id"
+        " FROM epoch ORDER BY opened_at, epoch_id"
+    ):
+        if int(closed) not in (0, 1):
+            raise ArchiveFormatError("epoch closed flag must be 0 or 1")
+        if int(closed) == 0:
+            if open_epoch_id is not None:
+                # 写入侧 start_epoch 单事务内只留一个 open epoch; 多个属关系损坏
+                raise ArchiveFormatError(
+                    "session archive has more than one open epoch (unclosed epoch interleaving)"
+                )
+            open_epoch_id = str(epoch_id)
+        _check_text_size(str(identity_json), MAX_METADATA_BYTES, "epoch identity")
+        try:
+            identity = decode_identity(str(identity_json))
+        except CodecError as exc:
+            raise ArchiveFormatError(f"epoch identity is corrupt: {exc}") from exc
+        identities[str(epoch_id)] = identity
+        current_epoch_id = str(epoch_id)
+    if archive_version >= 3:
+        pointer = connection.execute("SELECT current_epoch_id FROM session").fetchone()[0]
+        if (pointer is None) != (not identities) or (pointer is not None and pointer not in identities):
+            raise ArchiveFormatError("session current_epoch_id does not reference a validated epoch")
+        if open_epoch_id is not None and pointer != open_epoch_id:
+            raise ArchiveFormatError("session current_epoch_id does not match the open epoch")
+        current_epoch_id = pointer
+    elif open_epoch_id is not None:
+        # 旧档唯一 open 优先; 零 open 才保留 legacy 确定性排序解释。
+        current_epoch_id = open_epoch_id
+    return identities, current_epoch_id
 
 
 def _load_state(
@@ -1256,30 +1342,10 @@ def _load_state(
         schema_version=int(archive_version),
     )
 
-    epoch_ids: set[str] = set()
-    open_epoch_count = 0
-    for epoch_id, _opened_at, closed, identity_json, _run in connection.execute(
-        "SELECT epoch_id, opened_at, closed, identity_json, verification_run_id"
-        " FROM epoch ORDER BY opened_at, epoch_id"
-    ):
-        if int(closed) not in (0, 1):
-            raise ArchiveFormatError("epoch closed flag must be 0 or 1")
-        if int(closed) == 0:
-            open_epoch_count += 1
-            if open_epoch_count > 1:
-                # 写入侧 start_epoch 单事务内只留一个 open epoch; 多个属关系损坏
-                raise ArchiveFormatError(
-                    "session archive has more than one open epoch (unclosed epoch interleaving)"
-                )
-        _check_text_size(str(identity_json), MAX_METADATA_BYTES, "epoch identity")
-        try:
-            identity = decode_identity(str(identity_json))
-        except CodecError as exc:
-            raise ArchiveFormatError(f"epoch identity is corrupt: {exc}") from exc
-        epoch_ids.add(str(epoch_id))
-        state.identity = identity
-        state.epoch_count += 1
-        state.current_epoch_id = str(epoch_id)
+    identities, state.current_epoch_id = _load_epochs(connection, archive_version)
+    epoch_ids = set(identities)
+    state.epoch_count = len(identities)
+    state.identity = identities.get(state.current_epoch_id)
     # epoch_count == 0 合法: 新建后 bootstrap 前崩溃的空存档, 恢复准入由应用拒绝
 
     prompt_by_begin_seq: dict[int, str] = {}

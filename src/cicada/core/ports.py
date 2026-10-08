@@ -40,6 +40,17 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ReasoningDelta:
+    """独立思考增量; 空串也表明字段已收到."""
+
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise ValueError("ReasoningDelta.text must be str")
+
+
+@dataclass(frozen=True)
 class ToolCallEvent:
     """完整的一次工具调用事件. 增量参数事件是后续扩展, 不改变本接口."""
 
@@ -57,7 +68,7 @@ class StreamDone:
     metrics: ModelMetrics | None = None
 
 
-StreamEvent: TypeAlias = TextDelta | ToolCallEvent | StreamDone
+StreamEvent: TypeAlias = TextDelta | ReasoningDelta | ToolCallEvent | StreamDone
 
 
 class ModelPort(Protocol):

@@ -36,12 +36,25 @@ class UserMessage:
 
 
 @dataclass(frozen=True)
+class ReasoningContent:
+    """原始思考与协议完整性; 缺失由 None 表示, 完整空串仍是一条记录."""
+
+    text: str
+    complete: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not isinstance(self.complete, bool):
+            raise ValueError("ReasoningContent requires str text and bool complete")
+
+
+@dataclass(frozen=True)
 class AssistantMessage:
     text: str
     tool_calls: tuple[ToolCall, ...] = ()
     stop_reason: StopReason = "stop"
     error: str | None = None
     role: Literal["assistant"] = "assistant"
+    reasoning: ReasoningContent | None = None
 
 
 @dataclass(frozen=True)

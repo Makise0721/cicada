@@ -261,7 +261,7 @@ def test_v1_archive_opens_and_upgrades_in_place(tmp_path):
         user_version, schema_version, has_summaries = _raw_version(
             tmp_path / "sessions" / f"{session_id}.sqlite3"
         )
-        assert (user_version, schema_version, has_summaries) == (2, 2, True)
+        assert (user_version, schema_version, has_summaries) == (3, 3, True)
     finally:
         import asyncio
 
@@ -377,7 +377,7 @@ def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path, kill_step):
         snapshot = store.recovery_snapshot()
         assert len(snapshot.requests) == 1
         user_version, schema_version, _has_summaries = _raw_version(db_path)
-        assert (user_version, schema_version) in {(1, 1), (2, 2)}, "不留混合版本"
+        assert (user_version, schema_version) in {(1, 1), (3, 3)}, "不留混合版本"
     finally:
         import asyncio
 

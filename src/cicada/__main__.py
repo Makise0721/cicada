@@ -85,7 +85,7 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.ollama import OllamaConfig, ollama_plugin
-from cicada.plugins.session_store import list_sessions, open_session_store
+from cicada.plugins.session_store import list_sessions, read_session_identity
 from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
 from cicada.prompting import (
@@ -130,11 +130,11 @@ async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdenti
     """恢复前的存档身份预读; 失败返回 None (错误消息已打印, 调用方退出码 2).
 
     省略参数的继承需要存档值才能构造模型插件; 顺带把格式/workspace 校验提前到
-    模型插件构造与可达性探测之前 (契约 §1 次序)。store 打开后立即关闭, 存档的
-    完整校验与租约由 open_application 再次完成。
+    模型插件构造与可达性探测之前 (契约 §1 次序)。预读不迁移存档;
+    写租约与原子迁移由 open_application 完成。
     """
     try:
-        store = open_session_store(
+        identity = read_session_identity(
             directory=Path(workspace) / ".cicada" / "sessions",
             session_id=session_id,
             workspace=Path(workspace),
@@ -142,18 +142,14 @@ async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdenti
     except PersistenceError as exc:
         print(f"session store open failed: {exc}", file=sys.stderr)
         return None
-    try:
-        identity = store.recovery_snapshot().identity
-        if identity is None:
-            # 零 epoch 存档 (如保存进程在 bootstrap 前崩溃遗留): 与恢复准入同一拒绝
-            print(
-                "--resume: the session archive has no saved launch identity to compare against",
-                file=sys.stderr,
-            )
-            return None
-        return identity
-    finally:
-        await store.aclose()
+    if identity is None:
+        # 零 epoch 存档 (如保存进程在 bootstrap 前崩溃遗留): 与恢复准入同一拒绝
+        print(
+            "--resume: the session archive has no saved launch identity to compare against",
+            file=sys.stderr,
+        )
+        return None
+    return identity
 
 
 def _validate_saved_options(options: dict[str, object]) -> str | None:

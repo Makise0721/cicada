@@ -25,7 +25,7 @@ Agent → RunPolicy → BudgetPolicy → 适配器; 内核零改动, 规范历�
 - 自动压缩与 overflow 重试 (spec D7/PA06, 03): 每轮准入失败且尚未尝试时, 经
   auto_compact 回调先消费额度再压缩, 对有效投影重估; 仍超限按原两道口拒绝。
   adapter 的 StreamDone("error") 经 classify_overflow 确认上下文超限、该发送
-  零输出 (无任何 TextDelta 含空片段/ToolCallEvent) 且重试额度未用时, 由策略
+  零输出 (无任何 TextDelta/ReasoningDelta 含空片段/ToolCallEvent) 且重试额度未用时, 由策略
   内部暂存该终结错误, 压缩后重发一次; 只向上游发布一次终结。任何可见输出后
   的上下文错误不重试 (透明重发禁令); 取消不重试且收尾为 aborted 不按 error。
 - 摘要通道 (02) 与 overflow 分类器 (03) 经构造参数注入, 组装接线在
@@ -61,6 +61,7 @@ from cicada.core.ports import (
     StreamDone,
     StreamEvent,
     TextDelta,
+    ReasoningDelta,
     ToolCallEvent,
 )
 from cicada.persistence.codec import CodecError, encode_messages
@@ -412,7 +413,7 @@ class BudgetPolicy:
         分类终结错误先在策略内暂存 (不发布): 资格全满足且回调压缩成功才重发;
         重试发送的终结是唯一向上游发布的终结, 首次错误要么被重试取代要么原样
         发布, 绝不先发布 error 再继续流。零输出判定固定在该发送点: 任何
-        TextDelta (含空片段) 或 ToolCallEvent 都禁止透明重发; 发送点后无工具
+        TextDelta/ReasoningDelta (含空片段) 或 ToolCallEvent 都禁止透明重发; 发送点后无工具
         副作用由本层结构性保证 (工具只在内核终结交付后派发)。
         """
         seen_output = False
@@ -441,7 +442,7 @@ class BudgetPolicy:
                 self._consider_anchor(projected, report, event)
                 yield event
                 return
-            if isinstance(event, (TextDelta, ToolCallEvent)):
+            if isinstance(event, (TextDelta, ReasoningDelta, ToolCallEvent)):
                 seen_output = True
             yield event
 

@@ -30,7 +30,7 @@ from cicada.core.messages import (
 from cicada.core.ports import ToolSpec
 
 BUDGET_ESTIMATOR_NAME = "utf8-bytes-over-3-plus-template-overhead"
-BUDGET_ESTIMATOR_VERSION = "1"
+BUDGET_ESTIMATOR_VERSION = "2"
 
 OUTPUT_RESERVE_DEFAULT_TOKENS = 4096
 SAFETY_MARGIN_MIN_TOKENS = 256
@@ -172,6 +172,8 @@ def _message_bytes(message: Message) -> int:
         return len(message.text.encode("utf-8"))
     if isinstance(message, AssistantMessage):
         total = len(message.text.encode("utf-8"))
+        if message.reasoning is not None:
+            total += len(message.reasoning.text.encode("utf-8"))
         if message.error:
             total += len(message.error.encode("utf-8"))
         for call in message.tool_calls:

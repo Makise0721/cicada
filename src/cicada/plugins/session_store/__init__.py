@@ -10,12 +10,13 @@ from cicada.plugins.session_store.plugin import (
     SESSION_STORE_CAPABILITY,
     session_store_plugin,
 )
-from cicada.plugins.session_store.store import SQLiteSessionStore, open_session_store
+from cicada.plugins.session_store.store import SQLiteSessionStore, open_session_store, read_session_identity
 
 __all__ = [
     "SESSION_STORE_CAPABILITY",
     "SQLiteSessionStore",
     "list_sessions",
     "open_session_store",
+    "read_session_identity",
     "session_store_plugin",
 ]

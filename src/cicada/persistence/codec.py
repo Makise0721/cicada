@@ -15,6 +15,7 @@ from cicada.core.events import ModelCallCompleted
 from cicada.core.messages import (
     AssistantMessage,
     Message,
+    ReasoningContent,
     StopReason,
     ToolCall,
     ToolResult,
@@ -22,6 +23,7 @@ from cicada.core.messages import (
     UserMessage,
 )
 from cicada.core.ports import ModelMetrics
+from cicada.models import SafeModelIdentity
 from cicada.persistence.contracts import (
     MAX_JSON_DEPTH,
     LaunchIdentity,
@@ -177,6 +179,12 @@ def encode_messages(messages: Any) -> str:
                 "stop_reason": message.stop_reason,
                 "error": message.error,
             })
+            if message.reasoning is not None:
+                if not isinstance(message.reasoning, ReasoningContent):
+                    raise CodecError(f"{where}.reasoning must be ReasoningContent")
+                payload[-1]["reasoning"] = {
+                    "text": message.reasoning.text, "complete": message.reasoning.complete,
+                }
         elif isinstance(message, ToolResultMessage):
             payload.append({
                 "role": "tool",
@@ -212,7 +220,19 @@ def _decode_message(item: Any, where: str) -> Message:
         _exact_keys(item, frozenset({"role", "text"}), where)
         return UserMessage(text=_take_str(item, "text", where))
     if role == "assistant":
-        _exact_keys(item, frozenset({"role", "text", "tool_calls", "stop_reason", "error"}), where)
+        keys = frozenset({"role", "text", "tool_calls", "stop_reason", "error"})
+        _exact_keys(item, keys | {"reasoning"}, where)
+        if set(item) not in (keys, keys | {"reasoning"}):
+            raise CodecError(f"{where} is missing assistant fields")
+        reasoning = None
+        if "reasoning" in item:
+            raw = item["reasoning"]
+            if not isinstance(raw, dict) or set(raw) != {"text", "complete"}:
+                raise CodecError(f"{where}.reasoning must hold exactly text and complete")
+            reasoning = ReasoningContent(
+                _take_str(raw, "text", where + ".reasoning"),
+                _take_bool(raw, "complete", where + ".reasoning"),
+            )
         calls_raw = item["tool_calls"]
         if not isinstance(calls_raw, list):
             raise CodecError(f"{where}.tool_calls must be a list")
@@ -229,6 +249,7 @@ def _decode_message(item: Any, where: str) -> Message:
             tool_calls=calls,
             stop_reason=_take_stop_reason(item, "stop_reason", where),
             error=_take_opt_str(item, "error", where),
+            reasoning=reasoning,
         )
     if role == "tool":
         _exact_keys(item, frozenset({"role", "result"}), where)
@@ -498,14 +519,36 @@ def encode_summary_record(record: SummaryRecord) -> str:
         "created_at": record.created_at,
         "previous_projection_identity": record.previous_projection_identity,
     }
-    dumps_strict(payload)
+    if record.call_identity is not None:
+        identity = record.call_identity
+        payload["call_identity"] = {
+            "provider": identity.provider, "model": identity.model,
+            "base_url": identity.base_url, "think": identity.think,
+            "options": dict(identity.options), "max_request_bytes": identity.max_request_bytes,
+        }
     return dumps_strict(payload)
 
 
 def decode_summary_record(payload: Any) -> SummaryRecord:
     """严格 JSON dict -> SummaryRecord; 未知键/类型不符按存档损坏拒绝."""
     where = "summary record"
-    _exact_keys(payload, _SUMMARY_KEYS, where)
+    _exact_keys(payload, _SUMMARY_KEYS | {"call_identity"}, where)
+    if set(payload) not in (_SUMMARY_KEYS, _SUMMARY_KEYS | {"call_identity"}):
+        raise CodecError("summary record is missing fields")
+    call_identity = None
+    if "call_identity" in payload:
+        raw = payload["call_identity"]
+        keys = {"provider", "model", "base_url", "think", "options", "max_request_bytes"}
+        if not isinstance(raw, dict) or set(raw) != keys or not isinstance(raw["options"], dict):
+            raise CodecError("summary call_identity must hold exactly the safe identity fields")
+        try:
+            call_identity = SafeModelIdentity(
+                _take_str(raw, "provider", where), _take_str(raw, "model", where),
+                _take_opt_str(raw, "base_url", where), _take_opt_bool(raw, "think", where),
+                tuple(raw["options"].items()), _take_opt_int(raw, "max_request_bytes", where),
+            )
+        except ValueError as exc:
+            raise CodecError(f"invalid summary call_identity: {exc}") from exc
     metrics_raw = payload["metrics"]
     metrics = None
     if metrics_raw is not None:
@@ -541,6 +584,7 @@ def decode_summary_record(payload: Any) -> SummaryRecord:
             previous_projection_identity=_take_opt_str(
                 payload, "previous_projection_identity", where
             ),
+            call_identity=call_identity,
         )
     except ValueError as exc:
         raise CodecError(f"{where} is inconsistent: {exc}") from exc

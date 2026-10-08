@@ -30,6 +30,7 @@ from cicada.core.events import (
 from cicada.core.messages import (
     AssistantMessage,
     Message,
+    ReasoningContent,
     StopReason,
     ToolCall,
     ToolResult,
@@ -42,6 +43,7 @@ from cicada.core.messages import (
 from cicada.core.ports import (
     ModelPort,
     ModelRequest,
+    ReasoningDelta,
     StreamDone,
     TextDelta,
     ToolCallEvent,
@@ -128,7 +130,7 @@ class Agent:
                 break
             self._emit(TurnStarted(run_id, turn_index))
             started = time.monotonic()
-            done, text, calls = await self._collect_assistant(session, cancel, run_id, turn_index)
+            done, text, calls, reasoning_text = await self._collect_assistant(session, cancel, run_id, turn_index)
             elapsed_s = time.monotonic() - started
 
             if cancel.cancelled and done.stop_reason != "error":
@@ -138,6 +140,14 @@ class Agent:
             # 当前调用组身份约束: 非法或重复整组拒绝, 在 assistant 入历史与任何
             # 工具执行之前; 不改写原 ID, 不执行其中任何工具
             group_error = _validate_call_group(calls)
+            if group_error is None and done.stop_reason == "tool_use" and not calls:
+                done = StreamDone("error", "model signalled tool_use without any tool call", done.metrics)
+            reasoning = (
+                None if reasoning_text is None else ReasoningContent(
+                    reasoning_text,
+                    group_error is None and not cancel.cancelled and done.stop_reason in ("stop", "tool_use"),
+                )
+            )
 
             call_record = ModelCallCompleted(
                 run_id=run_id,
@@ -153,6 +163,7 @@ class Agent:
                     tool_calls=(),
                     stop_reason="error",
                     error=group_error,
+                    reasoning=reasoning,
                 )
                 session.append(assistant)
                 self._emit(AssistantCompleted(run_id, assistant))
@@ -166,6 +177,7 @@ class Agent:
                 tool_calls=tuple(calls),
                 stop_reason=done.stop_reason,
                 error=done.error,
+                reasoning=reasoning,
             )
             session.append(assistant)
             self._emit(AssistantCompleted(run_id, assistant))
@@ -220,14 +232,19 @@ class Agent:
 
     async def _collect_assistant(
         self, session: SessionState, cancel: CancelToken, run_id: str, turn_index: int
-    ) -> tuple[StreamDone, str, list[ToolCall]]:
+    ) -> tuple[StreamDone, str, list[ToolCall], str | None]:
         request = ModelRequest(
             messages=session.messages,
             tools=tuple(tool.spec for tool in self._tools.values()),
             system_prompt=self._system_prompt,
         )
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         calls: list[ToolCall] = []
+
+        def collected(done: StreamDone) -> tuple[StreamDone, str, list[ToolCall], str | None]:
+            return done, "".join(text_parts), calls, ("".join(reasoning_parts) if reasoning_parts else None)
+
         try:
             async for event in self._model.stream(request, cancel):
                 if isinstance(event, TextDelta):
@@ -235,15 +252,17 @@ class Agent:
                     if event.text:
                         # 只读文本增量: 零字节可忽略; 完成事件仍是权威
                         self._emit(AssistantTextDelta(run_id=run_id, turn_index=turn_index, text=event.text))
+                elif isinstance(event, ReasoningDelta):
+                    reasoning_parts.append(event.text)
                 elif isinstance(event, ToolCallEvent):
                     calls.append(ToolCall(event.id, event.name, event.arguments_json))
                 elif isinstance(event, StreamDone):
-                    return event, "".join(text_parts), calls
+                    return collected(event)
         except asyncio.CancelledError:
-            return StreamDone("aborted"), "".join(text_parts), calls
+            return collected(StreamDone("aborted"))
         except Exception as exc:
-            return StreamDone("error", f"model stream raised: {exc}"), "".join(text_parts), calls
-        return StreamDone("error", "model stream ended without terminal event"), "".join(text_parts), calls
+            return collected(StreamDone("error", f"model stream raised: {exc}"))
+        return collected(StreamDone("error", "model stream ended without terminal event"))
 
     async def _dispatch(self, call: ToolCall, run_id: str, cancel: CancelToken) -> ToolResult:
         if cancel.cancelled:
