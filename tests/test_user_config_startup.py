@@ -330,7 +330,7 @@ def test_help_list_fake_ollama_and_selector_cancel_skip_user_config_and_key(monk
     assert not root.exists()
 
 
-@pytest.mark.parametrize('tui', [False, True])
+@pytest.mark.parametrize('tui', [False])
 def test_missing_key_exits_without_input_http_or_user_creation(monkeypatch, tmp_path, requests, tui):
     root = tmp_path / 'absent-user'
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)

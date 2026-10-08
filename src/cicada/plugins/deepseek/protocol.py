@@ -8,6 +8,7 @@ from cicada.models import SafeModelIdentity
 
 BASE_URL = "https://api.deepseek.com"
 MODEL_IDS = ("deepseek-flash", "deepseek-v4-pro")
+REASONING_EFFORTS = ("low", "high", "max")
 REQUEST_LIMIT = 2 * 1024 * 1024
 
 
@@ -23,7 +24,7 @@ class DeepSeekConfig:
     def __post_init__(self) -> None:
         if self.model not in MODEL_IDS:
             raise ValueError("DeepSeek model must be deepseek-flash or deepseek-v4-pro")
-        if type(self.think) is not bool or self.reasoning_effort not in ("low", "high", "max"):
+        if type(self.think) is not bool or self.reasoning_effort not in REASONING_EFFORTS:
             raise ValueError("invalid DeepSeek thinking configuration")
         for name, limit in (("num_ctx", 1048576), ("max_tokens", 393216),
                             ("max_request_bytes", REQUEST_LIMIT)):

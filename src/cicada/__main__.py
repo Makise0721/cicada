@@ -46,6 +46,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -94,7 +95,8 @@ from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.user_config import (
-    UserConfigError, UserConfigSnapshot, UserConfigStore, UserDefaults, resolve_launch_config,
+    LoginResult, LoginView, UserConfigError, UserConfigSnapshot, UserConfigStore,
+    UserDefaults, resolve_launch_config,
 )
 from cicada.prompting import (
     CheckPrompt,
@@ -377,6 +379,36 @@ async def _launch_session_selector(workspace: Path) -> str | None:
     return session_id
 
 
+async def _launch_first_run(
+    store: UserConfigStore, snapshot: UserConfigSnapshot, defaults: UserDefaults, *,
+    explicit: dict[str, object], credentials_only: bool,
+) -> LoginResult | None:
+    """missing-only 接缝；安全视图重新观察变化时拒绝覆盖旧启动配置。"""
+    from cicada.ui.login_wizard import run_startup_login
+    from cicada.ui.terminal_io import PromptToolkitTerminal
+
+    view = store.read_view()
+    observed = UserDefaults(view.provider, view.model, view.think, view.reasoning_effort,
+                            view.num_ctx, view.max_output_tokens)
+    if (observed != replace(snapshot.defaults, credential_ref=None)
+            or view.credential_present or view.credential_source != 'missing'):
+        raise UserConfigError('config', 'configuration-changing')
+    view = replace(view, provider=defaults.provider, model=defaults.model, think=defaults.think,
+        reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
+        max_output_tokens=defaults.max_output_tokens, credentials_only=credentials_only,
+        effect=('只补凭据，本次仍继承存档' if credentials_only else
+                '保存下次默认值；本次显式 CLI 参数仍优先'))
+    result, errors = await run_startup_login(
+        PromptToolkitTerminal(), store, view,
+        save_defaults=snapshot.defaults if credentials_only else defaults, explicit=explicit)
+    if errors:
+        # 终端底层异常不经通用展示，以免包含秘密；保留恢复失败事实。
+        print('login terminal restore errors', file=sys.stderr)
+        return LoginResult(bool(result and result.defaults_saved), False,
+                           'not-requested', 'terminal-failed')
+    return result
+
+
 async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore | None = None) -> int:
     if args.list_sessions:
         return _run_list_sessions(args)
@@ -458,6 +490,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         )
         return 2
     workspace = Path(args.workspace)
+    if not workspace.expanduser().is_dir():
+        print('workspace 必须为存在的目录', file=sys.stderr)
+        return 2
     # 指令文件错误先于 preflight/bootstrap (P3 §4.2); Skills 目录错误同为启动输入
     # 错误, 在存档身份预读与 provider 探测之前 (D8)
     skills_snapshot = None
@@ -594,6 +629,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 return 2
     # 01: 预算配置只由 ollama 路径实填; fake 默认 None = 预算层不安装 (D9)
     budget_config: BudgetConfig | None = None
+    defaults_saved = False
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -635,8 +671,6 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 provisional = resolve_launch_config(
                     UserConfigSnapshot(UserDefaults(), frozenset(), None, 'missing', ''),
                     explicit=explicit, archive=archive).defaults
-                from dataclasses import replace
-
                 proposed = replace(saved_launch, model=provisional.model, think=provisional.think,
                     options={'num_ctx': provisional.num_ctx, 'max_tokens': provisional.max_output_tokens,
                              'reasoning_effort': provisional.reasoning_effort}, max_turns=max_turns,
@@ -670,9 +704,50 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
                 return 2
             if resolved.credential is None:
-                print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
-                      '交互入口为 --tui', file=sys.stderr)
-                return 2
+                if not args.tui:
+                    print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
+                          '交互入口为 --tui', file=sys.stderr)
+                    return 2
+                if checks:
+                    # 沿生产只读 inventory 核对 Git 根，不创建 Workspace 输出目录。
+                    from cicada.core.cancel import CancelToken
+                    from cicada.plugins.coding.inventory import GitInventory, InventoryError
+                    from cicada.plugins.coding.workspace import Workspace
+
+                    root = Path(os.path.realpath(workspace.expanduser()))
+                    try:
+                        await GitInventory(Workspace(root, root / '.cicada' / 'outputs')).list_files(CancelToken())
+                    except InventoryError:
+                        print('检查模式工作区 Git 预检失败', file=sys.stderr)
+                        return 2
+                try:
+                    result = await _launch_first_run(store, snapshot, defaults,
+                        explicit=explicit, credentials_only=archive is not None)
+                    if result is None:
+                        return 0
+                    defaults_saved = result.defaults_saved
+                    if not defaults_saved or result.error_code is not None:
+                        print(('用户默认值已保存；' if defaults_saved else '') +
+                              'login failed: ' + (result.error_code or 'save-failed'), file=sys.stderr)
+                        return 2
+                    snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
+                    resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
+                    defaults = resolved.defaults
+                    config = DeepSeekConfig(model=defaults.model, think=defaults.think,
+                        reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
+                        max_tokens=defaults.max_output_tokens,
+                        max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT)
+                    sources = dict(resolved.sources)
+                    sources['max_tokens'] = sources.pop('max_output_tokens')
+                    if resolved.credential is None:
+                        raise UserConfigError('credential', 'missing-credential')
+                except UserConfigError as exc:
+                    print(('用户默认值已保存；' if defaults_saved else '') + str(exc), file=sys.stderr)
+                    return 2
+                except Exception:
+                    print(('用户默认值已保存；' if defaults_saved else '') +
+                          'login startup failed', file=sys.stderr)
+                    return 2
             safe = config.identity
             identity = LaunchIdentity(
                 provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
@@ -806,7 +881,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if args.tui:
         assert run_tui_session_fn is not None
         return await _run_tui(
-            run_tui_session_fn, app_config, initial_prompt=args.prompt, preflight=preflight
+            run_tui_session_fn, app_config, initial_prompt=args.prompt, preflight=preflight,
+            defaults_saved=defaults_saved,
         )
     try:
         session = await open_application(app_config, preflight=preflight)
@@ -864,11 +940,14 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
 async def _run_tui(
     run_tui_session_fn, app_config: ApplicationConfig, *, initial_prompt: str | None,
     preflight: Callable[[], object] | None = None,
+    defaults_saved: bool = False,
 ) -> int:
     """--tui 分支: 依赖与 TTY 已在 _run 校验; 打开共享应用并运行生产组合."""
     try:
         session = await open_application(app_config, preflight=preflight)
     except ApplicationOpenError as exc:
+        if defaults_saved:
+            print('用户默认值已保存；应用打开失败', file=sys.stderr)
         print(f"{exc}", file=sys.stderr)
         return 2
     # /status 的只读诊断: CLI 组装不可变快照后注入, UI 不读取 provider 闭包
@@ -929,7 +1008,8 @@ max_output_tokens = 32768
 credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
 {"provider":"deepseek","api_key":"<key>"}}}。仅按 ref 选择，不搜索孤立条目。
 两个文件须为 UTF-8，各不超过 64 KiB；key 去首尾空白后须非空、无内部空白或
-控制字符，最多 4096 UTF-8 bytes。当前入口只读这些文件。''',
+控制字符，最多 4096 UTF-8 bytes。--tui 缺凭据时在应用打开前启动遮蔽输入向导，
+确认后可靠保存；取消退出且不创建会话。普通恢复只补凭据并保留存档设置。''',
     )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
