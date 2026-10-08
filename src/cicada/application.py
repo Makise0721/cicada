@@ -2050,9 +2050,11 @@ async def open_application(
             policy_state["service"] = service
         return model
 
-    # D1 四态: 检查+预算 = verification_policy(budget_policy(inner));
-    # 非检查+预算 = 仅 budget_policy(inner) (无 RunPolicy、不取 verification capability);
-    # 仅检查 = 现状; 皆无 = 不装 model_policy
+    # model_policy 无条件安装: 检测 ModelSelectionPort 能力并建立稳定路由与两通道
+    # 绑定 (D7), 无该能力的 provider 透传。预算/检查包装按 D1 四态在 _model_policy
+    # 内叠加: 检查+预算 = verification_policy(budget_policy(inner));
+    # 非检查+预算 = budget_policy(inner); 仅检查 = verification_policy(inner);
+    # 皆无 = 仅路由检测, 不加包装
     model_policy = _model_policy
 
     store: SQLiteSessionStore | None = None
