@@ -1,7 +1,14 @@
-"""用户 TOML/凭据 JSON 读取；只读路径不创建目录或锁文件。"""
+"""用户 TOML/凭据 JSON 一致读取与受拥有的原子发布。"""
 
+import asyncio
 import json
+import msvcrt
+import os
+import tempfile
+import threading
+import time
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -14,6 +21,40 @@ from cicada.user_config import (
 FILE_LIMIT = 64 * 1024
 DEFAULT_FIELDS = frozenset(('provider', 'model', 'think', 'reasoning_effort',
                             'num_ctx', 'max_output_tokens'))
+WRITE_LOCK_TIMEOUT_S = 2.0
+
+
+def _config_bytes(defaults: UserDefaults) -> bytes:
+    lines = ['version = 1', '[defaults]']
+    for name in sorted(DEFAULT_FIELDS):
+        value = getattr(defaults, name)
+        # JSON 的已校验目录字符串也是合法的 TOML basic string。
+        lines.append(f'{name} = {json.dumps(value, ensure_ascii=False)}')
+    if defaults.credential_ref is not None:
+        lines.extend(('', '[credentials.deepseek]', f'ref = "{defaults.credential_ref}"'))
+    raw = ('\n'.join(lines) + '\n').encode('utf-8')
+    _defaults(raw)  # 与读取使用同一白名单及严格类型边界。
+    return raw
+
+
+def _atomic_replace(path: Path, raw: bytes, cancelled: threading.Event) -> None:
+    """worker 独占临时文件；replace 之前最后检查尚未接受的取消。"""
+    temporary = None
+    replaced = False
+    try:
+        fd, name = tempfile.mkstemp(prefix=f'.{path.name}-', suffix='.tmp', dir=path.parent)
+        temporary = Path(name)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if cancelled.is_set():
+            raise UserConfigError('save', 'cancelled')
+        os.replace(temporary, path)
+        replaced = True
+    finally:
+        if temporary is not None and not replaced:
+            temporary.unlink(missing_ok=True)
 
 
 def _object(value, allowed, kind, field_name=None):
@@ -126,7 +167,8 @@ class FileUserConfigStore:
     def __init__(self, root: Path):
         self.root = Path(root)
         # 一份最近观察供02核对；原始字节只留在Adapter，不派生key hash。
-        self._observation: tuple[str, bytes | None, bytes | None] | None = None
+        self._observation: tuple[str, bytes | None, bytes | None, str] | None = None
+        self._save_task: asyncio.Task | None = None
 
     def load(self, environment_key: str | None = None) -> UserConfigSnapshot:
         environment = None
@@ -153,7 +195,7 @@ class FileUserConfigStore:
                 if error is not None:
                     raise error
             revision = str(uuid4())
-            self._observation = revision, raw, credential_raw
+            self._observation = revision, raw, credential_raw, source
             return UserConfigSnapshot(defaults, fields, secret, source, revision)
         raise UserConfigError('config', 'configuration-changing')
 
@@ -166,5 +208,94 @@ class FileUserConfigStore:
                          '之后新建会话使用这些默认值', ('defaults-only',), snapshot.revision)
 
     async def save(self, submission: LoginSubmission) -> LoginResult:
-        """01只冻结签名；02实现受拥有的可靠写入。"""
-        raise NotImplementedError('user configuration writing is not implemented')
+        """第一次 await 前占位；取消请求传给 worker，等待实际终态并如实返回。"""
+        if self._save_task is not None:
+            return LoginResult(False, False, 'not-requested', 'operation-in-progress')
+        observation = self._observation
+        if observation is None or observation[0] != submission.revision:
+            return LoginResult(False, False, 'not-requested', 'configuration-changed')
+        cancelled = threading.Event()
+        task = asyncio.create_task(asyncio.to_thread(self._save, submission, observation, cancelled))
+        self._save_task = task
+        try:
+            while True:
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    # 多次 cancel 也不能丢掉拥有关系，或把已经发布的文件报告为未保存。
+        finally:
+            self._save_task = None
+
+    def _save(self, submission, observation, cancelled) -> LoginResult:
+        lock_fd = None
+        locked = False
+        published = False
+        error_code = None
+        try:
+            if cancelled.is_set():
+                raise UserConfigError('save', 'cancelled')
+            self.root.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(self.root / 'config.lock', os.O_CREAT | os.O_RDWR, 0o600)
+            deadline = time.monotonic() + WRITE_LOCK_TIMEOUT_S
+            while True:
+                if cancelled.is_set():
+                    raise UserConfigError('save', 'cancelled')
+                try:
+                    os.lseek(lock_fd, 0, os.SEEK_SET)
+                    msvcrt.locking(lock_fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise UserConfigError('save', 'lock-timeout') from None
+                    time.sleep(0.01)
+            config_path = self.root / 'config.toml'
+            credentials_path = self.root / 'credentials.json'
+            raw = _read(config_path, 'config')
+            if raw != observation[1]:
+                raise UserConfigError('save', 'configuration-changed')
+            old, _ = _defaults(raw)
+            credential_raw = None
+            if observation[3] == 'file':
+                credential_raw = _read(credentials_path, 'credentials')
+                if credential_raw != observation[2]:
+                    raise UserConfigError('save', 'configuration-changed')
+            ref = old.credential_ref
+            credentials = None
+            if submission.credential_action == 'replace':
+                entries = {}
+                if ref is not None:
+                    if observation[3] != 'file':
+                        credential_raw = _read(credentials_path, 'credentials')
+                    previous = _credential(credential_raw, ref)
+                    entries[ref] = {'provider': 'deepseek', 'api_key': previous.reveal()}
+                ref = str(uuid4())
+                entries[ref] = {'provider': 'deepseek', 'api_key': submission.credential.reveal()}
+                credentials = json.dumps({'version': 1, 'entries': entries}).encode('utf-8')
+            elif observation[3] == 'missing':
+                raise UserConfigError('save', 'missing-credential')
+            target = replace(submission.defaults, credential_ref=ref)
+            target_raw = _config_bytes(target)
+            if credentials is not None:
+                _atomic_replace(credentials_path, credentials, cancelled)
+            _atomic_replace(config_path, target_raw, cancelled)
+            published = True  # 唯一 defaults_saved 接受点；之后不回滚。
+        except UserConfigError as exc:
+            error_code = exc.error_code
+        except OSError:
+            error_code = 'write-failed'
+        finally:
+            if lock_fd is not None:
+                try:
+                    if locked:
+                        os.lseek(lock_fd, 0, os.SEEK_SET)
+                        msvcrt.locking(lock_fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    error_code = 'lock-release-failed'
+                finally:
+                    try:
+                        os.close(lock_fd)
+                    except OSError:
+                        error_code = 'lock-release-failed'
+        return LoginResult(published, False, 'not-requested', error_code)

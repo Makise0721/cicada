@@ -116,7 +116,7 @@ class LoginResult:
 
 
 class UserConfigStore(Protocol):
-    """文件 Adapter 负责观察版本，save 的可靠写入由后继票实现。"""
+    """文件 Adapter 负责观察版本及受拥有的可靠保存。"""
 
     def load(self, environment_key: str | None = None) -> UserConfigSnapshot: ...
 
