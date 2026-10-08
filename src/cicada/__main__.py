@@ -78,6 +78,7 @@ from cicada.persistence.contracts import (
     PersistenceError,
     SessionPage,
     StoredIdentity,
+    conflicting_launch_fields,
 )
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
@@ -91,6 +92,10 @@ from cicada.plugins.deepseek.protocol import BASE_URL as DEEPSEEK_BASE_URL, REQU
 from cicada.plugins.session_store import list_sessions, read_session_identity
 from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
+from cicada.plugins.user_config import FileUserConfigStore
+from cicada.user_config import (
+    UserConfigError, UserConfigSnapshot, UserConfigStore, UserDefaults, resolve_launch_config,
+)
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
@@ -372,7 +377,7 @@ async def _launch_session_selector(workspace: Path) -> str | None:
     return session_id
 
 
-async def _run(args: argparse.Namespace) -> int:
+async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore | None = None) -> int:
     if args.list_sessions:
         return _run_list_sessions(args)
     if args.list_cursor is not None:
@@ -539,6 +544,10 @@ async def _run(args: argparse.Namespace) -> int:
     # 04: 默认恢复预读存档身份——省略参数继承存档, 显式参数与存档比对;
     # 检查定义只存签名不存命令, 检查模式存档遗漏 --check-command 时明确拒绝
     saved_launch: LaunchIdentity | None = None
+    if isinstance(args.resume, str) and args.resume_with_current_config:
+        # 采用当前配置仍须先核对存档/workspace；不能由缺key掩盖坏档。
+        if await _read_saved_identity(workspace, args.resume) is None:
+            return 2
     if isinstance(args.resume, str) and not args.resume_with_current_config:
         saved_stored = await _read_saved_identity(workspace, args.resume)
         if saved_stored is None:
@@ -616,23 +625,54 @@ async def _run(args: argparse.Namespace) -> int:
                 print("--ollama-url 只对 --provider ollama 合法", file=sys.stderr)
                 return 2
             saved_options = saved_launch.options if saved_launch is not None else {}
-            sources = {}
-            def resolve(name, explicit, stored, default):
-                sources[name] = "cli" if explicit is not None else "archive" if stored is not None else "default"
-                return explicit if explicit is not None else stored if stored is not None else default
+            explicit = {name: getattr(args, name) for name in (
+                'provider', 'model', 'think', 'reasoning_effort', 'num_ctx', 'max_output_tokens')}
+            archive = (UserDefaults(model=saved_launch.model, think=saved_launch.think,
+                num_ctx=saved_options['num_ctx'], max_output_tokens=saved_options['max_tokens'],
+                reasoning_effort=saved_options['reasoning_effort']) if saved_launch else None)
+            if saved_launch is not None:
+                # 与应用打开时的完整核对并存；在读取凭据及02向导前拒绝显式冲突。
+                provisional = resolve_launch_config(
+                    UserConfigSnapshot(UserDefaults(), frozenset(), None, 'missing', ''),
+                    explicit=explicit, archive=archive).defaults
+                from dataclasses import replace
+
+                proposed = replace(saved_launch, model=provisional.model, think=provisional.think,
+                    options={'num_ctx': provisional.num_ctx, 'max_tokens': provisional.max_output_tokens,
+                             'reasoning_effort': provisional.reasoning_effort}, max_turns=max_turns,
+                    prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+                    instructions_sha256=prompt_info.instructions_sha256,
+                    checks_signature=verification_checks_signature(plan.checks) if plan else None)
+                conflicts = conflicting_launch_fields(saved_launch, proposed)
+                if conflicts:
+                    print('--resume: config conflicts: ' + ', '.join(conflicts), file=sys.stderr)
+                    return 2
             try:
+                store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
+                snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
+                resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
+                defaults = resolved.defaults
+                sources = dict(resolved.sources)
+                # 会话options沿用既有max_tokens命名；用户文件采用max_output_tokens。
+                sources['max_tokens'] = sources.pop('max_output_tokens')
                 config = DeepSeekConfig(
-                    model=resolve("model", args.model, saved_launch.model if saved_launch else None, "deepseek-flash"),
-                    think=resolve("think", args.think, saved_launch.think if saved_launch else None, True),
-                    num_ctx=resolve("num_ctx", args.num_ctx, saved_options.get("num_ctx"), 131072),
-                    max_tokens=resolve("max_tokens", args.max_output_tokens, saved_options.get("max_tokens"), 32768),
-                    reasoning_effort=resolve("reasoning_effort", args.reasoning_effort, saved_options.get("reasoning_effort"), "high"),
+                    model=defaults.model, think=defaults.think, num_ctx=defaults.num_ctx,
+                    max_tokens=defaults.max_output_tokens, reasoning_effort=defaults.reasoning_effort,
                     max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT,
                 )
+            except UserConfigError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             except ValueError as exc:
                 print(f"invalid DeepSeek config: {exc}", file=sys.stderr)
                 return 2
-            sources["provider"] = "cli" if args.provider is not None else "archive" if saved_launch else "default"
+            if checks and config.num_ctx < CHECK_MODE_MIN_NUM_CTX:
+                print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
+                return 2
+            if resolved.credential is None:
+                print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
+                      '交互入口为 --tui', file=sys.stderr)
+                return 2
             safe = config.identity
             identity = LaunchIdentity(
                 provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
@@ -643,7 +683,7 @@ async def _run(args: argparse.Namespace) -> int:
                 sources=sources,
             )
             budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
-            model_plugin = deepseek_plugin(config)
+            model_plugin = deepseek_plugin(config, api_key=resolved.credential.reveal())
             model_label = config.model
             preflight = None
             if not args.tui:
@@ -863,11 +903,34 @@ async def _run_tui(
     return 3 if view_only else code
 
 
-def main() -> int:
+def main(*, user_config_store: UserConfigStore | None = None) -> int:
     # 与 powershell 工具一致: 入口输出统一 UTF-8, 不随控制台代码页变化
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(prog="cicada", description="Cicada coding agent")
+    parser = argparse.ArgumentParser(
+        prog="cicada", description="Cicada coding agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''DeepSeek 用户默认配置：读取当前用户 ~/.cicada/config.toml，不会读取工作区配置。
+新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
+普通 --resume 继承存档模型配置；凭据每次启动按有效 DEEPSEEK_API_KEY > 文件引用。
+help、list、fake 与显式 Ollama 不读取这些文件。文件存在但无效时明确失败。
+
+config.toml 示例（普通字段均可省略；不接受 API key 或 max_request_bytes）：
+version = 1
+[defaults]
+provider = "deepseek"
+model = "deepseek-flash"
+think = true
+reasoning_effort = "high"
+num_ctx = 131072
+max_output_tokens = 32768
+
+文件凭据：config.toml 可添加 [credentials.deepseek] 和 ref = "<UUIDv4>"。
+credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
+{"provider":"deepseek","api_key":"<key>"}}}。仅按 ref 选择，不搜索孤立条目。
+两个文件须为 UTF-8，各不超过 64 KiB；key 去首尾空白后须非空、无内部空白或
+控制字符，最多 4096 UTF-8 bytes。当前入口只读这些文件。''',
+    )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
     parser.add_argument("--provider", choices=("deepseek", "ollama"), help="真实 provider (新会话默认 deepseek; 恢复继承存档)")
@@ -948,7 +1011,7 @@ def main() -> int:
         "prompt", nargs="?", default=None,
         help="交给 agent 的 prompt (单次模式必填; --tui 可作首问)",
     )
-    return asyncio.run(_run(parser.parse_args()))
+    return asyncio.run(_run(parser.parse_args(), user_config_store=user_config_store))
 
 
 if __name__ == "__main__":

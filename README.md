@@ -4,7 +4,7 @@ Cicada 是一个面向 Windows 的 Python coding agent：通过模型循环调�
 
 ## 环境要求
 
-Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据来自 `DEEPSEEK_API_KEY`；Ollama 需本地服务（剧本模式不需要）；TUI 的 UI 依赖为可选组，仅 `--tui` 需要。
+Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据优先来自 `DEEPSEEK_API_KEY`，也可使用用户文件引用的凭据；Ollama 需本地服务（剧本模式不需要）；TUI 的 UI 依赖为可选组，仅 `--tui` 需要。
 
 ## 快速开始
 
@@ -15,10 +15,10 @@ $env:UV_CACHE_DIR = Join-Path $PWD '.uv-cache'
 uv sync --frozen --python 3.12
 uv sync --extra tui   # 仅 --tui 需要
 
-$env:DEEPSEEK_API_KEY = '<your-key>'   # 仅环境变量，不写入存档
+$env:DEEPSEEK_API_KEY = '<your-key>'   # 凭据不写入会话存档
 ```
 
-单次任务（终端显示轮次、工具调用与终结状态）：
+CLI 与 TUI 共用 `~/.cicada/config.toml` 用户默认值，新建及采用当前配置恢复按显式参数 > 用户文件 > 内置默认；普通恢复继承存档设置。文件格式见 `--help`，当前入口只读。单次任务（终端显示轮次、工具调用与终结状态）：
 
 ```powershell
 uv run --frozen python -m cicada --workspace .\sandbox '请用 write 创建 hello_cicada.txt，内容为 hello cicada，再用 read 读取确认。'

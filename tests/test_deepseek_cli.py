@@ -9,6 +9,7 @@ import pytest
 from cicada import __main__ as cli
 from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import read_session_identity
+from cicada.plugins.user_config import FileUserConfigStore
 from test_cli import _CaptureStream
 from test_deepseek_application import response
 
@@ -18,17 +19,19 @@ def invoke(monkeypatch, args):
     monkeypatch.setattr(cli.sys, "argv", ["cicada", *args])
     monkeypatch.setattr(cli.sys, "stdout", out)
     monkeypatch.setattr(cli.sys, "stderr", err)
-    return cli.main(), out.value, err.value
+    workspace = Path(args[args.index('--workspace') + 1])
+    return cli.main(user_config_store=FileUserConfigStore(workspace / 'test-user')), out.value, err.value
 
 
 def mock_provider(monkeypatch):
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'cli-mock-key')
     bodies = []
     def handle(req):
         bodies.append(json.loads(req.content))
         assert req.url == "https://api.deepseek.com/chat/completions"
         return httpx.Response(200, content=response("思考", "离线答复"))
-    monkeypatch.setattr(cli, "deepseek_plugin", lambda config: deepseek_plugin(
-        config, api_key="cli-mock-key", transport=httpx.MockTransport(handle)))
+    monkeypatch.setattr(cli, "deepseek_plugin", lambda config, *, api_key: deepseek_plugin(
+        config, api_key=api_key, transport=httpx.MockTransport(handle)))
     async def forbidden(*args):
         pytest.fail("DeepSeek must not probe Ollama")
     monkeypatch.setattr(cli, "_ollama_reachable", forbidden)
