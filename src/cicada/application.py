@@ -1621,13 +1621,17 @@ class ApplicationSession:
 
     @property
     def login_status(self) -> tuple[str, ...]:
-        """最后一次观察的安全设置；只读，不访问用户文件或环境凭据。"""
+        """来源是最近用户文件观察，当前模型/思考来自有效绑定；零凭据 I/O。"""
         view = self._login_view
         if view is None:
             return ()
-        return (f"登录凭据来源（最近观察）: {view.credential_source}",
-                f"登录模型/思考（最近观察）: {view.model}/"
-                + (view.reasoning_effort if view.think else 'off'))
+        lines = (f"默认凭据来源（最近观察）: {view.credential_source}",)
+        if self._model_route is not None:
+            identity = self._model_route.binding.identity
+            if identity.provider == 'deepseek':
+                effort = dict(identity.options)['reasoning_effort'] if identity.think else 'off'
+                lines += (f"当前有效模型/思考: {identity.model}/{effort}",)
+        return lines
 
     def _check_login_admission(self) -> None:
         if (self._closing or self._closed or self._state != 'idle' or

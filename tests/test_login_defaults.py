@@ -185,3 +185,26 @@ async def test_execute_reservation_refuses_login_before_http_finishes(tmp_path):
         release.set()
         await running
         await session.aclose()
+
+
+async def test_login_status_reads_latest_effective_binding_without_file_or_key_reads(tmp_path):
+    reads = []
+    def environment():
+        reads.append(True)
+        return 'status-sentinel'
+    session, store = await open_session(tmp_path, environment=environment)
+    try:
+        session.login_view()
+        session.cancel_login()
+        await session.select_model('deepseek-v4-pro')
+        before = session.persistence
+        assert 'deepseek-v4-pro/high' in ' '.join(session.login_status)
+        assert reads == [True] and not store.root.exists()
+        assert session.persistence == before
+        result = await session.configure_login(replace(keep(session.login_view()),
+            defaults=UserDefaults(model='deepseek-v4-pro', think=False)))
+        assert result.defaults_saved
+        assert 'deepseek-v4-pro/high' in ' '.join(session.login_status)
+        assert 'status-sentinel' not in repr(session.login_status)
+    finally:
+        await session.aclose()
