@@ -1603,8 +1603,7 @@ def _load_state(
             raise ArchiveFormatError(f"receipt {receipt.receipt_id} appears more than once")
         state.receipts[receipt.receipt_id] = receipt
 
-    # 摘要记录不在此加载 (02-F9): v1 档的全部校验面 (工作区/载荷摘要/关系/限额)
-    # 必须在原子迁移提交之前完成, 拒绝不改写原档; summaries 表由调用方在迁移后补读
+    # v1 没有摘要表; v2/v3 的摘要由调用方在任何迁移前补读校验。
     state.requests.sort(key=lambda item: item.seq)
     return state
 
@@ -1612,10 +1611,9 @@ def _load_state(
 def _load_summaries(
     connection: sqlite3.Connection, state: _LoadedState
 ) -> list[SummaryRecord]:
-    """v2 摘要表加载: 载荷摘要/列与 JSON 交叉核对/关系/限额 (02).
+    """v2/v3 摘要加载: 行摘要、列/JSON、关系、规范前缀来源及限额。
 
-    在 _load_state 全部既有校验面之后调用 (v1 档在原子升级完成后补读,
-    v2 档直接补读); 独立于请求加载, 保证 v1 拒绝路径不触碰新表 (02-F9)。
+    在 _load_state 之后、迁移前调用; v1 无摘要表且无需补读。
     """
     epoch_ids = {
         str(row[0]) for row in connection.execute("SELECT epoch_id FROM epoch")
@@ -1676,9 +1674,21 @@ def _load_summaries(
                 raise ArchiveFormatError(
                     f"summary {summary_id} generation does not match its covered requests"
                 )
-        if record.end_message_index > state.message_count:
+        generation_messages = tuple(
+            message for request in state.requests
+            if request.context_generation == record.context_generation
+            for message in request.messages
+        )
+        if record.end_message_index > len(generation_messages):
             raise ArchiveFormatError(
                 f"summary {summary_id} coverage end exceeds the archived message count"
+            )
+        observed_prefix = hashlib.sha256(
+            encode_messages(generation_messages[:record.end_message_index]).encode("utf-8")
+        ).hexdigest()
+        if observed_prefix != record.prefix_sha256:
+            raise ArchiveFormatError(
+                f"summary {summary_id} coverage does not match the canonical history (relation error)"
             )
         count = per_generation_summaries.get(record.context_generation, 0) + 1
         if count > MAX_SUMMARIES_PER_GENERATION:

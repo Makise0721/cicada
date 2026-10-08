@@ -111,6 +111,27 @@ async def test_cancel_after_terminal_consumption_marks_reasoning_partial():
     assert result.messages[-1].reasoning == ReasoningContent("", False)
 
 
+@pytest.mark.parametrize("stop", ["stop", "tool_use"])
+async def test_cancel_after_assistant_publication_preserves_completed_response(stop):
+    from cicada.core.events import AssistantCompleted
+    model = FakeModel([[ReasoningDelta("complete"),
+                        *([ToolCallEvent("id", "missing", "{}")] if stop == "tool_use" else []),
+                        StreamDone(stop)]])
+    token = CancelToken()
+    emitted = []
+    def observer(event):
+        if isinstance(event, AssistantCompleted):
+            emitted.append(event.message)
+            token.cancel()
+    agent = Agent(model=model, tools={})
+    agent.subscribe(observer)
+    result = await agent.run("q", token)
+    assert result.messages[1] == emitted[0]
+    assert result.messages[1].reasoning == ReasoningContent("complete", True)
+    if stop == "tool_use":
+        assert result.stop_reason == "aborted" and result.messages[-1].result.is_error
+
+
 @pytest.mark.parametrize("stop", ["length", "error", "aborted", "duplicate"])
 async def test_failed_call_groups_never_execute_and_preserve_reasoning(tmp_path, stop):
     root = _repo(tmp_path)

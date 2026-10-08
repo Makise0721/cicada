@@ -2,7 +2,7 @@
 
 v1 fixture 由裸 sqlite3 按固定 v1 DDL 现场构造 (不依赖版本常量或 01 工件);
 迁移故障在步骤/核对/进程终止三个层面注入, 重开只能是完整 v1 (可重新升级)
-或完整 v2; 篡改面逐项拒绝且原文件字节不变。
+或完整 v3; 篡改面逐项拒绝且原文件字节不变。
 """
 
 from __future__ import annotations
@@ -266,7 +266,7 @@ def test_v1_archive_opens_and_upgrades_in_place(tmp_path):
         import asyncio
 
         asyncio.run(store.aclose())
-    # 重开幂等: 已是 v2, 请求与身份不变
+    # 重开幂等: 已是 v3, 请求与身份不变
     store = open_session_store(
         directory=tmp_path / "sessions", session_id=session_id, workspace=tmp_path
     )
@@ -336,11 +336,11 @@ def test_migration_verify_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("kill_step", [0, 1, 2])
-def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path, kill_step):
+def test_migration_process_kill_leaves_complete_v1_or_v3(tmp_path, kill_step):
     """独立进程在迁移事务的每个步骤中途终止 (02-F4: 建表/版本标记逐步注入).
 
-    重开只能是完整 v1 (热日志回滚, 可重新升级) 或完整 v2, 旧完整请求可恢复,
-    不留混合版本 (PA04)。「提交后终止」无歧义: COMMIT 已落盘即完整 v2。
+    重开只能是完整 v1 (热日志回滚, 可重新升级) 或完整 v3, 旧完整请求可恢复,
+    不留混合版本 (PA04)。「提交后终止」无歧义: COMMIT 已落盘即完整 v3。
     """
     session_id = str(uuid.uuid4())
     directory = tmp_path / "sessions"
@@ -371,7 +371,7 @@ def test_migration_process_kill_leaves_complete_v1_or_v2(tmp_path, kill_step):
         encoding="utf-8", timeout=60, env=environment,
     )
     assert result.returncode == 9, (result.stdout, result.stderr)
-    # 重开: 只能是完整 v1 或完整 v2, 既有请求可恢复, 无混合版本
+    # 重开: 只能是完整 v1 或完整 v3, 既有请求可恢复, 无混合版本
     store = open_session_store(directory=directory, session_id=session_id, workspace=workspace)
     try:
         snapshot = store.recovery_snapshot()
@@ -404,7 +404,9 @@ def _record_for(store, epoch_id: str, **overrides) -> SummaryRecord:
         last_request_seq=requests[-1].seq,
         message_count=sum(len(r.messages) for r in requests),
         end_message_index=sum(len(r.messages) for r in requests),
-        prefix_sha256="b" * 64,
+        prefix_sha256=hashlib.sha256(encode_messages(tuple(
+            message for request in requests for message in request.messages
+        )).encode("utf-8")).hexdigest(),
         text="较早请求的摘要文本",
         provider="fake",
         model="fake",

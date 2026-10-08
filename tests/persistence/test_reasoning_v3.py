@@ -208,16 +208,19 @@ def test_multi_open_old_archives_rejected_without_migration(tmp_path, version):
     assert path.read_bytes() == before
 
 
-def test_bad_v2_summary_rejected_before_upgrade(tmp_path):
+@pytest.mark.parametrize("corruption", ["digest", "source"])
+def test_bad_v2_summary_rejected_before_upgrade(tmp_path, corruption):
     directory, session_id, path = _legacy(tmp_path, 2)
     with sqlite3.connect(path) as connection:
         epoch = connection.execute("SELECT epoch_id FROM epoch").fetchone()[0]
         record = replace(_make_record(tmp_path), epoch_id=epoch)
+        raw = encode_summary_record(record)
         connection.execute("INSERT INTO summaries VALUES (?, ?, 0, 2, 2, 2, 2, ?, ?, ?)", (
-            record.summary_id, epoch, record.prefix_sha256, encode_summary_record(record), "wrong-digest",
+            record.summary_id, epoch, record.prefix_sha256, raw,
+            "wrong-digest" if corruption == "digest" else hashlib.sha256(raw.encode()).hexdigest(),
         ))
     before = path.read_bytes()
-    with pytest.raises(ArchiveFormatError, match="digest"):
+    with pytest.raises(ArchiveFormatError, match="digest" if corruption == "digest" else "coverage does not match"):
         open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
     assert path.read_bytes() == before
 
