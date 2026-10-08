@@ -48,6 +48,14 @@ class SSEDecoder:
         if self._frame_bytes + len(self._line.encode("utf-8")) > FRAME_LIMIT:
             raise ProtocolError("SSE frame exceeds byte limit")
 
+    def finish(self) -> None:
+        try:
+            self._decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            raise ProtocolError("incomplete UTF-8 at EOF") from None
+        if self._line or self._data:
+            raise ProtocolError("incomplete SSE frame at EOF")
+
 
 @dataclass
 class _Call:

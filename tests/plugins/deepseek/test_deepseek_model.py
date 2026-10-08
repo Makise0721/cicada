@@ -274,3 +274,44 @@ async def test_task_cancel_during_response_close_waits_and_never_publishes_tools
         release.set()
         await asyncio.gather(task, return_exceptions=True)
     assert stream.closed and events[-1].stop_reason == "aborted"
+
+
+async def test_send_cancel_race_with_slow_close_is_bounded(monkeypatch):
+    import cicada.plugins.deepseek.model as module
+    monkeypatch.setattr(module, "CALL_DEADLINE_S", 0.01)
+    close_entered = asyncio.Event()
+    class Closing(BytesStream):
+        async def aclose(self):
+            close_entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.closed = True
+    stream = Closing(b"")
+    token = CancelToken()
+    async def handle(req):
+        token.cancel()
+        return httpx.Response(200, stream=stream)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        async def run():
+            return [e async for e in DeepSeekModel(client, DeepSeekConfig(), KEY).stream(REQUEST, token)]
+        events = await asyncio.wait_for(run(), 1)
+    assert close_entered.is_set() and stream.closed and events[-1].stop_reason == "aborted"
+
+
+@pytest.mark.parametrize("separate", [False, True])
+async def test_data_after_done_is_rejected_regardless_of_network_slice(separate):
+    head = frame({"reasoning_content": "ok", "tool_calls": [tool()]}, "tool_calls") + DONE
+    tail = b"data: broken\n\n"
+    class Trailing(BytesStream):
+        async def __aiter__(self):
+            if separate:
+                yield head
+                yield tail
+            else:
+                yield head + tail
+    stream = Trailing(b"")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, stream=stream))) as client:
+        events = [e async for e in DeepSeekModel(client, DeepSeekConfig(), KEY).stream(REQUEST, CancelToken())]
+    assert events[-1].stop_reason == "error"
+    assert not any(isinstance(e, ToolCallEvent) for e in events) and stream.closed

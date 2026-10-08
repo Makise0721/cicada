@@ -42,7 +42,7 @@ async def _wait_operation(operation, cancel: CancelToken, deadline: float):
         if not delivered and not task.cancelled() and task.exception() is None:
             result = task.result()
             if isinstance(result, httpx.Response):
-                await result.aclose()
+                await _close_response(result, deadline)
 
 
 async def _close_response(response: httpx.Response, deadline: float) -> bool:
@@ -99,7 +99,8 @@ class DeepSeekModel:
         try:
             body = build_request(request, self.config)
             built = self.client.build_request("POST", BASE_URL + "/chat/completions", json=body,
-                headers={"Authorization": "Bearer " + self._api_key}, timeout=DEFAULT_TIMEOUT)
+                headers={"Authorization": "Bearer " + self._api_key, "Accept-Encoding": "identity"},
+                timeout=DEFAULT_TIMEOUT)
             if len(built.content) > self.config.max_request_bytes:
                 raise ProtocolError("request exceeds byte limit; not sent")
             response = await _wait_operation(self.client.send(built, stream=True), cancel, deadline)
@@ -107,12 +108,20 @@ class DeepSeekModel:
                 # 不读取错误 body；状态码本身足以分类且不会回显服务提供的秘密。
                 terminal = StreamDone("error", f"deepseek HTTP {response.status_code}")
             else:
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise ProtocolError("unexpected response content encoding")
                 decoder = SSEDecoder()
-                chunks = response.aiter_bytes()
-                while not completion.done:
+                # httpx aiter_bytes 在 EOF 内隐式 aclose，读任务取消会打断关闭并
+                # 留下 is_closed=True 的未释放响应。直接消费已请求 identity 的
+                # transport stream，关闭只在下方受拥有的监督点发生。
+                chunks = response.stream.__aiter__()
+                while True:
                     try:
                         chunk = await _wait_operation(anext(chunks), cancel, deadline)
                     except StopAsyncIteration:
+                        decoder.finish()
+                        if completion.done:
+                            break
                         raise ProtocolError("stream ended without DONE") from None
                     for frame in decoder.feed(chunk):
                         for event in completion.consume(frame):
