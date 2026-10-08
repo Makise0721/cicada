@@ -58,12 +58,13 @@ from cicada.core.messages import (
     isolate_tool_result,
 )
 from cicada.core.ports import ModelRequest, ToolSpec
-from cicada.models import ModelSelectionPort
+from cicada.models import ModelBinding, ModelOption, ModelRoute, ModelSelectionPort
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
     ArchiveLimitError,
     InterruptedRequest,
     LaunchIdentity,
+    ModelChangeSubmission,
     PersistenceState,
     PersistenceError,
     RecoverySnapshot,
@@ -310,7 +311,18 @@ class OperationBusy:
     与 ContextCompacted 标记.
     """
 
-    operation: Literal["clear", "compact"]
+    operation: Literal["clear", "compact", "model"]
+
+
+@dataclass(frozen=True)
+class ModelChanged:
+    previous_label: str
+    model_label: str
+    epoch_id: str | None
+
+
+class ModelSelectionError(RuntimeError):
+    """本地模型选择被拒绝; 有界原因, 无请求历史或凭据."""
 
 
 @dataclass(frozen=True)
@@ -338,7 +350,7 @@ class ApplicationClosed:
 
 ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
-    | OperationBusy | ContextCompacted | ApplicationClosed
+    | OperationBusy | ContextCompacted | ModelChanged | ApplicationClosed
 )
 
 
@@ -429,12 +441,21 @@ class ApplicationSession:
         projection: HistoricalProjection | None = None,
         budget_policy: BudgetPolicy | None = None,
         context_projection: ContextProjection | None = None,
+        model_selection: ModelSelectionPort | None = None,
+        model_route: ModelRoute | None = None,
+        summary_route: ModelRoute | None = None,
     ) -> None:
         self._app = app
         self._config = config
         self._service = service
         self._policy = policy
         self._budget_policy = budget_policy
+        self._model_selection = model_selection
+        self._model_route = model_route
+        self._summary_route = summary_route
+        self._model_in_flight = False
+        self._model_done: asyncio.Future | None = None
+        self._model_task: asyncio.Task | None = None
         # 模型可见投影容器 (02, D4): 压缩成功后追加摘要块, clear 重置, 恢复重建;
         # 与 BudgetPolicy 持同一实例
         self._context_projection = context_projection if context_projection is not None else ContextProjection()
@@ -647,7 +668,115 @@ class ApplicationSession:
 
     # --- 执行 ----------------------------------------------------------------------
 
+    @property
+    def model_options(self) -> tuple[ModelOption, ...]:
+        return self._model_selection.options if self._model_selection is not None else ()
+
+    async def select_model(self, option_id: str) -> None:
+        if self._closing or self._closed or self._state != "idle":
+            raise ModelSelectionError("model selection requires an idle, open session")
+        if self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
+            raise ModelSelectionError("another operation is in progress")
+        if self._view_only_reason or self._storage_failed or self._process_uncertain:
+            raise ModelSelectionError("model selection is blocked by the session state")
+        if self._model_selection is None or self._model_route is None:
+            raise ModelSelectionError("model selection is unavailable for this provider")
+        if option_id not in {option.id for option in self.model_options}:
+            raise ModelSelectionError("unknown model option")
+        if option_id == self._model_route.binding.identity.model:
+            return
+        self._model_in_flight = True
+        self._model_done = asyncio.get_running_loop().create_future()
+        try:
+            try:
+                binding = self._model_selection.prepare_model(option_id)
+                binding.validate_request(ModelRequest(
+                    messages=self._context_projection.project(self._history),
+                    tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
+                ))
+            except ValueError as exc:
+                raise ModelSelectionError("model selection rejected by configuration or history") from exc
+            persistence = self._config.persistence
+            identity = None
+            if persistence is not None:
+                safe = binding.identity
+                identity = replace(persistence.identity, provider=safe.provider, model=safe.model,
+                    base_url=safe.base_url, think=safe.think, options=dict(safe.options),
+                    max_request_bytes=safe.max_request_bytes,
+                    sources={**persistence.identity.sources, "model": "selection"})
+                persistence = replace(persistence, identity=identity)
+            new_config = replace(self._config, model_label=binding.identity.model,
+                                 budget=binding.budget, persistence=persistence)
+            self._notify(OperationBusy(operation="model"))
+            if self._store is None:
+                if self._closing or self._closed:
+                    raise ModelSelectionError("application is closing; model selection was not accepted")
+                await self._finish_model_change(binding, new_config, None)
+                return
+            # 接受前唯一取消点; close 封口后不能把新事务排进队列。
+            await asyncio.sleep(0)
+            if self._closing or self._closed:
+                raise ModelSelectionError("application is closing; model selection was not accepted")
+            submission = None
+            if self._store is not None:
+                snapshot = self._store.recovery_snapshot()
+                assert identity is not None and snapshot.identity is not None
+                try:
+                    submission = self._store.submit_model_change(
+                        StoredIdentity(identity, snapshot.identity.tool_fingerprint),
+                        expected_epoch_id=self._epoch_id or "",
+                    )
+                except PersistenceError as exc:
+                    if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                        self._latch_storage_failed(str(exc))
+                    raise ModelSelectionError("model configuration was not accepted by storage") from exc
+            # 强引用覆盖事务和内存发布; close 等待同一完整生产者。
+            self._model_task = asyncio.create_task(
+                self._finish_model_change(binding, new_config, submission)
+            )
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(self._model_task)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError()
+        finally:
+            self._model_in_flight = False
+            if self._model_done is not None and not self._model_done.done():
+                self._model_done.set_result(None)
+
+    async def _finish_model_change(
+        self, binding: ModelBinding, config: ApplicationConfig,
+        submission: ModelChangeSubmission | None,
+    ) -> None:
+        epoch_id = self._epoch_id
+        if submission is not None:
+            try:
+                epoch_id = await submission.wait()
+            except PersistenceError as exc:
+                self._latch_storage_failed(str(exc))
+                raise ModelSelectionError("model configuration failed to persist; current model is unchanged") from exc
+        previous = self._config.model_label
+        assert self._model_route is not None and self._summary_route is not None
+        assert self._budget_policy is not None
+        self._epoch_id = epoch_id
+        self._model_route.binding = binding
+        self._summary_route.binding = binding
+        self._config = config
+        policy = self._budget_policy
+        policy.config = binding.budget
+        policy.summary_budget = binding.summary_budget
+        policy.summary_identity = binding.summary_identity
+        policy.validate_request = binding.validate_request
+        policy.invalidate()
+        self._notify(ModelChanged(previous, config.model_label, epoch_id))
+
     async def execute(self, prompt: str) -> RequestOutcome:
+        if self._model_in_flight:
+            raise RuntimeError("model selection is in progress; execute is refused")
         if self._closing or self._closed:
             raise RuntimeError(f"application is {self._state}; execute rejected before start")
         if self._state != "idle":
@@ -1060,6 +1189,8 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
+        if self._model_in_flight:
+            raise RuntimeError("model selection is in progress; clear is refused")
         if self._store is not None:
             raise RuntimeError(
                 "persistent sessions must use clear_context(); the synchronous entry is refused "
@@ -1068,6 +1199,8 @@ class ApplicationSession:
         if self._closing or self._closed or self._state != "idle":
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
         self._history.clear()
+        if self._budget_policy is not None:
+            self._budget_policy.invalidate()
         self._notify(HistoryCleared())
 
     async def clear_context(self) -> None:
@@ -1076,6 +1209,8 @@ class ApplicationSession:
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
         清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
+        if self._model_in_flight:
+            raise RuntimeError("model selection is in progress; clear is refused")
         if self._store is None:
             self.clear_history()
             return
@@ -1120,6 +1255,8 @@ class ApplicationSession:
             assert new_generation is not None
             self._context_generation = new_generation
             self._history.clear()
+            if self._budget_policy is not None:
+                self._budget_policy.invalidate()
             self._notify(HistoryCleared())
             if self._projection is not None:
                 # 前缀证明与内存历史同步重置; 失败路径不会到达这里 (契约 §5)
@@ -1146,6 +1283,8 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
+        if self._model_in_flight:
+            raise RuntimeError("model selection is in progress; compact is refused")
         if self._store is None:
             raise RuntimeError(
                 "compaction requires a persistent session (start with --save-session, "
@@ -1306,6 +1445,7 @@ class ApplicationSession:
         self._context_projection.apply_summary(
             block, canonical_length=len(self._history)
         )
+        self._budget_policy.invalidate()
         compacted = ContextCompacted(
             summary_id=record.summary_id,
             first_request_seq=record.first_request_seq,
@@ -1450,6 +1590,7 @@ class ApplicationSession:
     async def aclose(self) -> None:
         """幂等关闭; 重复调用共享同一次关闭任务和结果, 不重复 stop."""
         if self._close_task is None:
+            self._closing = True
             self._close_task = asyncio.get_running_loop().create_task(self._close())
         await asyncio.shield(self._close_task)
 
@@ -1469,7 +1610,7 @@ class ApplicationSession:
         # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
         # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
         producers = [
-            done for done in (self._active_done, self._clear_done, self._compact_done)
+            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done)
             if done is not None and not done.done()
         ]
         if producers and self._cancel_token is not None:
@@ -1870,7 +2011,7 @@ async def open_application(
             model,
             budget_config,
             # D5: 摘要通道注入同一无状态适配器实例; 仅持久会话可压缩 (D9)
-            summarize=(binding.summary_model if binding is not None else model) if store is not None else None,
+            summarize=(policy_state["summary_route"] if binding is not None else model) if store is not None else None,
             summary_budget=binding.summary_budget if binding is not None else None,
             summary_identity=binding.summary_identity if binding is not None else None,
             validate_request=binding.validate_request if binding is not None else None,
@@ -1888,11 +2029,14 @@ async def open_application(
         nonlocal config, budget_config, context_projection
         binding = model.initial_binding if isinstance(model, ModelSelectionPort) else None
         if binding is not None:
+            policy_state["model_selection"] = model
+            policy_state["model_route"] = ModelRoute(binding)
+            policy_state["summary_route"] = ModelRoute(binding, summary=True)
             budget_config = binding.budget
             config = replace(config, budget=budget_config, model_label=binding.identity.model)
             if context_projection is None:
                 context_projection = ContextProjection()
-            model = binding.model
+            model = policy_state["model_route"]
         if budget_config is not None:
             model = _make_budget_policy(model, binding)
         if plan is not None:
@@ -2050,6 +2194,9 @@ async def open_application(
                 view_only_reason=view_only_reason,
                 projection=history_projection,
                 budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
+                model_selection=policy_state.get("model_selection"),
+                model_route=policy_state.get("model_route"),
+                summary_route=policy_state.get("summary_route"),
                 context_projection=context_projection,
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
@@ -2073,6 +2220,9 @@ async def open_application(
             service=policy_state.get("service"),  # type: ignore[arg-type]
             policy=policy_state.get("policy"),  # type: ignore[arg-type]
             budget_policy=policy_state.get("budget_policy"),  # type: ignore[arg-type]
+            model_selection=policy_state.get("model_selection"),
+            model_route=policy_state.get("model_route"),
+            summary_route=policy_state.get("summary_route"),
             context_projection=context_projection,
         )
     if plan is None:

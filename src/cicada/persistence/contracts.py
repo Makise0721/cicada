@@ -550,6 +550,13 @@ class PersistenceState:
 
 
 @runtime_checkable
+class ModelChangeSubmission(Protocol):
+    """同步接受的配置事务; 可重复等待, 调用方取消不取消事务."""
+
+    async def wait(self) -> str: ...
+
+
+@runtime_checkable
 class SessionStorePort(Protocol):
     """单会话存储 port; 实现由 session_store 能力插件提供, 应用持直接引用.
 
@@ -566,6 +573,12 @@ class SessionStorePort(Protocol):
 
     async def start_epoch(self, identity: StoredIdentity) -> str:
         """可靠写入新的启动代次; 同时把此前 pending intent 标为 interrupted."""
+        ...
+
+    def submit_model_change(
+        self, identity: StoredIdentity, *, expected_epoch_id: str
+    ) -> ModelChangeSubmission:
+        """返回即已入队; 原子更新配置边界, 不改变请求/历史代次."""
         ...
 
     async def begin_request(self, epoch_id: str, prompt: str) -> str:

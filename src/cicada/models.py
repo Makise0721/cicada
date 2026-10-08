@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from cicada.budget import BudgetConfig
-from cicada.core.ports import ModelPort, ModelRequest
+from cicada.core.cancel import CancelToken
+from cicada.core.ports import ModelPort, ModelRequest, StreamEvent
 
 
 @dataclass(frozen=True)
@@ -83,3 +84,17 @@ class ModelSelectionPort(Protocol):
     def options(self) -> tuple[ModelOption, ...]: ...
 
     def prepare_model(self, option_id: str) -> ModelBinding: ...
+
+
+class ModelRoute:
+    """应用拥有的稳定出口; 每次开始流时捕获绑定, 发布仅替换引用."""
+
+    def __init__(self, binding: ModelBinding, *, summary: bool = False) -> None:
+        self.binding = binding
+        self.summary = summary
+
+    async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
+        binding = self.binding
+        model = binding.summary_model if self.summary else binding.model
+        async for event in model.stream(request, cancel):
+            yield event

@@ -294,6 +294,14 @@ class _LoadedState:
 # --- store 实现 -------------------------------------------------------------------------
 
 
+class _ModelChangeSubmission:
+    def __init__(self, future: asyncio.Future) -> None:
+        self._future = future
+
+    async def wait(self) -> str:
+        return await asyncio.shield(self._future)
+
+
 class SQLiteSessionStore:
     """SessionStorePort 的 SQLite 实现; 单会话单写入者."""
 
@@ -380,6 +388,46 @@ class SQLiteSessionStore:
             return epoch_id
 
         return await self._dispatch(job)
+
+    def submit_model_change(
+        self, identity: StoredIdentity, *, expected_epoch_id: str
+    ) -> _ModelChangeSubmission:
+        identity_json = self._encode_checked(
+            encode_identity(identity), MAX_METADATA_BYTES, "epoch identity"
+        )
+
+        def job() -> str:
+            epoch_id = str(uuid.uuid4())
+            self._check_db_size(len(identity_json.encode("utf-8")))
+            self._immediate()
+            try:
+                row = self._conn.execute("SELECT current_epoch_id FROM session").fetchone()
+                if row != (expected_epoch_id,) or self._state.current_epoch_id != expected_epoch_id:
+                    raise PersistenceError("model change conflicts with the current epoch")
+                if self._conn.execute(
+                    "SELECT 1 FROM request_intents WHERE status = 'pending' LIMIT 1"
+                ).fetchone() is not None:
+                    raise PersistenceError("model change requires no pending request")
+                if any(a.terminal is None or a.terminal.kind == "unproven_terminal"
+                       for a in self._state.activities.values()):
+                    raise PersistenceError("model change requires proven process termination")
+                self._conn.execute("UPDATE epoch SET closed = 1 WHERE epoch_id = ?", (expected_epoch_id,))
+                self._conn.execute(
+                    "INSERT INTO epoch (epoch_id, opened_at, closed, identity_json, verification_run_id)"
+                    " VALUES (?, ?, 0, ?, (SELECT verification_run_id FROM epoch WHERE epoch_id = ?))",
+                    (epoch_id, time.time(), identity_json, expected_epoch_id),
+                )
+                self._conn.execute("UPDATE session SET current_epoch_id = ?", (epoch_id,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._state.current_epoch_id = epoch_id
+            self._state.identity = identity
+            self._state.epoch_count += 1
+            return epoch_id
+
+        return _ModelChangeSubmission(self._enqueue(job))
 
     async def begin_request(self, epoch_id: str, prompt: str) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
@@ -856,12 +904,15 @@ class SQLiteSessionStore:
     # --- worker 纪律 -----------------------------------------------------------------
 
     async def _dispatch(self, job: Callable[[], T]) -> T:
+        return await self._enqueue(job)
+
+    def _enqueue(self, job: Callable[[], T]) -> asyncio.Future:
         if self._closing or self._closed:
             raise StorageUnavailableError("session store is closed; no new transactions accepted")
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         self._queue.put((job, loop, future))
-        return await future
+        return future
 
     def _work(self) -> None:
         while True:
