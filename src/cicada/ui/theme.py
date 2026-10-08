@@ -258,11 +258,11 @@ def format_workspace(workspace: str) -> str:
 
 
 class FooterComponent:
-    """两行底栏: 工作区行 + 计量左/模型右 (dim #666666)。
+    """两行底栏: 行 1 工作区左 + 模型右 (同一行水平对齐), 行 2 计量左 (dim #808080)。
 
     metrics 回调返回 (输入累计, 输入含缺失, 输出累计, 输出含缺失);
     None 字段按规格省略, 有值但部分调用缺失时标注 (部分)。低高度
-    (rows < 12) 只保留计量行, 工作区行让位给对话 (设计 §4)。
+    (rows < 12) 只保留单行 计量左 + 模型右, 工作区行让位给对话 (设计 §4)。
     """
 
     def __init__(
@@ -297,34 +297,36 @@ class FooterComponent:
 
     def render(self, width: int, rows: int) -> list[str]:
         dim = FOOTER_DIM
-        pwd = format_workspace(self._workspace)
-        # 先对纯文本截断再套样式: truncate_to_width 会剥离 SGR, 反向会丢 dim 色
-        pwd_line = fg(dim, truncate_to_width(pwd, width, "..."))
-
-        stats_left = self._stats_left()
         model = self._model_label or "不可得"
-        stats_left_width = visible_width(stats_left)
-        if stats_left_width > width:
-            stats_left = truncate_to_width(stats_left, width, "...")
-            stats_left_width = visible_width(stats_left)
-        min_padding = 2
-        total = stats_left_width + min_padding + visible_width(model)
-        if total <= width:
-            padding = " " * (width - stats_left_width - visible_width(model))
-            stats_line = stats_left + padding + model
-        else:
-            available = width - stats_left_width - min_padding
-            if available > 0:
-                truncated_right = truncate_to_width(model, available, "")
-                pad = " " * max(0, width - stats_left_width - visible_width(truncated_right))
-                stats_line = stats_left + pad + truncated_right
-            else:
-                stats_line = stats_left
-
-        lines = [pwd_line, fg(dim, stats_line)]
+        stats_left = self._stats_left()
+        # 先对纯文本排版再整体套样式: truncate_to_width 会剥离 SGR, 反向会丢 dim 色
         if rows < 12:
-            return lines[1:]  # 低高度: 工作区行让位
-        return lines
+            # 低高度: 单行 计量左 + 模型右, 工作区行让位
+            return [fg(dim, _line_with_right(stats_left, model, width))]
+        # 模型是当前状态事实: 右端优先保留, 工作区路径按剩余宽度截断
+        first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
+        return [fg(dim, first), fg(dim, truncate_to_width(stats_left, width, "..."))]
+
+
+def _line_with_right(left: str, right: str, width: int, *, keep_right: bool = False) -> str:
+    """左文本 + 右对齐文本拼成一行 (纯文本); 默认左端优先, keep_right 时右端优先。"""
+    min_padding = 2
+    if visible_width(left) > width:
+        left = truncate_to_width(left, width, "...")
+    left_width = visible_width(left)
+    right_width = visible_width(right)
+    if left_width + min_padding + right_width <= width:
+        return left + " " * (width - left_width - right_width) + right
+    if keep_right and right_width + min_padding <= width:
+        left = truncate_to_width(left, width - right_width - min_padding, "...")
+        left_width = visible_width(left)
+        return left + " " * (width - left_width - right_width) + right
+    available = width - left_width - min_padding
+    if available > 0:
+        truncated_right = truncate_to_width(right, available, "")
+        pad = " " * max(0, width - left_width - visible_width(truncated_right))
+        return left + pad + truncated_right
+    return left
 
 
 __all__ = [

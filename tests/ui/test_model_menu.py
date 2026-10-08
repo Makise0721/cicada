@@ -222,7 +222,11 @@ async def test_model_menu_opens_highlights_and_confirms_through_vt(tmp_path):
         assert not h.view.model_menu.is_open
         assert not h.find("选择模型")
         # 成功事件刷新底栏有效模型 + 确认条目; 启动事实不改写
-        assert "deepseek-v4-pro" in h.screen()[-1]  # 底栏行
+        model_rows = [i for i, row in enumerate(h.screen()) if "deepseek-v4-pro" in row]
+        assert len(model_rows) >= 2  # 确认条目 + 底栏
+        footer_row = h.screen()[model_rows[-1]]
+        assert model_rows[-1] >= len(h.screen()) - 2  # 底栏区 (末尾两行内)
+        assert footer_row.lstrip().startswith("~")  # 模型与工作区同一行 (水平对齐)
         assert h.find("已切换模型")
         assert session.config.model_label == "deepseek-v4-pro"
         # 确认后继请求使用新模型 (A13): 经前端键位提交, mock HTTP 体核对

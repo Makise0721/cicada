@@ -103,20 +103,21 @@ def test_footer_two_lines_workspace_and_right_aligned_model():
     footer = FooterComponent(r"C:\repo\demo", "qwen3.5:9b", lambda: (1500, False, 300, False))
     lines = footer.render(40, 24)
     assert len(lines) == 2
-    assert "累计 ↑1.5k · ↓300" in strip_terminal_sequences(lines[1])  # 规格 §E: · 分隔
-    # 模型右对齐 (去掉 dim 样式后行尾是模型名)
-    assert strip_terminal_sequences(lines[1]).endswith("qwen3.5:9b")
+    first = strip_terminal_sequences(lines[0])
+    # 行 1: 工作区左 + 模型右 (同一行水平对齐)
+    assert "demo" in first and first.endswith("qwen3.5:9b")
+    # 行 2: 计量左 (规格 §E: · 分隔)
+    assert "累计 ↑1.5k · ↓300" in strip_terminal_sequences(lines[1])
     assert "\x1b[38;2;128;128;128m" in lines[0]  # dim 提亮 #808080 (规格 §E)
-    # 工作区行含工作区路径
-    assert "demo" in strip_terminal_sequences(lines[0])
 
 
 def test_footer_unknown_metrics_not_zero_and_partial_marked():
     # 无任何计量: 不显示箭头不虚构 0
     footer = FooterComponent("w", "m", lambda: (None, False, None, False))
-    stats = strip_terminal_sequences(footer.render(60, 24)[1])
+    lines = footer.render(60, 24)
+    assert strip_terminal_sequences(lines[0]).strip().endswith("m")  # 模型在工作区行
+    stats = strip_terminal_sequences(lines[1])
     assert "↑" not in stats and "↓" not in stats
-    assert stats.strip().endswith("m")
     # 字段缺失: 有值照显 + (部分), 缺失标不可得
     footer2 = FooterComponent("w", "m", lambda: (100, True, None, True))
     stats2 = strip_terminal_sequences(footer2.render(60, 24)[1])
@@ -134,6 +135,7 @@ def test_footer_low_height_keeps_stats_only():
 def test_footer_narrow_truncates_model_not_dropping_stats():
     footer = FooterComponent("w", "很长的模型名称" * 10, lambda: (10, False, 5, False))
     lines = footer.render(20, 24)
+    assert visible_width(strip_terminal_sequences(lines[0])) <= 20  # 工作区+模型行
     assert visible_width(strip_terminal_sequences(lines[1])) <= 20
     assert "↑10" in strip_terminal_sequences(lines[1])  # 计量优先保留
 
