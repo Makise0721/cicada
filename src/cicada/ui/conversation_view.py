@@ -42,6 +42,7 @@ from cicada.application import (
     ApplicationClosed,
     ApplicationSession,
     ApplicationUpdate,
+    ConfigurationChanged,
     ContextCompacted,
     HistoryCleared,
     ModelChanged,
@@ -228,9 +229,28 @@ class ConversationView:
             result = update.result
             if result is not None:
                 if result.defaults_saved:
-                    self.transcript.append_system('用户默认值已保存（下次新会话生效）；当前会话配置保持。')
-                if result.error_code is not None:
+                    outcome = result.application_outcome
+                    if outcome == 'applied':
+                        self.transcript.append_system('用户默认值已保存；当前会话已应用新的登录配置。')
+                    elif outcome == 'unchanged':
+                        self.transcript.append_system('用户默认值已保存；当前会话配置与登录设置一致，未变更。')
+                    elif outcome == 'not-requested':
+                        self.transcript.append_system('用户默认值已保存（下次新会话生效）；当前会话配置保持。')
+                    else:
+                        self.transcript.append_error(
+                            '用户默认值已保存（下次新会话生效）；当前会话未应用：'
+                            + (result.error_code or outcome))
+                elif result.error_code is not None:
                     self.transcript.append_error('登录配置未完成：' + result.error_code)
+        elif isinstance(update, ConfigurationChanged):
+            # 登录 04 (C7): 底栏从有效配置读取; 事件只含安全身份与 epoch
+            self.footer.set_model_label(update.identity.model)
+            effort = (dict(update.identity.options).get('reasoning_effort', '-')
+                      if update.identity.think else 'off')
+            self.transcript.append_system(
+                f"已应用登录配置：{update.identity.model} · 思考={effort}"
+                "（仅影响后继请求；对话、摘要与验证状态保留）。"
+            )
         elif isinstance(update, ContextCompacted):
             # 02: 压缩切换成功; 确认条目 + 兜底释放屏障 (主释放由等待任务 finally)
             self._gate.note_compact_settled()
@@ -309,7 +329,11 @@ class ConversationView:
     def _status_text(self) -> str | None:
         """状态文案只取真实状态: 屏障/取消/执行/reservation 窗口, 空闲 None。"""
         if self._gate.login_active:
-            return '正在保存登录配置…' if self.login_modal.wizard and self.login_modal.wizard.submitting else None
+            wizard = self.login_modal.wizard
+            if wizard and wizard.submitting:
+                return ('正在保存并应用登录配置…' if wizard.target == 'save-and-apply'
+                        else '正在保存登录配置…')
+            return None
         if self._gate.clearing:
             return "正在清空…"
         if self._gate.compacting:

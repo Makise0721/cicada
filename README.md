@@ -18,7 +18,7 @@ uv sync --extra tui   # 仅 --tui 需要
 $env:DEEPSEEK_API_KEY = '<your-key>'   # 凭据不写入会话存档
 ```
 
-CLI 与 TUI 共用 `~/.cicada/config.toml` 用户默认值，新建及采用当前配置恢复按显式参数 > 用户文件 > 内置默认；普通恢复继承存档设置。`--tui` 缺凭据时进入遮蔽输入向导，确认后可靠保存；普通恢复只补凭据，取消不创建会话。主屏 `/login` 保存下次新会话的默认值，当前会话配置保持。文件格式见 `--help`。单次任务（终端显示轮次、工具调用与终结状态）：
+CLI 与 TUI 共用 `~/.cicada/config.toml` 用户默认值，新建及采用当前配置恢复按显式参数 > 用户文件 > 内置默认；普通恢复继承存档设置。`--tui` 缺凭据时进入遮蔽输入向导，确认后可靠保存；普通恢复只补凭据，取消不创建会话。主屏 `/login` 可仅保存下次新会话默认值，或在空闲 DeepSeek 会话保存并应用（仅影响后继请求；`/model` 不回退旧凭据）。文件格式见 `--help`。单次任务（终端显示轮次、工具调用与终结状态）：
 
 ```powershell
 uv run --frozen python -m cicada --workspace .\sandbox '请用 write 创建 hello_cicada.txt，内容为 hello cicada，再用 read 读取确认。'

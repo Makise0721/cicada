@@ -10,8 +10,8 @@ import httpx
 from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelRequest, StreamDone, StreamEvent
-from cicada.models import ModelBinding, ModelOption
-from cicada.plugins.deepseek.protocol import BASE_URL, MODEL_IDS, DeepSeekConfig, build_request
+from cicada.models import ConfigurationRequest, ModelBinding, ModelOption
+from cicada.plugins.deepseek.protocol import BASE_URL, MODEL_IDS, REQUEST_LIMIT, DeepSeekConfig, build_request
 from cicada.plugins.deepseek.sse import Completion, ProtocolError, SSEDecoder
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=60, write=30, pool=10)
@@ -84,6 +84,24 @@ class DeepSeekModel:
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
         return DeepSeekModel(self.client, config, self._api_key).initial_binding
+
+    def prepare_configuration(self, request: ConfigurationRequest) -> ModelBinding:
+        """登录应用准备: 复用既有 client, 零网络/文件 I/O, 旧对象保持不可变。"""
+        identity = request.identity
+        if identity.provider != "deepseek" or type(identity.think) is not bool:
+            raise ValueError("DeepSeek configuration requires a deepseek identity with explicit think")
+        if identity.base_url not in (None, BASE_URL):
+            raise ValueError("DeepSeek configuration requires the official endpoint")
+        options = dict(identity.options)
+        config = DeepSeekConfig(
+            model=identity.model, think=identity.think,
+            reasoning_effort=options.get("reasoning_effort", "high"),
+            num_ctx=options.get("num_ctx", 131072),
+            max_tokens=options.get("max_tokens", 32768),
+            max_request_bytes=identity.max_request_bytes or REQUEST_LIMIT,
+        )
+        key = self._api_key if request.credential_action == "keep" else request.credential.reveal()
+        return DeepSeekModel(self.client, config, key).initial_binding
 
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
         if cancel.cancelled:

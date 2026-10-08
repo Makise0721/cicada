@@ -58,7 +58,10 @@ from cicada.core.messages import (
     isolate_tool_result,
 )
 from cicada.core.ports import ModelRequest, ToolSpec
-from cicada.models import ModelBinding, ModelOption, ModelRoute, ModelSelectionPort
+from cicada.models import (
+    ConfigurationRequest, ModelBinding, ModelConfigurationPort, ModelOption, ModelRoute,
+    ModelSelectionPort, SafeModelIdentity,
+)
 from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
@@ -329,6 +332,14 @@ class ModelChanged:
     epoch_id: str | None
 
 
+@dataclass(frozen=True)
+class ConfigurationChanged:
+    """登录配置已应用到当前会话 (04, C7); 只含安全模型身份与 epoch, 无凭据/ref."""
+
+    identity: SafeModelIdentity
+    epoch_id: str | None
+
+
 class ModelSelectionError(RuntimeError):
     """本地模型选择被拒绝; 有界原因, 无请求历史或凭据."""
 
@@ -358,7 +369,8 @@ class ApplicationClosed:
 
 ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
-    | OperationBusy | ContextCompacted | ModelChanged | LoginCompleted | ApplicationClosed
+    | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
+    | LoginCompleted | ApplicationClosed
 )
 
 
@@ -463,6 +475,10 @@ class ApplicationSession:
         self._model_selection = model_selection
         self._model_route = model_route
         self._summary_route = summary_route
+        # 04 (C6): 最新接受的配置准备源; 发布时按结构能力更新, 不从启动缓存准备
+        self._model_configuration: ModelConfigurationPort | None = None
+        if model_route is not None and isinstance(model_route.binding.model, ModelConfigurationPort):
+            self._model_configuration = model_route.binding.model
         self._model_in_flight = False
         self._model_done: asyncio.Future | None = None
         self._model_task: asyncio.Task | None = None
@@ -780,6 +796,13 @@ class ApplicationSession:
                 self._latch_storage_failed(str(exc))
                 raise ModelSelectionError("model configuration failed to persist; current model is unchanged") from exc
         previous = self._config.model_label
+        self._publish_binding(binding, config, epoch_id)
+        self._notify(ModelChanged(previous, config.model_label, epoch_id))
+
+    def _publish_binding(
+        self, binding: ModelBinding, config: ApplicationConfig, epoch_id: str | None
+    ) -> None:
+        """无 await 同步发布 (C7): 路由/配置/预算/最新准备源在同一段一次落定."""
         assert self._model_route is not None and self._summary_route is not None
         assert self._budget_policy is not None
         self._epoch_id = epoch_id
@@ -792,7 +815,11 @@ class ApplicationSession:
         policy.summary_identity = binding.summary_identity
         policy.validate_request = binding.validate_request
         policy.invalidate()
-        self._notify(ModelChanged(previous, config.model_label, epoch_id))
+        # 04 (C6): /model 与 /login 从最新接受绑定准备, 不恢复启动缓存对象
+        if isinstance(binding.model, ModelSelectionPort):
+            self._model_selection = binding.model
+        if isinstance(binding.model, ModelConfigurationPort):
+            self._model_configuration = binding.model
 
     async def execute(self, prompt: str) -> RequestOutcome:
         if self._login_in_flight:
@@ -1651,6 +1678,7 @@ class ApplicationSession:
                 self._login_store = self._login_store_factory()
             environment = self._login_environment() if self._login_environment else None
             view = self._login_store.read_view(environment)
+            apply_offered = False
             if self._model_route is not None:
                 identity = self._model_route.binding.identity
                 if identity.provider == 'deepseek':
@@ -1658,8 +1686,19 @@ class ApplicationSession:
                     view = replace(view, model=identity.model, think=identity.think,
                         reasoning_effort=options['reasoning_effort'], num_ctx=options['num_ctx'],
                         max_output_tokens=options['max_tokens'])
-            view = replace(view, actions=('defaults-only',), credentials_only=False,
-                           effect='保存（下次新会话生效）；当前会话配置保持')
+                    # 04 (D7): 正常空闲 DeepSeek 会话才提供保存并应用; 阻断锁存只保存
+                    apply_offered = (
+                        self._model_configuration is not None
+                        and not self._view_only_reason and not self._storage_failed
+                        and not self._process_uncertain
+                    )
+            if apply_offered:
+                view = replace(view, actions=('save-and-apply', 'defaults-only'),
+                               credentials_only=False,
+                               effect='保存并应用：立即更新当前会话凭据与思考设置；仅保存：下次新会话生效')
+            else:
+                view = replace(view, actions=('defaults-only',), credentials_only=False,
+                               effect='保存（下次新会话生效）；当前会话配置保持')
             self._login_view = view
             self._notify(OperationBusy('login'))
             return view
@@ -1681,7 +1720,8 @@ class ApplicationSession:
                 submission.revision != self._login_view.revision or
                 (self._login_task is not None and not self._login_task.done())):
             raise UserConfigError('login', 'operation-in-progress')
-        if submission.target != 'defaults-only':
+        # 应用再次核对目标: 只允许本次视图实际提供的动作, 不能只信任 UI (D7)
+        if submission.target not in self._login_view.actions:
             raise UserConfigError('login', 'unsupported-target')
         self._login_cancel_requested = False
         self._login_task = asyncio.create_task(self._finish_login(submission))
@@ -1708,11 +1748,103 @@ class ApplicationSession:
                     pass  # 尚未起跑的 worker 零写入；已起跑的 Adapter 返回真实结果。
                 except Exception:
                     result = LoginResult(False, False, 'not-requested', 'write-failed')
+            if submission.target == 'save-and-apply':
+                if result.defaults_saved:
+                    result = await self._apply_login_configuration(submission, result)
+                elif result.application_outcome == 'not-requested':
+                    # 保存失败零应用 (D6); 应用结果与保存结果分开报告
+                    result = replace(result, application_outcome='failed')
             return result
         finally:
             self._login_save_task = None
             self._login_in_flight = False
             self._notify(LoginCompleted(result))
+
+    async def _apply_login_configuration(
+        self, submission: LoginSubmission, saved: LoginResult
+    ) -> LoginResult:
+        """defaults 发布点之后的会话应用段 (04, C6/C7); 已保存与未应用分开报告。
+
+        接受前取消/关闭/锁存零 epoch; 接受后沿模型选择事务等明确结果再无 await
+        发布, close 经 _login_task 等同一生产者才释放 store/client。
+        """
+        if self._closing or self._closed:
+            return replace(saved, application_outcome='closing', error_code='closing')
+        if self._login_cancel_requested:
+            return replace(saved, application_outcome='blocked', error_code='cancelled')
+        if self._view_only_reason or self._storage_failed or self._process_uncertain:
+            return replace(saved, application_outcome='blocked', error_code='session-blocked')
+        route = self._model_route
+        configuration = self._model_configuration
+        if (route is None or configuration is None
+                or route.binding.identity.provider != 'deepseek'):
+            return replace(saved, application_outcome='blocked', error_code='unsupported-target')
+        current = route.binding.identity
+        target = replace(current, model=submission.defaults.model,
+            think=submission.defaults.think,
+            options=(('num_ctx', submission.defaults.num_ctx),
+                     ('max_tokens', submission.defaults.max_output_tokens),
+                     ('reasoning_effort', submission.defaults.reasoning_effort)))
+        # 完全 keep + 有效设置相同 = no-op: 不新增 epoch, 不使计量锚失效 (D8)
+        if submission.credential_action == 'keep' and target == current:
+            return replace(saved, application_outcome='unchanged')
+        try:
+            binding = configuration.prepare_configuration(
+                ConfigurationRequest(target, submission.credential_action, submission.credential))
+        except (ValueError, UserConfigError):
+            return replace(saved, application_outcome='blocked', error_code='invalid-model-settings')
+        try:
+            # 当前有效投影的历史资格核对 (D7): 不兼容保留旧绑定, 不改写历史
+            binding.validate_request(ModelRequest(
+                messages=self._context_projection.project(self._history),
+                tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
+            ))
+        except ValueError:
+            return replace(saved, application_outcome='blocked', error_code='history-incompatible')
+        persistence = self._config.persistence
+        identity = None
+        if persistence is not None:
+            safe = binding.identity
+            sources = dict(persistence.identity.sources)
+            if submission.credential_action == 'replace':
+                # 固定安全来源标签; ref/key/hash 不进入 epoch (C6)
+                sources['credentials'] = 'login'
+            identity = replace(persistence.identity, provider=safe.provider, model=safe.model,
+                base_url=safe.base_url, think=safe.think, options=dict(safe.options),
+                max_request_bytes=safe.max_request_bytes, sources=sources)
+            persistence = replace(persistence, identity=identity)
+        new_config = replace(self._config, model_label=binding.identity.model,
+                             budget=binding.budget, persistence=persistence)
+        if self._store is None:
+            self._publish_binding(binding, new_config, self._epoch_id)
+            self._notify(ConfigurationChanged(binding.identity, self._epoch_id))
+            return LoginResult(True, True, 'applied')
+        # 接受前唯一取消点; close 封口后不能把新事务排进队列
+        await asyncio.sleep(0)
+        if self._closing or self._closed:
+            return replace(saved, application_outcome='closing', error_code='closing')
+        if self._login_cancel_requested:
+            return replace(saved, application_outcome='blocked', error_code='cancelled')
+        snapshot = self._store.recovery_snapshot()
+        assert identity is not None and snapshot.identity is not None
+        try:
+            handle = self._store.submit_model_change(
+                StoredIdentity(identity, snapshot.identity.tool_fingerprint),
+                expected_epoch_id=self._epoch_id or '',
+            )
+        except PersistenceError as exc:
+            if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                self._latch_storage_failed(str(exc))
+            return replace(saved, application_outcome='failed', error_code='storage-failed')
+        try:
+            epoch_id = await handle.wait()
+        except PersistenceError as exc:
+            # 已接受提交的真实存储失败: 保留旧绑定并沿原 storage_failed 锁存 (C7)
+            self._latch_storage_failed(str(exc))
+            return replace(saved, application_outcome='failed', error_code='storage-failed')
+        self._publish_binding(binding, new_config, epoch_id)
+        self._notify(ConfigurationChanged(binding.identity, epoch_id))
+        return LoginResult(True, True, 'applied')
 
     # --- 关闭 ----------------------------------------------------------------------
 

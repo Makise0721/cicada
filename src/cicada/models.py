@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Callable
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelPort, ModelRequest, StreamEvent
+from cicada.user_config import SecretValue
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,29 @@ class ModelSelectionPort(Protocol):
     def options(self) -> tuple[ModelOption, ...]: ...
 
     def prepare_model(self, option_id: str) -> ModelBinding: ...
+
+
+@dataclass(frozen=True)
+class ConfigurationRequest:
+    """登录应用的准备请求: 目标安全身份 + 短期凭据动作; 秘密不进入身份或历史."""
+
+    identity: SafeModelIdentity
+    credential_action: Literal["keep", "replace"]
+    credential: SecretValue | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, SafeModelIdentity):
+            raise ValueError("ConfigurationRequest.identity must be a SafeModelIdentity")
+        if not ((self.credential_action == "keep" and self.credential is None) or
+                (self.credential_action == "replace" and isinstance(self.credential, SecretValue))):
+            raise ValueError("invalid configuration credential action")
+
+
+@runtime_checkable
+class ModelConfigurationPort(Protocol):
+    """独立可选配置能力; 准备纯本地, 复用既有 client, 不改旧对象, 不发网络."""
+
+    def prepare_configuration(self, request: ConfigurationRequest) -> ModelBinding: ...
 
 
 class ModelRoute:

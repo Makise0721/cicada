@@ -4,6 +4,7 @@ import asyncio
 import threading
 import json
 
+import httpx
 import pytest
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
@@ -17,6 +18,7 @@ from cicada.ui.main_screen import visible_width, strip_terminal_sequences
 from cicada.ui.terminal_io import FakeTerminal
 from test_application import _repo
 from test_conversation_view import _config, _script
+from test_deepseek_application import response
 from test_login_defaults import open_session, wait_for_thread
 from test_model_menu import TUIHarness, ENTER, ESCAPE, DOWN, text_keys
 from tests.ui.vt_screen import VtScreen
@@ -58,7 +60,7 @@ async def test_real_vt_login_replace_masks_secret_saves_once_and_preserves_draft
         await h.settle()
         assert h.find('下次新会话生效') and h.find('后续启动仍优先环境变量')
         assert h.find('保存思考：max')
-        h.terminal.emit([ENTER, ENTER, ENTER])
+        h.terminal.emit([DOWN, ENTER, ENTER])  # 确认页先移到“仅保存”再提交
         await settled(h)
         snapshot = FileUserConfigStore(store.root).load()
         assert snapshot.defaults.reasoning_effort == 'max'
@@ -73,6 +75,45 @@ async def test_real_vt_login_replace_masks_secret_saves_once_and_preserves_draft
         for needle in ('modal-sentinel', snapshot.defaults.credential_ref, h.view._session._login_view.revision):
             assert needle not in h.terminal.output_text + repr(h.view.transcript) + repr(session.history)
             assert needle.encode() not in session._store.db_path.read_bytes()
+    finally:
+        await h.stop()
+        await session.aclose()
+        h.view.close()
+
+
+async def test_save_and_apply_updates_session_and_preserves_draft(tmp_path):
+    """04 (A11)：确认页首项保存并应用；新 epoch、安全显示、草稿与后续请求凭据。"""
+    recorded = []
+
+    def handle(req):
+        recorded.append((req.headers.get('authorization'), json.loads(req.content)))
+        return httpx.Response(200, content=response(' 思考\n '))
+
+    session, store = await open_session(tmp_path, transport=httpx.MockTransport(handle))
+    h = TUIHarness(session, columns=70, rows=18)
+    before = session.persistence
+    try:
+        await h.start()
+        h.view.editor.set_text('登录前草稿')
+        h.view.on_submit('/login')
+        h.terminal.emit([ENTER, DOWN, PASTE])  # 替换凭据
+        await h.settle()
+        h.terminal.emit([ENTER, ENTER])  # thinking 保持现状 -> 确认页
+        await h.settle()
+        assert h.find('保存并应用') and h.find('仅保存')
+        h.terminal.emit([ENTER, ENTER])  # 首项即保存并应用
+        await settled(h)
+        assert session.persistence.epoch_id != before.epoch_id
+        assert h.find('已应用登录配置') and h.find('已保存')
+        assert 'modal-sentinel' not in h.terminal.output_text
+        assert h.view.editor.get_text() == '登录前草稿'
+        h.view.on_submit('应用后的普通请求')
+        async with asyncio.timeout(5):
+            while not session.history:
+                await asyncio.sleep(0.01)
+        await h.settle()
+        assert recorded[-1][0] == 'Bearer modal-sentinel'
+        assert 'modal-sentinel' not in h.terminal.output_text + repr(h.view.transcript)
     finally:
         await h.stop()
         await session.aclose()
