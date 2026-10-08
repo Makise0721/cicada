@@ -218,7 +218,15 @@ async def run_startup_login(
         terminal.start(on_input, render)
         render()
         try:
-            await done.wait()
+            while not done.is_set():
+                try:
+                    await asyncio.wait_for(done.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+                if getattr(terminal, 'input_failed', False):
+                    failed = True
+                    errors.append('login terminal input failed')
+                    done.set()
         except asyncio.CancelledError:
             if save_task is None:
                 raise
@@ -248,7 +256,9 @@ async def run_startup_login(
         except Exception:
             errors.append('login terminal cursor restore failed')
         try:
-            errors.extend(terminal.stop())
+            if terminal.stop():
+                # 适配器的底层异常可能包含输入内容，只返回固定恢复失败事实。
+                errors.append('login terminal restore errors')
         except Exception:
             errors.append('login terminal mode restore failed')
     return result, errors

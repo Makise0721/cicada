@@ -330,13 +330,12 @@ def test_help_list_fake_ollama_and_selector_cancel_skip_user_config_and_key(monk
     assert not root.exists()
 
 
-@pytest.mark.parametrize('tui', [False])
-def test_missing_key_exits_without_input_http_or_user_creation(monkeypatch, tmp_path, requests, tui):
+def test_missing_key_exits_without_input_http_or_user_creation(monkeypatch, tmp_path, requests):
     root = tmp_path / 'absent-user'
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
     monkeypatch.setattr('builtins.input', lambda *args: pytest.fail('unexpected interaction'))
-    code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), *(['--tui'] if tui else []), '任务'], root)
+    code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '任务'], root)
     assert code == 2 and 'DEEPSEEK_API_KEY' in err and '--tui' in err
     assert requests == [] and not root.exists() and not (tmp_path / '.cicada').exists()
 

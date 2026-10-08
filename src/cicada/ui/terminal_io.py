@@ -93,6 +93,7 @@ class PromptToolkitTerminal:
         self._on_resize: ResizeCallback | None = None
         self._last_size: tuple[int, int] | None = None
         self.failures: list[str] = []
+        self.input_failed = False  # 可选故障事实；不改变 Terminal 必需接口。
 
     @staticmethod
     def _create_input():
@@ -146,6 +147,7 @@ class PromptToolkitTerminal:
     # --- 生命周期 ----------------------------------------------------------------
 
     def start(self, on_input: InputBatchCallback, on_resize: ResizeCallback) -> None:
+        self.input_failed = False
         self._on_resize = on_resize
         self._raw_mode = self._enter_raw_mode()
         self._raw_mode.__enter__()
@@ -159,6 +161,7 @@ class PromptToolkitTerminal:
                     batch = list(self._input.read_keys())
                     batch.extend(self._input.flush_keys())  # 强制解析器落出孤立 Escape
                 except Exception as exc:
+                    self.input_failed = True
                     self.failures.append(f"input read failed: {exc!r}")
                     return
                 if batch:
@@ -227,6 +230,7 @@ class PromptToolkitTerminal:
         try:
             return list(self._input.flush_keys())
         except Exception as exc:
+            self.input_failed = True
             self.failures.append(f"flush_keys failed: {exc!r}")
             return []
 

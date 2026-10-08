@@ -159,7 +159,8 @@ async def test_submitting_silences_keys_and_close_waits_for_actual_file_result(m
     assert store.load().credential.reveal() == 'close-sentinel'
 
 
-async def test_terminal_failure_during_save_waits_worker_before_stop(monkeypatch, tmp_path):
+@pytest.mark.parametrize('failure', ['render', 'input'])
+async def test_terminal_failure_during_save_waits_worker_before_stop(monkeypatch, tmp_path, failure):
     store = FileUserConfigStore(tmp_path / 'user')
     terminal = FakeTerminal()
     entered, release = threading.Event(), threading.Event()
@@ -178,9 +179,12 @@ async def test_terminal_failure_during_save_waits_worker_before_stop(monkeypatch
         while not entered.is_set():
             await asyncio.sleep(0.005)
     try:
-        terminal.fail_write = True
-        terminal.set_size(30, 8)
-        await asyncio.sleep(0.01)
+        if failure == 'render':
+            terminal.fail_write = True
+            terminal.set_size(30, 8)
+        else:
+            terminal.input_failed = True
+        await asyncio.sleep(0.07)
         assert not task.done() and not terminal.stopped
     finally:
         release.set()
@@ -188,3 +192,68 @@ async def test_terminal_failure_during_save_waits_worker_before_stop(monkeypatch
     assert not result.defaults_saved and result.error_code == 'terminal-failed'
     assert terminal.stopped and errors and store.load().credential is None
     assert not list(store.root.glob('*.tmp'))
+
+
+@pytest.mark.parametrize('failure', ['read', 'flush'])
+async def test_real_terminal_input_read_failure_ends_wizard_and_restores_raw_mode(tmp_path, failure):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from cicada.ui.terminal_io import PromptToolkitTerminal
+
+    class Input:
+        raw = False
+        attached = False
+        callback = None
+        fail = False
+
+        @contextmanager
+        def raw_mode(self):
+            self.raw = True
+            try:
+                yield
+            finally:
+                self.raw = False
+
+        @contextmanager
+        def attach(self, callback):
+            self.callback = callback
+            self.attached = True
+            try:
+                yield
+            finally:
+                self.attached = False
+
+        def read_keys(self):
+            if self.fail and failure == 'read':
+                raise OSError('input-secret-sentinel')
+            return [ENTER, KeyPress(Keys.BracketedPaste, 'input-secret-sentinel')]
+
+        def flush_keys(self):
+            if self.fail and failure == 'flush':
+                raise OSError('input-secret-sentinel')
+            return []
+
+    class Output:
+        written = ''
+        def get_size(self):
+            return SimpleNamespace(columns=80, rows=24)
+        def write_raw(self, data):
+            self.written += data
+        def flush(self):
+            pass
+
+    inp, out = Input(), Output()
+    terminal = PromptToolkitTerminal(input=inp, output=out)
+    # 只替换 OS raw-mode 实现；attach/read/flush/poll/宿主走真实适配器。
+    terminal._enter_raw_mode = inp.raw_mode
+    store = FileUserConfigStore(tmp_path / 'user')
+    task = asyncio.create_task(run_startup_login(terminal, store, store.read_view()))
+    await asyncio.sleep(0)
+    inp.callback()
+    inp.fail = True
+    inp.callback()
+    result, errors = await asyncio.wait_for(task, 0.5)
+    assert result.error_code == 'terminal-failed' and not result.defaults_saved
+    assert errors and not inp.raw and not inp.attached and terminal._poll_task is None
+    assert not store.root.exists()
+    assert 'input-secret-sentinel' not in out.written + repr(result) + repr(errors)

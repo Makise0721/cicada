@@ -95,7 +95,7 @@ from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.user_config import (
-    LoginResult, LoginView, UserConfigError, UserConfigSnapshot, UserConfigStore,
+    LoginResult, UserConfigError, UserConfigSnapshot, UserConfigStore,
     UserDefaults, resolve_launch_config,
 )
 from cicada.prompting import (
