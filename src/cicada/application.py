@@ -1626,6 +1626,10 @@ class ApplicationSession:
                     "the active operation did not finalize before the close supervision deadline"
                 )
                 break  # 截止时间已耗尽; 未完成生产者保持强引用与关闭诊断
+        # 配置接受后不能在 COMMIT 与内存发布之间释放 store/client 或观察者。
+        # 监督超时记录诊断, 不能替代事务明确结果; model 生产者仍受拥有。
+        if self._model_done is not None and not self._model_done.done():
+            await asyncio.shield(self._model_done)
         # 解除核心到应用的订阅; 应用 observer 保留到 ApplicationClosed 送达后
         self._unsubscribe_core()
         stop_error: str | None = None

@@ -160,7 +160,7 @@ async def test_before_acceptance_zero_commit(tmp_path, monkeypatch, action):
         await session.aclose()
 
 
-@pytest.mark.parametrize("action", ["cancel", "close", "none"])
+@pytest.mark.parametrize("action", ["cancel", "close", "close-timeout", "none"])
 async def test_accepted_commit_blocks_operations_until_publication(tmp_path, monkeypatch, action):
     session = await open_application(config(_repo(tmp_path), transport([])))
     real = session._store.submit_model_change
@@ -191,11 +191,17 @@ async def test_accepted_commit_blocks_operations_until_publication(tmp_path, mon
             task.cancel()
             await asyncio.sleep(0)
             assert not task.done()
-        elif action == "close":
+        elif action in ("close", "close-timeout"):
+            if action == "close-timeout":
+                monkeypatch.setattr("cicada.application.CLOSE_SUPERVISION_S", 0.02)
             close = asyncio.create_task(session.aclose())
             await asyncio.sleep(0)
             await asyncio.sleep(0)
             assert not close.done()
+            if action == "close-timeout":
+                await asyncio.sleep(0.05)
+                assert not close.done() and not session._store._closed
+                assert session._close_problems and changes == []
         release.set()
         if action == "cancel":
             with pytest.raises(asyncio.CancelledError):
