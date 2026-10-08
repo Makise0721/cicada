@@ -90,6 +90,7 @@ class TUIHarness:
             status_lines=self.bundle["status_lines"],
             model_menu=self.bundle["model_menu"],
             on_model_confirm=self.bundle["on_model_confirm"],
+            modal=self.bundle["modal"],
         )
         self.runner: asyncio.Task | None = None
 

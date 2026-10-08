@@ -91,6 +91,7 @@ async def run_tui_session(
         status_lines=view.status_lines,
         model_menu=view.model_menu,
         on_model_confirm=view.confirm_model_selection,
+        modal=view.login_modal,
     )
     refs["frontend"] = frontend
 
@@ -115,13 +116,14 @@ async def run_tui_session(
             restore_errors = await runner
         except asyncio.CancelledError:
             await _close_application(session)
+            view.close()
             raise
         except Exception as exc:
             # frontend 自身异常: 终端恢复由 run_async 收尾尽力而为, 应用关闭监督收尾;
             # 异常细节经 stderr 如实留痕 (renderer 已停, 不写屏), 退出 1
             await _close_application(session)
             view.close()
-            _report_stderr(f"frontend failure: {exc!r}")
+            _report_stderr('login frontend failure' if frontend.sensitive_input_used else f"frontend failure: {exc!r}")
             return 1
         if frontend.terminal_failed:
             await _close_application(session)

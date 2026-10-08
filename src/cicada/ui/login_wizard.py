@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from typing import Callable
 
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
@@ -20,8 +21,9 @@ class LoginWizard:
     """无终端、应用或文件控制权；主屏宿主可复用 handle/render/submission。"""
 
     def __init__(self, view: LoginView, *, save_defaults: UserDefaults | None = None,
-                 explicit: dict[str, object] | None = None):
+                 explicit: dict[str, object] | None = None, title: str | None = None):
         self.view = view
+        self.title = title
         self.defaults = save_defaults or UserDefaults(
             view.provider, view.model, view.think, view.reasoning_effort,
             view.num_ctx, view.max_output_tokens)
@@ -123,7 +125,7 @@ class LoginWizard:
                                self.target, self._credential)
 
     def render_lines(self, columns: int) -> list[str]:
-        lines = ['Cicada · 补齐凭据' if self.view.credentials_only else 'Cicada · 首次配置',
+        lines = [self.title or ('Cicada · 补齐凭据' if self.view.credentials_only else 'Cicada · 首次配置'),
                  '↑/↓ 选择 · Enter 继续/保存 · Tab 返回 · Esc/Ctrl+C 取消', '']
         if self.submitting:
             lines.append('正在可靠保存，请等待…')
@@ -166,6 +168,44 @@ class LoginWizard:
         if self.error:
             lines.append(self.error)
         return [truncate_to_width(sanitize_display(line), max(1, columns)) for line in lines]
+
+
+class LoginModal:
+    """主屏的可选模态槽；复用向导，无文件或 Terminal 控制权。"""
+
+    def __init__(self, on_cancel: Callable[[], None],
+                 on_submit: Callable[[LoginSubmission], None]):
+        self.wizard: LoginWizard | None = None
+        self._on_cancel = on_cancel
+        self._on_submit = on_submit
+
+    @property
+    def is_open(self) -> bool:
+        return self.wizard is not None
+
+    def open(self, view: LoginView) -> None:
+        self.wizard = LoginWizard(view, title='Cicada · 登录配置')
+
+    def dismiss(self) -> None:
+        if self.wizard is not None:
+            self.wizard.clear_secret()
+        self.wizard = None
+
+    def handle(self, key: KeyPress) -> None:
+        if self.wizard is None:
+            return
+        action = self.wizard.handle(key)
+        if action == 'cancel':
+            self.dismiss()
+            self._on_cancel()
+        elif action == 'submit':
+            submission = self.wizard.submission()
+            self.wizard.clear_secret()
+            self._on_submit(submission)
+
+    def render(self, columns: int, rows: int) -> list[str]:
+        lines = self.wizard.render_lines(columns) if self.wizard else []
+        return lines[-max(1, rows):]
 
 
 async def run_startup_login(

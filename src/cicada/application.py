@@ -59,6 +59,7 @@ from cicada.core.messages import (
 )
 from cicada.core.ports import ModelRequest, ToolSpec
 from cicada.models import ModelBinding, ModelOption, ModelRoute, ModelSelectionPort
+from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.contracts import (
     ArchiveLimitError,
@@ -311,7 +312,14 @@ class OperationBusy:
     与 ContextCompacted 标记.
     """
 
-    operation: Literal["clear", "compact", "model"]
+    operation: Literal["clear", "compact", "model", "login"]
+
+
+@dataclass(frozen=True)
+class LoginCompleted:
+    """仅携带安全保存事实；None 表示编辑取消，无模型轮或历史写入。"""
+
+    result: LoginResult | None
 
 
 @dataclass(frozen=True)
@@ -350,7 +358,7 @@ class ApplicationClosed:
 
 ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
-    | OperationBusy | ContextCompacted | ModelChanged | ApplicationClosed
+    | OperationBusy | ContextCompacted | ModelChanged | LoginCompleted | ApplicationClosed
 )
 
 
@@ -444,6 +452,8 @@ class ApplicationSession:
         model_selection: ModelSelectionPort | None = None,
         model_route: ModelRoute | None = None,
         summary_route: ModelRoute | None = None,
+        login_store_factory: Callable[[], UserConfigStore] | None = None,
+        login_environment: Callable[[], str | None] | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -456,6 +466,14 @@ class ApplicationSession:
         self._model_in_flight = False
         self._model_done: asyncio.Future | None = None
         self._model_task: asyncio.Task | None = None
+        self._login_store_factory = login_store_factory
+        self._login_environment = login_environment
+        self._login_store: UserConfigStore | None = None
+        self._login_view: LoginView | None = None
+        self._login_in_flight = False
+        self._login_task: asyncio.Task | None = None
+        self._login_save_task: asyncio.Task | None = None
+        self._login_cancel_requested = False
         # 模型可见投影容器 (02, D4): 压缩成功后追加摘要块, clear 重置, 恢复重建;
         # 与 BudgetPolicy 持同一实例
         self._context_projection = context_projection if context_projection is not None else ContextProjection()
@@ -673,6 +691,8 @@ class ApplicationSession:
         return self._model_selection.options if self._model_selection is not None else ()
 
     async def select_model(self, option_id: str) -> None:
+        if self._login_in_flight:
+            raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
             raise ModelSelectionError("model selection requires an idle, open session")
         if self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
@@ -775,6 +795,8 @@ class ApplicationSession:
         self._notify(ModelChanged(previous, config.model_label, epoch_id))
 
     async def execute(self, prompt: str) -> RequestOutcome:
+        if self._login_in_flight:
+            raise RuntimeError("login configuration is in progress; execute is refused")
         if self._model_in_flight:
             raise RuntimeError("model selection is in progress; execute is refused")
         if self._closing or self._closed:
@@ -1189,6 +1211,8 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
+        if self._login_in_flight:
+            raise RuntimeError("login configuration is in progress; clear is refused")
         if self._model_in_flight:
             raise RuntimeError("model selection is in progress; clear is refused")
         if self._store is not None:
@@ -1209,6 +1233,8 @@ class ApplicationSession:
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
         清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
+        if self._login_in_flight:
+            raise RuntimeError("login configuration is in progress; clear is refused")
         if self._model_in_flight:
             raise RuntimeError("model selection is in progress; clear is refused")
         if self._store is None:
@@ -1283,6 +1309,8 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
+        if self._login_in_flight:
+            raise RuntimeError("login configuration is in progress; compact is refused")
         if self._model_in_flight:
             raise RuntimeError("model selection is in progress; compact is refused")
         if self._store is None:
@@ -1585,12 +1613,111 @@ class ApplicationSession:
             )
         await self._store.commit_summary(record)
 
+    # --- 用户默认配置 ---------------------------------------------------------------
+
+    @property
+    def login_busy(self) -> bool:
+        return self._login_in_flight
+
+    @property
+    def login_status(self) -> tuple[str, ...]:
+        """最后一次观察的安全设置；只读，不访问用户文件或环境凭据。"""
+        view = self._login_view
+        if view is None:
+            return ()
+        return (f"登录凭据来源（最近观察）: {view.credential_source}",
+                f"登录模型/思考（最近观察）: {view.model}/"
+                + (view.reasoning_effort if view.think else 'off'))
+
+    def _check_login_admission(self) -> None:
+        if (self._closing or self._closed or self._state != 'idle' or
+                self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
+            raise UserConfigError('login', 'operation-in-progress')
+
+    def login_view(self) -> LoginView:
+        """同步占住编辑窗口后才观察；失败释放，关闭/取消不改变任何会话事实。"""
+        self._check_login_admission()
+        if self._login_in_flight:
+            raise UserConfigError('login', 'operation-in-progress')
+        if self._login_store_factory is None:
+            raise UserConfigError('login', 'unavailable')
+        self._login_in_flight = True
+        try:
+            if self._login_store is None:
+                self._login_store = self._login_store_factory()
+            environment = self._login_environment() if self._login_environment else None
+            view = self._login_store.read_view(environment)
+            if self._model_route is not None:
+                identity = self._model_route.binding.identity
+                if identity.provider == 'deepseek':
+                    options = dict(identity.options)
+                    view = replace(view, model=identity.model, think=identity.think,
+                        reasoning_effort=options['reasoning_effort'], num_ctx=options['num_ctx'],
+                        max_output_tokens=options['max_tokens'])
+            view = replace(view, actions=('defaults-only',), credentials_only=False,
+                           effect='保存（下次新会话生效）；当前会话配置保持')
+            self._login_view = view
+            self._notify(OperationBusy('login'))
+            return view
+        except BaseException:
+            self._login_in_flight = False
+            raise
+
+    def cancel_login(self) -> None:
+        """编辑取消；保存接受后由生产者发布真实结果。"""
+        if self._login_task is not None and not self._login_task.done():
+            return
+        if self._login_in_flight:
+            self._login_in_flight = False
+            self._notify(LoginCompleted(None))
+
+    async def configure_login(self, submission: LoginSubmission) -> LoginResult:
+        self._check_login_admission()
+        if (not self._login_in_flight or self._login_view is None or self._login_store is None or
+                submission.revision != self._login_view.revision or
+                (self._login_task is not None and not self._login_task.done())):
+            raise UserConfigError('login', 'operation-in-progress')
+        if submission.target != 'defaults-only':
+            raise UserConfigError('login', 'unsupported-target')
+        self._login_cancel_requested = False
+        self._login_task = asyncio.create_task(self._finish_login(submission))
+        # 保存任务是应用拥有的生产者；外层取消不能把已发布事实丢掉。
+        while True:
+            try:
+                return await asyncio.shield(self._login_task)
+            except asyncio.CancelledError:
+                self._cancel_login_save()
+
+    def _cancel_login_save(self) -> None:
+        self._login_cancel_requested = True
+        if self._login_save_task is not None and not self._login_save_task.done():
+            self._login_save_task.cancel()
+
+    async def _finish_login(self, submission: LoginSubmission) -> LoginResult:
+        result = LoginResult(False, False, 'closing' if self._closing else 'not-requested', 'cancelled')
+        try:
+            if not self._closing and not self._login_cancel_requested:
+                self._login_save_task = asyncio.create_task(self._login_store.save(submission))
+                try:
+                    result = await self._login_save_task
+                except asyncio.CancelledError:
+                    pass  # 尚未起跑的 worker 零写入；已起跑的 Adapter 返回真实结果。
+                except Exception:
+                    result = LoginResult(False, False, 'not-requested', 'write-failed')
+            return result
+        finally:
+            self._login_save_task = None
+            self._login_in_flight = False
+            self._notify(LoginCompleted(result))
+
     # --- 关闭 ----------------------------------------------------------------------
 
     async def aclose(self) -> None:
         """幂等关闭; 重复调用共享同一次关闭任务和结果, 不重复 stop."""
         if self._close_task is None:
             self._closing = True
+            self._cancel_login_save()
+            self.cancel_login()
             self._close_task = asyncio.get_running_loop().create_task(self._close())
         await asyncio.shield(self._close_task)
 
@@ -1602,6 +1729,9 @@ class ApplicationSession:
         deadline = time.monotonic() + CLOSE_SUPERVISION_S
         self._close_deadline = deadline
         self._close_latch.set()
+        if self._login_task is not None and not self._login_task.done():
+            # 不以监督超时代替文件 worker 的真实终结，不提前关闭资源。
+            await asyncio.shield(self._login_task)
         # 02/PA05: 永久封住未接受的摘要提交并协作取消摘要生成;
         # 已被 store 接受的提交由其生产者等明确结果 (PA03), 不被取消掩盖
         self._compact_sealed = True
@@ -1980,7 +2110,9 @@ async def _run_preflight(preflight: Callable[[], object] | None) -> None:
 
 
 async def open_application(
-    config: ApplicationConfig, *, preflight: Callable[[], object] | None = None
+    config: ApplicationConfig, *, preflight: Callable[[], object] | None = None,
+    login_store_factory: Callable[[], UserConfigStore] | None = None,
+    login_environment: Callable[[], str | None] | None = None,
 ) -> ApplicationSession:
     """输入/preflight/boot/initialize 成功才返回; 部分启动失败关闭已取得资源.
 
@@ -2204,6 +2336,7 @@ async def open_application(
                 model_route=policy_state.get("model_route"),
                 summary_route=policy_state.get("summary_route"),
                 context_projection=context_projection,
+                login_store_factory=login_store_factory, login_environment=login_environment,
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
@@ -2230,6 +2363,7 @@ async def open_application(
             model_route=policy_state.get("model_route"),
             summary_route=policy_state.get("summary_route"),
             context_projection=context_projection,
+            login_store_factory=login_store_factory, login_environment=login_environment,
         )
     if plan is None:
         return session

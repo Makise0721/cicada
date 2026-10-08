@@ -45,6 +45,7 @@ from cicada.application import (
     ContextCompacted,
     HistoryCleared,
     ModelChanged,
+    LoginCompleted,
     OperationBusy,
     RequestCompleted,
     RequestPhaseChanged,
@@ -73,6 +74,8 @@ from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.model_menu import ModelMenu
+from cicada.ui.login_wizard import LoginModal
+from cicada.user_config import LoginSubmission, UserConfigError
 from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
@@ -121,6 +124,8 @@ class ConversationView:
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
         self.model_menu = ModelMenu()
+        self.login_modal = LoginModal(self._cancel_login, self._submit_login)
+        self._login_task: asyncio.Task | None = None
         # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停
         self._clock = clock if clock is not None else time.monotonic
         self._spinner_task: asyncio.Task | None = None
@@ -161,6 +166,8 @@ class ConversationView:
     def close(self) -> None:
         """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
         self._unsubscribe()
+        self.login_modal.dismiss()
+        self._session.cancel_login()
         if self._spinner_task is not None:  # 防御: 宿主"关 view 不关 session"时不泄漏
             self._spinner_task.cancel()
             self._spinner_task = None
@@ -202,6 +209,8 @@ class ConversationView:
             elif update.operation == "clear":
                 self._gate.note_clear_started()
                 self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
+            elif update.operation == 'login':
+                self._gate.note_login_started()
             else:
                 # model: 屏障在菜单确认时已同步置位, 此处兜底; 进度由状态行表达
                 self._gate.note_model_started()
@@ -213,6 +222,15 @@ class ConversationView:
                 f"已切换模型：{update.previous_label} → {update.model_label}"
                 "（仅影响后继请求；对话、摘要与验证状态保留）。"
             )
+        elif isinstance(update, LoginCompleted):
+            if update.result is None or self._login_task is None or self._login_task.done():
+                self._settle_login()
+            result = update.result
+            if result is not None:
+                if result.defaults_saved:
+                    self.transcript.append_system('用户默认值已保存（下次新会话生效）；当前会话配置保持。')
+                if result.error_code is not None:
+                    self.transcript.append_error('登录配置未完成：' + result.error_code)
         elif isinstance(update, ContextCompacted):
             # 02: 压缩切换成功; 确认条目 + 兜底释放屏障 (主释放由等待任务 finally)
             self._gate.note_compact_settled()
@@ -229,6 +247,7 @@ class ConversationView:
             if self._session.has_process_uncertain():
                 self.transcript.append_system(f"{PROCESS_UNCERTAIN_LABEL}：清空历史不解锁。")
         elif isinstance(update, ApplicationClosed):
+            self._settle_login()
             self._gate.note_closed()
         self._sync_spinner()  # 状态行跟随最近一次应用状态 (规格 §F)
         if self._on_update is not None:
@@ -289,6 +308,8 @@ class ConversationView:
 
     def _status_text(self) -> str | None:
         """状态文案只取真实状态: 屏障/取消/执行/reservation 窗口, 空闲 None。"""
+        if self._gate.login_active:
+            return '正在保存登录配置…' if self.login_modal.wizard and self.login_modal.wizard.submitting else None
         if self._gate.clearing:
             return "正在清空…"
         if self._gate.compacting:
@@ -351,7 +372,7 @@ class ConversationView:
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
         取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
-        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting:
+        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
         if cancel_if_active(self._session):
             return
@@ -365,7 +386,7 @@ class ConversationView:
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
         持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
-        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting:
+        if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
         if cancel_if_active(self._session):
             return
@@ -441,10 +462,61 @@ class ConversationView:
             return True
         if command == "/model":
             return self._open_model_menu()
+        if command.startswith('/login') and (len(command) == 6 or command[6].isspace()):
+            if command != '/login':
+                self.transcript.append_system('用法：/login（不接受参数）')
+                return True
+            return self._open_login()
         if command.startswith("/skill") and (len(command) == 6 or command[6].isspace()):
             return self._handle_skill_command(text.lstrip())
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
+
+    def _open_login(self) -> bool:
+        self._gate.note_login_started()  # 同步屏障先于读取/任务创建。
+        self.model_menu.dismiss()
+        try:
+            view = self._session.login_view()
+            self.login_modal.open(view)
+        except UserConfigError as exc:
+            self._gate.note_login_settled()
+            self.transcript.append_error('登录配置不可用：' + exc.error_code)
+        except Exception:
+            self._gate.note_login_settled()
+            self._session.cancel_login()
+            self.transcript.append_error('登录配置不可用：read-failed')
+        if self._on_update:
+            self._on_update()
+        return True
+
+    def _settle_login(self) -> None:
+        self.login_modal.dismiss()
+        self._gate.note_login_settled()
+
+    def _cancel_login(self) -> None:
+        self._session.cancel_login()
+        self._settle_login()
+        self._sync_spinner()
+        if self._on_update:
+            self._on_update()
+
+    def _submit_login(self, submission: LoginSubmission) -> None:
+        self._login_task = asyncio.create_task(self._run_login(submission))
+        self._sync_spinner()
+
+    async def _run_login(self, submission: LoginSubmission) -> None:
+        try:
+            await self._session.configure_login(submission)
+        except UserConfigError as exc:
+            self.transcript.append_error('登录配置未完成：' + exc.error_code)
+        except Exception:
+            self.transcript.append_error('登录配置未完成：write-failed')
+        finally:
+            self._session.cancel_login()
+            self._settle_login()
+            self._sync_spinner()
+            if self._on_update:
+                self._on_update()
 
     def _open_model_menu(self) -> bool:
         """/model (DeepSeek 04, 契约 C7/D8): 打开模型目录的本地操作.
@@ -624,7 +696,7 @@ class ConversationView:
             *self._budget_sections(),
             ("计量", [self.transcript.metrics_summary()]),
             ("检查", self._checks.status_lines()),
-            ("配置", diagnostics),
+            ("配置", [*diagnostics, *self._session.login_status]),
         ]
         # 保留原有字段顺序及整体限额; 装饰标题/空行不挤占事实行预算。
         clipped_sections = [
@@ -803,6 +875,7 @@ def build(
         "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
         "model_menu": view.model_menu,  # DeepSeek 04: /model 目录 (契约 C7)
         "on_model_confirm": view.confirm_model_selection,
+        "modal": view.login_modal,
     }
 
 

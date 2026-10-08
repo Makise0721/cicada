@@ -26,6 +26,7 @@ from cicada.ui.commands import SlashCommandMenu
 from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
+from cicada.ui.login_wizard import LoginModal
 from cicada.ui.terminal_io import Terminal
 
 MIN_RENDER_INTERVAL_S = 1.0 / 60.0  # Pi MIN_RENDER_INTERVAL_MS = 16
@@ -53,6 +54,7 @@ class MainScreenFrontend:
         status_lines: Callable[[int], list[str]] | None = None,
         model_menu: ModelMenu | None = None,
         on_model_confirm: Callable[[str], None] | None = None,
+        modal: LoginModal | None = None,
     ) -> None:
         self._terminal = terminal
         self._editor = editor
@@ -67,6 +69,8 @@ class MainScreenFrontend:
         self._status_lines = status_lines
         self._model_menu = model_menu
         self._on_model_confirm = on_model_confirm
+        self._modal = modal
+        self.sensitive_input_used = False
         self.ui_failures: list[str] = []
         self.terminal_failed = False
         self._screen = MainScreen(self._render_frame_lines, terminal.write)
@@ -85,6 +89,9 @@ class MainScreenFrontend:
     # --- 帧合成 -----------------------------------------------------------------
 
     def _render_frame_lines(self, width: int) -> list[str]:
+        if self._modal_active():
+            self.sensitive_input_used = True
+            return self._modal.render(width, self._frame_rows)
         lines = list(self._document_lines(width))
         if lines and strip_terminal_sequences(lines[-1]).strip():
             lines.append("")  # 输出与编辑器上边框之间留一行。
@@ -176,7 +183,7 @@ class MainScreenFrontend:
             self._frame_rows = self._terminal.rows
             self._screen.render_once(self._terminal.columns, self._frame_rows)
         except Exception as exc:
-            self.ui_failures.append(f"render failed: {exc!r}")
+            self.ui_failures.append('login render failed' if self.sensitive_input_used else f"render failed: {exc!r}")
             self._attempt_recovery()
 
     def _attempt_recovery(self) -> None:
@@ -197,14 +204,17 @@ class MainScreenFrontend:
             self._screen.render_once(self._terminal.columns, self._frame_rows)
         except Exception as exc:
             self.terminal_failed = True
-            self.ui_failures.append(f"terminal write failed permanently: {exc!r}")
+            self.ui_failures.append('login terminal write failed permanently' if self.sensitive_input_used else f"terminal write failed permanently: {exc!r}")
             self._exit_event.set()
 
     # --- 输入 --------------------------------------------------------------------
 
     def _on_input_batch(self, keys: list) -> None:
         for key in keys:
+            modal_was_open = self._modal_active()
             self._dispatch_key(key)
+            if modal_was_open and not self._modal_active():
+                break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
         self.request_render_now()
 
     def request_render_now(self) -> None:
@@ -215,6 +225,11 @@ class MainScreenFrontend:
         self._render_immediate()
 
     def _dispatch_key(self, key) -> None:
+        if self._modal_active():
+            self.sensitive_input_used = True
+            self._disarm_escape_prefix()
+            self._modal.handle(key)
+            return
         self._sync_command_menu()
         data = key.data
         # Ctrl+C / Ctrl+D: 与 Escape 前缀无关, 直接派发
@@ -326,6 +341,8 @@ class MainScreenFrontend:
         result = self._on_submit(submitted)
         if result is False:
             return  # 拒绝: 草稿保留 (实际接受前不伪造用户条目)
+        if self._modal_active():
+            return  # 模态输入期间聊天草稿/光标/撤销栈保持原样。
         self._editor.clear()
         if asyncio.iscoroutine(result):
             asyncio.ensure_future(result)
@@ -365,6 +382,9 @@ class MainScreenFrontend:
     def _model_menu_active(self) -> bool:
         return self._model_menu is not None and self._model_menu.is_open
 
+    def _modal_active(self) -> bool:
+        return self._modal is not None and self._modal.is_open
+
     def _confirm_model_menu(self) -> None:
         """模型菜单 Enter: 收起并把 option ID 交回组合层 (屏障/任务归组合层与应用)。"""
         if self._model_menu is None:
@@ -388,7 +408,15 @@ class MainScreenFrontend:
             self._terminal.start(self._on_input_batch, lambda: self.request_render())
             self._last_render_at = loop.time()
             self.request_render_now()
-            await self._exit_event.wait()
+            while not self._exit_event.is_set():
+                try:
+                    await asyncio.wait_for(self._exit_event.wait(), timeout=0.05)
+                except TimeoutError:
+                    pass
+                if self._modal_active() and getattr(self._terminal, 'input_failed', False):
+                    self.terminal_failed = True
+                    self.ui_failures.append('login terminal input failed')
+                    self._exit_event.set()
         finally:
             # 终态冲刷: 退出前的待渲染请求 (如 gate 错误条目) 在收尾前落屏一次,
             # 不随 _stopped 丢弃 (规格: 终态事件不丢弃); 失败照常记录不阻断收尾
@@ -398,12 +426,14 @@ class MainScreenFrontend:
                     self._frame_rows = self._terminal.rows
                     self._screen.render_once(self._terminal.columns, self._frame_rows)
                 except Exception as exc:
-                    self.ui_failures.append(f"final render failed: {exc!r}")
+                    self.ui_failures.append('login final render failed' if self.sensitive_input_used else f"final render failed: {exc!r}")
             self._stopped = True
             self._cancel_render_timer()
             self._disarm_escape_prefix()
             self._write_stop_sequence()
             stop_errors = self._terminal.stop()
+            if self.sensitive_input_used and stop_errors:
+                stop_errors = ['login terminal restore errors']
         return stop_errors
 
     def request_exit(self) -> None:

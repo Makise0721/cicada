@@ -40,6 +40,7 @@ class AdmissionGate:
         # DeepSeek 阶段票据 04: 模型选择提交中 (OperationBusy("model") ->
         # ModelChanged/失败落定); 屏障语义与清空/压缩同型, 菜单确认时同步置位
         self._model_selecting = False
+        self._login_active = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
         self.on_error: Callable[[str], None] | None = None
 
@@ -78,7 +79,7 @@ class AdmissionGate:
         """
         if self._reservation_open:
             return None
-        if self._clearing or self._compacting or self._model_selecting:
+        if self._clearing or self._compacting or self._model_selecting or self._login_active:
             return None
         if self._session.state != "idle":
             return None
@@ -148,6 +149,16 @@ class AdmissionGate:
         """模型选择提交开始 (菜单确认时同步置位, 先于任务创建); 幂等。"""
         self._model_selecting = True
 
+    @property
+    def login_active(self) -> bool:
+        return self._login_active
+
+    def note_login_started(self) -> None:
+        self._login_active = True
+
+    def note_login_settled(self) -> None:
+        self._login_active = False
+
     def note_model_settled(self) -> None:
         """模型选择落定 (成功由 ModelChanged 投影, 失败/取消由等待任务释放); 幂等。"""
         self._model_selecting = False
@@ -167,6 +178,7 @@ class AdmissionGate:
         self._clearing = False
         self._compacting = False
         self._model_selecting = False
+        self._login_active = False
 
     # --- 取消意图 ----------------------------------------------------------------------
 
@@ -194,7 +206,7 @@ def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """
     if gate.busy():
         return True
-    if gate.clearing or gate.compacting or gate.model_selecting:
+    if gate.clearing or gate.compacting or gate.model_selecting or gate.login_active:
         return True
     return session.state in (
         "executing",

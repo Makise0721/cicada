@@ -883,6 +883,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         return await _run_tui(
             run_tui_session_fn, app_config, initial_prompt=args.prompt, preflight=preflight,
             defaults_saved=defaults_saved,
+            login_store_factory=lambda: user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada'),
         )
     try:
         session = await open_application(app_config, preflight=preflight)
@@ -941,10 +942,13 @@ async def _run_tui(
     run_tui_session_fn, app_config: ApplicationConfig, *, initial_prompt: str | None,
     preflight: Callable[[], object] | None = None,
     defaults_saved: bool = False,
+    login_store_factory: Callable[[], UserConfigStore] | None = None,
 ) -> int:
     """--tui 分支: 依赖与 TTY 已在 _run 校验; 打开共享应用并运行生产组合."""
     try:
-        session = await open_application(app_config, preflight=preflight)
+        session = await open_application(app_config, preflight=preflight,
+            login_store_factory=login_store_factory,
+            login_environment=lambda: os.environ.get('DEEPSEEK_API_KEY'))
     except ApplicationOpenError as exc:
         if defaults_saved:
             print('用户默认值已保存；应用打开失败', file=sys.stderr)
