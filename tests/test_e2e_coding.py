@@ -151,7 +151,7 @@ def _dead_port() -> int:
 def test_cli_without_script_unreachable_ollama_exits_2(tmp_path):
     proc = run_cli(
         "--workspace", str(tmp_path),
-        "--ollama-url", f"http://127.0.0.1:{_dead_port()}",
+        "--provider", "ollama", "--ollama-url", f"http://127.0.0.1:{_dead_port()}",
         "测试",
     )
     assert proc.returncode == 2
@@ -161,7 +161,7 @@ def test_cli_without_script_unreachable_ollama_exits_2(tmp_path):
 def test_cli_script_and_real_model_flags_are_mutually_exclusive(tmp_path):
     script = tmp_path / "script.json"
     script.write_text(json.dumps([{"text": "hi", "stop": True}]), encoding="utf-8")
-    for extra in (["--model", "qwen3.5:9b"], ["--ollama-url", "http://127.0.0.1:11434"], ["--think"]):
+    for extra in (["--model", "qwen3.5:9b"], ["--provider", "ollama", "--ollama-url", "http://127.0.0.1:11434"], ["--think"]):
         proc = run_cli("--workspace", str(tmp_path), "--script", str(script), *extra, "测试")
         assert proc.returncode == 2, extra
         assert "互斥" in proc.stderr

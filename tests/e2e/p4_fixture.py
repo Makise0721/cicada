@@ -420,7 +420,7 @@ def _execute_attempt(attempt: int, attempt_dir: Path, fixture_root: Path,
     _write_json(attempt_dir / "fixture-manifest-before.json", facts["baseline_manifest"])
     proxy = _TeeProxy(attempt_dir / "proxy")
     cli_args = [
-        "--workspace", str(fixture_root), "--ollama-url", proxy.url,
+        "--workspace", str(fixture_root), "--provider", "ollama", "--ollama-url", proxy.url,
         "--model", MODEL, "--num-ctx", str(NUM_CTX),
         "--check-command", CHECK_COMMAND, TASK_PROMPT,
     ]
