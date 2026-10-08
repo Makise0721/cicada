@@ -91,6 +91,7 @@ def run_observed_cli(evidence_dir: Path, cli_args: list[str]) -> int:
     import cicada.__main__ as cli
     import cicada.application as application
     from cicada.plugins.coding.verification_contracts import VERIFICATION_CAPABILITY
+    from cicada.runtime.runtime import CapabilityError
 
     observer = Observer(evidence_dir)
     # 02 共享编排迁移后, bootstrap/decide_delivery 的实际调用点在 cicada.application;
@@ -112,8 +113,11 @@ def run_observed_cli(evidence_dir: Path, cli_args: list[str]) -> int:
                 lambda event: observer.record("events.jsonl", event, append=True)))
             replace(app.agent, "run", observer.observe_async(
                 app.agent.run, "agent.run", "run-result.json", append=False))
-            if kwargs.get("model_policy") is not None:
+            try:
                 service = app.runtime.capability(VERIFICATION_CAPABILITY)
+            except CapabilityError:
+                service = None
+            if service is not None:
                 observer.record("verification.jsonl", {"operation": "plan", "value": service.plan},
                                 append=True)
                 for method in ("initialize", "run_check", "refresh", "finalize"):
