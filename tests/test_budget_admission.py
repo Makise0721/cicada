@@ -379,6 +379,7 @@ async def test_clear_drops_anchor_through_seam(tmp_path):
         await session.execute("q2")
         assert session.budget.report.source == "anchored", "请求 2 = 请求 1 的前缀延长"
         session.clear_history()
+        assert session.budget.report is None and session.budget.anchor is None, "成功清空立即失效"
         await session.execute("q3")
         assert session.budget.report.source == "estimated", "接缝 committed_count=0 丢弃锚"
         assert session.budget.anchor is None, "q3 无计量, 锚保持空"

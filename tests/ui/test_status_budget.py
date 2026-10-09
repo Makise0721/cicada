@@ -9,10 +9,13 @@ session.summary_records。
 
 from __future__ import annotations
 
+import pytest
+
 from test_compact_command import _ScriptedSummary, _manual_session
 from test_conversation_view import Harness, _wait_until
 
 from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
+from cicada.persistence.contracts import StorageWriteError
 from cicada.ui.checks import STATUS_MAX_LINES
 from cicada.ui.main_screen import strip_terminal_sequences, visible_width
 from cicada.ui.transcript import InformationEntry
@@ -72,7 +75,7 @@ async def test_status_budget_before_first_request_and_empty_compaction_facts(tmp
     harness = Harness(session)
     try:
         rendered = _status_render(harness)
-        assert "预算: 上限 1000000 · 占用估计不可得（本进程尚未发送请求）" in rendered
+        assert "预算: 上限 1000000 · 占用估计不可得（当前上下文尚无预算报告）" in rendered
         assert "压缩: 0 次 · 摘要边界: 无（未压缩）" in rendered
         assert "摘要计量: 不可得（本代次尚无已提交摘要）" in rendered
         # 占用 (当前窗口) 与 计量 (跨调用累计) 分行分区, 文字不混用
@@ -97,7 +100,11 @@ async def test_status_budget_anchor_and_deviation_after_requests(tmp_path):
         await harness.wait_request_done()
         rendered = _status_render(harness)
         assert "占用估计 2321 · 余量 " in rendered, "上限-占用-余量成行"
-        assert "来源: estimated · 估计器 utf8-bytes-over-3-plus-template-overhead v1" in rendered
+        snapshot = session.budget
+        assert snapshot is not None and snapshot.report is not None
+        report = snapshot.report
+        assert report.source == "estimated"
+        assert f"来源: {report.source} · 估计器 {report.estimator} v{report.estimator_version}" in rendered
         assert "anchor_measured_prefix" not in rendered
         assert "消息(user)x1~11" in rendered, "消息组件按类别合并"
         assert "output_reserve~2048" in rendered and "safety_margin~256" in rendered
@@ -116,6 +123,11 @@ async def test_status_budget_anchor_and_deviation_after_requests(tmp_path):
         snapshot = session.budget
         assert snapshot is not None and snapshot.report is not None
         assert snapshot.report.source == "anchored"
+        report = snapshot.report
+        assert (
+            f"来源: {report.source} · 估计器 {report.estimator} v{report.estimator_version}"
+            in " ".join(_status_rows(harness))
+        )
         assert snapshot.anchor is not None
         assert snapshot.anchor.measured_input_tokens == 640
         assert snapshot.anchor.estimated_input_tokens is not None
@@ -156,8 +168,61 @@ async def test_status_summary_metrics_single_listed_after_manual_compact(tmp_pat
             await store.aclose()
 
 
-async def test_status_budget_stale_after_clear_labeled_until_next_request(tmp_path):
-    """审查 04-F1: /clear 后预算段如实标注旧代次时效, 下一请求执行后恢复当前口径."""
+@pytest.mark.parametrize("persistent", [False, True], ids=["sync", "persistent"])
+async def test_status_budget_invalidated_after_clear_until_next_request(tmp_path, persistent):
+    """成功清空丢弃报告和锚; 显示文档保留旧页, 最新状态与下一问使用当前事实。"""
+    script = [
+        [TextDelta("答一"), StreamDone("stop", metrics=ModelMetrics(input_tokens=500, output_tokens=10))],
+        [TextDelta("答二"), StreamDone("stop", metrics=ModelMetrics(input_tokens=640, output_tokens=10))],
+    ]
+    session, model, _c, store = await _manual_session(tmp_path, script=script, store=persistent)
+    harness = Harness(session)
+    try:
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+        assert harness.submit("/status")
+        snapshot = session.budget
+        assert snapshot is not None and snapshot.report is not None and snapshot.anchor is not None
+        old_sections = _status_sections(harness)
+        old_budget_rows = next(rows for heading, rows in old_sections if heading == "预算")
+        assert any("占用估计 2321" in row for row in old_budget_rows)
+        assert harness.submit("/clear")
+        assert await _wait_until(lambda: not harness.view._gate.clearing), "清空落定"
+        cleared = session.budget
+        assert cleared is not None and cleared.report is None and cleared.anchor is None
+        assert session.history == ()
+        assert harness.submit("/status")
+        sections = _status_sections(harness)
+        budget_rows = next(rows for heading, rows in sections if heading == "预算")
+        assert budget_rows == ["预算: 上限 1000000 · 占用估计不可得（当前上下文尚无预算报告）"]
+        assert old_sections in [
+            e.sections for e in harness.entries() if isinstance(e, InformationEntry)
+        ], "旧状态页保留为显示记录"
+        if persistent:
+            assert "压缩: 0 次" in " ".join(_status_rows(harness)), "当前代次摘要段一致"
+        assert harness.submit("第二问")
+        await harness.wait_request_done()
+        assert harness.submit("/status")
+        current = session.budget
+        assert current is not None and current.report is not None and current.anchor is not None
+        assert current.report is not snapshot.report, "重新生成报告"
+        assert current.report.source == "estimated", "清空前的锚不参与下一问"
+        assert current.anchor.measured_input_tokens == 640 and current.anchor.message_count == 1
+        assert len(model.requests) == 2 and len(model.requests[-1].messages) == 1
+        assert model.requests[-1].messages[0].text == "第二问", "下一问不发送旧历史"
+        rows = " ".join(_status_rows(harness))
+        assert f"占用估计 {current.report.total_estimate} · 余量 {current.report.margin_remaining}" in rows
+        assert "来源: estimated" in rows and "最近估计未使用锚" in rows
+        assert "不可得（当前上下文尚无预算报告）" not in rows
+    finally:
+        await session.aclose()
+        harness.close()
+        if store is not None:
+            await store.aclose()
+
+
+async def test_status_budget_preserved_after_failed_persistent_clear(tmp_path, monkeypatch):
+    """提交失败不清空历史、报告或锚, 最新状态继续显示既有事实与存储故障。"""
     script = [
         [TextDelta("答一"), StreamDone("stop", metrics=ModelMetrics(input_tokens=500, output_tokens=10))],
         [TextDelta("答二"), StreamDone("stop", metrics=ModelMetrics(input_tokens=640, output_tokens=10))],
@@ -165,23 +230,33 @@ async def test_status_budget_stale_after_clear_labeled_until_next_request(tmp_pa
     session, _m, _c, store = await _manual_session(tmp_path, script=script)
     harness = Harness(session)
     try:
-        assert harness.submit("第一问")
-        await harness.wait_request_done()
+        for prompt in ("第一问", "第二问"):
+            assert harness.submit(prompt)
+            await harness.wait_request_done()
+        snapshot = session.budget
+        assert snapshot is not None and snapshot.report is not None and snapshot.anchor is not None
+        assert snapshot.report.source == "anchored"
+        history = session.history
         assert harness.submit("/status")
-        assert "提示:" not in " ".join(_status_rows(harness)), "正常窗口无时效标注"
+        old_budget_rows = next(rows for heading, rows in _status_sections(harness) if heading == "预算")
+
+        async def failing_clear(epoch_id):
+            raise StorageWriteError("disk gone")
+
+        assert store is not None
+        monkeypatch.setattr(store, "commit_clear", failing_clear)
         assert harness.submit("/clear")
-        assert await _wait_until(lambda: not harness.view._gate.clearing), "清空落定"
+        assert await _wait_until(lambda: not harness.view._gate.clearing), "失败后屏障释放"
+        assert session.history == history and session.budget == snapshot
+        assert session.persistence is not None and session.persistence.storage_failed
+        assert "清空提交失败" in strip_terminal_sequences("\n".join(harness.lines(90)))
         assert harness.submit("/status")
-        rows = " ".join(_status_rows(harness))
-        assert "提示: /clear 后尚无新请求，以下为清空前旧代次的最后估计" in rows
-        assert "占用估计" in rows, "旧估计保留显示但已被标注"
-        assert "压缩: 0 次" in rows, "与同页摘要段一致"
-        assert harness.submit("第二问")
-        await harness.wait_request_done()
-        assert harness.submit("/status")
-        assert "提示:" not in " ".join(_status_rows(harness)), "新请求后按当前代次重估"
+        budget_rows = next(rows for heading, rows in _status_sections(harness) if heading == "预算")
+        assert budget_rows == old_budget_rows, "失败不伪造失效或清空成功"
+        assert "保存失败已锁存: disk gone" in " ".join(_status_rows(harness))
     finally:
         await session.aclose()
+        harness.close()
         if store is not None:
             await store.aclose()
 
