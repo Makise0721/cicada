@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures("color_env")
+
 from cicada.ui.editor import Editor, create_scroll_border
 from cicada.ui.main_screen import CURSOR_MARKER, visible_width
 

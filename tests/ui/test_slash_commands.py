@@ -1,6 +1,8 @@
 """通过终端按键与实际 VT 屏幕核对斜线命令选择，不依赖菜单内部状态。"""
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("color_env")
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 

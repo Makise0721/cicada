@@ -8,7 +8,15 @@ pytest 无 __init__.py 的 prepend 导入只把被收集文件所在目录插入
 
 import sys
 from pathlib import Path
+import pytest
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 if str(TESTS_ROOT) not in sys.path:
     sys.path.append(str(TESTS_ROOT))
+
+
+@pytest.fixture
+def color_env(monkeypatch):
+    """有色外观断言显式选择有色环境，不依赖 pytest 宿主环境。"""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")

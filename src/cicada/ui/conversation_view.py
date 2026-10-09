@@ -85,6 +85,7 @@ from cicada.ui.theme import FooterComponent
 from cicada.ui.tool_view import ToolCardEntry, ToolDocument
 from cicada.ui.transcript import Transcript
 from cicada.ui.welcome import build_welcome_entry
+from cicada.ui.display_style import DisplayStyle
 
 # 状态行 (规格 §F): braille spinner 与节奏; 帧由可注入时钟决定 (测试可冻结)
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
@@ -105,6 +106,7 @@ class ConversationView:
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._session = session
+        self.display_style = DisplayStyle.capture()
         self._editor = editor if editor is not None else Editor(
             border_color=theme.editor_border(),
             padding_x=2,
@@ -129,7 +131,8 @@ class ConversationView:
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
         self.model_menu = ModelMenu()
-        self.login_modal = LoginModal(self._cancel_login, self._submit_login)
+        self.login_modal = LoginModal(self._cancel_login, self._submit_login,
+                                      display_style=self.display_style)
         self._login_task: asyncio.Task | None = None
         # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停
         self._clock = clock if clock is not None else time.monotonic
@@ -142,7 +145,7 @@ class ConversationView:
         self._current_turn: dict[str, int] = {}
         # welcome 01: 建立订阅前追加本视图唯一欢迎条目 (启动快照一次捕获后冻结,
         # 渲染/resize/模型切换/登录配置/clear/compact 都不重建; 与首条请求间无 await)
-        self.transcript.add_entry(build_welcome_entry(session))
+        self.transcript.add_entry(build_welcome_entry(session, display_style=self.display_style))
         # 票据 05: 建立订阅前注入只读恢复显示。
         # 04: 预算启用时传当前代次摘要记录 (压缩边界程序条目); 未启用时模型
         # 看到完整原文, 不得声称"模型所见为摘要"
@@ -165,6 +168,7 @@ class ConversationView:
             str(session.config.workspace),
             session.config.model_label,
             self.transcript.metrics_fact,
+            display_style=self.display_style,
         )
 
     # --- 生命周期 -----------------------------------------------------------------
@@ -306,11 +310,16 @@ class ConversationView:
 
     def document_lines(self, width: int) -> list[str]:
         """01 冻结的显示文档替换点: 整份文档按当前宽度排版。"""
-        return self.transcript.render(width)
+        with self.display_style.use():
+            return self.transcript.render(width)
 
     # --- 状态行 (tui-aesthetics 规格 §F) ---------------------------------------------
 
     def status_lines(self, width: int) -> list[str]:
+        with self.display_style.use():
+            return self._render_status_lines(width)
+
+    def _render_status_lines(self, width: int) -> list[str]:
         """输入框上方状态行: 忙时 1 行 (spinner + 真实状态文案), 空闲 0 行。
 
         宽度 < 4 放不下 spinner + 空格 + 1 列文案, 不占行 (防御截断无噪音)。
@@ -323,7 +332,7 @@ class ConversationView:
         return [
             theme.fg_open(theme.EDITOR_BORDER) + frame
             + theme.fg_open(theme.MUTED_GRAY) + " " + text
-            + "\x1b[0m"
+            + self.display_style.sgr("0")
         ]
 
     def _status_text(self) -> str | None:
@@ -893,6 +902,7 @@ def build(
         "on_exit": view.handle_exit,
         "editor": view.editor,
         "view": view,
+        "display_style": view.display_style,
         "footer_lines": view.footer.render,  # (width, rows) -> 底栏行
         "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
         "model_menu": view.model_menu,  # DeepSeek 04: /model 目录 (契约 C7)

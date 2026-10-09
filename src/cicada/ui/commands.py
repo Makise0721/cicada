@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width, visible_width
+from cicada.ui.display_style import current_style
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class SlashCommandMenu:
                     + theme.fg_open(theme.EDITOR_BORDER) + "→ "
                     + theme.fg_open(theme.MD_LINK) + name
                     + theme.fg_open(theme.MUTED_GRAY) + "  " + desc
-                    + pad + "\x1b[0m"
+                    + pad + current_style().sgr("0")
                 )
             else:
                 lines.append(f"  {name}  " + theme.fg(theme.MUTED_GRAY, desc))

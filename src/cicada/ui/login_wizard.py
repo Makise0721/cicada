@@ -12,6 +12,7 @@ from cicada.ui.rendering import sanitize_display
 from cicada.ui.terminal_io import Terminal
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui import theme
+from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.user_config import (
     LoginResult, LoginSubmission, LoginView, SecretValue, UserConfigError,
     UserConfigStore, UserDefaults,
@@ -22,7 +23,9 @@ class LoginWizard:
     """无终端、应用或文件控制权；主屏宿主可复用 handle/render/submission。"""
 
     def __init__(self, view: LoginView, *, save_defaults: UserDefaults | None = None,
-                 explicit: dict[str, object] | None = None, title: str | None = None):
+                 explicit: dict[str, object] | None = None, title: str | None = None,
+                 display_style: DisplayStyle | None = None):
+        self.display_style = display_style if display_style is not None else current_style()
         self.view = view
         self.title = title
         self.defaults = save_defaults or UserDefaults(
@@ -133,6 +136,10 @@ class LoginWizard:
                                self.target, self._credential)
 
     def render_lines(self, columns: int, rows: int | None = None) -> list[str]:
+        with self.display_style.use():
+            return self._render_lines(columns, rows)
+
+    def _render_lines(self, columns: int, rows: int | None = None) -> list[str]:
         """Pi 式对话框结构，沿用主屏主题；低窗口优先保留输入和选中动作。"""
         width = max(1, columns)
         self._viewport = (columns, rows)
@@ -169,7 +176,7 @@ class LoginWizard:
                 body += ' ' * max(0, width - visible_width(body))
                 if self.step == 'confirm':
                     required.add(len(items))
-            items.append((-3 if selected else 1, body + '\x1b[0m'))
+            items.append((-3 if selected else 1, body + self.display_style.sgr('0')))
 
         steps = ('provider', 'credential', 'confirm') if self.view.credentials_only else (
             'provider', 'credential', 'thinking', 'confirm')
@@ -178,7 +185,7 @@ class LoginWizard:
         title = self.title or ('Cicada · 补齐凭据' if self.view.credentials_only else 'Cicada · 首次配置')
         compact = rows is not None and rows < 14
         caption = (f'{names[self.step]} · {number}/{len(steps)}' if compact else title)
-        heading = pad + theme.fg(theme.EDITOR_BORDER, '\x1b[1m' + truncate_to_width(caption, content_width))
+        heading = pad + theme.fg(theme.EDITOR_BORDER, self.display_style.sgr('1') + truncate_to_width(caption, content_width))
         border = theme.fg(theme.EDITOR_BORDER, '─' * width)
         progress = pad + '   '.join(theme.fg(
             theme.EDITOR_BORDER if step == self.step else theme.MUTED_GRAY,
@@ -283,7 +290,9 @@ class LoginModal:
     """主屏的可选模态槽；复用向导，无文件或 Terminal 控制权。"""
 
     def __init__(self, on_cancel: Callable[[], None],
-                 on_submit: Callable[[LoginSubmission], None]):
+                 on_submit: Callable[[LoginSubmission], None], *,
+                 display_style: DisplayStyle | None = None):
+        self.display_style = display_style if display_style is not None else current_style()
         self.wizard: LoginWizard | None = None
         self._on_cancel = on_cancel
         self._on_submit = on_submit
@@ -293,7 +302,7 @@ class LoginModal:
         return self.wizard is not None
 
     def open(self, view: LoginView) -> None:
-        self.wizard = LoginWizard(view, title='Cicada · 登录配置')
+        self.wizard = LoginWizard(view, title='Cicada · 登录配置', display_style=self.display_style)
 
     def dismiss(self) -> None:
         if self.wizard is not None:

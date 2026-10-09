@@ -82,7 +82,11 @@ async def test_new_session_welcome_first_single_no_request_no_history(tmp_path):
         text = _text(h)
         assert "新会话 · 启动快照" in text
         # r2: Pi 风格段组 (段标题 + 缩进内容行)
-        assert "[工作区]" in text and f"  {format_workspace(str(root))}" in text
+        assert "[工作区]" in text
+        # 私有 basetemp 路径可能超过 80 列；完整路径事实在足够宽的视图核对。
+        workspace = format_workspace(str(root))
+        wide_text = _text(h, width=max(80, visible_width(workspace) + 2))
+        assert f"  {workspace}" in wide_text
         assert "[启动模型]" in text and "  fake · 思考 不可得" in text  # 无持久身份: 思考不可得
         assert "[指令]" in text and "  未指定" in text
         assert "[Skills]" in text and "  未启用" in text

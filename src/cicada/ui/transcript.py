@@ -26,6 +26,7 @@ from cicada.core.messages import AssistantMessage
 from cicada.core.ports import ModelMetrics
 from cicada.skills import SkillInvocation, decode_skill_request
 from cicada.ui import theme
+from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
@@ -98,15 +99,16 @@ class SkillRequestEntry(UserEntry):
         super().__init__(text)
         self.invocation = invocation
         self._expand_getter = expand_getter
-        self._render_cache: tuple[int, bool, list[str]] | None = None
+        self._render_cache: tuple[int, bool, DisplayStyle, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
         expanded = True if self._expand_getter is None else bool(self._expand_getter())
         cached = self._render_cache
-        if cached is not None and cached[0] == width and cached[1] == expanded:
-            return list(cached[2])
+        style = current_style()
+        if cached is not None and cached[:3] == (width, expanded, style):
+            return list(cached[3])
         lines = self._render_lines(width, expanded)
-        self._render_cache = (width, expanded, list(lines))
+        self._render_cache = (width, expanded, style, list(lines))
         return lines
 
     def _render_lines(self, width: int, expanded: bool) -> list[str]:
@@ -147,18 +149,19 @@ class AssistantEntry:
         self.finalized = False
         self.stop_reason: str | None = None
         self.error: str | None = None
-        self._render_cache: tuple[str, int, list[str]] | None = None
+        self._render_cache: tuple[str, int, DisplayStyle, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
         cleaned = sanitize_display(self.text)
         lines: list[str]
         if cleaned:
             cached = self._render_cache
-            if cached is not None and cached[0] == cleaned and cached[1] == width:
-                lines = list(cached[2])
+            style = current_style()
+            if cached is not None and cached[:3] == (cleaned, width, style):
+                lines = list(cached[3])
             else:
                 lines = theme.assistant_markdown_lines(cleaned, width)
-                self._render_cache = (cleaned, width, list(lines))
+                self._render_cache = (cleaned, width, style, list(lines))
             lines = ["", *lines]  # Pi assistant 前置空行
         elif not self.finalized:
             lines = ["", STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量 (统一前导空行)

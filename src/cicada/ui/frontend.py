@@ -28,6 +28,7 @@ from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
 from cicada.ui.terminal_io import Terminal
+from cicada.ui.display_style import DisplayStyle
 
 MIN_RENDER_INTERVAL_S = 1.0 / 60.0  # Pi MIN_RENDER_INTERVAL_MS = 16
 ESCAPE_PREFIX_TIMEOUT_S = 0.010  # Pi DEFAULT_ESCAPE_TIMEOUT_MS = 10
@@ -55,7 +56,9 @@ class MainScreenFrontend:
         model_menu: ModelMenu | None = None,
         on_model_confirm: Callable[[str], None] | None = None,
         modal: LoginModal | None = None,
+        display_style: DisplayStyle | None = None,
     ) -> None:
+        self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
         self._editor = editor
         self._document_lines = document_lines
@@ -89,6 +92,10 @@ class MainScreenFrontend:
     # --- 帧合成 -----------------------------------------------------------------
 
     def _render_frame_lines(self, width: int) -> list[str]:
+        with self.display_style.use():
+            return self._compose_frame_lines(width)
+
+    def _compose_frame_lines(self, width: int) -> list[str]:
         if self._modal_active():
             self.sensitive_input_used = True
             return self._modal.render(width, self._frame_rows)

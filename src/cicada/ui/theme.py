@@ -22,6 +22,7 @@ from pathlib import Path
 
 from cicada.ui.main_screen import truncate_to_width, visible_width, word_wrap_line, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
+from cicada.ui.display_style import DisplayStyle, current_style
 
 # --- dark.json 固定颜色 (var 引用已解析) ----------------------------------------------
 
@@ -61,25 +62,25 @@ def _rgb(hex_color: str) -> tuple[int, int, int]:
 def fg(hex_color: str, text: str) -> str:
     """真彩前景 SGR 包裹; 样式不改变可见列宽。"""
     r, g, b = _rgb(hex_color)
-    return f"\x1b[38;2;{r};{g};{b}m{text}\x1b[0m"
+    return current_style().sgr(f"38;2;{r};{g};{b}") + text + current_style().sgr("0")
 
 
 def bg(hex_color: str, text: str) -> str:
     """真彩背景 SGR 包裹。"""
     r, g, b = _rgb(hex_color)
-    return f"\x1b[48;2;{r};{g};{b}m{text}\x1b[0m"
+    return current_style().sgr(f"48;2;{r};{g};{b}") + text + current_style().sgr("0")
 
 
 def fg_open(hex_color: str) -> str:
     """只开不复位的前景序列: 背景行内部换色用 (内层 \\x1b[0m 会连带清掉外层背景)。"""
     r, g, b = _rgb(hex_color)
-    return f"\x1b[38;2;{r};{g};{b}m"
+    return current_style().sgr(f"38;2;{r};{g};{b}")
 
 
 def bg_open(hex_color: str) -> str:
     """只开不复位的背景序列。"""
     r, g, b = _rgb(hex_color)
-    return f"\x1b[48;2;{r};{g};{b}m"
+    return current_style().sgr(f"48;2;{r};{g};{b}")
 
 
 def editor_border() -> Callable[[str], str]:
@@ -101,7 +102,7 @@ def information_lines(
 
     def append_heading(text: str) -> None:
         for chunk in wrap_text_ansi(sanitize_display(text), content_width):
-            lines.append(pad + f"\x1b[1m{chunk}\x1b[0m")
+            lines.append(pad + current_style().sgr("1") + chunk + current_style().sgr("0"))
 
     append_heading(title)
     for heading, rows in sections:
@@ -168,7 +169,7 @@ _RICH_MD_THEME = {
 }
 
 _MD_CACHE_LIMIT = 64
-_md_cache: dict[tuple[str, int], list[str]] = {}
+_md_cache: dict[tuple[str, int, DisplayStyle], list[str]] = {}
 
 
 def assistant_markdown_lines(text: str, width: int) -> list[str]:
@@ -176,13 +177,15 @@ def assistant_markdown_lines(text: str, width: int) -> list[str]:
 
     Rich 只排版不打印 (现有 rendering.rich_to_ansi 同款约束, 真彩主题映射
     Pi md* 颜色; 代码块语法色用 Rich 缺省, 布局以固定场景为准——规格允许
-    Rich 与 Pi Markdown 的细节差异)。缓存按 (正文, 宽度) 复用, 流式增量
+    Rich 与 Pi Markdown 的细节差异)。缓存按 (正文, 宽度, 策略) 复用, 流式增量
     未变化时不重复排版。宽度 1-2 的极端窄窗退化为单列 (有界截断)。
     """
     cleaned = sanitize_display(text)
     if not cleaned:
         return []
-    cached = _md_cache.get((cleaned, width))
+    style = current_style()
+    key = (cleaned, width, style)
+    cached = _md_cache.get(key)
     if cached is not None:
         return list(cached)
     from rich.console import Console
@@ -196,7 +199,8 @@ def assistant_markdown_lines(text: str, width: int) -> list[str]:
         height=24,
         file=StringIO(),
         force_terminal=True,
-        color_system="truecolor",
+        color_system=None if style.plain else "truecolor",
+        no_color=style.plain,
         legacy_windows=False,
         markup=False,
         highlight=False,
@@ -221,7 +225,7 @@ def assistant_markdown_lines(text: str, width: int) -> list[str]:
         lines.pop()  # Rich 尾部空白行不进入文档 (条目间距由调用方统一)
     if len(_md_cache) >= _MD_CACHE_LIMIT:
         _md_cache.pop(next(iter(_md_cache)))
-    _md_cache[(cleaned, width)] = list(lines)
+    _md_cache[key] = list(lines)
     return lines
 
 
@@ -270,7 +274,9 @@ class FooterComponent:
         workspace: str,
         model_label: str | None,
         metrics: Callable[[], tuple[int | None, bool, int | None, bool]],
+        *, display_style: DisplayStyle | None = None,
     ) -> None:
+        self.display_style = display_style if display_style is not None else current_style()
         self._workspace = workspace
         self._model_label = model_label
         self._metrics = metrics
@@ -296,6 +302,10 @@ class FooterComponent:
         return joined
 
     def render(self, width: int, rows: int) -> list[str]:
+        with self.display_style.use():
+            return self._render(width, rows)
+
+    def _render(self, width: int, rows: int) -> list[str]:
         dim = FOOTER_DIM
         model = self._model_label or "不可得"
         stats_left = self._stats_left()

@@ -77,6 +77,7 @@ async def test_status_line_extreme_narrow_width_takes_no_row(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("color_env")
 async def test_executing_shows_spinner_and_frame_follows_clock(tmp_path):
     session, bundle, _ = await _open_view(tmp_path, clock := _Clock())
     try:

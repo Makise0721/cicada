@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("color_env")
+
 from cicada.application import (
     AgentEventReceived,
     ApplicationConfig,

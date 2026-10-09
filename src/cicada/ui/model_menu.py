@@ -11,6 +11,7 @@ from __future__ import annotations
 from cicada.models import ModelOption
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width, visible_width
+from cicada.ui.display_style import current_style
 
 MODEL_MENU_HINT = "选择模型  ↑/↓ 移动  Enter 确认  Esc 收起"
 _CURRENT_MARKER = " （当前）"
@@ -93,7 +94,7 @@ class ModelMenu:
                 + theme.fg_open(theme.EDITOR_BORDER) + "→ "
                 + theme.fg_open(theme.MD_LINK) + label
                 + (theme.fg_open(theme.MUTED_GRAY) + marker if marker else "")
-                + pad + "\x1b[0m"
+                + pad + current_style().sgr("0")
             )
         return "  " + label + (theme.fg(theme.MUTED_GRAY, marker) if marker else "")
 

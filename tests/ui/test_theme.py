@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("color_env")
+
 from cicada.ui import theme
 from cicada.ui.editor import Editor
 from cicada.ui.frontend import MainScreenFrontend

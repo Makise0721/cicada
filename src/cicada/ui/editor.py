@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from cicada.ui import theme
+from cicada.ui.display_style import current_style
 from cicada.ui.main_screen import (
     CURSOR_MARKER,
     WrapChunk,
@@ -410,9 +411,9 @@ class Editor:
                     graphemes = iter_graphemes(after)
                     first = graphemes[0] if graphemes else ""
                     rest = after[len(first) :]
-                    display = before + marker + f"\x1b[7m{first}\x1b[27m" + rest
+                    display = before + marker + current_style().sgr("7") + first + current_style().sgr("27") + rest
                 else:
-                    display = before + marker + "\x1b[7m \x1b[27m"
+                    display = before + marker + current_style().sgr("7") + " " + current_style().sgr("27")
                     line_width += 1
                     if line_width > content_width and padding_x > 0:
                         cursor_in_padding = True
@@ -440,7 +441,7 @@ class Editor:
                 left = (
                     theme.fg_open(style.prompt_color or theme.EDITOR_BORDER)
                     + style.prompt_glyph
-                    + "\x1b[39m"
+                    + current_style().sgr("39")
                     + left_pad[glyph_w:]
                 )
         if self.is_empty() and style.placeholder:
@@ -451,7 +452,7 @@ class Editor:
             padding = (
                 theme.fg_open(style.placeholder_color or theme.MUTED_GRAY)
                 + segment
-                + "\x1b[39m"
+                + current_style().sgr("39")
                 + padding[segment_w:]
             )
         return left + display + padding + right_pad

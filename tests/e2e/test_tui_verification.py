@@ -394,10 +394,19 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
 # --- T13 + T06: 可见产物控制码清理 / 内核错误闭合工具卡 ------------------------------------------
 
 
-async def test_t13_visible_output_has_no_control_codes(tmp_path):
+@pytest.mark.parametrize("no_color,term", [(None, "xterm-256color"), ("1", "xterm-256color"),
+                                          (None, "dumb"), ("", "xterm-256color")])
+async def test_t13_visible_output_has_no_control_codes(tmp_path, monkeypatch, no_color, term):
+    monkeypatch.setenv("TERM", term)
+    if no_color is None:
+        monkeypatch.delenv("NO_COLOR", raising=False)
+    else:
+        monkeypatch.setenv("NO_COLOR", no_color)
     root = _repo(tmp_path)
+    # Console 直接写原始字节，绕开 PowerShell 按 TERM/NO_COLOR 格式化对象的降级。
+    # 工具真实捕获带 SGR 的输出后，UI 净化和规范历史保留才能分别被验证。
     inject_command = (
-        "Write-Output \"$([char]27)[35;46mINJ\"; "
+        "[Console]::Out.WriteLine(\"$([char]27)[35;46mINJ\"); "
         "Write-Output '[bold]not markup[/bold]'"
     )
     script = script_json(
@@ -412,6 +421,10 @@ async def test_t13_visible_output_has_no_control_codes(tmp_path):
         task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
         await _run_until_idle(session, stage, "输出一些不可信内容", requests=1)
         raw = "".join(stage.terminal.written)
+        if no_color is not None or term == "dumb":
+            assert all(code in ("\x1b[0m",) for code in re.findall(r"\x1b\[[0-9;]*m", raw))
+        else:
+            assert "38;2;" in raw, "有色组合确有样式"
         assert not VISIBLE_SGR_RE.search(raw), "可见问号控制码出现 (ESC 丢失形态)"
         assert "\x1b[35;46m" not in raw, "注入 SGR 不得进入最终可见输出"
         flat = stage.flat()

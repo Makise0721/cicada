@@ -20,12 +20,12 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from typing import TYPE_CHECKING, Mapping
 
 from cicada.ui import theme
+from cicada.ui.display_style import DisplayStyle
 from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.rendering import sanitize_display
 
@@ -117,12 +117,12 @@ def capture_welcome_facts(session: ApplicationSession) -> WelcomeFacts:
 
 
 def build_welcome_entry(
-    session: ApplicationSession, *, environ: Mapping[str, str] | None = None
+    session: ApplicationSession, *, environ: Mapping[str, str] | None = None,
+    display_style: DisplayStyle | None = None,
 ) -> WelcomeEntry:
     """捕获事实与局部无色策略 (规格 D5), 构造本视图唯一的欢迎条目。"""
-    env = os.environ if environ is None else environ
-    plain = "NO_COLOR" in env or env.get("TERM") == "dumb"
-    return WelcomeEntry(capture_welcome_facts(session), plain=plain)
+    style = display_style if display_style is not None else DisplayStyle.capture(environ)
+    return WelcomeEntry(capture_welcome_facts(session), plain=style.plain)
 
 
 class WelcomeEntry:
@@ -208,7 +208,8 @@ class WelcomeEntry:
         if role == "title":
             return f"\x1b[1m{line}\x1b[0m"
         if role == "dim":
-            return theme.fg(theme.MUTED_GRAY, line)
+            with DisplayStyle(plain=False).use():
+                return theme.fg(theme.MUTED_GRAY, line)
         return line  # section 段标题默认前景
 
 

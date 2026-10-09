@@ -41,6 +41,7 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.ui import theme
+from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.checks import artifact_line as _artifact_line_from_details
 from cicada.ui.main_screen import truncate_to_width, visible_width, word_wrap_line
 from cicada.ui.rendering import sanitize_display
@@ -48,10 +49,11 @@ from cicada.ui.rendering import sanitize_display
 # Pi FALLBACK_PREVIEW_LINES: 工具输出默认预览行数
 PREVIEW_LINES = 10
 
-# 卡背景 SGR (tui-aesthetics 规格 §B 取值, theme.py 为唯一来源)
-TOOL_BG_PENDING = theme.bg_open(theme.TOOL_BG_PENDING)
-TOOL_BG_SUCCESS = theme.bg_open(theme.TOOL_BG_SUCCESS)
-TOOL_BG_ERROR = theme.bg_open(theme.TOOL_BG_ERROR)
+# 遗留有色常量导出；实际渲染按当前会话策略生成，theme.py 为取值唯一来源。
+with DisplayStyle(plain=False).use():
+    TOOL_BG_PENDING = theme.bg_open(theme.TOOL_BG_PENDING)
+    TOOL_BG_SUCCESS = theme.bg_open(theme.TOOL_BG_SUCCESS)
+    TOOL_BG_ERROR = theme.bg_open(theme.TOOL_BG_ERROR)
 
 BOLD = "\x1b[1m"
 BOLD_OFF = "\x1b[22m"
@@ -79,9 +81,9 @@ _UI_FAILURES_MAX = 100
 CardStatus: TypeAlias = Literal["running", "success", "error"]
 
 _STATUS_BG: dict[str, str] = {
-    "running": TOOL_BG_PENDING,
-    "success": TOOL_BG_SUCCESS,
-    "error": TOOL_BG_ERROR,
+    "running": theme.TOOL_BG_PENDING,
+    "success": theme.TOOL_BG_SUCCESS,
+    "error": theme.TOOL_BG_ERROR,
 }
 
 # v2 卡面 (规格 §B): 状态符号 / 强调条与标题色 / 状态背景
@@ -177,7 +179,7 @@ class ToolDocument:
         self._args_by_call: dict[tuple[str, str], str] = {}
         self._expanded = False
         self._version = 0
-        self._cache: tuple[int, int, list[str]] | None = None
+        self._cache: tuple[int, int, DisplayStyle, list[str]] | None = None
         self.ui_failures: list[str] = []
 
     # --- 事件入口 ---------------------------------------------------------------
@@ -326,12 +328,13 @@ class ToolDocument:
         """按当前列宽产出全部工具卡的显示行 (含返回副本, 修改不影响缓存)。"""
         width = max(1, int(width))
         cached = self._cache
-        if cached is not None and cached[0] == width and cached[1] == self._version:
-            return list(cached[2])
+        style = current_style()
+        if cached is not None and cached[:3] == (width, self._version, style):
+            return list(cached[3])
         lines: list[str] = []
         for card in self._cards:
             lines.extend(self._render_card(card, width))
-        self._cache = (width, self._version, list(lines))
+        self._cache = (width, self._version, style, list(lines))
         return lines
 
     def _render_card(self, card: _ToolCard, width: int) -> list[str]:
@@ -342,7 +345,8 @@ class ToolDocument:
         \\x1b[0m 会连带清掉卡片背景, 不得出现。窄窗 (<6 列) 省略强调条。
         """
         status = card.status
-        bg = _STATUS_BG[status]
+        style = current_style()
+        bg = theme.bg_open(_STATUS_BG[status])
         bar_on = width >= _BAR_MIN_WIDTH
         content_w = max(1, width - 3) if bar_on else width
 
@@ -353,8 +357,8 @@ class ToolDocument:
                 text = truncate_to_width(text, content_w)
             pad = " " * max(0, content_w - visible_width(text))
             if bar_on:
-                return theme.bg_open(_STATUS_ACCENT[status]) + "  " + bg + " " + text + pad + RESET
-            return bg + text + pad + RESET
+                return theme.bg_open(_STATUS_ACCENT[status]) + "  " + bg + " " + text + pad + style.sgr("0")
+            return bg + text + pad + style.sgr("0")
 
         # Pi 组件先 addChild(Spacer(1)): 卡片之间隔一个无背景空行
         lines: list[str] = [""]
@@ -397,7 +401,7 @@ class ToolDocument:
         left, right = chunk[:split_at], chunk[split_at:]
         styled = ""
         if left:
-            styled += theme.fg_open(_STATUS_ACCENT[status]) + BOLD + left + BOLD_OFF
+            styled += theme.fg_open(_STATUS_ACCENT[status]) + current_style().sgr("1") + left + current_style().sgr("22")
         if right:
             styled += theme.fg_open(theme.TOOL_HINT_FG) + right
         return styled
@@ -461,15 +465,16 @@ class ToolCardEntry:
     def __init__(self, document: "ToolDocument", index: int) -> None:
         self._document = document
         self._index = index
-        self._cache: tuple[int, int, list[str]] | None = None
+        self._cache: tuple[int, int, DisplayStyle, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
         cached = self._cache
         version = self._document.version
-        if cached is not None and cached[0] == width and cached[1] == version:
-            return list(cached[2])
+        style = current_style()
+        if cached is not None and cached[:3] == (width, version, style):
+            return list(cached[3])
         lines = self._document.render_card(self._index, width)
-        self._cache = (width, version, list(lines))
+        self._cache = (width, version, style, list(lines))
         return lines
 
 
