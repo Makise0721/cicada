@@ -39,6 +39,9 @@
   预览 (transcript.stream_reasoning_delta); 状态行按真实事件区分等待模型/
   思考/输出, 屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
   ApplicationClosed 幂等封存活动运行未完成预览并清阶段, 迟到事件不复活。
+- thinking-budget-visibility 票据 03: 底栏经 FooterComponent budget 回调
+  常驻"最近预算"（总需求/上限/近似标记/输入来源；待评估/未启用/超限如实
+  降级）；/help 增加一句口径说明。只读 session.budget, 不新增刷新任务。
 """
 
 from __future__ import annotations
@@ -179,11 +182,13 @@ class ConversationView:
                 f"恢复为查看状态（新请求被拒绝）：{session.view_only_reason}"
             )
         self._unsubscribe = session.subscribe(self._on_application_update)
-        # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计
+        # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计;
+        # 03 (契约 C5): 预算回调每帧至多读取一次 session.budget, 底栏显示最近预算
         self.footer = FooterComponent(
             str(session.config.workspace),
             session.config.model_label,
             self.transcript.metrics_fact,
+            budget=lambda: self._session.budget,
             display_style=self.display_style,
         )
 
@@ -527,6 +532,10 @@ class ConversationView:
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
                 ("快捷键", [
                     "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
+                ]),
+                ("预算", [
+                    "底栏「最近预算」为最近一次评估的总需求（输入＋输出预留＋安全余量，"
+                    "~ 为近似）；估/锚/测/未 表示输入来源；完整分解与余量见 /status。",
                 ]),
             ])
             return True

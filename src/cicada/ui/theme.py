@@ -19,6 +19,10 @@ import os
 from collections.abc import Callable
 from io import StringIO
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cicada.budget import BudgetSnapshot
 
 from cicada.ui.main_screen import truncate_to_width, visible_width, word_wrap_line, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
@@ -261,12 +265,64 @@ def format_workspace(workspace: str) -> str:
     return workspace
 
 
+_BUDGET_SOURCE_LABELS = {
+    # 输入来源标签 (规格 D5): 完整 / 短; unknown 即使有数值也保留"输入未知" (契约 C5)
+    "estimated": ("输入估计", "估"),
+    "anchored": ("输入锚定", "锚"),
+    "measured": ("输入实测", "测"),
+    "unknown": ("输入未知", "未"),
+}
+
+
+def _budget_levels(snapshot: BudgetSnapshot | None) -> list[str]:
+    """最近预算段候选级别, 从完整到简略 (思考可见性规格 D6、契约 C5)。
+
+    数值/分母/近似标记只整段出现; 待评估/未启用不补 0; 快照与报告上限不一致
+    按待评估显示, 不拼接不同身份的数值。
+    """
+    if snapshot is None:
+        return ["预算未启用", "未启用"]
+    report = snapshot.report
+    if report is None:
+        # 无报告: 空间充足时显示已知上限, 不伪造占用 (C5)
+        return [
+            f"最近预算 待评估 · 上限 {format_tokens(snapshot.limit)}",
+            "预算 待评估",
+            "待评估",
+        ]
+    if snapshot.limit != report.limit:
+        return ["最近预算 待评估", "预算 待评估", "待评估"]
+    total, limit = report.total_estimate, report.limit
+    numbers = f"~{format_tokens(total)}/{format_tokens(limit)}"
+    long_source, short_source = _BUDGET_SOURCE_LABELS.get(report.source, ("输入未知", "未"))
+    percent = f"{total * 100 / limit:.1f}%"  # 原始整数计算, 一位小数, 不封顶
+    if total > limit:  # 超限由原始整数判定, 优先保留 (D5/D6)
+        return [
+            f"最近预算 超限 {numbers} · {percent} · {long_source}",
+            f"最近预算 超限 {numbers} · {long_source}",
+            f"预算 超限 {numbers} · {short_source}",
+            f"预算 超限 {numbers}",
+            "预算 超限",
+            "超限",
+        ]
+    return [
+        f"最近预算 {numbers} · {percent} · {long_source}",
+        f"最近预算 {short_source} {numbers}",
+        f"预算 {short_source} {numbers}",
+        f"预算 {short_source}",
+        "预算",
+    ]
+
+
 class FooterComponent:
-    """两行底栏: 行 1 工作区左 + 模型右 (同一行水平对齐), 行 2 计量左 (dim #808080)。
+    """两行底栏: 行 1 工作区左 + 模型右 (同一行水平对齐), 行 2 预算先 + 累计 (dim)。
 
     metrics 回调返回 (输入累计, 输入含缺失, 输出累计, 输出含缺失);
-    None 字段按规格省略, 有值但部分调用缺失时标注 (部分)。低高度
-    (rows < 12) 只保留单行 计量左 + 模型右, 工作区行让位给对话 (设计 §4)。
+    None 字段按规格省略, 有值但部分调用缺失时标注 (部分)。
+    budget 回调 (契约 C5) 返回应用只读预算快照, 每次 render 至多读取一次;
+    行 2 以最近预算为先, 完整累计放得下才追加。低高度 (rows < 12) 单行以
+    预算为先, 模型名仅在预算段完整保留时加入, 累计与工作区让位 (规格 D6)。
+    未注入 budget 的独立旧调用者保持原 两行/单行计量 行为。
     """
 
     def __init__(
@@ -274,12 +330,15 @@ class FooterComponent:
         workspace: str,
         model_label: str | None,
         metrics: Callable[[], tuple[int | None, bool, int | None, bool]],
-        *, display_style: DisplayStyle | None = None,
+        *,
+        budget: Callable[[], BudgetSnapshot | None] | None = None,
+        display_style: DisplayStyle | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else current_style()
         self._workspace = workspace
         self._model_label = model_label
         self._metrics = metrics
+        self._budget = budget
 
     def set_model_label(self, label: str | None) -> None:
         """模型选择发布后更新底栏为有效配置 (DeepSeek 04/契约 C7); 启动诊断不受影响。"""
@@ -301,6 +360,14 @@ class FooterComponent:
             joined = f"累计 {joined}"
         return joined
 
+    def _budget_segment(self, snapshot: BudgetSnapshot | None, width: int) -> str:
+        """按可用宽度取第一个放得下的预算级别; 极窄防御截断纯文字 (D6)。"""
+        levels = _budget_levels(snapshot)
+        for level in levels:
+            if visible_width(level) <= width:
+                return level
+        return truncate_to_width(levels[-1], width)
+
     def render(self, width: int, rows: int) -> list[str]:
         with self.display_style.use():
             return self._render(width, rows)
@@ -308,14 +375,31 @@ class FooterComponent:
     def _render(self, width: int, rows: int) -> list[str]:
         dim = FOOTER_DIM
         model = self._model_label or "不可得"
-        stats_left = self._stats_left()
-        # 先对纯文本排版再整体套样式: truncate_to_width 会剥离 SGR, 反向会丢 dim 色
+        if self._budget is None:
+            # 未注入预算回调的旧调用者: 原底栏行为 (契约 C5 兼容)
+            stats_left = self._stats_left()
+            if rows < 12:
+                # 低高度: 单行 计量左 + 模型右, 工作区行让位
+                return [fg(dim, _line_with_right(stats_left, model, width))]
+            # 模型是当前状态事实: 右端优先保留, 工作区路径按剩余宽度截断
+            first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
+            return [fg(dim, first), fg(dim, truncate_to_width(stats_left, width, "..."))]
+        snapshot = self._budget()  # 契约 C5: 每 render 至多读取一次
+        budget_seg = self._budget_segment(snapshot, width)
         if rows < 12:
-            # 低高度: 单行 计量左 + 模型右, 工作区行让位
-            return [fg(dim, _line_with_right(stats_left, model, width))]
-        # 模型是当前状态事实: 右端优先保留, 工作区路径按剩余宽度截断
+            # 低高度单行: 预算段完整保留优先, 模型放得下才右对齐加入 (D6)
+            if visible_width(budget_seg) + 2 + visible_width(model) <= width:
+                return [fg(dim, _line_with_right(budget_seg, model, width))]
+            return [fg(dim, truncate_to_width(budget_seg, width))]
+        # 行 1 维持工作区/模型; 行 2 预算为先, 完整累计放得下才追加 (D6)
         first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
-        return [fg(dim, first), fg(dim, truncate_to_width(stats_left, width, "..."))]
+        second = budget_seg
+        stats_left = self._stats_left()
+        if stats_left:
+            combined = f"{budget_seg} · {stats_left}"
+            if visible_width(combined) <= width:
+                second = combined
+        return [fg(dim, first), fg(dim, second)]
 
 
 def _line_with_right(left: str, right: str, width: int, *, keep_right: bool = False) -> str:

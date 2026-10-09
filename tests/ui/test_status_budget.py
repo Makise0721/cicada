@@ -66,6 +66,9 @@ async def test_status_budget_disabled_single_line_without_summary_section(tmp_pa
         assert "摘要计量" not in rendered and "压缩:" not in rendered
         headings = [heading for heading, _ in _status_sections(harness)]
         assert "预算" in headings and "摘要" not in headings
+        # 票据 03: 底栏经 session.budget 显示未启用事实, 不补 0 (A08)
+        footer = strip_terminal_sequences(harness.view.footer.render(80, 24)[1])
+        assert footer == "预算未启用"
     finally:
         await session.aclose()
 
@@ -178,8 +181,17 @@ async def test_status_budget_invalidated_after_clear_until_next_request(tmp_path
     session, model, _c, store = await _manual_session(tmp_path, script=script, store=persistent)
     harness = Harness(session)
     try:
+        # 票据 03 (A09): 底栏读 session.budget——首问前待评估, 请求后最近预算,
+        # 清空后退回待评估, 下一问恢复; 全程不新增刷新任务
+        def footer_segment() -> str:
+            return strip_terminal_sequences(harness.view.footer.render(100, 24)[1])
+
+        assert "待评估 · 上限 1.0M" in footer_segment(), "首问前待评估并显示已知上限"
         assert harness.submit("第一问")
         await harness.wait_request_done()
+        first = footer_segment()
+        assert first.startswith("最近预算 ~") and "输入估计" in first, "请求后显示最近预算"
+        assert "累计" in first, "累计与预算同段共存, 口径分开"
         assert harness.submit("/status")
         snapshot = session.budget
         assert snapshot is not None and snapshot.report is not None and snapshot.anchor is not None
@@ -190,6 +202,7 @@ async def test_status_budget_invalidated_after_clear_until_next_request(tmp_path
         assert await _wait_until(lambda: not harness.view._gate.clearing), "清空落定"
         cleared = session.budget
         assert cleared is not None and cleared.report is None and cleared.anchor is None
+        assert "待评估" in footer_segment() and "~" not in footer_segment(), "清空后退回待评估"
         assert session.history == ()
         assert harness.submit("/status")
         sections = _status_sections(harness)
@@ -202,6 +215,7 @@ async def test_status_budget_invalidated_after_clear_until_next_request(tmp_path
             assert "压缩: 0 次" in " ".join(_status_rows(harness)), "当前代次摘要段一致"
         assert harness.submit("第二问")
         await harness.wait_request_done()
+        assert "输入估计" in footer_segment(), "下一问后恢复最近预算"
         assert harness.submit("/status")
         current = session.budget
         assert current is not None and current.report is not None and current.anchor is not None
