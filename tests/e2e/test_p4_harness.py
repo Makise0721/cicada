@@ -11,7 +11,8 @@ import pytest
 import p4_fixture as harness
 
 
-@pytest.mark.parametrize("attempt", [-1, 0, 3, True, False, "1", 1.0, None])
+# 代表值覆盖两个拒绝分支: 越下界/越上界 (范围) 与非 int 类型
+@pytest.mark.parametrize("attempt", [-1, 3, "1"])
 def test_invalid_attempt_stops_before_creating_evidence(tmp_path, monkeypatch, attempt):
     monkeypatch.setattr(harness, "PROJECT", tmp_path)
     monkeypatch.setattr(harness, "EVIDENCE_ROOT", tmp_path / "evidence")

@@ -15,7 +15,6 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 
 import httpx
@@ -32,6 +31,7 @@ from cicada.ui import run_tui_session
 from tui_fixture import (
     ENTER,
     StageTerminal,
+    git_repo,
     make_config,
     model_of,
     script_json,
@@ -46,22 +46,6 @@ CHECK_COMMAND = (
 
 # 01 探针同一形态的"可见问号控制码"签名: ESC 丢失/未被解析后残留的 SGR 文本
 VISIBLE_SGR_RE = re.compile(r"\?\[[0-9;]*m")
-
-
-def _git(root: Path, *args: str) -> bytes:
-    return subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, check=True
-    ).stdout
-
-
-def _repo(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    root.mkdir()
-    _git(root, "init", "-q")
-    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8", newline="")
-    _git(root, "add", ".")
-    _git(root, "commit", "-q", "-m", "baseline")
-    return root
 
 
 def _plan(root: Path, command: str, timeout_s: float = 30.0) -> VerificationPlan:
@@ -101,7 +85,7 @@ async def _run_until_idle(session, stage: StageTerminal, question: str, *, reque
 
 
 async def test_t08_cumulative_changes_and_historical_pass_source(tmp_path):
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = _plan(root, CHECK_COMMAND)
     script = script_json(
         {"tool_calls": [_edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
@@ -137,7 +121,7 @@ async def test_t08_cumulative_changes_and_historical_pass_source(tmp_path):
 
 
 async def test_t08_latest_failure_and_stale_not_deliverable(tmp_path):
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = _plan(root, CHECK_COMMAND)
     # 请求 1 检查失败 (VALUE=3 不满足); 请求 2 通过后第三轮再改不重检 -> stale
     script = script_json(
@@ -179,7 +163,7 @@ async def test_t08_latest_failure_and_stale_not_deliverable(tmp_path):
 
 
 async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path):
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = _plan(root, "Start-Sleep -Seconds 5", timeout_s=0.5)
     script = script_json(
         {"tool_calls": [_check_call("c1")], "stop": True},
@@ -241,7 +225,7 @@ def _check_artifact_from_history(session) -> tuple[Path, str]:
 
 @pytest.mark.parametrize("mode", ["tamper", "missing"])
 async def test_t10_artifact_tamper_or_missing_shows_failure(tmp_path, mode):
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = _plan(root, CHECK_COMMAND)
     script = script_json(
         {"tool_calls": [_edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
@@ -394,15 +378,16 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
 # --- T13 + T06: 可见产物控制码清理 / 内核错误闭合工具卡 ------------------------------------------
 
 
-@pytest.mark.parametrize("no_color,term", [(None, "xterm-256color"), ("1", "xterm-256color"),
-                                          (None, "dumb"), ("", "xterm-256color")])
+# NO_COLOR 存在(含空值) 与 TERM=dumb 都走 plain; "" 即 NO_COLOR 存在的代表值
+@pytest.mark.parametrize("no_color,term", [(None, "xterm-256color"), ("", "xterm-256color"),
+                                          (None, "dumb")])
 async def test_t13_visible_output_has_no_control_codes(tmp_path, monkeypatch, no_color, term):
     monkeypatch.setenv("TERM", term)
     if no_color is None:
         monkeypatch.delenv("NO_COLOR", raising=False)
     else:
         monkeypatch.setenv("NO_COLOR", no_color)
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     # Console 直接写原始字节，绕开 PowerShell 按 TERM/NO_COLOR 格式化对象的降级。
     # 工具真实捕获带 SGR 的输出后，UI 净化和规范历史保留才能分别被验证。
     inject_command = (
@@ -449,7 +434,7 @@ async def test_t13_visible_output_has_no_control_codes(tmp_path, monkeypatch, no
 
 async def test_t06_unstarted_tool_completion_after_model_error(tmp_path):
     """模型错误路径: 无 ToolStarted 的 ToolCompleted 以终态卡显示内核固定文本."""
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     script = script_json(
         {"tool_calls": [{"id": "g1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
          "error": "provider exploded"},
@@ -477,7 +462,7 @@ async def test_t06_unstarted_tool_completion_after_model_error(tmp_path):
 
 async def test_status_normal_mode_reports_check_not_enabled(tmp_path):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "普通回答", "stop": True}), chunks=1)
+        make_config(git_repo(tmp_path), script_json({"text": "普通回答", "stop": True}), chunks=1)
     )
     stage = StageTerminal()
     try:

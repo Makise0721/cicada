@@ -30,6 +30,12 @@ def _assert_manifest_shape(manifest: dict, script: str) -> None:
     assert manifest["real_model_effect"] == "untested (spec D9)"
 
 
+def _assert_no_skills_baseline(model) -> None:
+    """无 Skills 基线: 固定配置提示前缀 (RunPolicy 其后追加有界验证状态段) + 既有完整工具名单."""
+    assert model.requests[0].system_prompt.startswith(fx.SYSTEM_PROMPT)
+    assert fx.declared_tools(model) == fx.EXPECTED_NO_SKILLS_TOOLS
+
+
 def _comparable(message) -> str:
     """请求投影可比形: RunPolicy 会在发送时对历史 check/powershell 结果重写
     freshness 标记行 (恢复后为 historical/unknown), 比较前剥离该行."""
@@ -60,10 +66,8 @@ async def test_scenario_a_multi_file_locate_and_fix(tmp_path):
     outcome = await session.execute("定位并修复摄氏转华氏缺陷, 使 check-1 通过")
     await session.aclose()
 
-    # 无 Skills 基线: 配置提示为固定文本 (RunPolicy 在其后追加有界验证状态段),
-    # 工具集合为既有完整名单
-    assert model.requests[0].system_prompt.startswith(fx.SYSTEM_PROMPT)
-    assert fx.declared_tools(model) == fx.EXPECTED_NO_SKILLS_TOOLS
+    # 无 Skills 基线: 配置提示为固定文本, 工具集合为既有完整名单
+    _assert_no_skills_baseline(model)
 
     expected = fx.SCENARIO_A_EXPECTED
     facts = fx.outcome_facts(outcome)
@@ -105,8 +109,7 @@ async def test_scenario_b_check_failure_then_fix(tmp_path):
     outcome = await session.execute("先运行 check-1, 修复缺陷后重检, 再做一次改动")
     await session.aclose()
 
-    assert model.requests[0].system_prompt.startswith(fx.SYSTEM_PROMPT)
-    assert fx.declared_tools(model) == fx.EXPECTED_NO_SKILLS_TOOLS
+    _assert_no_skills_baseline(model)
 
     expected = fx.SCENARIO_B_EXPECTED
     facts = fx.outcome_facts(outcome)
@@ -159,9 +162,8 @@ async def test_scenario_c_compaction_resume_continuation(tmp_path):
     session_id = session.persistence.session_id
     first = await session.execute("读取当前实现")
     second = await session.execute("运行 check-1")
-    # 无 Skills 基线: 固定配置提示 + 既有工具集合; 两进程声明一致
-    assert first_model.requests[0].system_prompt.startswith(fx.SYSTEM_PROMPT)
-    assert fx.declared_tools(first_model) == fx.EXPECTED_NO_SKILLS_TOOLS
+    # 无 Skills 基线: 两进程声明一致
+    _assert_no_skills_baseline(first_model)
     assert first.persistence.saved and second.persistence.saved
     old_receipt_ids = {
         r["receipt_id"] for r in fx.outcome_facts(second)["receipts"]
@@ -210,8 +212,7 @@ async def test_scenario_c_compaction_resume_continuation(tmp_path):
     third = await resumed.execute(prompt)
     sent = resumed_model.requests[0]
     # 恢复进程同样收到固定配置提示与一致的工具声明
-    assert sent.system_prompt.startswith(fx.SYSTEM_PROMPT)
-    assert fx.declared_tools(resumed_model) == fx.EXPECTED_NO_SKILLS_TOOLS
+    _assert_no_skills_baseline(resumed_model)
     # 历史工具不重放: 实际请求 = [摘要块] + 请求二规范消息 + 新 UserMessage;
     # 除 RunPolicy 请求时追加的 freshness 标记行外逐位一致
     assert [_comparable(m) for m in sent.messages] == [

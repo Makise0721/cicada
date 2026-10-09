@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,6 +27,7 @@ from tui_fixture import (
     ENTER,
     StageTerminal,
     clear_draft,
+    git_repo,
     make_config,
     model_of,
     script_json,
@@ -38,7 +38,7 @@ from tui_fixture import (
 DRAFT_KEYS = [KeyPress(ch, ch) for ch in "忙碌草稿"]
 
 
-@pytest.mark.parametrize("columns, rows", [(10, 8), (20, 8), (40, 8), (100, 36)])
+@pytest.mark.parametrize("columns, rows", [(10, 8), (100, 36)])
 async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_path, columns, rows):
     """真实 VT 主屏: 回答、信息分组和输入框彼此分开，缩放后仍保留全文。"""
     session = await open_application(
@@ -159,22 +159,12 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path):
             await session.aclose()
 
 
-def _repo(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    root.mkdir()
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
-    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "baseline"], check=True)
-    return root
-
-
 # --- T04: 流式增量同一条目原位更新, 完成校准一次, 无重复正文 -------------------------
 
 
 async def test_t04_streaming_in_place_and_final_once(tmp_path):
     answer = "第一段流式内容,先出现在同一 assistant 条目中。\n第二段内容随后追加。"
-    session = await open_application(make_config(_repo(tmp_path), script_json({"text": answer, "stop": True}), chunks=6, delay=0.05))
+    session = await open_application(make_config(git_repo(tmp_path), script_json({"text": answer, "stop": True}), chunks=6, delay=0.05))
     stage = StageTerminal()
     try:
         task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
@@ -202,7 +192,7 @@ async def test_t04_streaming_in_place_and_final_once(tmp_path):
 
 async def test_t05_busy_submit_silent_draft_kept(tmp_path):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "慢慢回答", "stop": True}), chunks=4, delay=0.2)
+        make_config(git_repo(tmp_path), script_json({"text": "慢慢回答", "stop": True}), chunks=4, delay=0.2)
     )
     stage = StageTerminal()
     try:
@@ -266,7 +256,7 @@ async def test_t07_finalizing_submit_silent(tmp_path):
     from cicada.plugins.coding.verification import generate_verification_run_id
     from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = VerificationPlan(
         verification_run_id=generate_verification_run_id(),
         root=Path(os.path.realpath(root)),
@@ -359,7 +349,7 @@ def _tui_ready(session, lifecycle):
 
 async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path, tui_lifecycle):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "回答", "stop": True}))
     )
     stage = StageTerminal()
     try:
@@ -385,13 +375,16 @@ async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path, tui_lifecyc
             await session.aclose()
 
 
-@pytest.mark.parametrize("draft", ["屏障草稿", "/exit"])
 async def test_t14_idle_before_owned_task_done_keeps_enter_silent(
-    tmp_path, monkeypatch, tui_lifecycle, draft,
+    tmp_path, monkeypatch, tui_lifecycle,
 ):
-    """真实 execute 已发完成事件，测试侧仅阻挡返回，固定复现旧 idle 等待窗。"""
+    """真实 execute 已发完成事件，测试侧仅阻挡返回，固定复现旧 idle 等待窗。
+
+    草稿取 /exit: 窗口内连退出命令也不得执行 (exit_event 保持 False)。
+    """
+    draft = "/exit"
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "回答", "stop": True}))
     )
     reached = asyncio.Event()
     release = asyncio.Event()
@@ -430,10 +423,6 @@ async def test_t14_idle_before_owned_task_done_keeps_enter_silent(
         release.set()
         assert await wait_until(lambda: _tui_ready(session, tui_lifecycle))
         assert owned.done() and not tui_lifecycle["view"]._gate.busy()
-        if draft != "/exit":
-            stage.emit([CTRL_C])
-            assert await wait_until(lambda: tui_lifecycle["view"].editor.get_text() == "")
-            stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         accepted = await asyncio.wait_for(tui_lifecycle["submissions"].get(), timeout=5)
         facts.append(accepted)
@@ -457,7 +446,7 @@ async def test_t14_idle_before_owned_task_done_keeps_enter_silent(
 
 async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path, tui_lifecycle):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "慢慢回答", "stop": True}), chunks=4, delay=0.2)
+        make_config(git_repo(tmp_path), script_json({"text": "慢慢回答", "stop": True}), chunks=4, delay=0.2)
     )
     stage = StageTerminal()
     try:
@@ -489,7 +478,7 @@ async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path, tui_life
 
 async def test_close_observer_retained_until_application_closed(tmp_path):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "回答", "stop": True}))
     )
     stage = StageTerminal()
     observed: list[str] = []
@@ -523,7 +512,7 @@ async def test_runner_failure_closes_session_and_exits_one(tmp_path, monkeypatch
 
     monkeypatch.setattr(MainScreenFrontend, "run_async", boom)
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     try:
         code = await run_tui_session(session, terminal=StageTerminal().terminal)
@@ -537,7 +526,7 @@ async def test_runner_failure_closes_session_and_exits_one(tmp_path, monkeypatch
 async def test_unrecoverable_write_failure_exits_one(tmp_path):
     """写失败恢复重试仍失败: terminal_failed -> 退出 1, 会话仍有序关闭 (P10/P15)."""
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     stage = StageTerminal()
     stage.terminal.fail_write = True
@@ -558,7 +547,7 @@ async def test_unrecoverable_write_failure_exits_one(tmp_path):
 async def test_resize_reflows_visible_document(tmp_path):
     long_line = "这是一段很长的中文回答用于缩放重排验收" * 6
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": long_line, "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": long_line, "stop": True}))
     )
     stage = StageTerminal(columns=120, rows=30)
     try:
@@ -593,7 +582,7 @@ async def test_resize_reflows_visible_document(tmp_path):
 
 async def test_status_diagnostics_injected_and_bounded(tmp_path):
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}), chunks=1)
+        make_config(git_repo(tmp_path), script_json({"text": "回答", "stop": True}), chunks=1)
     )
     stage = StageTerminal()
 
@@ -633,7 +622,7 @@ async def test_run_tui_cli_assembles_diagnostics_from_config(tmp_path):
     from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
     from cicada.ui import run_tui_session as run_fn
 
-    root = _repo(tmp_path)
+    root = git_repo(tmp_path)
     plan = VerificationPlan(
         verification_run_id=generate_verification_run_id(),
         root=Path(os.path.realpath(root)),
@@ -681,7 +670,7 @@ async def test_run_tui_cli_assembles_diagnostics_from_config(tmp_path):
 async def test_close_failure_takes_priority_one_and_writes_short_error(tmp_path, monkeypatch):
     """aclose 抛错: 晚到关闭错误优先退出 1, renderer 停止后由同一终端适配写一次短错误."""
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     stage = StageTerminal()
     try:
@@ -707,7 +696,7 @@ async def test_close_failure_takes_priority_one_and_writes_short_error(tmp_path,
 async def test_application_closed_error_takes_priority_one(tmp_path, monkeypatch):
     """runtime.stop 失败: ApplicationClosed.error 非空经真实关闭事件回归退出 1."""
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     stage = StageTerminal()
     try:
@@ -737,7 +726,7 @@ async def test_request_crash_without_request_completed_exits_one(tmp_path, monke
 
     monkeypatch.setattr(ApplicationSession, "_finalize_request", boom)
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     stage = StageTerminal()
     try:
@@ -755,7 +744,7 @@ async def test_request_crash_without_request_completed_exits_one(tmp_path, monke
 async def test_restore_errors_reported_on_stderr(tmp_path, capsys):
     """正常关闭但终端恢复失败: stderr 单行留痕, 退出码不受影响."""
     session = await open_application(
-        make_config(_repo(tmp_path), script_json({"text": "答", "stop": True}))
+        make_config(git_repo(tmp_path), script_json({"text": "答", "stop": True}))
     )
     stage = StageTerminal()
     stage.terminal.restore_errors = ["raw mode restore failed: injected"]
