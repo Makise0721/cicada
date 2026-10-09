@@ -203,6 +203,7 @@ async def test_enter_after_escape_timeout_is_fresh_submit():
 
 @pytest.mark.asyncio
 async def test_bracketed_paste_multiline_does_not_submit():
+    """paste 换行无误提交; 粘贴后普通 Enter 仍提交全文 (换行键机制回归哨兵)。"""
     h = Harness()
     try:
         await h.start()
@@ -210,6 +211,9 @@ async def test_bracketed_paste_multiline_does_not_submit():
         await h.settle()
         assert h.submitted == []
         assert h.editor.get_text() == "粘贴一\n粘贴二\n粘贴三"  # \r\n 归一化
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["粘贴一\n粘贴二\n粘贴三"]
     finally:
         await h.stop()
 
@@ -282,74 +286,6 @@ async def test_permanent_write_failure_sets_terminal_failed_and_exits():
     assert h.frontend.terminal_failed
     assert any("permanently" in f for f in h.frontend.ui_failures)
     assert h.terminal.stopped  # 终端恢复流程已执行
-
-
-def test_prompt_toolkit_size_failure_falls_back_to_last_good():
-    """适配层 get_size 失败: 记录失败并沿用上次良好值 (P10 故障矩阵)。"""
-    from prompt_toolkit.data_structures import Size
-
-    class FlakyOutput:
-        def __init__(self) -> None:
-            self.calls = 0
-            self.size = Size(rows=30, columns=100)
-
-        def get_size(self) -> Size:
-            self.calls += 1
-            if self.calls == 1:
-                raise OSError("injected size failure")
-            return self.size
-
-        def write_raw(self, data: str) -> None:
-            pass
-
-        def flush(self) -> None:
-            pass
-
-    from cicada.ui.terminal_io import PromptToolkitTerminal
-
-    output = FlakyOutput()
-    terminal = PromptToolkitTerminal(input=object(), output=output)
-    assert terminal.columns == 80  # 无良好值时回退默认并记录失败
-    assert any("get_size failed" in f for f in terminal.failures)
-    assert terminal.rows == 30  # 第三次成功后获得真实尺寸
-    assert terminal.columns == 100
-
-
-@pytest.mark.asyncio
-async def test_ctrl_c_and_ctrl_d_semantics():
-    h = Harness()
-    try:
-        await h.start()
-        h.terminal.emit(text_keys("草稿"))
-        h.terminal.emit([CTRL_C])
-        await h.settle()
-        assert h.ctrl_c_count == 1
-        h.terminal.emit([CTRL_D])  # 非空草稿: 不触发退出
-        await h.settle()
-        assert h.exit_requested is False
-        h.editor.clear()
-        await h.settle()
-        h.terminal.emit([CTRL_D])  # 空草稿: 退出
-        await h.settle()
-        assert h.exit_requested
-    finally:
-        await h.stop()
-
-
-@pytest.mark.asyncio
-async def test_backspace_and_undo_through_frontend():
-    h = Harness()
-    try:
-        await h.start()
-        h.terminal.emit(text_keys("中文abc"))
-        h.terminal.emit([BACKSPACE])  # 删 c
-        await h.settle()
-        assert h.editor.get_text() == "中文ab"
-        h.terminal.emit([KeyPress("\x1f", "\x1f")])  # Ctrl+_ 撤销
-        await h.settle()
-        assert h.editor.get_text() == "中文abc"
-    finally:
-        await h.stop()
 
 
 def test_prompt_toolkit_start_failure_rolls_back_partial_modes():
@@ -532,20 +468,6 @@ async def test_backspace_and_undo_through_frontend():
         h.terminal.emit([KeyPress("\x1f", "\x1f")])  # Ctrl+_ 撤销
         await h.settle()
         assert h.editor.get_text() == "中文abc"
-    finally:
-        await h.stop()
-
-
-@pytest.mark.asyncio
-async def test_plain_enter_after_paste_text_still_submits():
-    """换行键机制回归哨兵: 无 Shift 的 Enter 保持提交语义。"""
-    h = Harness()
-    try:
-        await h.start()
-        h.terminal.emit(text_keys("普通提交"))
-        h.terminal.emit([ENTER])
-        await h.settle()
-        assert h.submitted == ["普通提交"]
     finally:
         await h.stop()
 
