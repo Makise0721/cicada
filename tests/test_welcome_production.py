@@ -1,10 +1,10 @@
-"""tui-startup-welcome 票据 03 生产组合检查: 真实 CLI → 真实 run_tui_session.
+"""tui-startup-welcome 票据 03/04 生产组合检查: 真实 CLI → 真实 run_tui_session.
 
 A13/A10 三场景经真实入口组合 (cicada.__main__ → _run_tui →
 cicada.ui.run_tui_session → MainScreenFrontend), 终端经 PromptToolkitTerminal
 工厂接缝注入探针终端 (VT 屏镜像 + 观察-再-退出驱动); mock HTTP 零真实网络。
-断言真实 VT 画面含启动欢迎 (新会话七行 + 96 列宽窗左侧 28×6 标志 / 恢复
-三行无标志), 新请求体与 SQLite 存档不含欢迎文字 (A10), 首次配置场景向导
+断言真实 VT 画面含启动欢迎 (r2 Pi 风格: 新会话完整块段组, 无图标 / 恢复
+三行短版), 新请求体与 SQLite 存档不含欢迎文字 (A10), 首次配置场景向导
 终端先停、主屏终端后启动的顺序 owner 交接。生产代码零改动。
 """
 
@@ -213,10 +213,11 @@ def test_new_session_welcome_reaches_real_tui_screen(monkeypatch, tmp_path, requ
     assert events == ['main-start', 'main-stop']
     welcome = main.notes.get('welcome_text')
     assert welcome is not None, '主屏未出现新会话欢迎'
-    for needle in ('新会话 · 启动快照', '工作区:', '启动模型: deepseek-flash', '/help 帮助'):
+    for needle in ('新会话 · 启动快照', '[工作区]', '[启动模型]', '[Skills]', '/help 全部命令'):
         assert needle in welcome
+    assert not any(mark in welcome for mark in _LOGO_CHARS), 'r2 起全宽度无标志'
     title = main.notes['title_line']
-    assert any(mark in title[1:29] for mark in _LOGO_CHARS), '96 列宽窗标题行左侧 1..28 列含标志'
+    assert title.lstrip().startswith('Cicada '), 'r2 完整块标题无左侧图标缩进'
     assert main.notes.get('answer_seen'), 'mock 回答未上屏'
     assert len(requests) == 1 and requests[0][0] == 'Bearer file-sentinel-key'
     _assert_body_has_no_welcome(requests[0][1])
@@ -242,8 +243,7 @@ def test_resumed_session_welcome_has_no_logo_and_replies_again(monkeypatch, tmp_
     assert welcome is not None, '主屏未出现恢复欢迎'
     for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '/help 帮助 · /status 状态'):
         assert needle in welcome
-    title = main.notes['title_line']
-    assert not any(mark in title[1:29] for mark in _LOGO_CHARS), '恢复欢迎无标志'
+    assert not any(mark in welcome for mark in _LOGO_CHARS), '恢复短欢迎无标志'
     assert main.notes.get('restored_seen'), '恢复投影的旧记录不可见'
     assert main.notes.get('answer_seen'), '恢复后会话无法再提交新请求'
     assert len(requests) == 2 and requests[-1][0] == 'Bearer file-sentinel-key'

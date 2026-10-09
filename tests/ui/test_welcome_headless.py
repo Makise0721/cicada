@@ -1,9 +1,9 @@
-"""tui-startup-welcome 票据 02 无头前端检查: 宽窗标志、resize 与低高度编辑器可用性.
+"""tui-startup-welcome 无头前端检查: 完整块上屏、resize 与低高度编辑器可用性.
 
-A07 resize / A11 (02 范围): 真实 ApplicationSession + ConversationView.build 接缝 +
+A07 resize / A11: 真实 ApplicationSession + ConversationView.build 接缝 +
 MainScreenFrontend + FakeTerminal/VtScreen; fake 模型, 零真实模型调用。
-宽窗 28×6 标志进入真实 VT 画面; 96→48→96 resize 与 8/12/24 行低高度下
-输入/草稿/光标保留, 光标不移入标志区, resize 不增加欢迎条目。
+r2 (票据 04) 起欢迎区为无图标 Pi 风格段组: >=48 列同一 13 行完整块,
+96→40→96 resize 与 8/12/24 行低高度下输入/草稿/光标保留, resize 不增加欢迎条目。
 """
 
 from __future__ import annotations
@@ -86,11 +86,11 @@ def _force_color_env(monkeypatch) -> None:
     monkeypatch.setenv("TERM", "xterm-256color")
 
 
-# --- A09/A11: 宽窗标志进入真实画面, 编辑器与光标不受标志影响 -------------------------------------
+# --- r2/A11: 完整块段组进入真实画面, 编辑器与光标可用 -------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_wide_window_logo_beside_text_editor_cursor_usable(tmp_path, monkeypatch):
+async def test_wide_window_full_block_editor_cursor_usable(tmp_path, monkeypatch):
     _force_color_env(monkeypatch)
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True})))
@@ -100,14 +100,15 @@ async def test_wide_window_logo_beside_text_editor_cursor_usable(tmp_path, monke
         title_row = h.vt.find_row("新会话 · 启动快照")
         assert title_row is not None
         title_line = h.vt.line_text(title_row)
-        assert any(mark in title_line[:32] for mark in _LOGO_CHARS), "标题行左侧为标志"
-        assert title_line.index("Cicada ") == 32, "文字从第 32 列起 (1 缩进 + 28 标志 + 3 间隔)"
+        assert not any(mark in title_line for mark in _LOGO_CHARS), "r2 起无标志"
+        assert title_line.startswith("Cicada "), "r2 完整块无左侧图标缩进"
+        assert h.find("[工作区]") and h.find("[Skills]"), "段组上屏"
 
         h.terminal.emit(text_keys("草稿一"))
         await h.settle()
         draft_row = h.vt.find_row("草稿一")
-        assert draft_row is not None, "宽窗标志下草稿可输入"
-        assert h.vt.cursor_row == draft_row, "硬件光标在编辑器草稿行, 不移入标志区"
+        assert draft_row is not None, "完整块下草稿可输入"
+        assert h.vt.cursor_row == draft_row, "硬件光标在编辑器草稿行"
 
         h.terminal.emit([ENTER])
         assert await _wait_until(lambda: h.find("答")), "提交经原准入路径完成"
@@ -149,11 +150,11 @@ async def test_low_heights_keep_editor_draft_and_cursor(tmp_path, monkeypatch, r
     assert errors == []
 
 
-# --- A07/A11: 96→48→96 resize 重排, 草稿保留且欢迎不重复 ------------------------------------------
+# --- A07/A11: 96→40→96 resize 重排, 草稿保留且欢迎不重复 ------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_resize_96_48_96_rewraps_and_keeps_draft(tmp_path, monkeypatch):
+async def test_resize_96_40_96_rewraps_and_keeps_draft(tmp_path, monkeypatch):
     _force_color_env(monkeypatch)
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True})))
@@ -162,26 +163,25 @@ async def test_resize_96_48_96_rewraps_and_keeps_draft(tmp_path, monkeypatch):
         await h.start()
         title_row = h.vt.find_row("新会话 · 启动快照")
         assert title_row is not None
-        assert any(mark in h.vt.line_text(title_row)[:32] for mark in _LOGO_CHARS)
+        assert h.find("[工作区]"), "96 列为完整块段组"
 
         h.terminal.emit(text_keys("保留我"))
         await h.settle()
         assert h.find("保留我")
 
-        h.terminal.set_size(48, 24)  # 48 列: 48–87 档七行无标志
+        h.terminal.set_size(40, 24)  # 40 列: 24–47 档窄窗四行块 (无段组)
         await h.settle()
         assert h.find("保留我"), "resize 后草稿保留"
         assert h.find("/help 帮助")
+        assert h.vt.find_row("[工作区]") is None, "窄档无段组"
         # 行宽界在文档出口断言 (VT 屏镜像行恒 <= columns, 屏幕行断言恒真无证据力)
-        doc = h.view.document_lines(48)
-        assert all(visible_width(line) <= 48 for line in doc)
-        assert not any(mark in line for line in h.vt.screen_text() for mark in _LOGO_CHARS), "窄窗无标志"
+        doc = h.view.document_lines(40)
+        assert all(visible_width(line) <= 40 for line in doc)
 
-        h.terminal.set_size(96, 24)  # 回到宽窗: 标志恢复并排
+        h.terminal.set_size(96, 24)  # 回到宽窗: 完整块段组恢复
         await h.settle()
-        title_row = h.vt.find_row("新会话 · 启动快照")
-        assert title_row is not None
-        assert any(mark in h.vt.line_text(title_row)[:32] for mark in _LOGO_CHARS)
+        assert h.find("新会话 · 启动快照")
+        assert h.find("[工作区]")
         assert h.find("保留我")
         draft_row = h.vt.find_row("保留我")
         assert h.vt.cursor_row == draft_row, "resize 后光标回到编辑器草稿行"

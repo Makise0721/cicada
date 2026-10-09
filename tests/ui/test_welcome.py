@@ -1,9 +1,10 @@
-"""tui-startup-welcome 票据 01 检查: 文字欢迎区贯通.
+"""tui-startup-welcome 检查: 文字欢迎区贯通 (票据 01) 与 r2 Pi 风格排版 (票据 04).
 
-覆盖规格 A01–A07 与 A10 的 01 范围: 新建/恢复/空存档/view-only 启动快照、
-缺失值降级、思考决策表、宽度降级与行宽有界、控制字符清理、模型切换后
-启动快照保留、clear/compact/initial_prompt 不重复条目; 欢迎不发模型请求、
-不写历史/持久存档、不调用 login_view。真实 ApplicationSession + fake 模型 /
+覆盖规格 A01–A07 与 A10: 新建/恢复/空存档/view-only 启动快照、缺失值降级、
+思考决策表、宽度降级与行宽有界、控制字符清理、模型切换后启动快照保留、
+clear/compact/initial_prompt 不重复条目; 欢迎不发模型请求、不写历史/持久存档、
+不调用 login_view。r2: Pi 风格段组行序与样式 (标题加粗/低亮行/段标题默认前景)、
+>=48 各宽度同一无图标布局、资产模块退场。真实 ApplicationSession + fake 模型 /
 mock HTTP (DeepSeek), 零真实模型调用。
 """
 
@@ -11,7 +12,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import re
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,11 +81,12 @@ async def test_new_session_welcome_first_single_no_request_no_history(tmp_path):
         assert strip_terminal_sequences(lines[0]).startswith("Cicada ")
         text = _text(h)
         assert "新会话 · 启动快照" in text
-        assert f"工作区: {format_workspace(str(root))}" in text
-        assert "启动模型: fake · 思考 不可得" in text  # 无持久身份: 思考不可得
-        assert "指令: 未指定" in text
-        assert "Skills: 未启用" in text
-        assert "/help 帮助 · /model 模型 · /login 配置" in text
+        # r2: Pi 风格段组 (段标题 + 缩进内容行)
+        assert "[工作区]" in text and f"  {format_workspace(str(root))}" in text
+        assert "[启动模型]" in text and "  fake · 思考 不可得" in text  # 无持久身份: 思考不可得
+        assert "[指令]" in text and "  未指定" in text
+        assert "[Skills]" in text and "  未启用" in text
+        assert "/help 全部命令 · /model 模型 · /login 配置 · /status 状态" in text
         assert "Enter 发送 · Shift+Enter 换行" in text
     finally:
         h.close()
@@ -122,7 +123,8 @@ async def test_instructions_filename_shown(tmp_path):
     session = await open_application(config)
     h = Harness(session)
     try:
-        assert "指令: AGENTS.md" in _text(h)
+        text = _text(h)
+        assert "[指令]" in text and "  AGENTS.md" in text
     finally:
         h.close()
         await session.aclose()
@@ -138,8 +140,8 @@ async def test_skills_count_and_skill_entry_hint(tmp_path):
     h = Harness(session)
     try:
         text = _text(h)
-        assert "Skills: 2 个 · /skill 查看目录" in text
-        assert "指令: 未指定" in text
+        assert "  2 个 · /skill 查看目录" in text
+        assert "[指令]" in text and "  未指定" in text
     finally:
         h.close()
         await session.aclose()
@@ -154,7 +156,7 @@ async def test_empty_skills_dir_shows_zero_without_skill_command(tmp_path):
     h = Harness(session)
     try:
         text = _text(h)
-        assert "Skills: 0 个" in text
+        assert "  0 个" in text
         assert "/skill 查看目录" not in text
     finally:
         h.close()
@@ -197,7 +199,7 @@ async def test_thinking_decision_table(tmp_path, provider, think, options, expec
     )
     h = Harness(session)
     try:
-        assert f"启动模型: fake · 思考 {expected}" in _text(h)
+        assert f"  fake · 思考 {expected}" in _text(h)
     finally:
         h.close()
         await session.aclose()
@@ -253,12 +255,12 @@ async def test_model_change_keeps_startup_snapshot(tmp_path):
     session = await open_application(ds_config(root, httpx.MockTransport(handle)))
     h = Harness(session)
     try:
-        assert "启动模型: deepseek-flash · 思考 high" in _text(h)
+        assert "  deepseek-flash · 思考 high" in _text(h)
         assert h.submit("/model")
         h.view.confirm_model_selection("deepseek-v4-pro")
         assert await _wait_model_settled(h)
         rendered = _text(h)
-        assert "启动模型: deepseek-flash · 思考 high" in rendered  # 启动快照保留启动值
+        assert "  deepseek-flash · 思考 high" in rendered  # 启动快照保留启动值
         assert "已切换模型：deepseek-flash → deepseek-v4-pro" in rendered  # 确认条目反映新值
         footer = strip_terminal_sequences("\n".join(h.view.footer.render(80, 20)))
         assert "deepseek-v4-pro" in footer  # 底栏为有效配置
@@ -401,9 +403,10 @@ async def test_nonpersistent_clear_keeps_single_welcome(tmp_path):
 
 
 @pytest.mark.parametrize("width", [120, 96, 88, 87, 48])
-def test_full_block_seven_lines_within_width(width):
+def test_full_block_r2_layout_within_width(width):
+    """r2: 新会话完整块 (Pi 风格段组) 在所有 >=48 宽度同一布局, 行宽有界。"""
     lines = WelcomeEntry(_facts(), plain=True).render(width)
-    assert len(lines) == 8  # 1 行前导空行 + 七行文字块
+    assert len(lines) == 13  # 前导空行 + 标题/键位/命令/空行 + 四段组各两行
     assert lines[0] == ""
     assert "启动快照" in lines[1]
     assert all(visible_width(line) <= width for line in lines)
@@ -484,11 +487,17 @@ def test_plain_entry_outputs_no_escape_at_any_width():
 
 
 def test_color_entry_resets_every_styled_line():
+    """r2: 标题加粗, 键位/命令/段内容行 MUTED_GRAY 低亮, 段标题默认前景; 行末复位。"""
     lines = WelcomeEntry(_facts(), plain=False).render(80)
     assert lines[1].startswith("\x1b[1m") and lines[1].endswith("\x1b[0m")  # 标题加粗
     styled = [line for line in lines if "\x1b" in line]
-    assert len(styled) == 3  # 标题 + /help 行 + Enter 行
+    assert len(styled) == 7  # 标题 + 键位行 + 命令行 + 四个段内容行
     assert all(line.endswith("\x1b[0m") for line in styled)
+    dim = "\x1b[38;2;128;128;128m"  # theme.MUTED_GRAY
+    assert all(line.startswith(dim) for line in styled[1:]), "标题外着色行均为低亮"
+    for heading in ("[工作区]", "[启动模型]", "[指令]", "[Skills]"):
+        row = next(line for line in lines if heading in line)
+        assert "\x1b" not in row, "段标题默认前景零样式"
 
 
 async def test_capture_plain_policy_from_environment(tmp_path, monkeypatch):
@@ -524,8 +533,8 @@ async def test_control_characters_in_model_label_are_cleaned(tmp_path):
     try:
         raw = "\n".join(h.lines(80))
         assert "\x1b[31m" not in raw, "控制序列不得进入终端"
-        # 换行/Tab 折成空格: 单行内展示
-        assert "启动模型: fake红 绿 y · 思考 不可得" in _text(h)
+        # 换行/Tab 折成空格: 单行内展示 (r2: 启动模型段内容行)
+        assert "  fake红 绿 y · 思考 不可得" in _text(h)
     finally:
         h.close()
         await session.aclose()
@@ -553,7 +562,7 @@ async def test_welcome_text_not_in_model_requests_or_archive(tmp_path):
     archive = root / ".cicada" / "sessions"
     blobs = [p.read_bytes() for p in archive.rglob("*") if p.is_file()]
     assert blobs, "存档真实写入"
-    for marker in ("启动快照", "Shift+Enter", "/help 帮助"):
+    for marker in ("启动快照", "Shift+Enter", "[工作区]", "/help 全部命令"):
         assert all(marker.encode("utf-8") not in blob for blob in blobs)
 
 
@@ -579,72 +588,55 @@ def test_resume_fallback_without_persistence_uses_restored_facts():
     assert capture_welcome_facts(stub).resumed is False
 
 
-# --- 票据 02: A08/A09 宽窗图文并排、标志复位与资产白名单 (A12) ---------------------------------
-
-from cicada.ui.welcome_assets import LOGO_ASCII_28, LOGO_CELLS_28, LOGO_PALETTE
-
-_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
-_LOGO_VISIBLE_ROWS = tuple("".join(cell[0] for cell in row) for row in LOGO_CELLS_28)
-_WIDE_SGR_WHITELIST = {
-    "\x1b[0m",
-    "\x1b[1m",
-    f"\x1b[38;2;138;190;183m",  # theme.MD_CODE (命令/键位行)
-    *(
-        f"\x1b[{kind};2;{r};{g};{b}m"
-        for kind in ("38", "48")
-        for r, g, b in ((35, 103, 255), (21, 53, 147), (255, 255, 255))
-    ),
-}
+# --- 票据 04 (r2): Pi 风格完整块行序、段组样式与资产退场 -------------------------------------
 
 
-@pytest.mark.parametrize("width", [88, 96, 120])
 @pytest.mark.parametrize("plain", [True, False])
-def test_wide_layout_logo_beside_text_bounded(width, plain):
-    """宽窗新会话: 左缩进 1 + 28 列标志 + 3 列间隔 + 文字 (规格 D3 / 契约 C3)。"""
+def test_r2_full_block_line_order_and_indent(plain):
+    """r2 行序: 标题/键位/命令/空行 + [工作区]/[启动模型]/[指令]/[Skills] 段组 (内容缩进 2 列)。"""
+    lines = WelcomeEntry(_facts(), plain=plain).render(96)
+    visible = [strip_terminal_sequences(line) for line in lines]
+    assert visible[1].startswith("Cicada 0.1.0 · 新会话 · 启动快照")
+    assert visible[2].startswith("Enter 发送 · Shift+Enter 换行")
+    assert visible[3] == "/help 全部命令 · /model 模型 · /login 配置 · /status 状态"
+    assert visible[4] == ""
+    assert visible[5] == "[工作区]" and visible[6] == "  ~/codex_space/cicada"
+    assert visible[7] == "[启动模型]" and visible[8] == "  deepseek-flash · 思考 high"
+    assert visible[9] == "[指令]" and visible[10] == "  AGENTS.md"
+    assert visible[11] == "[Skills]" and visible[12] == "  3 个 · /skill 查看目录"
+
+
+@pytest.mark.parametrize(
+    ("skills_count", "expected"),
+    [(None, "  未启用"), (0, "  0 个"), (5, "  5 个 · /skill 查看目录")],
+)
+def test_r2_skills_section_three_states(skills_count, expected):
+    """Skills 段只显示三态计数, 不列名称 (用户故事 7)。"""
+    lines = WelcomeEntry(_facts(skills_count=skills_count), plain=True).render(96)
+    assert lines[12] == expected
+
+
+@pytest.mark.parametrize("width", [48, 87, 88, 96, 120])
+@pytest.mark.parametrize("plain", [True, False])
+def test_r2_same_layout_above_48_no_logo(width, plain):
+    """r2 起无图标: >=48 各宽度同一 13 行布局, 无标志字符残留。"""
     lines = WelcomeEntry(_facts(), plain=plain).render(width)
-    assert len(lines) == 8  # 前导空行 + 六行图文并排 + 第七行左侧空白
-    assert lines[0] == ""
+    assert len(lines) == 13
     assert all(visible_width(line) <= width for line in lines)
     visible = [strip_terminal_sequences(line) for line in lines]
-    expected_logo = LOGO_ASCII_28 if plain else _LOGO_VISIBLE_ROWS
-    for index in range(6):
-        row = visible[1 + index]
-        assert row[1:29] == expected_logo[index].ljust(28)
-        assert row[29:32] == "   "  # 间隔 3 列
-    assert visible[1][32:].startswith("Cicada ")  # 标题从第 32 列起
-    assert visible[7][:32].strip() == ""  # 第七行左侧为空白
-    assert "Enter 发送" in visible[7]
-
-
-def test_wide_colored_logo_sgr_whitelisted_and_reset_before_text():
-    """颜色逐行复位且不越界: SGR 全部在白名单, 标志着色在间隔前已复位。"""
-    lines = WelcomeEntry(_facts(), plain=False).render(96)
-    for line in lines:
-        sequences = set(_SGR_RE.findall(line))
-        assert sequences <= _WIDE_SGR_WHITELIST, sequences - _WIDE_SGR_WHITELIST
-        if "\x1b" in line:
-            # 最后一处复位之后只剩无样式纯文字 (颜色不越界到间隔/正文/下一条目)
-            assert not _SGR_RE.search(line.rsplit("\x1b[0m", 1)[-1])
-    for index in range(6):
-        body = lines[1 + index]
-        assert "\x1b[0m   " in body, "标志最后一处着色必须在三列间隔前复位"
-
-
-@pytest.mark.parametrize("width", [88, 96, 120])
-def test_wide_plain_outputs_no_escape(width):
-    entry = WelcomeEntry(_facts(), plain=True)
-    for line in entry.render(width):
-        assert "\x1b" not in line
+    assert not any(mark in line for line in visible for mark in "█▄▀")
 
 
 @pytest.mark.parametrize("plain", [True, False])
-def test_wide_resume_has_no_logo(plain):
-    """恢复依旧短版无标志 (宽窗同样三行文字块)。"""
+def test_r2_resume_short_block_has_no_sections(plain):
+    """恢复保持三行短版: 无段组、无键位行, 宽度档文案同 v1。"""
     lines = WelcomeEntry(_facts(resumed=True), plain=plain).render(96)
-    assert len(lines) == 4
     visible = [strip_terminal_sequences(line) for line in lines]
-    assert all(not any(mark in line for mark in "█▄▀") for line in visible)
+    assert len(lines) == 4
     assert "恢复会话 · 启动快照" in visible[1]
+    assert visible[2] == "启动模型: deepseek-flash · 思考 high"
+    assert visible[3] == "/help 帮助 · /status 状态"
+    assert not any(line.startswith("[") for line in visible)
     if plain:
         assert all("\x1b" not in line for line in lines)
 
@@ -652,48 +644,35 @@ def test_wide_resume_has_no_logo(plain):
 @pytest.mark.parametrize("width", [1, 2, 23, 24, 47, 48, 87, 88, 96, 120])
 @pytest.mark.parametrize("plain", [True, False])
 def test_a08_boundary_widths_bounded(width, plain):
-    """A08 阈值两侧全部有界; 行数按宽度档固定。"""
+    """A08 阈值两侧全部有界; 行数按宽度档固定 (r2: >=48 为 13 行完整块)。"""
     lines = WelcomeEntry(_facts(), plain=plain).render(width)
-    expected = 8 if width >= 48 else (5 if width >= 24 else 3)
+    expected = 13 if width >= 48 else (5 if width >= 24 else 3)
     assert len(lines) == expected
     assert all(visible_width(line) <= width for line in lines)
 
 
-@pytest.mark.parametrize("width", [88, 96, 120])
+@pytest.mark.parametrize("width", [48, 87, 88, 96, 120])
 @pytest.mark.parametrize("plain", [True, False])
-def test_wide_long_cjk_emoji_fields_bounded(width, plain):
+def test_r2_long_cjk_emoji_fields_bounded(width, plain):
     facts = _facts(
         workspace="~/工作区/" + "蝉" * 60 + "🪲" * 20,
         model_label="模型🪲" + "x" * 200,
     )
     lines = WelcomeEntry(facts, plain=plain).render(width)
-    assert len(lines) == 8
+    assert len(lines) == 13
     assert all(visible_width(line) <= width for line in lines)
-    assert "…" in strip_terminal_sequences(lines[2] + lines[3])  # 超长字段截断保留省略标记
+    assert "…" in strip_terminal_sequences(lines[6] + lines[8])  # 超长字段截断保留省略标记
 
 
-def test_a12_asset_whitelist_and_dimensions():
-    """生产资产为受控静态数据: 28×6, 字符/颜色白名单固定 (规格 D5)。"""
-    assert len(LOGO_CELLS_28) == 6
-    assert all(len(row) == 28 for row in LOGO_CELLS_28)
-    assert len(LOGO_ASCII_28) == 6
-    assert all(len(line) <= 28 for line in LOGO_ASCII_28)
-    assert set(LOGO_PALETTE) == {"blue", "navy", "white"}
-    for row in LOGO_CELLS_28:
-        for char, fg_color, bg_color in row:
-            assert char in {" ", "▀", "▄", "█"}
-            assert fg_color in {"blue", "navy", "white", None}
-            assert bg_color in {"blue", "navy", "white", None}
+def test_r2_no_asset_module_or_image_dependency():
+    """r2: 图标资产整体退场——无 welcome_assets 模块, 欢迎模块无设计目录/图片引用。"""
+    import importlib.util
 
-
-def test_a12_no_external_or_image_dependency():
-    """A12: 欢迎模块不引用设计目录/图片文件, 分发清单无 Pillow (运行时不读资产源)。"""
+    assert importlib.util.find_spec("cicada.ui.welcome_assets") is None
     import cicada.ui.welcome as welcome_module
-    import cicada.ui.welcome_assets as assets_module
 
-    for module in (welcome_module, assets_module):
-        source = Path(module.__file__).read_text(encoding="utf-8")
-        for marker in (".scratch", "PIL", "Pillow", "pillow", ".png", ".PNG"):
-            assert marker not in source, (module.__name__, marker)
+    source = Path(welcome_module.__file__).read_text(encoding="utf-8")
+    for marker in (".scratch", "PIL", "Pillow", "pillow", ".png", ".PNG", "welcome_assets"):
+        assert marker not in source, marker
     pyproject = Path(__file__).parents[2].joinpath("pyproject.toml").read_text(encoding="utf-8")
     assert "pillow" not in pyproject.lower()

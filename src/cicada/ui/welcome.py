@@ -1,15 +1,16 @@
-"""启动欢迎区 (tui-startup-welcome 票据 01): 一次捕获的启动快照与操作入口.
+"""启动欢迎区 (tui-startup-welcome; 票据 04 起为 r2 Pi 风格, 无图标).
 
-职责 (规格 D1–D6 / 契约 C1–C5):
+职责 (规格 D1–D6 + r2 修订 / 契约 C1–C5):
 - WelcomeFacts 是 ConversationView 初始化时一次捕获的不可变安全值 (版本/工作区/
   启动模型/思考/指令文件名/Skills 计数/恢复判定); 不持有 ApplicationConfig、
   LaunchIdentity 或凭据对象。事实只取自已发布的会话只读出口, 不读插件闭包,
   不调用 login_view。
 - WelcomeEntry 是 TranscriptEntry 实现, 每个 ConversationView 只追加一次。
-  新会话七行 (标题/工作区/启动模型与思考/指令/Skills/命令入口/键位), 恢复三行;
-  宽窗 (>=88 列) 新会话左侧并排 28×6 蝉标志 (有色真彩格 / plain ASCII 轮廓,
-  资产为 welcome_assets 受控静态数据), 恢复短版无标志; 24–47 列降为四行
-  (恢复两行), 1–23 列仅 Cicada 与 /help, 宽度 <= 0 返回空行集。
+  新会话完整块 (>=48 列, r2 Pi 风格): 加粗标题 + 低亮键位行 + 低亮命令入口行 +
+  空行 + [工作区]/[启动模型]/[指令]/[Skills] 四个段组 (段标题默认前景, 内容缩进
+  2 列低亮); 恢复会话三行短版 (不加段组)。24–47 列降为四行 (恢复两行),
+  1–23 列仅 Cicada 与 /help, 宽度 <= 0 返回空行集。r2 起无图标资产,
+  所有宽度共用同一文字布局。
 - 动态值捕获时先 sanitize_display、换行/Tab 折成空格、按字段上限裁剪; 渲染再按
   当前可见列宽截断。plain 策略 (捕获时 NO_COLOR 存在或 TERM=dumb) 输出零 ESC;
   有色模式只对截断后的文本套样式, 每行末尾一次复位, 不污染相邻条目。
@@ -27,7 +28,6 @@ from typing import TYPE_CHECKING, Mapping
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.rendering import sanitize_display
-from cicada.ui.welcome_assets import LOGO_ASCII_28, LOGO_CELLS_28, LOGO_PALETTE
 
 if TYPE_CHECKING:
     from cicada.application import ApplicationSession
@@ -42,47 +42,11 @@ _MAX_MODEL_CHARS = 128
 _MAX_INSTRUCTIONS_CHARS = 128
 _MAX_WORKSPACE_CHARS = 256
 
-_COMMANDS_LINE = "/help 帮助 · /model 模型 · /login 配置"
-_KEYS_LINE = "Enter 发送 · Shift+Enter 换行"
+# r2 文案 (Pi 风格; 行序固定, 规格 r2 修订)
+_KEYS_LINE = "Enter 发送 · Shift+Enter 换行 · Esc/Ctrl+C 中断 · Ctrl+D 退出 · / 命令 · Ctrl+O 展开"
+_COMMANDS_LINE = "/help 全部命令 · /model 模型 · /login 配置 · /status 状态"
 _RESUME_COMMANDS_LINE = "/help 帮助 · /status 状态"
 _HELP_LINE = "/help 帮助"
-
-# 宽窗并排排版 (规格 D3 / 契约 C3): 左缩进 1 + 标志 28 + 间隔 3 + 文字 + 右留白 1
-_WIDE_MIN_WIDTH = 88
-_LOGO_WIDTH = 28
-_LOGO_GAP = 3
-_LOGO_BLANK = " " * _LOGO_WIDTH
-
-
-def _color_logo_row(cells: tuple[tuple[str, str | None, str | None], ...]) -> str:
-    """同色连续段共享只开 SGR; 无着色段前先复位, 行末一次复位 (颜色不越界)。"""
-    parts: list[str] = []
-    current: tuple[str | None, str | None] = (None, None)
-    index = 0
-    while index < len(cells):
-        color = (cells[index][1], cells[index][2])
-        end = index
-        while end < len(cells) and (cells[end][1], cells[end][2]) == color:
-            end += 1
-        if color != current:
-            if current != (None, None):
-                parts.append("\x1b[0m")
-            fg, bg = color
-            if fg is not None:
-                parts.append(theme.fg_open(LOGO_PALETTE[fg]))
-            if bg is not None:
-                parts.append(theme.bg_open(LOGO_PALETTE[bg]))
-            current = color
-        parts.append("".join(cell[0] for cell in cells[index:end]))
-        index = end
-    if current != (None, None):
-        parts.append("\x1b[0m")
-    return "".join(parts)
-
-
-# 静态数据一次组装, render 只投影不再整形; ASCII 行尾空格补齐到 28 列
-_COLORED_LOGO_ROWS: tuple[str, ...] = tuple(_color_logo_row(row) for row in LOGO_CELLS_28)
-_PLAIN_LOGO_ROWS: tuple[str, ...] = tuple(line.ljust(_LOGO_WIDTH) for line in LOGO_ASCII_28)
 
 
 @dataclass(frozen=True)
@@ -172,53 +136,47 @@ class WelcomeEntry:
         """按当前宽度投影; 每行可见列宽 <= width, 宽度 <= 0 返回空行集。"""
         if width <= 0:
             return []
-        if width >= _WIDE_MIN_WIDTH and not self.facts.resumed:
-            return self._wide_lines(width)
-        lines = ["", *(
-            self._style(truncate_to_width(text, width), title=index == 0)
-            for index, text in enumerate(self._text_lines(width))
-        )]
-        return lines
+        return [
+            "",
+            *(
+                self._style(role, truncate_to_width(text, width))
+                for role, text in self._lines(width)
+            ),
+        ]
 
-    def _wide_lines(self, width: int) -> list[str]:
-        """宽窗新会话: 左缩进 1 + 28×6 标志 + 间隔 3 + 七行摘要; 第七行左侧空白。"""
-        text_budget = width - (1 + _LOGO_WIDTH + _LOGO_GAP + 1)
-        logo = _PLAIN_LOGO_ROWS if self._plain else _COLORED_LOGO_ROWS
-        lines = [""]
-        for index, text in enumerate(self._text_lines(width)):
-            left = logo[index] if index < len(logo) else _LOGO_BLANK
-            styled = self._style(truncate_to_width(text, text_budget), title=index == 0)
-            lines.append(" " + left + "   " + styled)
-        return lines
+    # --- 文案 (规格 D2/D4 + r2 行序, (角色, 文本) 对) ----------------------------------
 
-    # --- 文案 (规格 D2/D4, 行序固定) --------------------------------------------------
-
-    def _text_lines(self, width: int) -> list[str]:
+    def _lines(self, width: int) -> list[tuple[str, str]]:
         if width < 24:
-            return ["Cicada", "/help"]
+            return [("title", "Cicada"), ("dim", "/help")]
         if width < 48:
             if self.facts.resumed:
-                return ["Cicada · 恢复会话", _HELP_LINE]
+                return [("title", "Cicada · 恢复会话"), ("dim", _HELP_LINE)]
             return [
-                self._title(),
-                f"启动模型: {self._model()}",
-                f"指令: {self._instructions()} · Skills: {self._skills_brief()}",
-                _HELP_LINE,
+                ("title", self._title()),
+                ("dim", f"启动模型: {self._model()}"),
+                ("dim", f"指令: {self._instructions()} · Skills: {self._skills_brief()}"),
+                ("dim", _HELP_LINE),
             ]
         if self.facts.resumed:
             return [
-                self._title(),
-                f"启动模型: {self._model()} · 思考 {self.facts.thinking_label}",
-                _RESUME_COMMANDS_LINE,
+                ("title", self._title()),
+                ("dim", f"启动模型: {self._model()} · 思考 {self.facts.thinking_label}"),
+                ("dim", _RESUME_COMMANDS_LINE),
             ]
         return [
-            self._title(),
-            f"工作区: {self.facts.workspace}",
-            f"启动模型: {self._model()} · 思考 {self.facts.thinking_label}",
-            f"指令: {self._instructions()}",
-            self._skills_line(),
-            _COMMANDS_LINE,
-            _KEYS_LINE,
+            ("title", self._title()),
+            ("dim", _KEYS_LINE),
+            ("dim", _COMMANDS_LINE),
+            ("dim", ""),
+            ("section", "[工作区]"),
+            ("dim", f"  {self.facts.workspace}"),
+            ("section", "[启动模型]"),
+            ("dim", f"  {self._model()} · 思考 {self.facts.thinking_label}"),
+            ("section", "[指令]"),
+            ("dim", f"  {self._instructions()}"),
+            ("section", "[Skills]"),
+            ("dim", f"  {self._skills_content()}"),
         ]
 
     def _title(self) -> str:
@@ -235,23 +193,23 @@ class WelcomeEntry:
     def _skills_brief(self) -> str:
         return "未启用" if self.facts.skills_count is None else f"{self.facts.skills_count} 个"
 
-    def _skills_line(self) -> str:
+    def _skills_content(self) -> str:
         if self.facts.skills_count is None:
-            return "Skills: 未启用"
+            return "未启用"
         if self.facts.skills_count == 0:
-            return "Skills: 0 个"
-        return f"Skills: {self.facts.skills_count} 个 · /skill 查看目录"
+            return "0 个"
+        return f"{self.facts.skills_count} 个 · /skill 查看目录"
 
-    # --- 样式 (规格 D5): plain 零 ESC; 有色只套截断后文本, 行末一次复位 ------------------
+    # --- 样式 (规格 r2): plain 零 ESC; 有色只套截断后文本, 行末一次复位 -----------------
 
-    def _style(self, line: str, *, title: bool) -> str:
+    def _style(self, role: str, line: str) -> str:
         if self._plain or not line:
             return line
-        if title:
+        if role == "title":
             return f"\x1b[1m{line}\x1b[0m"
-        if line.startswith("/help") or line.startswith("Enter"):
-            return theme.fg(theme.MD_CODE, line)
-        return line
+        if role == "dim":
+            return theme.fg(theme.MUTED_GRAY, line)
+        return line  # section 段标题默认前景
 
 
 __all__ = ["WelcomeEntry", "WelcomeFacts", "build_welcome_entry", "capture_welcome_facts"]
