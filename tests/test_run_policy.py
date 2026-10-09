@@ -1,5 +1,6 @@
 """P4 05 应用层投影策略测试: 共享 VerificationService fake + 真实 ModelPort/MockTransport."""
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -17,8 +18,10 @@ from cicada.core.messages import (
     ToolResult,
     ToolResultMessage,
     UserMessage,
+    isolate_message,
 )
 from cicada.core.ports import ModelRequest, StreamDone, TextDelta, ToolContext, ToolSpec
+from cicada.persistence.codec import encode_messages
 from cicada.plugins.coding import process as coding_process
 from cicada.plugins.coding.inventory import GitInventory
 from cicada.plugins.coding.process import BoundedText, PowerShellRunner, ProcessResult
@@ -39,6 +42,10 @@ from cicada.plugins.ollama.model import OllamaModel
 from cicada.plugins.ollama.protocol import OllamaConfig
 from cicada.run_policy import (
     CONTROL_SECTION_MAX_BYTES,
+    HistoricalPrefixProof,
+    HistoricalProjection,
+    PrefixEntry,
+    PrefixViolation,
     RunPolicy,
     RunPolicyConfig,
     verification_policy,
@@ -250,6 +257,11 @@ async def test_system_section_reports_snapshot_and_check_state_within_budget():
     assert len(section.encode("utf-8")) <= CONTROL_SECTION_MAX_BYTES
     assert events[-1] == StreamDone("stop")
 
+    # 空原始 prompt: 控制段单独构成 system_prompt, 恰好追加一次
+    request2, _ = await projected_request(FakeVerificationService(make_view()), (UserMessage(text="go"),))
+    assert request2.system_prompt.startswith("<cicada-verification-state>")
+    assert request2.system_prompt.count("<cicada-verification-state>") == 1
+
 
 async def test_system_section_is_bounded_for_oversized_identifiers_and_reasons():
     # 默认界下靠字段膨胀超过 4096 需要极端输入; 这里用同一路径的收紧界证明截断与关键字段优先
@@ -319,12 +331,6 @@ async def test_unavailable_snapshot_reports_unknown_instead_of_claiming_current(
     assert REF not in request.system_prompt
 
 
-async def test_empty_original_prompt_yields_exactly_the_control_section():
-    request, _ = await projected_request(FakeVerificationService(make_view()), (UserMessage(text="go"),))
-    assert request.system_prompt.startswith("<cicada-verification-state>")
-    assert request.system_prompt.count("<cicada-verification-state>") == 1
-
-
 # --- 历史投影: receipt_id 账本关联 ---------------------------------------------
 
 
@@ -389,19 +395,6 @@ async def test_duplicate_model_call_ids_do_not_confuse_ledger_and_do_not_leak_re
     assert "stale=true" not in bodies[1].content
 
 
-async def test_original_message_objects_are_not_rewritten():
-    first = make_receipt("r-1")
-    view = make_view(states=(CheckState("check-1", receipt=first, freshness="current"),), receipts=(first,))
-    message = check_result("c1", "original content", receipt_id="r-1")
-    request = ModelRequest((message,), (), "sys")
-    policy = RunPolicy(RecordingModel(), FakeVerificationService(view))
-    async for _ in policy.stream(request, CancelToken()):
-        pass
-    assert message.result.content == "original content"
-    assert message.result.details == {"receipt_id": "r-1"}
-    assert request.system_prompt == "sys"
-
-
 async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
     """锁存路径同样不得改写原消息: id/name/顺序/正文一字不改, 只追加投影 marker."""
     view = make_view()  # 空账本: 所有 check 回执都是 unknown
@@ -449,6 +442,21 @@ async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
     assert messages[3].result.content == "check body"
     assert request.messages[2].result.content == messages[2].result.content
     assert request.system_prompt == "rules"
+
+    # 非锁存路径 (已知回执) 同样不改写原消息对象与传入请求
+    resolved = make_receipt("r-1")
+    resolved_view = make_view(
+        states=(CheckState("check-1", receipt=resolved, freshness="current"),), receipts=(resolved,)
+    )
+    known = check_result("c9", "original content", receipt_id="r-1")
+    known_request = ModelRequest((known,), (), "sys")
+    async for _ in RunPolicy(RecordingModel(), FakeVerificationService(resolved_view)).stream(
+        known_request, CancelToken()
+    ):
+        pass
+    assert known.result.content == "original content"
+    assert known.result.details == {"receipt_id": "r-1"}
+    assert known_request.system_prompt == "sys"
 
 
 async def test_missing_structured_receipt_is_unknown_and_latched_conservatively():
@@ -556,8 +564,10 @@ async def test_reliable_non_eof_latches_even_with_exit_code_zero():
     assert service.uncertain_reasons == [
         "powershell ended without reaching EOF; termination unproven"
     ]
-    # 锁存发生在 refresh 之前, 同一轮系统状态段已含 process_uncertain
+    # 锁存发生在 refresh 之前, 同一轮系统状态段已含 process_uncertain;
+    # 每轮一次 refresh, 扫描先于 refresh
     assert "process_uncertain: true" in request.system_prompt
+    assert len(service.refresh_calls) == 1
 
 
 async def test_unknown_receipt_id_never_skips_ledger_check():
@@ -638,35 +648,29 @@ async def test_trustworthy_terminal_facts_stay_clean():
     assert "process_uncertain: true" not in request.system_prompt
 
 
-async def test_known_receipt_in_ledger_resolves_check_identity():
-    """正例: 账本里能找到且自身终结可信的回执不需要锁存."""
+async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
+    """账本可核对且自身终结可信的回执不需要锁存 (check 与 powershell 同一分支); 幽灵回执锁存."""
     passed = make_receipt("r-1")
     view = make_view(states=(CheckState("check-1", receipt=passed, freshness="current"),), receipts=(passed,))
     service = FakeVerificationService(view)
-    result = check_result("c1", "PASS", receipt_id="r-1")
-    request, _ = await projected_request(service, (result,))
+    check_known = check_result("c1", "PASS", receipt_id="r-1")
+    request, _ = await projected_request(service, (check_known,))
     assert service.uncertain_reasons == []
     assert "process_uncertain: true" not in request.system_prompt
     assert "- none reported by the verification view" in request.system_prompt
     assert "freshness=current" in check_messages(request)[0].result.content
-    assert len(service.refresh_calls) == 1
 
-
-async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
-    """通用 powershell 结果同样按账本核对回执身份, 不因工具名不同而跳过."""
-    passed = make_receipt("r-1")
-    view = make_view(states=(CheckState("check-1", receipt=passed, freshness="current"),), receipts=(passed,))
-    service = FakeVerificationService(view)
+    service2 = FakeVerificationService(view)
     known = ToolResultMessage(
-        result=ToolResult("c1", "powershell", "out", details={"receipt_id": "r-1"})
+        result=ToolResult("c2", "powershell", "out", details={"receipt_id": "r-1"})
     )
-    request, _ = await projected_request(service, (known,))
-    assert service.uncertain_reasons == []
-    assert "process_uncertain: true" not in request.system_prompt
-    assert check_messages(request)[0].result.content.startswith("out\nCicada freshness: stale=false freshness=current")
+    request2, _ = await projected_request(service2, (known,))
+    assert service2.uncertain_reasons == []
+    assert "process_uncertain: true" not in request2.system_prompt
+    assert check_messages(request2)[0].result.content.startswith("out\nCicada freshness: stale=false freshness=current")
 
     ghost = ToolResultMessage(
-        result=ToolResult("c2", "powershell", "out", details={"receipt_id": "ghost"})
+        result=ToolResult("c3", "powershell", "out", details={"receipt_id": "ghost"})
     )
     service_ghost = FakeVerificationService(make_view())
     ghost_request, _ = await projected_request(service_ghost, (ghost,))
@@ -783,29 +787,6 @@ async def test_success_text_does_not_clear_latched_uncertainty_and_successes_are
     assert "process_uncertain: true" in request.system_prompt
 
 
-async def test_check_receipt_identity_alone_does_not_decide_termination():
-    """receipt_id 只是待核对身份: 账本里没有它就不能跳过终结核对."""
-    service = FakeVerificationService(make_view())
-    result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True, extra={"output_complete": False})
-    await projected_request(service, (result,))
-    assert len(service.uncertain_reasons) == 1
-    assert "not in the verification ledger" in service.uncertain_reasons[0]
-
-
-async def test_policy_scans_before_refresh_and_uses_one_view_per_stream():
-    service = FakeVerificationService(make_view())
-    result = ToolResultMessage(
-        result=ToolResult("c1", "powershell", "x", is_error=True, details={"output_complete": False})
-    )
-    model = RecordingModel()
-    policy = RunPolicy(model, service)
-    async for _ in policy.stream(ModelRequest((result,), ()), CancelToken()):
-        pass
-    assert len(service.refresh_calls) == 1
-    # 锁存发生在 refresh 之前: 同一轮系统状态段已含 process_uncertain
-    assert "process_uncertain: true" in model.requests[0].system_prompt
-
-
 async def test_already_cancelled_stream_sends_nothing_and_skips_refresh():
     service = FakeVerificationService(make_view())
     model = RecordingModel()
@@ -873,7 +854,6 @@ async def test_wire_request_cap_counts_projection_and_refuses_one_byte_over():
     tools = (ToolSpec("check", "run a check", {"type": "object"}),)
     service = FakeVerificationService(view)
 
-    at_limit = Qwen(service, limit=4096)
     # 先量出同一投影的真实 wire 字节, 再按差值把上限设成 恰好 / 恰好-1
     reference = Qwen(service)
     await reference.run(messages, tools, system_prompt="rules")
@@ -893,7 +873,6 @@ async def test_wire_request_cap_counts_projection_and_refuses_one_byte_over():
     assert dones[0].stop_reason == "error"
     assert f"{size} bytes" in dones[0].error
     assert f"{size - 1} bytes" in dones[0].error
-    assert at_limit is not None
 
 
 # --- bootstrap 公开组装入口 ----------------------------------------------------
@@ -1142,11 +1121,6 @@ async def test_real_service_execution_cancel_propagates_and_projection_latches(t
 
 
 def _prefix_entry(message, *, epoch_id="e1", request_id="q1", seq=2, receipt_id=None, run_id=None):
-    import hashlib
-
-    from cicada.persistence.codec import encode_messages
-    from cicada.run_policy import PrefixEntry
-
     return PrefixEntry(
         epoch_id=epoch_id, request_id=request_id, seq=seq,
         message_sha256=hashlib.sha256(encode_messages((message,)).encode("utf-8")).hexdigest(),
@@ -1155,9 +1129,6 @@ def _prefix_entry(message, *, epoch_id="e1", request_id="q1", seq=2, receipt_id=
 
 
 def test_proof_validate_rejects_missing_reorder_and_modification():
-    from cicada.core.messages import AssistantMessage, UserMessage, isolate_message
-    from cicada.run_policy import HistoricalPrefixProof, PrefixViolation
-
     prefix = (
         UserMessage(text="旧问"),
         check_result("c1", "旧检查输出", receipt_id="r-old"),
@@ -1202,8 +1173,6 @@ def test_proof_validate_rejects_missing_reorder_and_modification():
 
 async def test_prefix_walks_historical_path_without_current_ledger_latch():
     """A09: 前缀内旧回执不走当前账本核对 (不 ghost 锁存), 投影追加历史说明."""
-    from cicada.run_policy import HistoricalProjection
-
     prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
     proof_entries = (
         _prefix_entry(prefix[0]),
@@ -1233,9 +1202,6 @@ async def test_prefix_walks_historical_path_without_current_ledger_latch():
 
 async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():
     """A09: 新后缀逐字段复制旧回执也不获历史豁免 —— 仍按当前账本锁存."""
-    from cicada.core.messages import isolate_message
-    from cicada.run_policy import HistoricalProjection
-
     prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
     history = HistoricalProjection()
     history.proof = type(history.proof)(entries=(
@@ -1263,8 +1229,6 @@ async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():
 
 async def test_prefix_violation_refuses_before_any_request():
     """A09: 前缀被改动 -> 发送前拒绝, 内层模型零请求."""
-    from cicada.run_policy import HistoricalProjection, PrefixViolation
-
     prefix = (UserMessage(text="旧问"),)
     history = HistoricalProjection()
     history.proof = type(history.proof)(entries=(_prefix_entry(prefix[0]),))
@@ -1282,8 +1246,6 @@ async def test_prefix_violation_refuses_before_any_request():
 
 async def test_projection_reset_returns_all_messages_to_current_rules():
     """清空重置后前缀为空: 全部消息按当前规则扫描/核对."""
-    from cicada.run_policy import HistoricalProjection
-
     history = HistoricalProjection()
     history.proof = type(history.proof)(entries=(
         _prefix_entry(UserMessage(text="旧问")),),

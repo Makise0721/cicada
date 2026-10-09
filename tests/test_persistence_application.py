@@ -7,19 +7,56 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 import pytest
 
 from cicada.application import (
+    AgentEventReceived,
+    ApplicationConfig,
     ApplicationOpenError,
     ApplicationSession,
+    OperationBusy,
+    PersistenceConfig,
     RequestCompleted,
+    _admit_persistent_resume,
+    _build_prefix_proof,
     open_application,
 )
-from cicada.core.messages import UserMessage
-from cicada.persistence.contracts import LaunchIdentity, PersistenceError
+from cicada.boot import bootstrap
+from cicada.core.cancel import CancelToken
+from cicada.core.events import ToolStarted
+from cicada.core.messages import (
+    AssistantMessage,
+    ToolCall,
+    ToolResult,
+    ToolResultMessage,
+    UserMessage,
+)
+from cicada.core.ports import ModelMetrics, StreamDone, TextDelta, ToolSpec
+from cicada.persistence.codec import decode_identity
+from cicada.persistence.contracts import (
+    LaunchIdentity,
+    LeaseHeldError,
+    PersistenceError,
+    RecoverySnapshot,
+    RequestOutcomeFacts,
+    RestoredRequest,
+    StorageWriteError,
+    StoredIdentity,
+    StoredReceipt,
+)
+from cicada.plugins.coding.verification import generate_verification_run_id
+from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.plugins.fake_tools import fake_tools_plugin
+from cicada.plugins.session_store import open_session_store, session_store_plugin
+from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
+from cicada.run_policy import RunPolicy
+from cicada.runtime.plugin import PluginDefinition
 
 from test_application import _repo, _script  # 复用既有工作区/剧本构造
 from tests.support.app import identity as _identity, prompt_info as _prompt_info
@@ -27,8 +64,6 @@ from tests.support.app import identity as _identity, prompt_info as _prompt_info
 
 def _texts(messages) -> list[str]:
     """按消息类型取展示文本; 工具结果以 <tool:{name}> 标记."""
-    from cicada.core.messages import ToolResultMessage
-
     return [
         f"<tool:{m.result.name}>" if isinstance(m, ToolResultMessage) else m.text
         for m in messages
@@ -36,8 +71,6 @@ def _texts(messages) -> list[str]:
 
 
 def _config(root: Path, script: list, *, session_id: str | None):
-    from cicada.application import ApplicationConfig, PersistenceConfig
-
     return ApplicationConfig(
         workspace=root,
         system_prompt="test system prompt",
@@ -50,8 +83,6 @@ def _config(root: Path, script: list, *, session_id: str | None):
 
 
 def _plain_config(root: Path, script: list):
-    from cicada.application import ApplicationConfig
-
     return ApplicationConfig(
         workspace=root,
         system_prompt="test system prompt",
@@ -103,9 +134,6 @@ async def test_save_then_resume_new_process_continues_without_replay(tmp_path):
     tool_starts: list = []
 
     def on_event(update):
-        from cicada.application import AgentEventReceived
-        from cicada.core.events import ToolStarted
-
         if isinstance(update, AgentEventReceived) and isinstance(update.event, ToolStarted):
             tool_starts.append(update.event.name)
 
@@ -229,26 +257,6 @@ async def test_commit_failure_keeps_facts_latches_and_exit_code_one(tmp_path):
     await session.aclose()
 
 
-async def test_clear_commit_failure_keeps_memory_unchanged(tmp_path):
-    root = _repo(tmp_path)
-    session = await open_application(_config(root, _script({"text": "答", "stop": True}),
-                                            session_id=None))
-    await session.execute("问")
-    store = session._store
-
-    async def failing_clear(epoch_id):
-        raise PersistenceError("disk gone")
-
-    store.commit_clear = failing_clear  # type: ignore[method-assign]
-    with pytest.raises(RuntimeError, match="in-memory history is unchanged"):
-        await session.clear_context()
-    assert len(session.history) == 2
-    await session.aclose()
-
-
-# --- 清空边界 --------------------------------------------------------------------------------
-
-
 async def test_persistent_clear_requires_async_entry_and_restores_post_clear_history(tmp_path):
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script(
@@ -370,9 +378,6 @@ async def test_resume_with_config_conflict_names_fields(tmp_path):
     session_id = session.persistence.session_id
     await session.aclose()
 
-    from cicada.application import ApplicationConfig, PersistenceConfig
-    from dataclasses import replace as dc_replace
-
     other_identity = LaunchIdentity(
         provider="fake", model="fake", base_url=None, think=None, options={},
         max_turns=9, prompt_version="test", prompt_sha256="a" * 64,
@@ -412,10 +417,6 @@ async def test_resume_with_tool_fingerprint_mismatch_refused_and_lease_released(
 
 def _latest_epoch_identity(root: Path, session_id: str):
     """读存档最新 epoch 的身份; 用于核对差异记录通道."""
-    import sqlite3
-
-    from cicada.persistence.codec import decode_identity
-
     db = root / ".cicada" / "sessions" / f"{session_id}.sqlite3"
     connection = sqlite3.connect(str(db))
     try:
@@ -430,10 +431,6 @@ def _latest_epoch_identity(root: Path, session_id: str):
 
 async def test_resume_adopt_current_config_skips_conflict_and_records_epoch(tmp_path):
     """A11: 显式采用当前配置恢复——冲突不拒绝, 差异记入新 epoch, 历史与代次保持."""
-    from dataclasses import replace as dc_replace
-
-    from cicada.application import ApplicationConfig, PersistenceConfig
-
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
@@ -466,10 +463,6 @@ async def test_resume_adopt_current_config_skips_conflict_and_records_epoch(tmp_
 
 
 async def test_resume_adopt_current_config_without_differences_records_no_change(tmp_path):
-    from dataclasses import replace as dc_replace
-
-    from cicada.application import ApplicationConfig, PersistenceConfig
-
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
@@ -492,10 +485,6 @@ async def test_resume_adopt_current_config_without_differences_records_no_change
 
 async def test_resume_adopt_current_config_keeps_view_only(tmp_path):
     """A15: 显式配置覆盖不解除未证终结活动的查看状态."""
-    from dataclasses import replace as dc_replace
-
-    from cicada.application import ApplicationConfig, PersistenceConfig
-
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script(
         {"tool_calls": [{"id": "c1", "name": "powershell",
@@ -532,10 +521,6 @@ async def test_resume_adopt_current_config_adopts_changed_tool_fingerprint(
     tmp_path, monkeypatch
 ):
     """显式采用当前配置时工具指纹差异不拒绝 (当前启动整体被采用), 新指纹记入 epoch."""
-    from dataclasses import replace as dc_replace
-
-    from cicada.application import ApplicationConfig, PersistenceConfig
-
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
@@ -561,33 +546,8 @@ async def test_resume_adopt_current_config_adopts_changed_tool_fingerprint(
 
 def test_persistence_config_requires_launch_identity():
     """AC5: 无必要身份的持久编程调用拒绝; ephemeral 调用不受影响 (persistence=None)."""
-    from cicada.application import PersistenceConfig
-
     with pytest.raises(ValueError, match="LaunchIdentity"):
         PersistenceConfig(session_id=None, identity=None)  # type: ignore[arg-type]
-
-
-async def test_check_mode_with_persistence_opened_at_config(tmp_path):
-    """03: 检查模式 + 持久会话组合放开; 真实执行面由 A08/A10 集成测试覆盖."""
-    from cicada.application import ApplicationConfig, PersistenceConfig
-    from cicada.plugins.coding.verification import generate_verification_run_id
-    from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
-
-    root = _repo(tmp_path)
-    plan = VerificationPlan(
-        verification_run_id=generate_verification_run_id(),
-        root=Path(root),
-        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
-    )
-    config = ApplicationConfig(
-        workspace=root,
-        system_prompt="s",
-        prompt_info=_prompt_info(root),
-        model_plugin=fake_model_plugin(FakeModel([])),
-        plan=plan,
-        persistence=PersistenceConfig(session_id=None, identity=_identity()),
-    )
-    assert config.plan is not None
 
 
 # --- 02: 拓扑清理顺序与关闭拥有权 (A14) --------------------------------------------------------
@@ -595,9 +555,6 @@ async def test_check_mode_with_persistence_opened_at_config(tmp_path):
 
 def _recording_model_plugin(order: list, script: list):
     """带清理记录的 fake 模型插件定义; 清理顺序用于验证逆拓扑."""
-    from cicada.plugins.fake_model import FakeModel
-    from cicada.runtime.plugin import PluginDefinition
-
     model = FakeModel(script)
 
     def setup(ctx):
@@ -609,11 +566,7 @@ def _recording_model_plugin(order: list, script: list):
 
 async def test_persistent_topology_cleans_resources_before_store(tmp_path, monkeypatch):
     """A14: 显式 requires 的真实 open_application 装配 —— 模型先清理, store 最后释放."""
-    from dataclasses import replace as dc_replace
-
     import cicada.application as app_module
-    from cicada.application import PersistenceConfig
-    from cicada.plugins.session_store import open_session_store
 
     root = _repo(tmp_path)
     order: list[str] = []
@@ -651,8 +604,6 @@ class _GateTool:
     """受控 powershell 形工具: 真实结果形态, 执行等待闸门 (A14 反例的可控工具)."""
 
     def __init__(self, gate: asyncio.Event) -> None:
-        from cicada.core.ports import ToolSpec
-
         self._gate = gate
         self.spec = ToolSpec(name="powershell", description="gate", parameters={
             "type": "object", "properties": {},
@@ -660,8 +611,6 @@ class _GateTool:
         self.started = asyncio.Event()
 
     async def execute(self, arguments, ctx):
-        from cicada.core.messages import ToolResult
-
         self.started.set()
         await self._gate.wait()
         return ToolResult(
@@ -672,27 +621,14 @@ class _GateTool:
 
 
 def _identity_stored():
-    from cicada.persistence.contracts import StoredIdentity
-
     return StoredIdentity(launch=_identity(), tool_fingerprint="fp")
 
 
 async def _manual_persistent_session(tmp_path, script: list, tool, *, store, coordinator):
     """绕过 open_application 手工装配: 注入受控工具与受控事务 (A14 反例需要)."""
-    from cicada.application import (
-        ApplicationConfig,
-        ApplicationSession,
-        PersistenceConfig,
-        _bind_store_last_cleanup,
-    )
-    from cicada.boot import bootstrap
-    from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-    from cicada.plugins.fake_tools import fake_tools_plugin
-    from cicada.plugins.session_store import session_store_plugin
+    from cicada.application import _bind_store_last_cleanup
 
     def tool_policy(inner, runtime):
-        from cicada.process_activity import ProcessActivityWrapper
-
         return ProcessActivityWrapper(inner, store, coordinator)
 
     definitions = [session_store_plugin(store)]
@@ -717,12 +653,7 @@ async def _manual_persistent_session(tmp_path, script: list, tool, *, store, coo
 
 async def test_close_supervision_expiry_keeps_store_until_inflight_end_settles(tmp_path, monkeypatch):
     """A14 反例: 监督到期时 end 事务仍在 worker 在途 —— lease/连接不提前释放."""
-    import threading
-
     import cicada.application as app_module
-    from cicada.persistence.contracts import LeaseHeldError
-    from cicada.plugins.session_store import open_session_store
-    from cicada.process_activity import ActivityCoordinator
 
     store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     coordinator = ActivityCoordinator()
@@ -784,8 +715,6 @@ async def test_close_supervision_expiry_keeps_store_until_inflight_end_settles(t
 async def test_sealed_store_gives_late_writes_definitive_results(tmp_path, monkeypatch):
     """A14: 队列暂空即封店释放后, 迟到的 end/commit 得到明确拒绝, 不挂起不丢结果."""
     import cicada.application as app_module
-    from cicada.plugins.session_store import open_session_store
-    from cicada.process_activity import ActivityCoordinator
 
     store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     coordinator = ActivityCoordinator()
@@ -847,8 +776,6 @@ async def test_close_waits_for_inflight_clear_producer(tmp_path):
     assert session.state == "closed"
     assert session._close_problems == [], "清空生产者在监督窗口内完成, 不进关闭诊断"
     # 清空已落库: 重开存档代次前进
-    from cicada.plugins.session_store import open_session_store
-
     reopened = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
     )
@@ -923,8 +850,6 @@ async def test_begin_cancel_waits_for_result_then_closing_without_mislatch(tmp_p
     await session.aclose()
 
     # 事务已落库: pending intent 留在存档 (下次 start_epoch 标中断)
-    from cicada.plugins.session_store import open_session_store
-
     reopened = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
     )
@@ -954,7 +879,6 @@ async def test_begin_relation_conflict_not_latched_as_storage_failure(tmp_path, 
     # 对照: 真实写失败仍锁存
     session2 = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                              session_id=None))
-    from cicada.persistence.contracts import StorageWriteError
 
     async def write_failure(epoch_id, prompt):
         raise StorageWriteError("disk gone")
@@ -995,8 +919,6 @@ async def test_clear_cancel_syncs_memory_before_propagating(tmp_path):
     assert session.state == "idle", "清空生产者完成, 会话不进 closing"
     await session.aclose()
 
-    from cicada.plugins.session_store import open_session_store
-
     reopened = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
     )
@@ -1015,13 +937,7 @@ _CHECK_RUN = {"tool_calls": [{"id": "k1", "name": "check",
 
 def _check_config(root, entries, *, session_id=None, command="exit 0", timeout_s=30.0):
     """检查模式 + 持久会话的应用配置; 同一 root/检查定义保证 checks_signature 一致."""
-    from cicada.application import (
-        ApplicationConfig,
-        PersistenceConfig,
-        verification_checks_signature,
-    )
-    from cicada.plugins.coding.verification import generate_verification_run_id
-    from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
+    from cicada.application import verification_checks_signature
 
     checks = (CheckDefinition("check-1", command, timeout_s=timeout_s),)
     plan = VerificationPlan(
@@ -1038,8 +954,6 @@ def _check_config(root, entries, *, session_id=None, command="exit 0", timeout_s
 
 
 def _inner_model(session):
-    from cicada.run_policy import RunPolicy
-
     model = session._app.agent._model
     assert isinstance(model, RunPolicy)
     return model.inner
@@ -1047,8 +961,6 @@ def _inner_model(session):
 
 async def test_check_mode_save_resume_old_pass_is_historical_new_ledger_independent(tmp_path):
     """A08: 旧真实 PASS 回执恢复到新验证运行 —— 新运行/基线/账本独立, 旧 PASS 仅历史."""
-    from cicada.core.messages import ToolResultMessage
-
     root = _repo(tmp_path)
     session = await open_application(_check_config(root, (
         _CHECK_RUN, {"text": "已检查", "stop": True},
@@ -1096,8 +1008,6 @@ async def test_check_mode_save_resume_old_pass_is_historical_new_ledger_independ
     assert outcome3.view.receipts[0].receipt_id != old_receipt_id, "新回执与旧回执身份不同"
     await third.aclose()
 
-    from cicada.plugins.session_store import open_session_store
-
     store = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=session_id, workspace=root,
     )
@@ -1131,8 +1041,6 @@ async def test_prefix_tamper_after_resume_refuses_before_sending(tmp_path):
 
 async def test_check_then_clear_drops_context_keeps_display_and_receipts(tmp_path):
     """A10: 真实检查后清空 —— 保存恢复不复活旧上下文, 旧显示与回执保留."""
-    from cicada.application import OperationBusy
-
     root = _repo(tmp_path)
     session = await open_application(_check_config(root, (
         _CHECK_RUN, {"text": "已检查", "stop": True}, {"text": "清空后作答", "stop": True},
@@ -1168,8 +1076,6 @@ async def test_check_then_clear_drops_context_keeps_display_and_receipts(tmp_pat
     )
     assert resumed.persistence.restored_request_count == 2, "原始显示记录保留"
     await resumed.aclose()
-
-    from cicada.plugins.session_store import open_session_store
 
     store = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=session_id, workspace=root,
@@ -1210,8 +1116,6 @@ async def test_clear_failure_keeps_memory_and_prefix_proof(tmp_path):
 
 async def test_uncertain_latch_survives_clear_and_restore_is_view_only(tmp_path):
     """A15: 超时检查锁存 process_uncertain —— 清空不解锁, 恢复仅可查看且新服务同步."""
-    from cicada.core.cancel import CancelToken
-
     root = _repo(tmp_path)
     session = await open_application(_check_config(root, (
         _CHECK_RUN, {"text": "超时后作答", "stop": True},
@@ -1242,9 +1146,6 @@ async def test_uncertain_latch_survives_clear_and_restore_is_view_only(tmp_path)
 
 def test_admission_derives_view_only_from_untrusted_receipts_alone():
     """A15: 无未证活动时, 不可信回执单独构成跨恢复 process_uncertain 证据."""
-    from cicada.application import PersistenceConfig, _admit_persistent_resume
-    from cicada.persistence.contracts import RecoverySnapshot, StoredIdentity, StoredReceipt
-
     identity = _identity()
     snapshot = RecoverySnapshot(
         session_id="s", canonical_workspace="w", created_at=0.0, short_title="",
@@ -1269,13 +1170,6 @@ def test_admission_derives_view_only_from_untrusted_receipts_alone():
 
 def _proof_snapshot(messages, receipts):
     """构造带单一已提交请求的恢复快照 (直接喂 _build_prefix_proof)."""
-    from cicada.persistence.contracts import (
-        RecoverySnapshot,
-        RequestOutcomeFacts,
-        RestoredRequest,
-        StoredIdentity,
-        StoredReceipt,
-    )
     identity = _identity()
     return RecoverySnapshot(
         session_id="s", canonical_workspace="w", created_at=0.0, short_title="",
@@ -1293,8 +1187,6 @@ def _proof_snapshot(messages, receipts):
 
 
 def _check_messages_pair(receipt_id="r-1", *, details=None):
-    from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage
-
     if details is None:
         details = {"receipt_id": receipt_id, "exit_code": 0, "timed_out": False,
                    "cancelled": False, "output_complete": True}
@@ -1308,8 +1200,6 @@ def _check_messages_pair(receipt_id="r-1", *, details=None):
 
 
 def _stored(receipt_id="r-1", **overrides):
-    from cicada.persistence.contracts import StoredReceipt
-
     fields = dict(
         verification_run_id="run-old", receipt_id=receipt_id, epoch_id="e1",
         request_id="q1", definition_fingerprint="f" * 64, execution_status="exited",
@@ -1322,8 +1212,6 @@ def _stored(receipt_id="r-1", **overrides):
 
 def test_prefix_proof_rejects_missing_and_mismatched_receipt_facts():
     """契约 §5 恢复关系错误: 回执缺失 / 事实与消息矛盾 -> 拒绝, 模型零请求."""
-    from cicada.application import ApplicationOpenError, _build_prefix_proof
-
     # 回执缺失
     with pytest.raises(ApplicationOpenError, match="not in the archive"):
         _build_prefix_proof(_proof_snapshot(_check_messages_pair("r-missing"), ()))
@@ -1343,12 +1231,8 @@ def test_prefix_proof_rejects_missing_and_mismatched_receipt_facts():
 
 def test_prefix_proof_rejects_requests_not_reconstructing_history():
     """requests 拼接与 canonical_history 逐位置不符 -> 关系错误 (显式校验)."""
-    from cicada.application import ApplicationOpenError, _build_prefix_proof
-
     snapshot = _proof_snapshot(_check_messages_pair(), (_stored(),))
     # 篡改 canonical_history 使与 requests 分叉 (条数相同内容不同)
-    from dataclasses import replace as dc_replace
-
     tampered = dc_replace(
         snapshot,
         canonical_history=(UserMessage(text="被改写的问"),) + snapshot.canonical_history[1:],
@@ -1364,10 +1248,6 @@ async def test_close_during_request_run_commit_still_saved(tmp_path):
     提交派发先于 store 释放, 不因关闭产生 StorageUnavailableError 误锁
     storage_failed (与摘要路径 PA05 的关闭取消口径一致)。
     """
-    from dataclasses import replace as dc_replace
-
-    from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
-
     release = asyncio.Event()
 
     class _GatedModel:
