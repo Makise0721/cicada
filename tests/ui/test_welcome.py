@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -575,3 +576,123 @@ def test_resume_fallback_without_persistence_uses_restored_facts():
     assert capture_welcome_facts(stub).resumed is True
     stub.restored_requests = ()
     assert capture_welcome_facts(stub).resumed is False
+
+
+# --- 票据 02: A08/A09 宽窗图文并排、标志复位与资产白名单 (A12) ---------------------------------
+
+from cicada.ui.welcome_assets import LOGO_ASCII_28, LOGO_CELLS_28, LOGO_PALETTE
+
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LOGO_VISIBLE_ROWS = tuple("".join(cell[0] for cell in row) for row in LOGO_CELLS_28)
+_WIDE_SGR_WHITELIST = {
+    "\x1b[0m",
+    "\x1b[1m",
+    f"\x1b[38;2;138;190;183m",  # theme.MD_CODE (命令/键位行)
+    *(
+        f"\x1b[{kind};2;{r};{g};{b}m"
+        for kind in ("38", "48")
+        for r, g, b in ((35, 103, 255), (21, 53, 147), (255, 255, 255))
+    ),
+}
+
+
+@pytest.mark.parametrize("width", [88, 96, 120])
+@pytest.mark.parametrize("plain", [True, False])
+def test_wide_layout_logo_beside_text_bounded(width, plain):
+    """宽窗新会话: 左缩进 1 + 28 列标志 + 3 列间隔 + 文字 (规格 D3 / 契约 C3)。"""
+    lines = WelcomeEntry(_facts(), plain=plain).render(width)
+    assert len(lines) == 8  # 前导空行 + 六行图文并排 + 第七行左侧空白
+    assert lines[0] == ""
+    assert all(visible_width(line) <= width for line in lines)
+    visible = [strip_terminal_sequences(line) for line in lines]
+    expected_logo = LOGO_ASCII_28 if plain else _LOGO_VISIBLE_ROWS
+    for index in range(6):
+        row = visible[1 + index]
+        assert row[1:29] == expected_logo[index].ljust(28)
+        assert row[29:32] == "   "  # 间隔 3 列
+    assert visible[1][32:].startswith("Cicada ")  # 标题从第 32 列起
+    assert visible[7][:32].strip() == ""  # 第七行左侧为空白
+    assert "Enter 发送" in visible[7]
+
+
+def test_wide_colored_logo_sgr_whitelisted_and_reset_before_text():
+    """颜色逐行复位且不越界: SGR 全部在白名单, 标志着色在间隔前已复位。"""
+    lines = WelcomeEntry(_facts(), plain=False).render(96)
+    for line in lines:
+        sequences = set(_SGR_RE.findall(line))
+        assert sequences <= _WIDE_SGR_WHITELIST, sequences - _WIDE_SGR_WHITELIST
+        if "\x1b" in line:
+            # 最后一处复位之后只剩无样式纯文字 (颜色不越界到间隔/正文/下一条目)
+            assert not _SGR_RE.search(line.rsplit("\x1b[0m", 1)[-1])
+    for index in range(6):
+        body = lines[1 + index]
+        assert "\x1b[0m   " in body, "标志最后一处着色必须在三列间隔前复位"
+
+
+@pytest.mark.parametrize("width", [88, 96, 120])
+def test_wide_plain_outputs_no_escape(width):
+    entry = WelcomeEntry(_facts(), plain=True)
+    for line in entry.render(width):
+        assert "\x1b" not in line
+
+
+@pytest.mark.parametrize("plain", [True, False])
+def test_wide_resume_has_no_logo(plain):
+    """恢复依旧短版无标志 (宽窗同样三行文字块)。"""
+    lines = WelcomeEntry(_facts(resumed=True), plain=plain).render(96)
+    assert len(lines) == 4
+    visible = [strip_terminal_sequences(line) for line in lines]
+    assert all(not any(mark in line for mark in "█▄▀") for line in visible)
+    assert "恢复会话 · 启动快照" in visible[1]
+    if plain:
+        assert all("\x1b" not in line for line in lines)
+
+
+@pytest.mark.parametrize("width", [1, 2, 23, 24, 47, 48, 87, 88, 96, 120])
+@pytest.mark.parametrize("plain", [True, False])
+def test_a08_boundary_widths_bounded(width, plain):
+    """A08 阈值两侧全部有界; 行数按宽度档固定。"""
+    lines = WelcomeEntry(_facts(), plain=plain).render(width)
+    expected = 8 if width >= 48 else (5 if width >= 24 else 3)
+    assert len(lines) == expected
+    assert all(visible_width(line) <= width for line in lines)
+
+
+@pytest.mark.parametrize("width", [88, 96, 120])
+@pytest.mark.parametrize("plain", [True, False])
+def test_wide_long_cjk_emoji_fields_bounded(width, plain):
+    facts = _facts(
+        workspace="~/工作区/" + "蝉" * 60 + "🪲" * 20,
+        model_label="模型🪲" + "x" * 200,
+    )
+    lines = WelcomeEntry(facts, plain=plain).render(width)
+    assert len(lines) == 8
+    assert all(visible_width(line) <= width for line in lines)
+    assert "…" in strip_terminal_sequences(lines[2] + lines[3])  # 超长字段截断保留省略标记
+
+
+def test_a12_asset_whitelist_and_dimensions():
+    """生产资产为受控静态数据: 28×6, 字符/颜色白名单固定 (规格 D5)。"""
+    assert len(LOGO_CELLS_28) == 6
+    assert all(len(row) == 28 for row in LOGO_CELLS_28)
+    assert len(LOGO_ASCII_28) == 6
+    assert all(len(line) <= 28 for line in LOGO_ASCII_28)
+    assert set(LOGO_PALETTE) == {"blue", "navy", "white"}
+    for row in LOGO_CELLS_28:
+        for char, fg_color, bg_color in row:
+            assert char in {" ", "▀", "▄", "█"}
+            assert fg_color in {"blue", "navy", "white", None}
+            assert bg_color in {"blue", "navy", "white", None}
+
+
+def test_a12_no_external_or_image_dependency():
+    """A12: 欢迎模块不引用设计目录/图片文件, 分发清单无 Pillow (运行时不读资产源)。"""
+    import cicada.ui.welcome as welcome_module
+    import cicada.ui.welcome_assets as assets_module
+
+    for module in (welcome_module, assets_module):
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        for marker in (".scratch", "PIL", "Pillow", "pillow", ".png", ".PNG"):
+            assert marker not in source, (module.__name__, marker)
+    pyproject = Path(__file__).parents[2].joinpath("pyproject.toml").read_text(encoding="utf-8")
+    assert "pillow" not in pyproject.lower()
