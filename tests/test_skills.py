@@ -42,7 +42,6 @@ from cicada.skills import (
     decode_skill_request,
     find_skill,
     manifest_json,
-    manifest_sha256,
     render_skill_request,
 )
 
@@ -150,8 +149,7 @@ def test_discovers_sorted_documents_with_normalized_body(tmp_path):
     assert snapshot.documents[0].info.base_dir == str(root / "alpha")
     assert snapshot.root == str(root)
     assert snapshot.diagnostics == ()
-    # manifest 确定性: 两次加载一致; JSON 版本固定
-    assert snapshot.manifest_sha256 == manifest_sha256(snapshot.root, snapshot.documents)
+    # manifest JSON 版本固定; 跨加载稳定性另见 empty_root 用例
     assert json.loads(manifest_json(snapshot.root, snapshot.documents))["version"] == (
         MANIFEST_VERSION
     )

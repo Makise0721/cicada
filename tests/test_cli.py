@@ -263,16 +263,13 @@ def test_normal_mode_has_no_request_limit(tmp_path):
 
 
 def test_tui_non_tty_rejected_with_clear_exit(tmp_path):
-    # 子进程 stdin/stdout 均为管道: --tui 必须给出明确退出码 2
-    proc = run_cli("--tui", "--workspace", str(tmp_path))
-    assert proc.returncode == 2
-    assert "交互式终端" in proc.stderr
-
-
-def test_tui_non_tty_rejected_even_with_prompt(tmp_path):
-    proc = run_cli("--tui", "--workspace", str(tmp_path), "首问")
-    assert proc.returncode == 2
-    assert "交互式终端" in proc.stderr
+    # 子进程 stdin/stdout 均为管道: --tui 必须给出明确退出码 2;
+    # 无 prompt 时也先于「缺少 prompt」拒绝
+    for args in (["--tui", "--workspace", str(tmp_path)],
+                 ["--tui", "--workspace", str(tmp_path), "首问"]):
+        proc = run_cli(*args)
+        assert proc.returncode == 2
+        assert "交互式终端" in proc.stderr
 
 
 def test_single_mode_requires_prompt(tmp_path):
@@ -635,7 +632,8 @@ def _run_main_with_storage_failure(tmp_path, monkeypatch, method: str):
         # 真实落盘故障类; 裸 PersistenceError 在 02 后按关系冲突分类, 不再锁存
         raise StorageWriteError("disk gone")
 
-    monkeypatch.setattr(SQLiteSessionStore, method, failing)
+    original = getattr(SQLiteSessionStore, method)
+    setattr(SQLiteSessionStore, method, failing)
     out, err = _CaptureStream(), _CaptureStream()
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
@@ -644,37 +642,25 @@ def _run_main_with_storage_failure(tmp_path, monkeypatch, method: str):
         ["cicada", "--workspace", str(tmp_path), "--script", str(script),
          "--save-session", "任务"],
     )
-    code = m.main()
+    try:
+        code = m.main()
+    finally:
+        setattr(SQLiteSessionStore, method, original)
     return code, err.value
 
 
-def test_begin_save_failure_exits_one(tmp_path, monkeypatch):
-    code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, "begin_request")
-    assert code == 1, err
-    assert "session save failed before the request started" in err
-
-
-def test_commit_save_failure_exits_one(tmp_path, monkeypatch):
-    code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, "commit_request")
-    assert code == 1, err
-    assert "[session save failed:" in err
+def test_save_failure_exits_one(tmp_path, monkeypatch):
+    """begin/commit 两处保存故障注入: 执行期间保存失败退出码 1 (契约 §6)."""
+    for method, marker in (
+        ("begin_request", "session save failed before the request started"),
+        ("commit_request", "[session save failed:"),
+    ):
+        code, err = _run_main_with_storage_failure(tmp_path, monkeypatch, method)
+        assert code == 1, err
+        assert marker in err
 
 
 # --- 02: view-only 恢复退出码与中断显示 --------------------------------------------------
-
-
-def _cli_identity(work):
-    """与 CLI fake 剧本路径一致的启动身份; 直建存档时用于准入匹配."""
-    from cicada.persistence.contracts import LaunchIdentity
-    from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
-
-    _prompt, info = compose_system_prompt(work, None, tools=DEFAULT_TOOLS, checks=())
-    return LaunchIdentity(
-        provider="fake", model="fake", base_url=None, think=None, options={},
-        max_request_bytes=None, max_turns=50,
-        prompt_version=info.version, prompt_sha256=info.prompt_sha256,
-        instructions_sha256=info.instructions_sha256, checks_signature=None, sources={},
-    )
 
 
 def _seed_archive(work: Path, session_id: str, *, open_activity: bool) -> None:

@@ -8,11 +8,13 @@ A11 工具路径 (Skill 文本不产生检查回执) 与设计审查 F1 的错�
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from cicada.__main__ import parse_script
 from cicada.application import (
     ApplicationConfig,
     ApplicationOpenError,
@@ -113,6 +115,24 @@ def tool_messages(result) -> list[ToolResultMessage]:
     return [m for m in result.messages if isinstance(m, ToolResultMessage)]
 
 
+def _git_repo(root: Path) -> None:
+    """检查模式的验证服务要求 Git 工作区根 (验证基线); 建最小仓库."""
+    for git_args in (
+        ["init", "-q"], ["add", "-A"],
+        ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "base"],
+    ):
+        proc = subprocess.run(["git", *git_args], cwd=root, capture_output=True)
+        assert proc.returncode == 0, proc.stderr
+
+
+def _check_plan(root: Path, command: str = "exit 0", *, timeout_s: float = 30.0) -> VerificationPlan:
+    return VerificationPlan(
+        verification_run_id=generate_verification_run_id(),
+        root=root,
+        checks=(CheckDefinition("check-1", command, timeout_s=timeout_s),),
+    )
+
+
 # --- A02: 首次模型输入只含目录, 未含正文 ------------------------------------------------------
 
 
@@ -150,8 +170,6 @@ async def test_first_model_input_contains_catalog_not_bodies(tmp_path):
 
 
 async def test_load_skill_pairs_and_body_enters_next_request(tmp_path):
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
@@ -182,8 +200,6 @@ async def test_load_skill_pairs_and_body_enters_next_request(tmp_path):
 
 
 async def test_load_skill_unknown_and_manual_are_normal_errors(tmp_path):
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
@@ -212,8 +228,6 @@ async def test_load_skill_unknown_and_manual_are_normal_errors(tmp_path):
 
 
 async def test_body_is_frozen_and_reload_changes_manifest(tmp_path):
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     write_skill(skills_dir, "alpha", "Frozen body v1.")
@@ -315,10 +329,6 @@ async def test_resume_rejects_modified_body_and_adopt_uses_current_identity(tmp_
 
 async def test_resume_rejects_path_change_and_adopt_keeps_latch(tmp_path):
     """A09 补证: 路径变化拒绝; adopt 当前配置保留历史与未证终结锁存."""
-    import asyncio as _asyncio
-
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
@@ -332,10 +342,10 @@ async def test_resume_rejects_path_change_and_adopt_keeps_latch(tmp_path):
     config, _p, _i = make_config(root, script, snapshot, persist=True)
     session = await open_application(config)
     session_id = session.persistence.session_id
-    task = _asyncio.create_task(session.execute("会留下未证终结"))
-    await _asyncio.sleep(0.3)
+    task = asyncio.create_task(session.execute("会留下未证终结"))
+    await asyncio.sleep(0.3)
     session.cancel()
-    await _asyncio.wait_for(task, timeout=15)
+    await asyncio.wait_for(task, timeout=15)
     await session.aclose()
 
     # 路径变化 (新目录 + 当前身份): prompt hash 随 root 变化, 默认恢复冲突拒绝
@@ -413,8 +423,6 @@ async def test_f1_identity_prompt_mismatch_rejected_before_store_io(tmp_path):
 
 
 async def test_skill_text_with_receipt_words_creates_no_receipt(tmp_path):
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     receipt_like = (
@@ -423,24 +431,12 @@ async def test_skill_text_with_receipt_words_creates_no_receipt(tmp_path):
     )
     write_skill(skills_dir, "alpha", receipt_like)
     snapshot = make_snapshot(skills_dir)
-    # 检查模式的验证服务要求 Git 工作区根
-    import subprocess as _sp
-
-    for git_args in (
-        ["init", "-q"], ["add", "-A"],
-        ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "base"],
-    ):
-        proc = _sp.run(["git", *git_args], cwd=root, capture_output=True)
-        assert proc.returncode == 0, proc.stderr
+    _git_repo(root)
     script = parse_script(
         '[{"tool_calls": [{"id": "c1", "name": "load_skill", "arguments": {"name": "alpha"}}]},'
         ' {"text": "完成", "stop": true}]'
     )
-    plan = VerificationPlan(
-        verification_run_id=generate_verification_run_id(),
-        root=root,
-        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
-    )
+    plan = _check_plan(root)
     config, _p, _i = make_config(root, script, snapshot, plan=plan)
     session = await open_application(config)
     try:
@@ -568,8 +564,6 @@ async def test_explicit_request_rides_budget_and_clear(tmp_path):
 
 async def test_explicit_request_text_creates_no_receipt(tmp_path):
     """A11 显式路径: 封装正文含回执词汇不产生检查回执或交付判定."""
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     receipt_like = (
@@ -578,20 +572,9 @@ async def test_explicit_request_text_creates_no_receipt(tmp_path):
     )
     write_skill(skills_dir, "alpha", receipt_like)
     snapshot = make_snapshot(skills_dir)
-    import subprocess as _sp
-
-    for git_args in (
-        ["init", "-q"], ["add", "-A"],
-        ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "base"],
-    ):
-        proc = _sp.run(["git", *git_args], cwd=root, capture_output=True)
-        assert proc.returncode == 0, proc.stderr
+    _git_repo(root)
     script = parse_script('[{"text": "完成", "stop": true}]')
-    plan = VerificationPlan(
-        verification_run_id=generate_verification_run_id(),
-        root=root,
-        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
-    )
+    plan = _check_plan(root)
     config, _p, _i = make_config(root, script, snapshot, plan=plan)
     session = await open_application(config)
     try:
@@ -609,30 +592,17 @@ async def test_explicit_request_text_creates_no_receipt(tmp_path):
 
 async def test_explicit_request_respects_process_uncertain(tmp_path):
     """A11: 显式请求不解除 process_uncertain 锁存, 请求被既有规则拒绝."""
-    from cicada.__main__ import parse_script
-
     root = tmp_path / "ws"
     skills_dir = root / "skills"
     write_skill(skills_dir, "alpha", SKILL_BODY_ALPHA)
     snapshot = make_snapshot(skills_dir)
-    import subprocess as _sp
-
-    for git_args in (
-        ["init", "-q"], ["add", "-A"],
-        ["-c", "user.email=t@local", "-c", "user.name=t", "commit", "-q", "-m", "base"],
-    ):
-        proc = _sp.run(["git", *git_args], cwd=root, capture_output=True)
-        assert proc.returncode == 0, proc.stderr
+    _git_repo(root)
     script = parse_script(
         '[{"tool_calls": [{"id": "c1", "name": "check",'
         ' "arguments": {"action": "run", "check_id": "check-1"}}]},'
         ' {"text": "完成", "stop": true}]'
     )
-    plan = VerificationPlan(
-        verification_run_id=generate_verification_run_id(),
-        root=root,
-        checks=(CheckDefinition("check-1", "Start-Sleep -Seconds 30", timeout_s=0.5),),
-    )
+    plan = _check_plan(root, "Start-Sleep -Seconds 30", timeout_s=0.5)
     config, _p, _i = make_config(root, script, snapshot, plan=plan)
     session = await open_application(config)
     try:
