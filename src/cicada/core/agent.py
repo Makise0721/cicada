@@ -18,6 +18,7 @@ import jsonschema
 from cicada.core.cancel import CancelToken
 from cicada.core.events import (
     AssistantCompleted,
+    AssistantReasoningDelta,
     AssistantTextDelta,
     Event,
     ModelCallCompleted,
@@ -253,7 +254,10 @@ class Agent:
                         # 只读文本增量: 零字节可忽略; 完成事件仍是权威
                         self._emit(AssistantTextDelta(run_id=run_id, turn_index=turn_index, text=event.text))
                 elif isinstance(event, ReasoningDelta):
+                    # 先按原路径累计规范原文, 再发布只读预览事件;
+                    # 空字符串同样发布 (区分未返回字段与已收到空字段)
                     reasoning_parts.append(event.text)
+                    self._emit(AssistantReasoningDelta(run_id=run_id, turn_index=turn_index, text=event.text))
                 elif isinstance(event, ToolCallEvent):
                     calls.append(ToolCall(event.id, event.name, event.arguments_json))
                 elif isinstance(event, StreamDone):

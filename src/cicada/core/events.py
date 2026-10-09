@@ -40,6 +40,19 @@ class AssistantTextDelta:
 
 
 @dataclass(frozen=True)
+class AssistantReasoningDelta:
+    """只读思考增量: 供 UI 活动预览; 空字符串同样发布 (区分未返回字段).
+
+    完成事件 (AssistantCompleted.message.reasoning) 仍是思考权威, 预览不是
+    规范记录, 也不参与模型续写历史。
+    """
+
+    run_id: str
+    turn_index: int
+    text: str
+
+
+@dataclass(frozen=True)
 class ModelCallCompleted:
     """一次模型调用的计量记录; 取消/错误路径同样产生记录."""
 
@@ -74,6 +87,7 @@ Event: TypeAlias = (
     RunStarted
     | TurnStarted
     | AssistantTextDelta
+    | AssistantReasoningDelta
     | AssistantCompleted
     | ModelCallCompleted
     | ToolStarted

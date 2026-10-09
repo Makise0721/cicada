@@ -17,6 +17,9 @@
 - 思考块 (thinking-budget-visibility 票据 01): 助手条目内答案前独立呈现
   message.reasoning (ui/reasoning_view), 缺失省略; 展开状态是本文档唯一
   bool (toggle_reasoning, Ctrl+T), 初始收起, 区别于工具/Skill 的 expand_getter。
+- 思考流中预览 (票据 02): stream_reasoning_delta 把只读思考增量送入同一条目
+  的有界预览 (空增量也建立条目); finish_reasoning_previews 按 run_id 幂等封存
+  未完成预览并登记终结运行, 迟到增量不复活。
 - ModelCallCompleted 计量在此累计: None 字段显示"不可得", 不当作 0;
   展示出口 (底栏) 由票据 04 组装, 本模块只提供口径文本。
 """
@@ -240,6 +243,9 @@ class Transcript:
         self._assistant_index: dict[tuple[str, int], AssistantEntry] = {}
         self._expand_getter = expand_getter
         self._reasoning_expanded = False
+        # 票据 02: 已终结运行的 run_id 集合 (与显示文档同生命周期);
+        # 终结运行的迟到思考增量被忽略, 不新建终结运行的新预览
+        self._finished_runs: set[str] = set()
         # 计量累计: None = 尚无任何数值 (显示不可得); unknown = 有调用但该字段缺失
         self._input_total: int | None = None
         self._output_total: int | None = None
@@ -299,6 +305,31 @@ class Transcript:
         if entry.finalized:
             return  # 迟到增量不复活已完成条目
         entry.text += text
+
+    def stream_reasoning_delta(self, run_id: str, turn_index: int, text: str) -> None:
+        """AssistantReasoningDelta (票据 02): 有界预览进入 (run_id, turn_index) 条目。
+
+        空字符串同样建立条目 (区分未返回字段与已收到空字段); 已完成条目与
+        已终结运行的迟到增量忽略, 不复活条目、不新建终结运行的新预览。
+        """
+        if run_id in self._finished_runs:
+            return
+        entry = self._assistant_entry(run_id, turn_index)
+        if entry.finalized:
+            return  # 完成后迟到增量: 权威记录已原位替换, 不复活预览
+        entry.reasoning.append_preview(text)
+
+    def finish_reasoning_previews(self, run_id: str) -> None:
+        """按 run_id 封存尚未完成的思考预览 (票据 02, 幂等)。
+
+        无完成记录的防御性终止只封存为未完成预览, 不生成规范思考或
+        complete=true; 已有权威记录的条目不受影响。之后该运行的迟到思考
+        增量被忽略 (终结运行集合与显示文档同生命周期)。
+        """
+        self._finished_runs.add(run_id)
+        for entry in self._entries:
+            if isinstance(entry, AssistantEntry) and entry.run_id == run_id:
+                entry.reasoning.seal_preview()
 
     def complete_assistant(self, run_id: str, turn_index: int, message: AssistantMessage) -> None:
         """AssistantCompleted: 校准同一条目的完整正文与终结事实, 不二次追加。

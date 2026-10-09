@@ -84,7 +84,8 @@ async def test_executing_shows_spinner_and_frame_follows_clock(tmp_path):
         assert bundle["on_submit"]("你好") is True
         line = bundle["status_lines"](80)[0]
         plain = strip_terminal_sequences(line)
-        assert "正在输出…" in plain
+        # 票据 02 (D4): 提交后未收到 TurnStarted, 状态是"正在执行"而非"正在输出"
+        assert "正在执行…" in plain
         assert "⠋" in plain  # clock=0.0 -> 第 0 帧
         assert SPINNER_FG in line and TEXT_FG in line
         clock.now = 0.15  # 第 1 帧

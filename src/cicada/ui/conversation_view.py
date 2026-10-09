@@ -35,6 +35,10 @@
   ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认收起);
   handle_ctrl_t 只切换本文档思考展开状态, 经 build() 的 on_ctrl_t 与生产
   组装接 MainScreenFrontend。
+- thinking-budget-visibility 票据 02: AssistantReasoningDelta 进有界思考
+  预览 (transcript.stream_reasoning_delta); 状态行按真实事件区分等待模型/
+  思考/输出, 屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
+  ApplicationClosed 幂等封存活动运行未完成预览并清阶段, 迟到事件不复活。
 """
 
 from __future__ import annotations
@@ -62,9 +66,13 @@ from cicada.budget import BudgetReport, BudgetSnapshot
 from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
+    AssistantReasoningDelta,
     AssistantTextDelta,
     Event,
     ModelCallCompleted,
+    RunFinished,
+    RunStarted,
+    ToolStarted,
     TurnStarted,
 )
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
@@ -147,6 +155,10 @@ class ConversationView:
         self._checks = CheckProjection(session)
         # AssistantCompleted 不带 turn_index: 按内核 TurnStarted 跟踪当前轮
         self._current_turn: dict[str, int] = {}
+        # 票据 02: 真实活动阶段 (显示事实, 不改生命周期): waiting/thinking/answering;
+        # 旧运行迟到事件不覆盖新阶段, 终结/异常关闭幂等清理并封存活动运行预览
+        self._active_run_id: str | None = None
+        self._model_stage: str | None = None
         # welcome 01: 建立订阅前追加本视图唯一欢迎条目 (启动快照一次捕获后冻结,
         # 渲染/resize/模型切换/登录配置/clear/compact 都不重建; 与首条请求间无 await)
         self.transcript.add_entry(build_welcome_entry(session, display_style=self.display_style))
@@ -201,6 +213,12 @@ class ConversationView:
             self._gate.note_phase(update.phase)
         elif isinstance(update, RequestCompleted):
             outcome = update.outcome
+            # 票据 02: 请求级终结封存该运行预览 (RunFinished 已封存则幂等);
+            # 防御 RunFinished 缺席时仍清活动状态
+            self.transcript.finish_reasoning_previews(outcome.result.run_id)
+            if outcome.result.run_id == self._active_run_id:
+                self._model_stage = None
+                self._active_run_id = None
             self.transcript.record_request_result(outcome.result.stop_reason, outcome.result.error)
             # 检查结论条目只在 decision 非空 (检查模式) 时追加; 正常完成安静
             summary = self._checks.on_request_completed(outcome)
@@ -277,13 +295,25 @@ class ConversationView:
         elif isinstance(update, ApplicationClosed):
             self._settle_login()
             self._gate.note_closed()
+            self._seal_active_run()  # 票据 02: 关闭兜底封存, 阻止迟到复活
         self._sync_spinner()  # 状态行跟随最近一次应用状态 (规格 §F)
         if self._on_update is not None:
             self._on_update()
 
+    def _seal_active_run(self) -> None:
+        """票据 02/A07 异常关闭兜底: 封存当前运行未完成预览并清活动阶段。
+
+        幂等; 无活动运行时只清状态, 不新建条目、不制造规范记录。
+        """
+        if self._active_run_id is not None:
+            self.transcript.finish_reasoning_previews(self._active_run_id)
+        self._active_run_id = None
+        self._model_stage = None
+
     def _on_gate_error(self, message: str) -> None:
         """execute 异常如实成条; 会话已进入 closing/closed 时通知宿主退出前端。"""
         self.transcript.append_error(message)
+        self._seal_active_run()  # 票据 02: 终结事件缺席路径的幂等封存
         if (
             self._session.state in ("closing", "closed")
             and self.on_unrecoverable is not None
@@ -293,13 +323,36 @@ class ConversationView:
             self._on_update()  # 错误条目不经应用事件, 必须显式触发渲染
 
     def _project_agent_event(self, event: Event) -> None:
-        if isinstance(event, TurnStarted):
+        if isinstance(event, RunStarted):
+            # 票据 02: 新运行建立活动身份; 阶段清空 (TurnStarted 前为"正在执行")
+            self._active_run_id = event.run_id
+            self._model_stage = None
+        elif isinstance(event, TurnStarted):
+            if event.run_id == self._active_run_id:
+                self._model_stage = "waiting"
             self._current_turn[event.run_id] = event.turn_index
+        elif isinstance(event, AssistantReasoningDelta):
+            if event.run_id == self._active_run_id:
+                self._model_stage = "thinking"  # 空增量同样表达"正在思考"
+            self.transcript.stream_reasoning_delta(event.run_id, event.turn_index, event.text)
         elif isinstance(event, AssistantTextDelta):
+            if event.run_id == self._active_run_id:
+                self._model_stage = "answering"  # 内核只发布非空答案增量
             self.transcript.stream_assistant_delta(event.run_id, event.turn_index, event.text)
         elif isinstance(event, AssistantCompleted):
+            if event.run_id == self._active_run_id:
+                self._model_stage = None  # 完成模型记录清除模型阶段
             turn_index = self._current_turn.get(event.run_id, 0)
             self.transcript.complete_assistant(event.run_id, turn_index, event.message)
+        elif isinstance(event, ToolStarted):
+            if event.run_id == self._active_run_id:
+                self._model_stage = None  # 工具执行期间回到"正在执行"
+        elif isinstance(event, RunFinished):
+            # 内核运行结束: 清阶段并封存该运行未完成预览 (幂等; 防御缺完成记录)
+            self.transcript.finish_reasoning_previews(event.run_id)
+            if event.run_id == self._active_run_id:
+                self._model_stage = None
+                self._active_run_id = None
         elif isinstance(event, ModelCallCompleted):
             self.transcript.add_metrics(event.metrics)
         # 工具卡与检查回执收集: 全部内核事件过一遍 (各自过滤)
@@ -358,7 +411,14 @@ class ConversationView:
         if self._session.state == "finalizing":
             return "正在收尾…"  # 模型已停笔, 持久化/检查收尾中 (审查 06-3)
         if self._session.state == "executing" or self._gate.busy():
-            return "正在输出…"
+            # 票据 02 (D4): 模型阶段以真实事件为准, 无增量时只显示执行事实
+            if self._model_stage == "thinking":
+                return "正在思考…"
+            if self._model_stage == "answering":
+                return "正在输出…"
+            if self._model_stage == "waiting":
+                return "等待模型…"
+            return "正在执行…"
         return None
 
     def _sync_spinner(self) -> None:
@@ -401,7 +461,10 @@ class ConversationView:
         task = self._gate.try_admit(prompt)
         if task is None:
             return False
-        # 应用准入事实已取得 (reservation 已占, 任务已建): 此时才创建用户条目
+        # 新请求预留清旧活动阶段 (票据 02 C4); 应用准入事实已取得 (reservation
+        # 已占, 任务已建): 此时才创建用户条目
+        self._active_run_id = None
+        self._model_stage = None
         self.transcript.append_user(prompt)
         self._sync_spinner()  # reservation 窗口即忙: 状态行与动画立即上线
         return True

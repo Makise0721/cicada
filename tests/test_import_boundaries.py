@@ -6,7 +6,8 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src" / "cicada"
 
 FORBIDDEN = {
-    "core": {"cicada.runtime", "cicada.plugins", "cicada.boot"},
+    # 思考可见性 02/A04: 核心不导入 UI／运行时, 也不反向依赖应用编排
+    "core": {"cicada.ui", "cicada.application", "cicada.runtime", "cicada.plugins", "cicada.boot"},
     "runtime": {"cicada.core", "cicada.plugins", "cicada.boot"},
     "plugins": {"cicada.boot"},
     # 纯持久化契约 (会话保存恢复 v1): 只依赖内核类型, 不执行 SQL, 不碰插件/boot

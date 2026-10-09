@@ -30,7 +30,8 @@ CTRL_D = KeyPress(Keys.ControlD, '')
 BACKSPACE = KeyPress(Keys.ControlH, '\b')
 _LOGO_CHARS = '█▄▀'
 _WELCOME_LEAKS = ('启动快照', '启动模型', '/help 帮助')
-_BUSY_MARKERS = ('正在输出…', '正在收尾…', '正在取消…')
+_BUSY_MARKERS = ('正在输出…', '正在收尾…', '正在取消…',
+                 '正在执行…', '等待模型…', '正在思考…')  # 票据 02: 忙态文案全集
 
 
 def text_keys(text: str) -> list[KeyPress]:
