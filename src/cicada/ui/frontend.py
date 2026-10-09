@@ -7,6 +7,9 @@ Copyright (c) 2025 Mario Zechner) 的 requestRender 合并 (16ms 最小间隔,
   Enter 是完整 Alt+Enter (仅换行, 不提交); 超时后才按孤立 Escape 派发
   on_escape。解析器层的孤立 Escape 由终端适配 flush_keys 落出。
 - 粘贴是单事件 (Keys.BracketedPaste), 原文插入草稿, 换行不触发提交。
+- Ctrl+T (thinking-budget-visibility 票据 01): 思考展开切换回调 on_ctrl_t,
+  与 on_ctrl_o 同层; 模态键位优先, 菜单未处模态时切换且保留选中项, 无回调
+  安全消费控制键不写入文本。
 - Ctrl+C/Ctrl+D/Enter 的语义回调由宿主注入 (01 演示: Enter 提交到
   on_submit, Ctrl+D 空草稿退出); 本模块不接真实模型。
 
@@ -48,6 +51,7 @@ class MainScreenFrontend:
         on_escape: Callable[[], None] | None = None,
         on_ctrl_c: Callable[[], None] | None = None,
         on_ctrl_o: Callable[[], None] | None = None,
+        on_ctrl_t: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
         escape_prefix_timeout: float = ESCAPE_PREFIX_TIMEOUT_S,
         footer_lines: Callable[[int, int], list[str]] | None = None,
@@ -66,6 +70,7 @@ class MainScreenFrontend:
         self._on_escape = on_escape
         self._on_ctrl_c = on_ctrl_c
         self._on_ctrl_o = on_ctrl_o
+        self._on_ctrl_t = on_ctrl_t
         self._on_exit = on_exit
         self._footer_lines = footer_lines
         self._command_menu = command_menu
@@ -256,6 +261,12 @@ class MainScreenFrontend:
         if key.key is Keys.ControlO or data == "\x0f":
             if self._on_ctrl_o is not None:
                 self._on_ctrl_o()
+            return
+        # Ctrl+T: 思考块展开切换 (票据 01); 无回调时安全消费, 不写入文本。
+        # 置于模型菜单收起逻辑前: 菜单未处模态时允许切换且保留选中项 (契约 C3)
+        if key.key is Keys.ControlT or data == "\x14":
+            if self._on_ctrl_t is not None:
+                self._on_ctrl_t()
             return
         # Escape 前缀状态机: Escape 后窗口内 Enter = Alt+Enter 换行
         if key.key is Keys.Escape or (data == "\x1b" and len(data) == 1):

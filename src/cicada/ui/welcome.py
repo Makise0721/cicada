@@ -42,8 +42,12 @@ _MAX_MODEL_CHARS = 128
 _MAX_INSTRUCTIONS_CHARS = 128
 _MAX_WORKSPACE_CHARS = 256
 
-# r2 文案 (Pi 风格; 行序固定, 规格 r2 修订)
-_KEYS_LINE = "Enter 发送 · Shift+Enter 换行 · Esc/Ctrl+C 中断 · Ctrl+D 退出 · / 命令 · Ctrl+O 展开"
+# r2 文案 (Pi 风格; 行序固定, 规格 r2 修订); Ctrl+T 表述为"思考"、Ctrl+O 表述为
+# "工具/Skill" (thinking-budget-visibility 契约 C3), 不改变原发送和取消按键
+_KEYS_LINE = (
+    "Enter 发送 · Shift+Enter 换行 · Esc/Ctrl+C 中断 · Ctrl+D 退出 · / 命令"
+    " · Ctrl+T 思考 · Ctrl+O 工具/Skill"
+)
 _COMMANDS_LINE = "/help 全部命令 · /model 模型 · /login 配置 · /status 状态"
 _RESUME_COMMANDS_LINE = "/help 帮助 · /status 状态"
 _HELP_LINE = "/help 帮助"

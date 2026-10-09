@@ -40,7 +40,7 @@ uv run --frozen python -m cicada --workspace .\repo --check-command 'python chec
 
 ## 交互终端与持久会话
 
-`--tui` 进入同进程连续对话终端（Pi 式主屏：启动欢迎快照（Pi 风格段组，窄窗/无色自动降级）、原位流式更新、工具卡与 `Ctrl+O` 展开、忙碌可编辑草稿、斜线命令菜单与 `/model` 模型选择（仅影响后继请求）、忙碌状态行动画、协作取消）：
+`--tui` 进入同进程连续对话终端（Pi 式主屏：启动欢迎快照（Pi 风格段组，窄窗/无色自动降级）、原位流式更新、思考块默认收起与 `Ctrl+T` 折叠/展开、工具卡与 `Ctrl+O` 展开、忙碌可编辑草稿、斜线命令菜单与 `/model` 模型选择（仅影响后继请求）、忙碌状态行动画、协作取消）：
 
 ```powershell
 uv run --frozen python -m cicada --tui --workspace .\sandbox

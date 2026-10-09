@@ -77,6 +77,10 @@ async def run_tui_session(
         view.handle_ctrl_o()
         refs["frontend"].request_render_now()
 
+    def _toggle_reasoning() -> None:
+        view.handle_ctrl_t()  # 票据 01: 思考展开切换 + 既有立即渲染
+        refs["frontend"].request_render_now()
+
     frontend = MainScreenFrontend(
         terminal,
         document_lines=view.document_lines,
@@ -85,6 +89,7 @@ async def run_tui_session(
         on_escape=view.handle_escape,
         on_ctrl_c=view.handle_ctrl_c,
         on_ctrl_o=_toggle_tools,
+        on_ctrl_t=_toggle_reasoning,
         on_exit=view.handle_exit,
         footer_lines=view.footer.render,
         command_menu=SlashCommandMenu(),

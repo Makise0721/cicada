@@ -14,6 +14,9 @@
   封装, 成功时挂 SkillRequestEntry (UserEntry 显示实现, text 保留完整
   原文本); 展开状态经构造时注入的只读 getter 读全局展开标志 (Ctrl+O 与
   工具输出共享), 未注入时完整显示正文。解码失败保持原 UserEntry。
+- 思考块 (thinking-budget-visibility 票据 01): 助手条目内答案前独立呈现
+  message.reasoning (ui/reasoning_view), 缺失省略; 展开状态是本文档唯一
+  bool (toggle_reasoning, Ctrl+T), 初始收起, 区别于工具/Skill 的 expand_getter。
 - ModelCallCompleted 计量在此累计: None 字段显示"不可得", 不当作 0;
   展示出口 (底栏) 由票据 04 组装, 本模块只提供口径文本。
 """
@@ -28,6 +31,7 @@ from cicada.skills import SkillInvocation, decode_skill_request
 from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
+from cicada.ui.reasoning_view import ReasoningBlock
 from cicada.ui.rendering import sanitize_display
 
 ERROR_PREFIX = "错误: "
@@ -140,20 +144,26 @@ class AssistantEntry:
 
     渲染为离屏 Markdown (Pi 样式, 前置空行, 左右 1 列); 缓存按
     (正文, 宽度) 复用, 流式增量未变化时不重复排版。
+    思考块 (票据 01): 答案前独立呈现, complete/restore 以 message.reasoning
+    权威替换 (None 撤掉); 顺序为思考、答案、终结标注。
     """
 
-    def __init__(self, run_id: str, turn_index: int) -> None:
+    def __init__(
+        self, run_id: str, turn_index: int,
+        *, reasoning_expand_getter: Callable[[], bool] | None = None,
+    ) -> None:
         self.run_id = run_id
         self.turn_index = turn_index
         self.text = ""
         self.finalized = False
         self.stop_reason: str | None = None
         self.error: str | None = None
+        self.reasoning = ReasoningBlock(expand_getter=reasoning_expand_getter)
         self._render_cache: tuple[str, int, DisplayStyle, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
+        reasoning_lines = self.reasoning.render(width)  # 思考块自带缓存与样式
         cleaned = sanitize_display(self.text)
-        lines: list[str]
         if cleaned:
             cached = self._render_cache
             style = current_style()
@@ -162,14 +172,17 @@ class AssistantEntry:
             else:
                 lines = theme.assistant_markdown_lines(cleaned, width)
                 self._render_cache = (cleaned, width, style, list(lines))
-            lines = ["", *lines]  # Pi assistant 前置空行
         elif not self.finalized:
-            lines = ["", STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量 (统一前导空行)
+            lines = [STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量
+        elif reasoning_lines:
+            lines = []  # 完成无正文但有思考: 空行 + 思考块
         else:
-            lines = []  # 完成但无正文 (如错误路径): 事实由错误/取消条目表达
+            return []  # 完成但无正文 (如错误路径): 事实由错误/取消条目表达
+        # 统一前导空行; 思考块在答案前 (票据 01: 思考、答案、终结标注)
+        result = ["", *reasoning_lines, *lines]
         if self.finalized and self.stop_reason == "length":
-            lines.append(theme.fg(theme.MUTED_GRAY, LENGTH_NOTE))
-        return lines
+            result.append(theme.fg(theme.MUTED_GRAY, LENGTH_NOTE))
+        return result
 
 
 class SystemEntry:
@@ -218,12 +231,15 @@ class Transcript:
     expand_getter (local-skills-v1 票据 03): 只读展开标志 getter, 生产组合注入
     工具文档的全局展开状态 (Ctrl+O 同时影响工具输出与 Skill 正文); 未注入时
     SkillRequestEntry 完整显示正文。
+    思考展开 (票据 01): 本文档唯一 bool, 初始 false, Ctrl+T 切换全部现有与
+    后续思考块; /clear 保留显示文档因此保留该状态, 新建/恢复文档自然重置。
     """
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
         self._entries: list[TranscriptEntry] = []
         self._assistant_index: dict[tuple[str, int], AssistantEntry] = {}
         self._expand_getter = expand_getter
+        self._reasoning_expanded = False
         # 计量累计: None = 尚无任何数值 (显示不可得); unknown = 有调用但该字段缺失
         self._input_total: int | None = None
         self._output_total: int | None = None
@@ -288,27 +304,40 @@ class Transcript:
         """AssistantCompleted: 校准同一条目的完整正文与终结事实, 不二次追加。
 
         message 本身不带 turn_index, 由调用方按内核 TurnStarted 跟踪的当前轮传入。
+        思考记录 (票据 01): message.reasoning 权威替换条目思考块, None 撤掉。
         """
         entry = self._assistant_entry(run_id, turn_index)
         entry.text = message.text  # 完成事件是权威: 校准 (非追加) 同一条目
         entry.finalized = True
         entry.stop_reason = message.stop_reason
         entry.error = message.error
+        entry.reasoning.set_record(message.reasoning)
 
     def restore_assistant(self, key_run_id: str, turn_index: int, message: AssistantMessage) -> None:
         """恢复投影 (票据 05): 以终态直建助手条目; key_run_id 必须命名空间化,
-        避免与本进程新 run_id (如 run-1) 碰撞 (A13)。"""
+        避免与本进程新 run_id (如 run-1) 碰撞 (A13)。
+
+        思考 (票据 01): 原始记录直接进显示引用, 命名空间与归属不变。
+        """
         entry = self._assistant_entry(key_run_id, turn_index)
         entry.text = message.text
         entry.finalized = True
         entry.stop_reason = message.stop_reason
         entry.error = message.error
+        entry.reasoning.set_record(message.reasoning)
+
+    def toggle_reasoning(self) -> None:
+        """Ctrl+T (票据 01): 切换本文档全部思考块展开状态; 只改显示。"""
+        self._reasoning_expanded = not self._reasoning_expanded
 
     def _assistant_entry(self, run_id: str, turn_index: int) -> AssistantEntry:
         key = (run_id, turn_index)
         entry = self._assistant_index.get(key)
         if entry is None:
-            entry = AssistantEntry(run_id, turn_index)
+            entry = AssistantEntry(
+                run_id, turn_index,
+                reasoning_expand_getter=lambda: self._reasoning_expanded,
+            )
             self._assistant_index[key] = entry
             self._entries.append(entry)
         return entry

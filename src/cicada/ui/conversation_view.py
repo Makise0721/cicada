@@ -30,7 +30,11 @@
 - DeepSeek 阶段票据 04 (契约 C7): /model 打开模型菜单 (本地操作, 非 UserMessage);
   菜单确认同步置 model 屏障 (先于任务创建), select_model 只提交 option ID;
   ModelChanged 刷新底栏有效模型并追加确认条目, 失败有界成条, closing 不重开。
-  思考正文不进入普通答案/预览/恢复显示 (transcript 只渲染 message.text)。
+  思考正文不进入普通答案 (transcript 只渲染 message.text 为答案)。
+- thinking-budget-visibility 票据 01: 完成／恢复 message.reasoning 经
+  ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认收起);
+  handle_ctrl_t 只切换本文档思考展开状态, 经 build() 的 on_ctrl_t 与生产
+  组装接 MainScreenFrontend。
 """
 
 from __future__ import annotations
@@ -430,6 +434,13 @@ class ConversationView:
         """Ctrl+O 接缝 (票据 05): 切换工具输出展开; 只改展示, 不触请求或工具。"""
         self.tools.toggle_expand()
 
+    def handle_ctrl_t(self) -> None:
+        """Ctrl+T 接缝 (票据 01): 切换思考块展开; 只改显示状态, 不触请求或草稿。
+
+        忙碌/finalizing 一样可切换 (A02); 模态键位由前端优先处理, 不经此入口。
+        """
+        self.transcript.toggle_reasoning()
+
     def handle_exit(self) -> None:
         """退出回调 (Ctrl+D 与 /exit 共用): 仅 idle 且无 reservation 时执行。"""
         if is_enter_barrier(self._session, self._gate):
@@ -451,6 +462,9 @@ class ConversationView:
                     f"{item.command:<{command_width}}  {item.description}" for item in SLASH_COMMANDS
                 ]),
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
+                ("快捷键", [
+                    "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
+                ]),
             ])
             return True
         if command == "/status":
@@ -899,6 +913,7 @@ def build(
         "on_submit": view.on_submit,
         "on_escape": view.handle_escape,
         "on_ctrl_c": view.handle_ctrl_c,
+        "on_ctrl_t": view.handle_ctrl_t,  # 票据 01: 思考展开切换 (原键不变)
         "on_exit": view.handle_exit,
         "editor": view.editor,
         "view": view,
