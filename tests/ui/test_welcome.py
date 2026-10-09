@@ -446,13 +446,14 @@ def test_resume_width_tiers():
     assert entry.render(10)[1:] == ["Cicada", "/help"]
 
 
-def test_long_cjk_emoji_fields_stay_bounded():
+@pytest.mark.parametrize("plain", [True, False])
+def test_long_cjk_emoji_fields_stay_bounded(plain):
     facts = _facts(
         workspace="~/工作区/" + "蝉" * 60 + "🪲" * 20,
         model_label="模型🪲" + "x" * 200,
     )
     for width in (120, 80, 47, 24, 23):
-        lines = WelcomeEntry(facts, plain=True).render(width)
+        lines = WelcomeEntry(facts, plain=plain).render(width)
         assert all(visible_width(line) <= width for line in lines)
 
 

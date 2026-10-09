@@ -17,6 +17,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPress
 from cicada.application import open_application
 from cicada.ui.conversation_view import build
 from cicada.ui.frontend import MainScreenFrontend
+from cicada.ui.main_screen import visible_width
 from cicada.ui.terminal_io import FakeTerminal
 from cicada.ui.welcome import WelcomeEntry
 from tests.ui.vt_screen import VtScreen
@@ -167,13 +168,14 @@ async def test_resize_96_48_96_rewraps_and_keeps_draft(tmp_path, monkeypatch):
         await h.settle()
         assert h.find("保留我")
 
-        h.terminal.set_size(48, 24)  # 48 列: 省略标志的窄窗四行块
+        h.terminal.set_size(48, 24)  # 48 列: 48–87 档七行无标志
         await h.settle()
         assert h.find("保留我"), "resize 后草稿保留"
         assert h.find("/help 帮助")
-        screen = h.vt.screen_text()
-        assert all(len(line) <= 48 for line in screen)
-        assert not any(mark in line for line in screen for mark in _LOGO_CHARS), "窄窗无标志"
+        # 行宽界在文档出口断言 (VT 屏镜像行恒 <= columns, 屏幕行断言恒真无证据力)
+        doc = h.view.document_lines(48)
+        assert all(visible_width(line) <= 48 for line in doc)
+        assert not any(mark in line for line in h.vt.screen_text() for mark in _LOGO_CHARS), "窄窗无标志"
 
         h.terminal.set_size(96, 24)  # 回到宽窗: 标志恢复并排
         await h.settle()
