@@ -202,9 +202,14 @@ class StageTerminal:
         self.terminal.emit(keys)
 
     def set_size(self, columns: int, rows: int) -> None:
+        # resize只更改几何尺寸，真实终端保留私有模式；新VT镜像也应保留。
+        cursor_visible = self.vt.cursor_visible
+        sync_output_active = self.vt.sync_output_active
         self.columns, self.rows = columns, rows
         self.terminal.set_size(columns, rows)
         self._attach()
+        self.vt.cursor_visible = cursor_visible
+        self.vt.sync_output_active = sync_output_active
 
     # --- 可见文本视图 ---------------------------------------------------------------
 
