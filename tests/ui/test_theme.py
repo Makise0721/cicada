@@ -216,10 +216,12 @@ async def test_layout_composition_document_editor_footer():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("width", [40, 80, 120, 160])
-@pytest.mark.parametrize("rows", [8, 24, 40])
+@pytest.mark.parametrize("width,rows", [(40, 8), (80, 24), (160, 40)])
 async def test_layout_resize_matrix_replays_consistently(width, rows):
-    """P08/P09: 尺寸矩阵下重排当前文档; 完整重绘回放与新宽度静态排版一致。"""
+    """P08/P09: 尺寸矩阵下重排当前文档; 完整重绘回放与新宽度静态排版一致。
+
+    (12 组合矩阵精简为窄低/常规/宽高三代表; 全状态宽高往返由
+    test_resize_stability 的生产组合覆盖。)"""
     h = LayoutHarness(columns=61, rows=23)  # 初始尺寸异于所有目标: 保证 resize 必触发重绘
     try:
         await h.start()

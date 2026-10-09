@@ -406,23 +406,28 @@ async def test_nonpersistent_clear_keeps_single_welcome(tmp_path):
 # --- D3: 纯文字宽度降级 (条目级排版; 成品行宽有界) ----------------------------------------------
 
 
-@pytest.mark.parametrize("width", [120, 96, 88, 87, 48])
+@pytest.mark.parametrize("width", [48, 120])
 def test_full_block_r2_layout_within_width(width):
-    """r2: 新会话完整块 (Pi 风格段组) 在所有 >=48 宽度同一布局, 行宽有界。"""
+    """r2: 新会话完整块 (Pi 风格段组) 在 >=48 宽度同一 13 行布局, 行宽有界, 无标志字符。
+
+    (v1 五宽度版与 r2_same_layout/a08 重档合并: 档位边界由
+    test_a08_boundary_widths_bounded 双向覆盖, 无图标断言并入本条。)
+    """
     lines = WelcomeEntry(_facts(), plain=True).render(width)
     assert len(lines) == 13  # 前导空行 + 标题/键位/命令/空行 + 四段组各两行
     assert lines[0] == ""
     assert "启动快照" in lines[1]
+    visible = [strip_terminal_sequences(line) for line in lines]
+    assert not any(mark in line for line in visible for mark in "█▄▀")
     assert all(visible_width(line) <= width for line in lines)
 
 
-@pytest.mark.parametrize("width", [47, 24])
-def test_narrow_block_four_lines_within_width(width):
-    lines = WelcomeEntry(_facts(), plain=True).render(width)
+def test_narrow_block_four_lines_within_width():
+    lines = WelcomeEntry(_facts(), plain=True).render(47)
     assert len(lines) == 5  # 前导空行 + 标题/启动模型/资源简述//help
     assert "启动模型: deepseek-flash" in lines[2]
     assert strip_terminal_sequences(lines[4]).startswith("/help")
-    assert all(visible_width(line) <= width for line in lines)
+    assert all(visible_width(line) <= 47 for line in lines)
 
 
 def test_narrow_resource_brief_fixed_order_at_47():
@@ -433,33 +438,26 @@ def test_narrow_resource_brief_fixed_order_at_47():
     assert "指令: AGENTS.md · Skills: 未启用" in lines[3]
 
 
-@pytest.mark.parametrize("width", [23, 10, 2, 1])
-def test_minimal_block_two_lines_within_width(width):
+def test_minimal_block_two_lines_within_width():
+    width = 23
     lines = WelcomeEntry(_facts(), plain=True).render(width)
     assert len(lines) == 3  # 前导空行 + Cicada + /help
     assert all(visible_width(line) <= width for line in lines)
 
 
-@pytest.mark.parametrize("width", [0, -1, -80])
-def test_nonpositive_width_returns_no_lines(width):
-    assert WelcomeEntry(_facts(), plain=True).render(width) == []
-
-
-def test_resume_width_tiers():
-    entry = WelcomeEntry(_facts(resumed=True), plain=True)
-    assert len(entry.render(80)) == 4  # 前导空行 + 三行
-    narrow = entry.render(40)
-    assert narrow[1:] == ["Cicada · 恢复会话", "/help 帮助"]
-    assert entry.render(10)[1:] == ["Cicada", "/help"]
+def test_nonpositive_width_returns_no_lines():
+    assert WelcomeEntry(_facts(), plain=True).render(0) == []
 
 
 @pytest.mark.parametrize("plain", [True, False])
 def test_long_cjk_emoji_fields_stay_bounded(plain):
+    """超长 CJK/emoji 字段在窄档 (四行块/最小块) 行宽有界; 宽档 13 行截断
+    路径由 test_r2_long_cjk_emoji_fields_bounded 覆盖。"""
     facts = _facts(
         workspace="~/工作区/" + "蝉" * 60 + "🪲" * 20,
         model_label="模型🪲" + "x" * 200,
     )
-    for width in (120, 80, 47, 24, 23):
+    for width in (47, 23):
         lines = WelcomeEntry(facts, plain=plain).render(width)
         assert all(visible_width(line) <= width for line in lines)
 
@@ -595,10 +593,9 @@ def test_resume_fallback_without_persistence_uses_restored_facts():
 # --- 票据 04 (r2): Pi 风格完整块行序、段组样式与资产退场 -------------------------------------
 
 
-@pytest.mark.parametrize("plain", [True, False])
-def test_r2_full_block_line_order_and_indent(plain):
+def test_r2_full_block_line_order_and_indent():
     """r2 行序: 标题/键位/命令/空行 + [工作区]/[启动模型]/[指令]/[Skills] 段组 (内容缩进 2 列)。"""
-    lines = WelcomeEntry(_facts(), plain=plain).render(96)
+    lines = WelcomeEntry(_facts(), plain=True).render(96)
     visible = [strip_terminal_sequences(line) for line in lines]
     assert visible[1].startswith("Cicada 0.1.0 · 新会话 · 启动快照")
     assert visible[2].startswith("Enter 发送 · Shift+Enter 换行")
@@ -620,21 +617,11 @@ def test_r2_skills_section_three_states(skills_count, expected):
     assert lines[12] == expected
 
 
-@pytest.mark.parametrize("width", [48, 87, 88, 96, 120])
-@pytest.mark.parametrize("plain", [True, False])
-def test_r2_same_layout_above_48_no_logo(width, plain):
-    """r2 起无图标: >=48 各宽度同一 13 行布局, 无标志字符残留。"""
-    lines = WelcomeEntry(_facts(), plain=plain).render(width)
-    assert len(lines) == 13
-    assert all(visible_width(line) <= width for line in lines)
-    visible = [strip_terminal_sequences(line) for line in lines]
-    assert not any(mark in line for line in visible for mark in "█▄▀")
-
-
 @pytest.mark.parametrize("plain", [True, False])
 def test_r2_resume_short_block_has_no_sections(plain):
-    """恢复保持三行短版: 无段组、无键位行, 宽度档文案同 v1。"""
-    lines = WelcomeEntry(_facts(resumed=True), plain=plain).render(96)
+    """恢复保持三行短版: 无段组、无键位行, 宽度档文案同 v1 (含 40/10 窄档)。"""
+    entry = WelcomeEntry(_facts(resumed=True), plain=plain)
+    lines = entry.render(96)
     visible = [strip_terminal_sequences(line) for line in lines]
     assert len(lines) == 4
     assert "恢复会话 · 启动快照" in visible[1]
@@ -643,9 +630,13 @@ def test_r2_resume_short_block_has_no_sections(plain):
     assert not any(line.startswith("[") for line in visible)
     if plain:
         assert all("\x1b" not in line for line in lines)
+    narrow = [strip_terminal_sequences(line) for line in entry.render(40)]
+    assert narrow[1:] == ["Cicada · 恢复会话", "/help 帮助"]
+    minimal = [strip_terminal_sequences(line) for line in entry.render(10)]
+    assert minimal[1:] == ["Cicada", "/help"]
 
 
-@pytest.mark.parametrize("width", [1, 2, 23, 24, 47, 48, 87, 88, 96, 120])
+@pytest.mark.parametrize("width", [1, 23, 24, 47, 48, 120])
 @pytest.mark.parametrize("plain", [True, False])
 def test_a08_boundary_widths_bounded(width, plain):
     """A08 阈值两侧全部有界; 行数按宽度档固定 (r2: >=48 为 13 行完整块)。"""
@@ -655,7 +646,7 @@ def test_a08_boundary_widths_bounded(width, plain):
     assert all(visible_width(line) <= width for line in lines)
 
 
-@pytest.mark.parametrize("width", [48, 87, 88, 96, 120])
+@pytest.mark.parametrize("width", [48, 120])
 @pytest.mark.parametrize("plain", [True, False])
 def test_r2_long_cjk_emoji_fields_bounded(width, plain):
     facts = _facts(

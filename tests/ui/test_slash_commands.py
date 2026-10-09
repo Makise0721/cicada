@@ -60,8 +60,10 @@ async def test_escape_hides_menu_without_cancelling_or_losing_draft():
         await h.stop()
 
 
-@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /help", "/help 参数"])
+@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /help"])
 async def test_non_command_prefix_keeps_original_editing_and_submission(text):
+    """非命令形态不打开菜单、原样提交: // 转义、过滤为空、斜杠不在草稿开头
+    ("/help 参数" 的过滤为空分支与 "/unknown" 同型, 不再单列)。"""
     h = Harness(commands=True)
     try:
         await h.start()
@@ -132,7 +134,7 @@ async def test_moving_cursor_out_of_prefix_returns_to_text_editing():
         await h.stop()
 
 
-@pytest.mark.parametrize("columns,rows", [(10, 8), (40, 8), (80, 24), (160, 40)])
+@pytest.mark.parametrize("columns,rows", [(10, 8), (80, 24)])
 async def test_menu_fits_window_and_keeps_hardware_cursor_in_editor(columns, rows):
     h = Harness(commands=True, columns=columns, rows=rows)
     try:

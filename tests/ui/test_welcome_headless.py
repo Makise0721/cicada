@@ -3,7 +3,7 @@
 A07 resize / A11: 真实 ApplicationSession + ConversationView.build 接缝 +
 MainScreenFrontend + FakeTerminal/VtScreen; fake 模型, 零真实模型调用。
 r2 (票据 04) 起欢迎区为无图标 Pi 风格段组: >=48 列同一 13 行完整块,
-96→40→96 resize 与 8/12/24 行低高度下输入/草稿/光标保留, resize 不增加欢迎条目。
+96→40→96 resize 与 8/24 行低高度下输入/草稿/光标保留, resize 不增加欢迎条目。
 """
 
 from __future__ import annotations
@@ -124,8 +124,9 @@ async def test_wide_window_full_block_editor_cursor_usable(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("rows", [8, 12, 24])
+@pytest.mark.parametrize("rows", [8, 24])
 async def test_low_heights_keep_editor_draft_and_cursor(tmp_path, monkeypatch, rows):
+    """低高度 (8 与常规 24 代表) 允许欢迎滚出可见区, 编辑器/光标优先。"""
     _force_color_env(monkeypatch)
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True})))

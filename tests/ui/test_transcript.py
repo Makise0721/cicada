@@ -220,7 +220,7 @@ def test_user_and_assistant_entries_in_order():
     assert [x for x in rendered if x] == ["问题", "回答", "系统提示"]
 
 
-@pytest.mark.parametrize("width", [20, 40, 80, 160])
+@pytest.mark.parametrize("width", [20, 80, 160])
 @pytest.mark.parametrize(
     "text",
     [
@@ -232,6 +232,8 @@ def test_user_and_assistant_entries_in_order():
     ],
 )
 def test_every_rendered_line_fits_width(width, text):
+    """五种注入文本 × 窄/中/宽列宽行宽有界 (v1 四档列宽矩阵的中档 40
+    与 80 同分支, 由 20/80 边界与 160 宽档代表)。"""
     t = Transcript()
     t.append_user(text)
     t.stream_assistant_delta("run-1", 0, text)

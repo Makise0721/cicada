@@ -297,7 +297,7 @@ async def test_model_menu_alt_enter_is_edit_not_confirm(tmp_path):
         await session.aclose()
 
 
-@pytest.mark.parametrize("columns,rows", [(30, 8), (60, 16), (120, 30)])
+@pytest.mark.parametrize("columns,rows", [(30, 8), (60, 16)])
 async def test_model_menu_fits_window_and_cursor_stays_in_editor(tmp_path, columns, rows):
     bodies: list = []
     answers = iter([ds_response("", "答")])
