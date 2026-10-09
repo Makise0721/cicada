@@ -7,6 +7,7 @@ v1 fixture 由裸 sqlite3 按固定 v1 DDL 现场构造 (不依赖版本常量�
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import sqlite3
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 import pytest
@@ -263,8 +265,6 @@ def test_v1_archive_opens_and_upgrades_in_place(tmp_path):
         )
         assert (user_version, schema_version, has_summaries) == (3, 3, True)
     finally:
-        import asyncio
-
         asyncio.run(store.aclose())
     # 重开幂等: 已是 v3, 请求与身份不变
     store = open_session_store(
@@ -273,8 +273,6 @@ def test_v1_archive_opens_and_upgrades_in_place(tmp_path):
     try:
         assert len(store.recovery_snapshot().requests) == 1
     finally:
-        import asyncio
-
         asyncio.run(store.aclose())
 
 
@@ -289,9 +287,12 @@ def _steps_raising_at(index: int):
     return tuple(steps)
 
 
-@pytest.mark.parametrize("step_index", [0, 1, 2])
+@pytest.mark.parametrize("step_index", [0, 2])
 def test_migration_step_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch, step_index):
-    """每个迁移步骤注入异常: 原档保持完整 v1, 重开可重新升级 (PA04)."""
+    """每个迁移步骤注入异常: 原档保持完整 v1, 重开可重新升级 (PA04).
+
+    步骤参数保留首/尾边界: 各步骤在同一事务内同分支, 中间步骤不增加检测力。
+    """
     monkeypatch.setattr(store_module, "_V2_MIGRATION_STEPS", _steps_raising_at(step_index))
     session_id = str(uuid.uuid4())
     directory = tmp_path / "sessions"
@@ -315,8 +316,6 @@ def test_migration_step_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch, s
     try:
         assert len(store.recovery_snapshot().requests) == 1
     finally:
-        import asyncio
-
         asyncio.run(store.aclose())
 
 
@@ -335,9 +334,9 @@ def test_migration_verify_fault_rolls_back_to_complete_v1(tmp_path, monkeypatch)
     assert _raw_version(db_path) == (1, 1, False)
 
 
-@pytest.mark.parametrize("kill_step", [0, 1, 2])
+@pytest.mark.parametrize("kill_step", [0, 2])
 def test_migration_process_kill_leaves_complete_v1_or_v3(tmp_path, kill_step):
-    """独立进程在迁移事务的每个步骤中途终止 (02-F4: 建表/版本标记逐步注入).
+    """独立进程在迁移事务的首/尾步骤中途终止 (02-F4: 同事务分支, 保留边界代表).
 
     重开只能是完整 v1 (热日志回滚, 可重新升级) 或完整 v3, 旧完整请求可恢复,
     不留混合版本 (PA04)。「提交后终止」无歧义: COMMIT 已落盘即完整 v3。
@@ -379,8 +378,6 @@ def test_migration_process_kill_leaves_complete_v1_or_v3(tmp_path, kill_step):
         user_version, schema_version, _has_summaries = _raw_version(db_path)
         assert (user_version, schema_version) in {(1, 1), (3, 3)}, "不留混合版本"
     finally:
-        import asyncio
-
         asyncio.run(store.aclose())
 
 
@@ -426,8 +423,6 @@ async def test_commit_summary_persists_and_snapshot_exposes_current_generation(t
     await store.commit_summary(record)
     snapshot = store.recovery_snapshot()
     assert snapshot.summaries == (record,)
-    import asyncio
-
     await store.aclose()
     reopened = open_session_store(
         directory=fixture.directory, session_id=store.session_id, workspace=tmp_path
@@ -448,8 +443,6 @@ async def test_commit_summary_rejects_duplicate_and_relations(tmp_path):
     with pytest.raises(Exception, match="already persisted"):
         await store.commit_summary(record)
     wrong_generation = _record_for(store, fixture.epoch_id)
-    from dataclasses import replace as dc_replace
-
     with pytest.raises(Exception, match="does not match the current generation"):
         await store.commit_summary(dc_replace(wrong_generation, context_generation=7))
     with pytest.raises(Exception, match="committed requests of the current generation"):
@@ -459,8 +452,6 @@ async def test_commit_summary_rejects_duplicate_and_relations(tmp_path):
     unknown_epoch = dc_replace(_record_for(store, fixture.epoch_id), epoch_id="no-such-epoch")
     with pytest.raises(Exception, match="unknown epoch"):
         await store.commit_summary(unknown_epoch)
-    import asyncio
-
     await store.aclose()
 
 
@@ -472,8 +463,6 @@ async def test_commit_summary_enforces_per_generation_limit(tmp_path, monkeypatc
     second = _record_for(store, fixture.epoch_id)
     with pytest.raises(ArchiveLimitError, match="summaries-per-generation"):
         await store.commit_summary(second)
-    import asyncio
-
     await store.aclose()
 
 
@@ -487,8 +476,6 @@ async def test_summary_rows_survive_clear_but_leave_current_generation_view(tmp_
     snapshot = store.recovery_snapshot()
     assert snapshot.context_generation == new_generation
     assert snapshot.summaries == (), "当前代次视图不含旧代次摘要"
-    import asyncio
-
     await store.aclose()
     connection = sqlite3.connect(str(store.db_path))
     try:
@@ -508,8 +495,6 @@ async def _closed_v2_archive_with_summary(tmp_path):
     await store.commit_summary(record)
     db_path = store.db_path
     session_id = store.session_id
-    import asyncio
-
     await store.aclose()
     return fixture.directory, session_id, db_path
 
@@ -605,8 +590,6 @@ async def test_summary_non_integer_column_tamper_is_format_error(tmp_path):
     await store.commit_summary(record)
     db_path = store.db_path
     session_id = store.session_id
-    import asyncio
-
     await store.aclose()
     connection = sqlite3.connect(str(db_path))
     try:

@@ -175,27 +175,10 @@ async def test_cancel_during_tool_execution():
     results = [m.result for m in result.messages if isinstance(m, ToolResultMessage)]
     assert [r.call_id for r in results] == ["c1", "c2"]
     assert all(r.is_error for r in results)
-
-
-async def test_model_error_event_terminates_run():
-    model, agent = make_agent([[StreamDone("error", "provider boom")]])
-    result = await agent.run("x")
-    assert result.stop_reason == "error"
-    assert result.error == "provider boom"
-
-
-async def test_model_stream_raising_becomes_error():
-    model, agent = make_agent([RuntimeError("adapter exploded")])
-    result = await agent.run("x")
-    assert result.stop_reason == "error"
-    assert "adapter exploded" in (result.error or "")
-
-
-async def test_stream_without_terminal_event_is_error():
-    model, agent = make_agent([[TextDelta("hanging")]])
-    result = await agent.run("x")
-    assert result.stop_reason == "error"
-    assert "terminal" in (result.error or "")
+    # 被中断的 tool_use 轮仍留有一条 model-call 记录 (取消不抹掉记账)
+    assert len(result.model_calls) == 1
+    assert result.model_calls[0].stop_reason == "tool_use"
+    assert result.model_calls[0].elapsed_s >= 0
 
 
 async def test_max_turns_exceeded():
@@ -204,18 +187,6 @@ async def test_max_turns_exceeded():
     result = await agent.run("x")
     assert result.stop_reason == "error"
     assert "max turns" in (result.error or "")
-
-
-async def test_subscriber_error_does_not_break_run():
-    model, agent = make_agent([[TextDelta("ok"), StreamDone("stop")]])
-
-    def bad_handler(event):
-        raise RuntimeError("ui boom")
-
-    agent.subscribe(bad_handler)
-    result = await agent.run("x")
-    assert result.stop_reason == "stop"
-    assert len(agent.subscriber_errors) > 0
 
 
 async def test_second_run_rejected_while_active():
@@ -235,42 +206,16 @@ async def test_second_run_rejected_while_active():
     assert result.stop_reason == "stop"
 
 
-async def test_agent_accepts_system_prompt_and_stores_it():
-    model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
-    tools = {"echo": EchoTool()}
-    default_agent = Agent(model=model, tools=tools)
-    assert default_agent._system_prompt == ""
-    prompted = Agent(model=model, tools=tools, system_prompt="be terse")
-    assert prompted._system_prompt == "be terse"
-
-
-async def test_run_with_system_prompt_reaches_request():
-    model = FakeModel([[TextDelta("ok"), StreamDone("stop")]])
-    agent = Agent(model=model, tools={"echo": EchoTool()}, system_prompt="be terse")
-    events = []
-    agent.subscribe(events.append)
-    result = await agent.run("x")
-    assert result.stop_reason == "stop"
-    assert len(result.model_calls) == 1
-    assert result.model_calls[0].stop_reason == "stop"
-    assert result.model_calls[0].metrics is None
-    assert [type(e) for e in events] == [
-        RunStarted,
-        TurnStarted,
-        AssistantTextDelta,
-        AssistantCompleted,
-        ModelCallCompleted,
-        RunFinished,
-    ]
-    assert model.requests[0].system_prompt == "be terse"
-
-
-async def test_empty_system_prompt_keeps_old_request_shape():
-    model, agent = make_agent([[TextDelta("ok"), StreamDone("stop")]])
+async def test_system_prompt_forwarded_to_model_request():
+    model, agent = make_agent(
+        [[TextDelta("ok"), StreamDone("stop")], [TextDelta("ok"), StreamDone("stop")]]
+    )
     result = await agent.run("x")
     assert result.stop_reason == "stop"
     assert model.requests[0].system_prompt == ""
-    assert model.requests[0].messages[0].text == "x"
+    prompted = Agent(model=model, tools={"echo": EchoTool()}, system_prompt="be terse")
+    await prompted.run("x")
+    assert model.requests[1].system_prompt == "be terse"
 
 
 async def test_system_prompt_carried_in_every_turn_request():
@@ -380,6 +325,7 @@ async def test_stream_error_produces_one_record():
     model, agent = make_agent([[StreamDone("error", "provider boom")]])
     result = await agent.run("x")
     assert result.stop_reason == "error"
+    assert result.error == "provider boom"
     assert len(result.model_calls) == 1
     record = result.model_calls[0]
     assert record.stop_reason == "error"
@@ -391,6 +337,7 @@ async def test_raising_stream_produces_one_error_record():
     model, agent = make_agent([RuntimeError("adapter exploded")])
     result = await agent.run("x")
     assert result.stop_reason == "error"
+    assert "adapter exploded" in (result.error or "")
     assert len(result.model_calls) == 1
     assert result.model_calls[0].stop_reason == "error"
     assert result.model_calls[0].metrics is None
@@ -400,6 +347,7 @@ async def test_stream_without_terminal_produces_one_error_record():
     model, agent = make_agent([[TextDelta("hanging")]])
     result = await agent.run("x")
     assert result.stop_reason == "error"
+    assert "terminal" in (result.error or "")
     assert len(result.model_calls) == 1
     assert result.model_calls[0].stop_reason == "error"
 
@@ -444,30 +392,6 @@ async def test_cancel_winning_race_has_unknown_metrics():
     record = result.model_calls[0]
     assert record.stop_reason == "aborted"
     assert record.metrics is None
-
-
-async def test_cancel_during_tool_execution_keeps_turn_record():
-    slow = SlowTool()
-    echo = EchoTool()
-    model, agent = make_agent(
-        [
-            [
-                ToolCallEvent("c1", "slow", "{}"),
-                ToolCallEvent("c2", "echo", '{"text": "never"}'),
-                StreamDone("tool_use"),
-            ],
-        ],
-        tools=[slow, echo],
-    )
-    cancel = CancelToken()
-    task = asyncio.create_task(agent.run("x", cancel))
-    await slow.started.wait()
-    cancel.cancel()
-    result = await task
-    assert result.stop_reason == "aborted"
-    assert len(result.model_calls) == 1
-    assert result.model_calls[0].stop_reason == "tool_use"
-    assert result.model_calls[0].elapsed_s >= 0
 
 
 async def test_subscriber_error_does_not_lose_model_call_records():

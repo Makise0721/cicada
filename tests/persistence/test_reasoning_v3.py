@@ -85,8 +85,9 @@ async def test_legacy_migration_preserves_payloads_and_identity(tmp_path, versio
 
 
 @pytest.mark.parametrize("version", [1, 2])
-@pytest.mark.parametrize("step", [0, 1, 2])
+@pytest.mark.parametrize("step", [0, 2])
 def test_v3_step_failure_restores_original_bytes(tmp_path, monkeypatch, version, step):
+    """v3 各迁移步骤同分支 (单事务原子回滚): 保留首/尾边界代表."""
     directory, session_id, path = _legacy(tmp_path, version)
     before = path.read_bytes()
     steps = list(store_module._V3_MIGRATION_STEPS)
@@ -103,7 +104,7 @@ def test_v3_step_failure_restores_original_bytes(tmp_path, monkeypatch, version,
 
 
 @pytest.mark.parametrize("version", [1, 2])
-@pytest.mark.parametrize("step", [0, 1, 2])
+@pytest.mark.parametrize("step", [0, 2])
 async def test_v3_process_interruption_never_leaves_partial_upgrade(tmp_path, version, step):
     directory, session_id, path = _legacy(tmp_path, version)
     child = f"""

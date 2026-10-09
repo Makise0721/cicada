@@ -181,17 +181,17 @@ def _session_dir(work: Path) -> Path:
     return work / ".cicada" / "sessions"
 
 
-_CRASH_CASES = {
-    # 名称: (到达 kill 点的动作, 断言路径)
-    "after-begin": None,
-    "activity-open": None,
-    "activity-terminal": None,
-    "before-commit": None,
-    "mid-commit": None,
-}
+_KILL_POINTS = (
+    # 名称 -> 到达 kill 点的动作与断言路径见测试正文对应分支
+    "after-begin",
+    "activity-open",
+    "activity-terminal",
+    "before-commit",
+    "mid-commit",
+)
 
 
-@pytest.mark.parametrize("kill_point", sorted(_CRASH_CASES))
+@pytest.mark.parametrize("kill_point", _KILL_POINTS)
 def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
     gate_a = tmp_path / "gateA.txt"
     gate_b = tmp_path / "gateB.txt"

@@ -341,7 +341,8 @@ async def test_duplicate_call_id_in_current_group_rejected():
     assert "duplicate tool call id" in (result.error or "")
 
 
-async def test_tool_result_identity_mismatch_closes_with_original_identity():
+async def test_tool_result_identity_or_type_mismatch_closes_with_original_identity():
+    # 身份不符 (badid 返回错误的 call_id)
     model, agent = make_agent(
         [[ToolCallEvent("c1", "badid", "{}"), StreamDone("tool_use")], [StreamDone("stop")]],
         tools=[BadIdentityTool()],
@@ -354,9 +355,7 @@ async def test_tool_result_identity_mismatch_closes_with_original_identity():
     assert tool_msg.result.is_error
     # 已执行协议异常: 保守锁存语义依赖该前缀 (RunPolicy 既有标记覆盖)
     assert tool_msg.result.content.startswith("tool raised:")
-
-
-async def test_non_toolresult_return_closes_with_original_identity():
+    # 返回类型不是 ToolResult
     model, agent = make_agent(
         [[ToolCallEvent("c1", "weird", "{}"), StreamDone("tool_use")], [StreamDone("stop")]],
         tools=[NonToolResultTool()],
