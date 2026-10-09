@@ -81,6 +81,8 @@ class ProductionHarness:
         before = self.frontend._screen.full_redraws
         old = (self.stage.columns, self.stage.rows)
         self.stage.set_size(columns, rows)
+        # 预置旧画面残留，证明resize帧确实擦除视口，而非仅使用空白镜像。
+        self.stage.vt.feed("\x1b[H" + "\r\n".join("RESIZE-STALE" for _ in range(rows)))
         if old == (columns, rows):
             # StageTerminal更换VT镜像；同尺寸强制回放以建立比较画面。
             self.frontend.request_render(force=True)
@@ -94,7 +96,7 @@ class ProductionHarness:
         expected = [strip_terminal_sequences(line).rstrip() for line in frame]
         visible = expected[-rows:]
         screen = [self.stage.vt.line_text(i).rstrip() for i in range(rows)]
-        assert screen[:len(visible)] == visible, "新尺寸回放与同尺寸静态帧一致，无旧行残影"
+        assert screen == visible + [""] * (rows - len(visible)), "新尺寸可见正文与静态帧一致，尾部旧内容已擦除"
         if editor:
             row, line = next((i, line) for i, line in enumerate(frame) if CURSOR_MARKER in line)
             col = visible_width(line.split(CURSOR_MARKER)[0])
