@@ -11,24 +11,14 @@ import asyncio
 
 import pytest
 
-from cicada.budget import BudgetConfig, estimate_message_tokens
+from cicada.budget import estimate_message_tokens
 from cicada.context_policy import BudgetPolicy
 from cicada.core.cancel import CancelToken
 from cicada.core.messages import UserMessage
 from cicada.core.ports import ModelMetrics, ModelRequest, StreamDone, TextDelta, ToolSpec
 from cicada.plugins.fake_model import FakeModel
 
-
-def _config(**overrides) -> BudgetConfig:
-    defaults = dict(
-        num_ctx=100_000,
-        num_predict=1,
-        safety_margin_min=1,
-        safety_margin_ratio=0,
-        message_template_overhead=1,
-    )
-    defaults.update(overrides)
-    return BudgetConfig(**defaults)
+from tests.support.budget import policy_config as _config
 
 
 def _specs(*names: str) -> tuple[ToolSpec, ...]:

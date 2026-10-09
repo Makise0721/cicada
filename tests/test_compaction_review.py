@@ -1,12 +1,13 @@
 """02 独立审查处置测试 (2026-10-06): F6/F8/F10/F12 应用层补测.
 
 复用 test_compaction 的手工会话夹具; 全部为审查发现的直接钉子。
+PA03 事件序钉子已并入 test_compaction 的接受后取消测试 (同一 gated-commit
+场景); A11 扫描钉子由 test_auto_trigger 的自动重试复核代表。
 """
 
 from __future__ import annotations
 
 import asyncio
-import math
 
 import pytest
 
@@ -20,9 +21,9 @@ from test_compaction import (
     _two_committed_requests,
 )
 
-from cicada.application import ApplicationSession, ContextCompacted
-from cicada.budget import BudgetConfig, estimate_input_components
+from cicada.application import ApplicationSession
 from cicada.boot import bootstrap
+from cicada.budget import BudgetConfig
 from cicada.context_policy import BudgetPolicy
 from cicada.core.messages import AssistantMessage, UserMessage
 from cicada.core.ports import StreamDone
@@ -34,13 +35,7 @@ from cicada.persistence.contracts import (
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.session_store import open_session_store
 
-
-def _admission_total(messages, config) -> int:
-    """请求前预估口的总需求复算 (与 _refuse_overbudget_request 同构; 无工具/无 plan)."""
-    raw, _components = estimate_input_components("test system prompt", (), messages, config)
-    return raw + config.effective_output_reserve + max(
-        config.safety_margin_min, math.ceil(config.safety_margin_ratio * raw)
-    )
+from tests.support.budget import admission_total
 
 
 async def test_admission_uses_projection_after_compaction_not_canonical(tmp_path):
@@ -52,9 +47,11 @@ async def test_admission_uses_projection_after_compaction_not_canonical(tmp_path
     u1, a1 = UserMessage(text="x" * 9000), AssistantMessage(text="")
     u2, a2 = UserMessage(text="y" * 2000), AssistantMessage(text="")
     probe = BudgetConfig(num_ctx=1, num_predict=2048)
-    t_second = _admission_total((u1, a1, u2), probe)
-    t_summary = _admission_total((u1, a1), probe)  # 摘要输入下界 (提示+覆盖区间)
-    t_final_canonical = _admission_total((u1, a1, u2, a2, UserMessage(text="第三问")), probe)
+    t_second = admission_total("test system prompt", (u1, a1, u2), probe)
+    t_summary = admission_total("test system prompt", (u1, a1), probe)  # 摘要输入下界 (提示+覆盖区间)
+    t_final_canonical = admission_total(
+        "test system prompt", (u1, a1, u2, a2, UserMessage(text="第三问")), probe
+    )
     assert t_second < t_final_canonical and t_summary < t_final_canonical
     num_ctx = (max(t_second, t_summary) + t_final_canonical) // 2
     config = BudgetConfig(num_ctx=num_ctx, num_predict=2048)
@@ -70,8 +67,8 @@ async def test_admission_uses_projection_after_compaction_not_canonical(tmp_path
         compacted = await session.compact_context()
         assert compacted is not None and compacted.end_message_index == 2
         # 前置断言: 若预估仍按规范历史 (含被摘要的 req1 原文), 此请求必被拒绝
-        assert _admission_total(
-            (*session._history, UserMessage(text="第三问")), config
+        assert admission_total(
+            "test system prompt", (*session._history, UserMessage(text="第三问")), config
         ) > num_ctx, "前置条件: 规范历史口径必须超限"
         outcome = await session.execute("第三问")
         assert outcome.result.stop_reason == "stop", "有效投影口径放行 (01-F10)"
@@ -117,56 +114,6 @@ async def test_summary_failure_never_persists_or_switches(tmp_path):
         assert session._compact_done.done(), "屏障落定"
         assert session.persistence.storage_failed is None, "失败分类不是存储故障"
     finally:
-        await session.aclose()
-        await store.aclose()
-
-
-async def test_accepted_cancel_publishes_event_before_propagating(tmp_path):
-    """PA03 事件序 (审查 02-F6): 接受后取消 → ContextCompacted 先发布, 再传播取消."""
-    store = open_session_store(
-        directory=tmp_path / ".cicada" / "sessions", session_id=None, workspace=tmp_path
-    )
-    epoch_id = await store.start_epoch(StoredIdentity(launch=_identity(), tool_fingerprint="fp"))
-    original_commit = store.commit_summary
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def gated_commit(record):
-        await original_commit(record)
-        entered.set()
-        await release.wait()
-        return None
-
-    main_model = FakeModel([[StreamDone("stop")], [StreamDone("stop")]])
-    config = _config(tmp_path, main_model, budget=_budget())
-    channel = _ScriptedSummary()
-    policy = BudgetPolicy(main_model, config.budget, summarize=channel)
-    app = await bootstrap(
-        [fake_model_plugin(main_model)], tool_capabilities=(),
-        system_prompt="test system prompt", model_policy=lambda inner, runtime: policy,
-    )
-    session = ApplicationSession(
-        app=app, config=config, service=None, policy=None,
-        store=store, epoch_id=epoch_id, persistence_mode="save",
-        budget_policy=policy,
-    )
-    object.__setattr__(store, "commit_summary", gated_commit)
-    events: list = []
-    session.subscribe(events.append)
-    try:
-        await _two_committed_requests(session)
-        task = asyncio.ensure_future(session.compact_context())
-        await asyncio.wait_for(entered.wait(), timeout=5)
-        task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert len([e for e in events if isinstance(e, ContextCompacted)]) == 1, (
-            "成功事件在取消传播前已发布"
-        )
-        assert len(store.recovery_snapshot().summaries) == 1
-    finally:
-        release.set()
         await session.aclose()
         await store.aclose()
 

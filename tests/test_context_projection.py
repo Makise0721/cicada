@@ -10,7 +10,7 @@ import asyncio
 
 import pytest
 
-from cicada.budget import BudgetConfig, estimate_message_tokens
+from cicada.budget import estimate_message_tokens
 from cicada.context_policy import (
     SUMMARY_PROMPT_SHA256,
     SUMMARY_PROMPT_VERSION,
@@ -32,16 +32,7 @@ from cicada.core.ports import (
     TextDelta,
     ToolCallEvent,
 )
-from cicada.persistence.codec import encode_messages
-
-
-def _config(**overrides) -> BudgetConfig:
-    defaults = dict(
-        num_ctx=100_000, num_predict=1,
-        safety_margin_min=1, safety_margin_ratio=0, message_template_overhead=1,
-    )
-    defaults.update(overrides)
-    return BudgetConfig(**defaults)
+from tests.support.budget import policy_config as _config
 
 
 # --- 投影容器 (D4) ---------------------------------------------------------------------
@@ -120,12 +111,18 @@ def test_summary_block_message_is_deterministic_and_declares_authority():
     assert first.text.endswith("正文")
 
 
-def test_canonical_prefix_sha256_matches_canonical_encoding():
+def test_canonical_prefix_sha256_pins_fingerprint_recipe():
+    """冻结契约: 覆盖前缀指纹 = sha256(encode_messages 的 UTF-8 字节) 的十六进制.
+
+    字面量钉死哈希配方——编码或哈希算法变化必须显式更新本测试 (历史摘要
+    指纹依赖该配方, 不允许随实现静默漂移)。
+    """
     messages = (UserMessage(text="a"), AssistantMessage(text="b"))
-    expected = __import__("hashlib").sha256(
-        encode_messages(messages).encode("utf-8")
-    ).hexdigest()
+    expected = "2dfb44c815e76d41aec06b061ae9e434a6fc67b00e4369d4f4cc815dcccc0656"
     assert canonical_prefix_sha256(messages) == expected
+    assert canonical_prefix_sha256(messages[:1]) == (
+        "e5f96f7748bb025531abd7d87193e18fc3b51d6c600e4491ff49f00a10f474e1"
+    )
     assert canonical_prefix_sha256(messages[:1]) != expected
 
 

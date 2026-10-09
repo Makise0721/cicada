@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import math
 
 import pytest
 
@@ -122,9 +121,8 @@ def test_report_covers_every_section_and_sums_to_total():
         config, input_estimate=input_estimate, input_components=components, source="estimated"
     )
     assert report.output_reserve == 10
-    assert report.safety_margin == max(
-        config.safety_margin_min, math.ceil(config.safety_margin_ratio * input_estimate)
-    )
+    # 字面值钉默认安全余量下限 (256) 主导 max 分支; 估计器本身只断言方向与可加性
+    assert report.safety_margin == 256
     assert report.total_estimate == (
         report.input_estimate + report.output_reserve + report.safety_margin
     )
@@ -137,12 +135,12 @@ def test_report_covers_every_section_and_sums_to_total():
 
 def test_report_output_reserve_uses_default_when_num_predict_absent():
     config = BudgetConfig(num_ctx=50_000)
-    assert config.effective_output_reserve == config.output_reserve_default
+    assert config.effective_output_reserve == 4096, "num_predict 缺省时用固定缺省预留"
     report = assemble_report(
         config, input_estimate=100, input_components=(), source="estimated"
     )
     reserve = next(c for c in report.components if c.label == "output_reserve")
-    assert reserve.tokens == config.output_reserve_default
+    assert reserve.tokens == 4096
 
 
 def test_report_is_json_serializable():

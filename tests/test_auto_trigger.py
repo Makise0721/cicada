@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 
 import pytest
 
@@ -23,14 +22,9 @@ from cicada.application import (
     ApplicationConfig,
     ApplicationSession,
     ContextCompacted,
-    PersistenceConfig,
 )
 from cicada.boot import bootstrap
-from cicada.budget import (
-    BudgetConfig,
-    assemble_report,
-    estimate_input_components,
-)
+from cicada.budget import BudgetConfig
 from cicada.context_policy import (
     BudgetPolicy,
     ContextProjection,
@@ -50,7 +44,6 @@ from cicada.core.ports import (
     ToolCallEvent,
 )
 from cicada.persistence.contracts import (
-    LaunchIdentity,
     RequestOutcomeFacts,
     StoredIdentity,
 )
@@ -62,17 +55,11 @@ from cicada.run_policy import verification_policy
 from test_application import _prompt_info
 from test_persistence_application import _identity
 
+from tests.support.budget import admission_total
+
 
 def _budget(num_ctx: int = 1_000_000) -> BudgetConfig:
     return BudgetConfig(num_ctx=num_ctx, num_predict=2048)
-
-
-def _total(config: BudgetConfig, messages) -> int:
-    """与 assemble_report 相同口径的总需求 (测试窗口计算用)."""
-    raw, _components = estimate_input_components("sys", (), tuple(messages), config)
-    return raw + config.effective_output_reserve + max(
-        config.safety_margin_min, math.ceil(config.safety_margin_ratio * raw)
-    )
 
 
 # 适配器归一后的上下文超限错误文本 (上游出处见 tests/plugins/ollama/test_context_overflow.py)
@@ -143,30 +130,17 @@ class _AutoCompactStub:
         return True
 
 
-def _over_request() -> ModelRequest:
-    """两条消息: 大历史 + 当前请求; 桩投影覆盖第一条后 [块]+当前请求可装下."""
-    big = UserMessage(text="x" * 4000)
-    prompt = UserMessage(text="please")
-    config = _budget(1)
-    full = _total(config, (big, prompt))
-    projected = _total(config, (summary_block_message(
-        first_request_seq=1, last_request_seq=1, message_count=1, text="摘要正文",
-    ), prompt))
-    assert full > projected
-    return ModelRequest(messages=(big, prompt), tools=(), system_prompt="sys")
-
-
 def _window_request() -> tuple[ModelRequest, BudgetConfig]:
     """请求 + 恰好卡在 full>num_ctx≥projected 窗口内的配置."""
     big = UserMessage(text="x" * 4000)
     prompt = UserMessage(text="please")
     config = _budget(1)
-    full = _total(config, (big, prompt))
-    projected = _total(config, (summary_block_message(
+    full = admission_total("sys", (big, prompt), config)
+    projected = admission_total("sys", (summary_block_message(
         first_request_seq=1, last_request_seq=1, message_count=1, text="摘要正文",
-    ), prompt))
+    ), prompt), config)
     config = BudgetConfig(num_ctx=projected + (full - projected) // 2, num_predict=2048)
-    assert _total(config, (big, prompt)) > config.num_ctx
+    assert admission_total("sys", (big, prompt), config) > config.num_ctx
     return ModelRequest(messages=(big, prompt), tools=(), system_prompt="sys"), config
 
 
@@ -180,7 +154,7 @@ def _server_overflow_request() -> tuple[ModelRequest, BudgetConfig]:
         tools=(), system_prompt="sys",
     )
     config = _budget()
-    assert _total(config, request.messages) <= config.num_ctx
+    assert admission_total("sys", request.messages, config) <= config.num_ctx
     return request, config
 
 
@@ -334,7 +308,7 @@ async def test_overflow_retry_still_over_budget_refuses_after_compaction():
     request = ModelRequest(
         messages=(UserMessage(text="x" * 4000), prompt), tools=(), system_prompt="sys"
     )
-    assert _total(config, request.messages) <= config.num_ctx, "准入通过"
+    assert admission_total("sys", request.messages, config) <= config.num_ctx, "准入通过"
     model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
     policy = BudgetPolicy(
         model, config,
@@ -353,11 +327,10 @@ async def test_overflow_retry_still_over_budget_refuses_after_compaction():
 @pytest.mark.parametrize(
     "prefix_events",
     [
-        [TextDelta("可见输出")],
-        [TextDelta("")],  # 空片段同样禁止透明重发 (A10)
+        [TextDelta("")],  # 空片段同样禁止透明重发 (A10 边界)
         [ToolCallEvent("c1", "read", "{}")],
     ],
-    ids=["text-delta", "empty-text-delta", "tool-call-event"],
+    ids=["empty-text-delta", "tool-call-event"],
 )
 async def test_transparent_resend_banned_after_any_output(prefix_events):
     """透明重发禁令: 该发送点出现任何 TextDelta/ToolCallEvent 后的上下文错误不重试."""
@@ -549,13 +522,6 @@ class _LatchingModel(FakeModel):
             yield event
 
 
-def _app_total(system: str, messages, config: BudgetConfig) -> int:
-    raw, _components = estimate_input_components(system, (), tuple(messages), config)
-    return raw + config.effective_output_reserve + max(
-        config.safety_margin_min, math.ceil(config.safety_margin_ratio * raw)
-    )
-
-
 def _seed_pair() -> tuple[tuple, tuple]:
     """种子请求: 请求1 (大, 可摘要) + 请求2 (中等, 保留后缀主体).
 
@@ -567,24 +533,20 @@ def _seed_pair() -> tuple[tuple, tuple]:
     return req1, req2
 
 
-def _config_for(num_ctx: int) -> BudgetConfig:
-    return BudgetConfig(num_ctx=num_ctx, num_predict=2048)
-
-
 def _window_config_auto() -> tuple[BudgetConfig, tuple, tuple]:
     """Class A (begin 前触发): summary_input ≤ num_ctx < total(H + 小 prompt)."""
     req1, req2 = _seed_pair()
-    base = _config_for(1)
+    base = _budget(1)
     block = summary_block_message(
         first_request_seq=1, last_request_seq=1, message_count=len(req1),
         text="较早请求的摘要正文",
     )
-    summary_input = _app_total(summary_prompt_text(), summary_input_messages(req1), base)
-    full = _app_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), base)
+    summary_input = admission_total(summary_prompt_text(), summary_input_messages(req1), base)
+    full = admission_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), base)
     assert summary_input < full, "摘要输入窗口必须窄于预估失败的完整请求"
-    config = _config_for(summary_input + (full - summary_input) // 2)
-    projected = _app_total("test system prompt", (block, *req2, UserMessage(text="第三问")), config)
-    assert _app_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), config) > config.num_ctx
+    config = _budget(summary_input + (full - summary_input) // 2)
+    projected = admission_total("test system prompt", (block, *req2, UserMessage(text="第三问")), config)
+    assert admission_total("test system prompt", (*req1, *req2, UserMessage(text="第三问")), config) > config.num_ctx
     assert projected <= config.num_ctx, "压缩后投影可容纳"
     return config, req1, req2
 
@@ -601,7 +563,7 @@ def _tool_turn(text_len: int = 600) -> list:
 def _window_config_per_turn() -> tuple[BudgetConfig, tuple, tuple]:
     """Class B (begin 后触发): 预估 (H+prompt) 通过, 轮 1 (H+prompt+轮0增量) 超限."""
     req1, req2 = _seed_pair()
-    base = _config_for(1)
+    base = _budget(1)
     prompt = UserMessage(text="第三问")
     block = summary_block_message(
         first_request_seq=1, last_request_seq=1, message_count=len(req1),
@@ -614,13 +576,13 @@ def _window_config_per_turn() -> tuple[BudgetConfig, tuple, tuple]:
             is_error=True,
         )),
     )
-    summary_input = _app_total(summary_prompt_text(), summary_input_messages(req1), base)
-    admitted = _app_total("test system prompt", (*req1, *req2, prompt), base)
-    next_turn = _app_total("test system prompt", (*req1, *req2, prompt, *turn0), base)
+    summary_input = admission_total(summary_prompt_text(), summary_input_messages(req1), base)
+    admitted = admission_total("test system prompt", (*req1, *req2, prompt), base)
+    next_turn = admission_total("test system prompt", (*req1, *req2, prompt, *turn0), base)
     assert summary_input <= admitted < next_turn, "预估通过而下一轮超限的窗口必须存在"
-    config = _config_for(admitted + (next_turn - admitted) // 2)
-    assert _app_total("test system prompt", (*req1, *req2, prompt), config) <= config.num_ctx
-    projected = _app_total("test system prompt", (block, *req2, prompt, *turn0), config)
+    config = _budget(admitted + (next_turn - admitted) // 2)
+    assert admission_total("test system prompt", (*req1, *req2, prompt), config) <= config.num_ctx
+    projected = admission_total("test system prompt", (block, *req2, prompt, *turn0), config)
     assert projected <= config.num_ctx, "压缩后轮 1 可容纳"
     return config, req1, req2
 

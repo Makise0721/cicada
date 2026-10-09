@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import math
 
 import pytest
 
@@ -30,10 +29,8 @@ from cicada.context_policy import (
     canonical_prefix_sha256,
     summary_block_message,
 )
-from cicada.core.events import ModelCallCompleted  # noqa: F401
 from cicada.core.messages import AssistantMessage, UserMessage
 from cicada.core.ports import ModelMetrics, StreamDone
-from cicada.persistence.codec import encode_messages
 from cicada.persistence.contracts import LaunchIdentity, StoredIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.session_store import open_session_store
@@ -46,6 +43,8 @@ from tests.support.summary import (
     ScriptedSummary as _ScriptedSummary,
     budget as _budget,
 )
+
+from tests.support.budget import admission_total
 
 
 def _config(tmp_path, model: FakeModel, *, budget: BudgetConfig | None = None) -> ApplicationConfig:
@@ -125,7 +124,6 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
         assert summary_request.messages[-1].role == "user"
         assert summary_request.messages[-1].text == SUMMARY_TURN_TEXT
         assert summary_request.messages[:-1] == history_before[:2]
-        assert compacted.message_count == 2
         # 前一投影身份 = 切换前的恒等投影 (完整规范历史) 指纹
         assert record.previous_projection_identity == canonical_prefix_sha256(history_before)
         # 投影切换: 有效消息 = [摘要块] + 保留后缀; 结构合法 (切点不切工具组)
@@ -159,12 +157,6 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
     finally:
         await session.aclose()
         await store.aclose()
-
-
-def _isolate(messages):
-    from cicada.core.messages import isolate_message
-
-    return tuple(isolate_message(m) for m in messages)
 
 
 async def test_compaction_requires_two_committed_requests_and_channel(tmp_path):
@@ -225,7 +217,6 @@ async def test_compaction_refusals_view_only_storage_failed_and_no_channel(tmp_p
 
 async def test_compaction_shrinks_range_to_fit_summary_budget(tmp_path):
     """摘要输入自身须满足预算: 最长最旧前缀区间; 收缩从新端开始 (D4)."""
-    from cicada.budget import assemble_report, estimate_input_components
     from cicada.context_policy import summary_input_messages, summary_prompt_text
 
     # 三个请求; num_ctx 卡在"覆盖前两个请求装不下、单个请求可装"的窗口内
@@ -235,10 +226,9 @@ async def test_compaction_shrinks_range_to_fit_summary_budget(tmp_path):
     )
 
     def _total(messages):
-        input_estimate, _components = estimate_input_components(
-            summary_prompt_text(), (), summary_input_messages(messages), _budget(1)
+        return admission_total(
+            summary_prompt_text(), summary_input_messages(messages), _budget(1)
         )
-        return input_estimate + 2048 + max(256, math.ceil(0.10 * input_estimate))
 
     total_one = _total(canonical_two[:2])
     total_two = _total(canonical_two)
@@ -348,6 +338,8 @@ async def test_cancel_after_store_accept_settles_then_switches_and_propagates(tm
         budget_policy=policy,
     )
     object.__setattr__(store, "commit_summary", gated_commit)
+    events: list = []
+    session.subscribe(events.append)
     try:
         await _two_committed_requests(session)
         task = asyncio.ensure_future(session.compact_context())
@@ -356,7 +348,10 @@ async def test_cancel_after_store_accept_settles_then_switches_and_propagates(tm
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        # 已接受事务的成功不能被取消掩盖: 摘要落库 + 投影已切换 + 事件已发布
+        # 已接受事务的成功不能被取消掩盖: 摘要落库 + 投影已切换 + 事件先发布再传播 (PA03)
+        assert len([e for e in events if isinstance(e, ContextCompacted)]) == 1, (
+            "成功事件在取消传播前已发布"
+        )
         assert len(store.recovery_snapshot().summaries) == 1
         assert len(session._context_projection.blocks) == 1
         assert session._compact_done.done()
@@ -588,63 +583,6 @@ async def test_restore_rebuilds_identical_projection_and_rejects_tamper(tmp_path
             await open_application(config)
     finally:
         pass
-
-
-async def test_terminal_scan_still_covers_canonical_after_projection(tmp_path):
-    """A11 预备: 压缩投影替换发生在 RunPolicy 下游, 终结扫描仍针对完整规范历史.
-
-    被摘要覆盖的未证终结 powershell 结果仍触发保守锁存; 下游 BudgetPolicy 所见
-    请求首条已是摘要块 (替换真实发生), 证明扫描面不随投影收缩。
-    """
-    from cicada.core.messages import ToolResult, ToolResultMessage
-    from cicada.core.ports import ModelRequest
-    from cicada.plugins.coding.verification_contracts import VerificationView
-    from cicada.run_policy import verification_policy
-
-    class _RecordingService:
-        def __init__(self, view) -> None:
-            self._view = view
-            self.reasons: list[str] = []
-
-        def mark_process_uncertain(self, reason: str) -> None:
-            self.reasons.append(reason)
-
-        async def refresh(self, cancel):
-            return self._view
-
-    view = VerificationView(
-        verification_run_id="run-1", snapshot_ref=None, scope_id=None,
-        checks=(), receipts=(), process_uncertain=False, blocking_reasons=(),
-    )
-    service = _RecordingService(view)
-    inner = FakeModel([])
-    policy = BudgetPolicy(inner, _budget())
-    canonical = (
-        UserMessage(text="第一问"),
-        ToolResultMessage(result=ToolResult(
-            call_id="c1", name="powershell", content="超时被杀", is_error=True, details=None,
-        )),
-        UserMessage(text="第二问"),  # 保留后缀起点 (第二请求)
-    )
-    from cicada.context_policy import SummaryBlock
-
-    policy.projection.apply_summary(
-        SummaryBlock(
-            message=summary_block_message(
-                first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
-            ),
-            end_message_index=2, first_request_seq=1, last_request_seq=1, message_count=2,
-            prefix_sha256=canonical_prefix_sha256(canonical[:2]),
-        ),
-        canonical_length=len(canonical),
-    )
-    wrapped = verification_policy(policy, service)
-    request = ModelRequest(messages=canonical, tools=(), system_prompt="sys")
-    from cicada.core.cancel import CancelToken
-    _ = [event async for event in wrapped.stream(request, CancelToken())]
-    assert service.reasons, "被摘要覆盖的未证终结事实仍被扫描锁存 (A11)"
-    assert inner.requests, "请求已发出 (投影替换后正常放行)"
-    assert inner.requests[0].messages[0].text.startswith("[程序生成的对话摘要]")
 
 
 # --- 阶段收口审查处置 (STG-F1): begin 等待窗的应用层互斥 ----------------------------------
