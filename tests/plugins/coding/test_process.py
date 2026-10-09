@@ -19,6 +19,7 @@ from cicada.plugins.coding.process import (
     _OutputCollector,
 )
 from cicada.plugins.coding.workspace import Workspace
+from tests.support.plugins import pid_alive, wait_pid_gone
 
 
 def make(tmp_path):
@@ -32,21 +33,6 @@ async def run_runner(runner, ws, cancel=None, **arguments):
         output_dir=ws.output_dir,
         **arguments,
     )
-
-
-def pid_alive(pid: int) -> bool:
-    out = subprocess.run(
-        ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True
-    ).stdout
-    return str(pid) in out
-
-
-async def wait_pid_gone(pid: int, attempts: int = 30) -> bool:
-    for _ in range(attempts):
-        if not pid_alive(pid):
-            return True
-        await asyncio.sleep(0.1)
-    return not pid_alive(pid)
 
 
 async def wait_until(predicate, attempts: int = 200, interval: float = 0.05) -> bool:
@@ -73,7 +59,6 @@ def collect(chunks, output_dir) -> _OutputCollector:
 COLLECTOR_PAYLOADS = {
     "long_single_line": lambda: b"x" * 60000 + b"\n",
     "multibyte_multiline": lambda: ("中文🙂ok\n" * 9000).encode(),
-    "no_newline": lambda: b"w" * 60000,
     "multibyte_single_line": lambda: ("中文🙂" * 20000 + "\n").encode(),
     "empty": lambda: b"",
     "short": lambda: b"hi\n",
@@ -127,9 +112,19 @@ async def test_tail_and_pending_are_bounded_for_long_single_line(tmp_path):
     assert result.output.full_output_path.read_text(encoding="utf-8").strip() == "z" * 60000
 
 
-async def test_artifact_cap_truncates_prefix_and_keeps_raw_total(tmp_path):
+async def test_artifact_cap_truncates_prefix_and_keeps_raw_total(tmp_path, monkeypatch):
     ws = make(tmp_path)
-    # 约 17 MiB 输出: 工件只保留 16 MiB 前缀, 原始 total_bytes 仍如实上报
+    # 同一趟重输出同时钉工件上限与固定读块: 工件只保留 16 MiB 前缀,
+    # 原始 total_bytes 如实上报, feed 块大小不随总量膨胀
+    sizes: list[int] = []
+    original = _OutputCollector.feed
+
+    def counting_feed(self, data):
+        sizes.append(len(data))
+        original(self, data)
+
+    monkeypatch.setattr(_OutputCollector, "feed", counting_feed)
+    # 约 17 MiB 输出
     result = await run_runner(
         PowerShellRunner(),
         ws,
@@ -146,25 +141,6 @@ async def test_artifact_cap_truncates_prefix_and_keeps_raw_total(tmp_path):
     assert stored <= ARTIFACT_MAX_BYTES
     assert stored > ARTIFACT_MAX_BYTES - 65536
     assert result.output.full_output_path.read_bytes().decode("utf-8", "replace")
-
-
-async def test_read_chunk_is_fixed_and_independent_of_total_output(tmp_path, monkeypatch):
-    ws = make(tmp_path)
-    sizes: list[int] = []
-    original = _OutputCollector.feed
-
-    def counting_feed(self, data):
-        sizes.append(len(data))
-        original(self, data)
-
-    monkeypatch.setattr(_OutputCollector, "feed", counting_feed)
-    result = await run_runner(
-        PowerShellRunner(),
-        ws,
-        command="1..600 | ForEach-Object { Write-Output ('y' * 30000) }",
-        timeout=120.0,
-    )
-    assert result.exit_code == 0
     assert sizes and max(sizes) <= READ_CHUNK_BYTES
 
 

@@ -7,7 +7,6 @@
 import asyncio
 import hashlib
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -26,14 +25,9 @@ from cicada.plugins.coding.verification import (
 )
 from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 from cicada.plugins.coding.workspace import Workspace
+from tests.support.plugins import git
 
 PY = Path(".venv/Scripts/python.exe").resolve().as_posix()
-
-
-def git(root, *args, input=None):
-    return subprocess.run(
-        ["git", "-C", str(root), *args], input=input, capture_output=True, check=True
-    ).stdout
 
 
 @pytest.fixture

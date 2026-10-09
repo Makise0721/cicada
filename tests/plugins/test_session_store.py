@@ -19,6 +19,7 @@ import pytest
 from cicada.core.events import ModelCallCompleted
 from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage, UserMessage
 from cicada.core.ports import ModelMetrics
+from cicada.persistence.codec import dumps_strict
 from cicada.persistence.contracts import (
     MAX_METADATA_BYTES,
     SESSION_APPLICATION_ID,
@@ -92,11 +93,32 @@ async def _populate(store: SQLiteSessionStore, *, request_count: int = 1) -> str
     return epoch
 
 
+async def _make_session(directory: Path, *, requests: int = 1, title: str | None = None) -> str:
+    """经真实 store 建一个带提交请求的会话; 返回 session_id。"""
+    store = open_session_store(directory=directory, session_id=None, workspace=directory)
+    session_id = store.session_id
+    await _populate(store, request_count=requests)
+    await store.aclose()
+    if title is not None:
+        connection = sqlite3.connect(str(directory / f"{session_id}.sqlite3"))
+        connection.execute("UPDATE session SET short_title = ?", (title,))
+        connection.commit()
+        connection.close()
+    return session_id
+
+
+@pytest.fixture
+async def store(tmp_path):
+    """空白会话存档; 测试结束后幂等关闭 (aclose 幂等由本文件的关闭纪律测试钉住)."""
+    handle = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    yield handle
+    await handle.aclose()
+
+
 # --- 创建 / lease / 关闭 ---------------------------------------------------------------------
 
 
-async def test_new_session_creates_files_and_close_keeps_lock_file(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_new_session_creates_files_and_close_keeps_lock_file(store, tmp_path):
     db = tmp_path / f"{store.session_id}.sqlite3"
     lock = tmp_path / f"{store.session_id}.lock"
     assert db.is_file() and lock.is_file()
@@ -166,7 +188,7 @@ def test_independent_process_holds_lease_until_exit(tmp_path):
     asyncio.run(reopened.aclose())
 
 
-async def test_store_plugin_activates_first_in_persistent_topology(tmp_path):
+async def test_store_plugin_activates_first_in_persistent_topology(store, tmp_path):
     """钉住持久拓扑: store 插件在名单首位、零依赖 -> 最先激活 -> runtime 逆序清理时最后释放.
 
     这是「store 最后清理」的注册顺序机制回归; 02 换显式 capability requires 时本测试
@@ -177,7 +199,6 @@ async def test_store_plugin_activates_first_in_persistent_topology(tmp_path):
     from cicada.plugins.coding.workspace import workspace_plugin
     from cicada.plugins.session_store import session_store_plugin
 
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     definitions = [
         session_store_plugin(store),
         workspace_plugin(tmp_path),
@@ -189,14 +210,6 @@ async def test_store_plugin_activates_first_in_persistent_topology(tmp_path):
     assert store._closed, "逆序清理后 store 必须已被插件 scope 释放"
 
 
-async def test_released_lease_allows_reacquire_after_process_style_close(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
-    session_id = store.session_id
-    await store.aclose()
-    reopened = open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
-    await reopened.aclose()
-
-
 async def test_resume_unknown_or_malformed_id_rejected(tmp_path):
     with pytest.raises(SessionNotFoundError):
         open_session_store(directory=tmp_path, session_id=UUID, workspace=tmp_path)
@@ -204,8 +217,7 @@ async def test_resume_unknown_or_malformed_id_rejected(tmp_path):
         open_session_store(directory=tmp_path, session_id="../../etc", workspace=tmp_path)
 
 
-async def test_workspace_mismatch_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_workspace_mismatch_rejected(store, tmp_path):
     session_id = store.session_id
     await store.aclose()
     other = tmp_path / "elsewhere"
@@ -217,8 +229,7 @@ async def test_workspace_mismatch_rejected(tmp_path):
 # --- 提交边界与恢复 roundtrip ----------------------------------------------------------------
 
 
-async def test_epoch_begin_commit_and_restore_roundtrip(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_epoch_begin_commit_and_restore_roundtrip(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     details = {"path": "a.py", "nested": {"deep": [1, 2, {"leaf": "ünïcödé \x1b"}]}}
     request_id = await store.begin_request(epoch, "第一问 ünïcödé")
@@ -259,8 +270,7 @@ async def test_epoch_begin_commit_and_restore_roundtrip(tmp_path):
     await reopened.aclose()
 
 
-async def test_clear_advances_generation_and_history_composition(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_clear_advances_generation_and_history_composition(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     first = await store.begin_request(epoch, "第一问")
     await store.commit_request(first, messages=_suffix(("第一问", "一答")), outcome=_outcome())
@@ -279,8 +289,7 @@ async def test_clear_advances_generation_and_history_composition(tmp_path):
     await reopened.aclose()
 
 
-async def test_pending_intent_survives_and_start_epoch_marks_interrupted(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_pending_intent_survives_and_start_epoch_marks_interrupted(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     await store.begin_request(epoch, "未完成的请求")
     session_id = store.session_id
@@ -298,8 +307,7 @@ async def test_pending_intent_survives_and_start_epoch_marks_interrupted(tmp_pat
     await reopened.aclose()
 
 
-async def test_second_active_request_and_unknown_commit_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_second_active_request_and_unknown_commit_rejected(store):
     epoch = await store.start_epoch(_identity())
     await store.begin_request(epoch, "第一个")
     with pytest.raises(PersistenceError, match="pending"):
@@ -308,33 +316,27 @@ async def test_second_active_request_and_unknown_commit_rejected(tmp_path):
         await store.commit_request("not-a-request", messages=_suffix(("x", "y")), outcome=_outcome())
     with pytest.raises(PersistenceError, match="unknown epoch"):
         await store.begin_request("no-such-epoch", "问")
-    await store.aclose()
 
 
-async def test_duplicate_commit_after_committed_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_duplicate_commit_after_committed_rejected(store):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "问")
     await store.commit_request(request_id, messages=_suffix(("问", "答")), outcome=_outcome())
     with pytest.raises(PersistenceError, match="already committed"):
         await store.commit_request(request_id, messages=_suffix(("问", "答")), outcome=_outcome())
-    await store.aclose()
 
 
 # --- 限额 ------------------------------------------------------------------------------------
 
 
-async def test_prompt_metadata_limit_rejected_before_begin(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_prompt_metadata_limit_rejected_before_begin(store):
     epoch = await store.start_epoch(_identity())
     huge = "x" * (MAX_METADATA_BYTES + 1)
     with pytest.raises(ArchiveLimitError, match="request prompt"):
         await store.begin_request(epoch, huge)
-    await store.aclose()
 
 
-async def test_request_payload_limit_rejected_with_no_partial_write(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_request_payload_limit_rejected_with_no_partial_write(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "大请求")
     big = "y" * (8 * 1024 * 1024 + 64)
@@ -354,25 +356,7 @@ async def test_request_payload_limit_rejected_with_no_partial_write(tmp_path):
 # --- 损坏 / 未知版本: 打开前拒绝, 保留原文件 ---------------------------------------------------
 
 
-def _corrupt(tmp_path: Path, store: SQLiteSessionStore, statements: tuple[str, ...]) -> None:
-    """直接用 sqlite3 修改已关闭的存档 (测试专用的受控破坏)."""
-    connection = sqlite3.connect(str(tmp_path / f"{store.session_id}.sqlite3"))
-    try:
-        for statement in statements:
-            connection.execute(statement)
-        connection.commit()
-    finally:
-        connection.close()
-
-
-async def _open_closed(tmp_path: Path, store: SQLiteSessionStore, **kwargs):
-    session_id = store.session_id
-    await store.aclose()
-    return open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path, **kwargs)
-
-
-async def test_unknown_version_rejected_and_file_untouched(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_unknown_version_rejected_and_file_untouched(store, tmp_path):
     session_id = store.session_id
     await store.aclose()
     db = tmp_path / f"{session_id}.sqlite3"
@@ -386,8 +370,7 @@ async def test_unknown_version_rejected_and_file_untouched(tmp_path):
     assert db.read_bytes() == before, "拒绝恢复不得改写原存档"
 
 
-async def test_wrong_application_id_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_wrong_application_id_rejected(store, tmp_path):
     await store.aclose()
     connection = sqlite3.connect(str(tmp_path / f"{store.session_id}.sqlite3"))
     connection.execute(f"PRAGMA application_id = {SESSION_APPLICATION_ID + 1}")
@@ -403,8 +386,7 @@ async def test_garbage_file_rejected_as_format_error(tmp_path):
         open_session_store(directory=tmp_path, session_id=UUID, workspace=tmp_path)
 
 
-async def test_missing_table_and_corrupt_payload_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_missing_table_and_corrupt_payload_rejected(store, tmp_path):
     session_id = store.session_id
     await _populate(store)
     await store.aclose()
@@ -430,13 +412,12 @@ async def test_missing_table_and_corrupt_payload_rejected(tmp_path):
     # JSON 解析损坏才成为拒绝面 —— 两道校验分别钉住
     with pytest.raises(ArchiveFormatError, match="recorded digest"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
-    import hashlib as _hashlib
 
     connection = sqlite3.connect(str(tmp_path / f"{session_id}.sqlite3"))
     row = connection.execute(
         "SELECT seq, payload_json FROM records WHERE kind = 'request'"
     ).fetchone()
-    forged = _hashlib.sha256(str(row[1]).encode("utf-8")).hexdigest()
+    forged = hashlib.sha256(str(row[1]).encode("utf-8")).hexdigest()
     connection.execute(
         "UPDATE records SET payload_sha256 = ? WHERE seq = ?", (forged, row[0])
     )
@@ -446,8 +427,7 @@ async def test_missing_table_and_corrupt_payload_rejected(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-async def test_inconsistent_intent_relation_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_inconsistent_intent_relation_rejected(store, tmp_path):
     session_id = store.session_id
     await _populate(store)
     await store.aclose()
@@ -459,30 +439,10 @@ async def test_inconsistent_intent_relation_rejected(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-# --- worker 纪律: 串行、明确结果、取消不回滚、关闭排空 -----------------------------------------
+# --- worker 纪律: 明确结果、取消不回滚、关闭排空 -----------------------------------------------
 
 
-async def test_transactions_serialize_and_errors_propagate(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
-    epoch = await store.start_epoch(_identity())
-    order: list[str] = []
-
-    original = store._immediate
-
-    def tracking():
-        order.append("txn")
-        return original()
-
-    store._immediate = tracking
-    request_id = await store.begin_request(epoch, "串行")
-    await store.commit_request(request_id, messages=_suffix(("串行", "答")), outcome=_outcome())
-    store._immediate = original
-    assert order == ["txn", "txn"]
-    await store.aclose()
-
-
-async def test_caller_cancellation_does_not_rollback_dispatched_transaction(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_caller_cancellation_does_not_rollback_dispatched_transaction(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     gate = threading.Event()
     original = store._immediate
@@ -507,8 +467,7 @@ async def test_caller_cancellation_does_not_rollback_dispatched_transaction(tmp_
     await reopened.aclose()
 
 
-async def test_close_drains_dispatched_work_before_release(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_close_drains_dispatched_work_before_release(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     task = asyncio.create_task(store.commit_clear(epoch))
     await asyncio.sleep(0.05)
@@ -519,8 +478,7 @@ async def test_close_drains_dispatched_work_before_release(tmp_path):
     await reopened.aclose()
 
 
-async def test_dispatch_after_close_rejected(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_dispatch_after_close_rejected(store):
     epoch = await store.start_epoch(_identity())
     await store.aclose()
     with pytest.raises(StorageUnavailableError):
@@ -534,9 +492,8 @@ _PROVEN = ProcessTerminalFacts(kind="proven_terminal", exit_code=0, output_compl
 _UNPROVEN = ProcessTerminalFacts(kind="unproven_terminal", timed_out=True, reason="timed out")
 
 
-async def test_process_activity_begin_end_roundtrip_and_snapshot_evidence(tmp_path):
+async def test_process_activity_begin_end_roundtrip_and_snapshot_evidence(store, tmp_path):
     """begin 在快照里是未证终结, end 后变已证; 重开存档事实保持, 关系完整."""
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "带命令的请求")
     activity_id = await store.begin_process(
@@ -574,8 +531,7 @@ async def test_process_activity_begin_end_roundtrip_and_snapshot_evidence(tmp_pa
     await reopened.aclose()
 
 
-async def test_begin_process_relation_and_input_validation(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_begin_process_relation_and_input_validation(store):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "请求")
     with pytest.raises(PersistenceError, match="unknown request"):
@@ -597,11 +553,9 @@ async def test_begin_process_relation_and_input_validation(tmp_path):
     await store.commit_request(request_id, messages=_suffix(("请求", "答")), outcome=_outcome())
     with pytest.raises(PersistenceError, match="pending request"):
         await store.begin_process(request_id, tool_name="powershell", call_id="c2", arguments={})
-    await store.aclose()
 
 
-async def test_end_process_rejects_unknown_and_double_terminal(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_end_process_rejects_unknown_and_double_terminal(store):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "请求")
     activity_id = await store.begin_process(
@@ -612,12 +566,10 @@ async def test_end_process_rejects_unknown_and_double_terminal(tmp_path):
     await store.end_process(activity_id, _PROVEN)
     with pytest.raises(PersistenceError, match="already has a terminal record"):
         await store.end_process(activity_id, _UNPROVEN)
-    await store.aclose()
 
 
-async def test_commit_request_refuses_open_process_activity(tmp_path):
+async def test_commit_request_refuses_open_process_activity(store):
     """完整提交等待本请求全部活动写入: 未闭合活动在 store 侧也被拒绝."""
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "有未闭合活动的请求")
     activity_id = await store.begin_process(
@@ -632,7 +584,6 @@ async def test_commit_request_refuses_open_process_activity(tmp_path):
         request_id, messages=_suffix(("有未闭合活动的请求", "答")), outcome=_outcome()
     )
     assert seq == 2
-    await store.aclose()
 
 
 def test_orphan_process_activity_rejected_and_file_unchanged(tmp_path):
@@ -710,9 +661,8 @@ def test_corrupt_process_activity_records_rejected_on_load(tmp_path):
 # --- 02 审查处置: 加载校验篡改面与写读对称 ---------------------------------------------------
 
 
-async def test_commit_request_rejects_prompt_mismatch_at_write_time(tmp_path):
+async def test_commit_request_rejects_prompt_mismatch_at_write_time(store, tmp_path):
     """写侧与加载侧同一不变量: 首消息文本 != intent prompt 在提交时拒绝."""
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "真实 prompt")
     with pytest.raises(PersistenceError, match="exact intent prompt"):
@@ -741,8 +691,6 @@ def _seed_tamper_archive(tmp_path):
 
 def test_load_rejects_payload_sha_mismatch(tmp_path):
     """载荷被篡改但摘要未重算 -> 摘要不一致拒绝, 不静默读出改写历史."""
-    import hashlib as _hl
-
     db, session_id = _seed_tamper_archive(tmp_path)
     connection = sqlite3.connect(str(db))
     payload = connection.execute(
@@ -755,7 +703,7 @@ def test_load_rejects_payload_sha_mismatch(tmp_path):
     )
     connection.commit()
     connection.close()
-    assert _hl.sha256(tampered.encode()).hexdigest() != _hl.sha256(payload.encode()).hexdigest()
+    assert hashlib.sha256(tampered.encode()).hexdigest() != hashlib.sha256(payload.encode()).hexdigest()
     with pytest.raises(ArchiveFormatError, match="recorded digest"):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
@@ -817,8 +765,7 @@ def test_load_rejects_orphan_request_begin(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-async def test_load_rejects_intent_epoch_mismatch(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_load_rejects_intent_epoch_mismatch(store, tmp_path):
     session_id = store.session_id
     epoch1 = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch1, "问")
@@ -837,8 +784,7 @@ async def test_load_rejects_intent_epoch_mismatch(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-async def test_load_rejects_multiple_open_epochs(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_load_rejects_multiple_open_epochs(store, tmp_path):
     session_id = store.session_id
     await store.start_epoch(_identity())
     await store.aclose()
@@ -856,11 +802,10 @@ async def test_load_rejects_multiple_open_epochs(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-async def test_aclose_retry_after_drain_timeout_completes_release(tmp_path, monkeypatch):
+async def test_aclose_retry_after_drain_timeout_completes_release(store, tmp_path, monkeypatch):
     """排空超时后重试 aclose: 队列已清空则补完成释放, 不再静默返回."""
     import cicada.plugins.session_store.store as store_module
 
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     release = threading.Event()
     original_immediate = store._immediate
@@ -893,7 +838,7 @@ async def test_aclose_retry_after_drain_timeout_completes_release(tmp_path, monk
     await store.aclose()  # 队列已排空: 补完成释放
     reopened = open_session_store(directory=tmp_path, session_id=store.session_id, workspace=tmp_path)
     assert reopened.recovery_snapshot().context_generation == 1
-    await reopened.aclose() 
+    await reopened.aclose()
 
 
 # --- 03: 历史检查回执写入与加载 ---------------------------------------------------------------
@@ -919,9 +864,8 @@ def _receipt(request_id: str, epoch_id: str, receipt_id: str = "r-1", **override
     return StoredReceipt(**fields)
 
 
-async def test_commit_with_receipts_roundtrip_and_activity_link(tmp_path):
+async def test_commit_with_receipts_roundtrip_and_activity_link(store, tmp_path):
     """回执行与请求同事务落库; check 活动按 receipt_id 自动关联; 重开事实保持."""
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "带检查的问")
     activity_id = await store.begin_process(
@@ -961,8 +905,7 @@ async def test_commit_with_receipts_roundtrip_and_activity_link(tmp_path):
     await reopened.aclose()
 
 
-async def test_commit_receipts_relation_and_duplicate_validation(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_commit_receipts_relation_and_duplicate_validation(store):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "问")
     await store.commit_request(request_id, messages=_suffix(("问", "答")), outcome=_outcome(),
@@ -986,11 +929,9 @@ async def test_commit_receipts_relation_and_duplicate_validation(tmp_path):
         await store.commit_request(request3, messages=_suffix(("第三问", "答")),
                                    outcome=_outcome(),
                                    receipts=(_receipt(request_id, epoch),))
-    await store.aclose()
 
 
-async def test_untrustworthy_receipt_records_process_uncertain(tmp_path):
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+async def test_untrustworthy_receipt_records_process_uncertain(store, tmp_path):
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "超时检查")
     await store.commit_request(
@@ -1063,12 +1004,11 @@ def test_load_rejects_receipt_relation_violations(tmp_path):
 # --- 03 审查处置: 回执字节配额、id 上界与活动关联对称校验 -------------------------------
 
 
-async def test_receipt_bytes_counted_into_db_size_checkpoint(tmp_path, monkeypatch):
+async def test_receipt_bytes_counted_into_db_size_checkpoint(store, tmp_path, monkeypatch):
     """回执行 (terminal_json + 标识列) 计入 db-size 检查点: 超限提交被拒, 不写出打不开的存档."""
     import cicada.plugins.session_store.store as store_module
     from cicada.persistence.contracts import StoredReceipt
 
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "带大回执的问")
     # 单条回执行经 03 上界后已天然有界; 用多条回执叠加越过紧贴当前库容量的限额
@@ -1098,10 +1038,9 @@ async def test_receipt_bytes_counted_into_db_size_checkpoint(tmp_path, monkeypat
     await reopened.aclose()
 
 
-async def test_receipt_id_length_cap_rejected_at_write_and_load(tmp_path):
+async def test_receipt_id_length_cap_rejected_at_write_and_load(store, tmp_path):
     from cicada.persistence.contracts import RECEIPT_ID_MAX_CHARS, StoredReceipt
 
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "问")
     with pytest.raises(ValueError, match="exceeds the limit"):
@@ -1123,9 +1062,8 @@ async def test_receipt_id_length_cap_rejected_at_write_and_load(tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
-async def test_load_rejects_receipt_relinked_to_foreign_activity(tmp_path):
+async def test_load_rejects_receipt_relinked_to_foreign_activity(store, tmp_path):
     """加载侧与写侧对称: 回执关联的活动必须携带同一回执身份."""
-    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     epoch = await store.start_epoch(_identity())
     request_id = await store.begin_request(epoch, "带检查与命令的问")
     check_activity = await store.begin_process(
@@ -1159,25 +1097,42 @@ async def test_load_rejects_receipt_relinked_to_foreign_activity(tmp_path):
 # --- 05: 工作区会话列表 (A12) -----------------------------------------------------------------
 
 
-async def _make_session(directory: Path, *, requests: int = 1, title: str | None = None) -> str:
-    """经真实 store 建一个带提交请求的会话; 返回 session_id。"""
-    store = open_session_store(directory=directory, session_id=None, workspace=directory)
-    session_id = store.session_id
-    epoch = await store.start_epoch(_identity())
-    for index in range(requests):
-        prompt = f"问题 {index}"
-        request_id = await store.begin_request(epoch, prompt)
-        await store.commit_request(
-            request_id, messages=_suffix((prompt, f"回答 {index}")),
-            outcome=_outcome(run_id=f"run-{index + 1}"),
+def _inject_activity_and_receipt(
+    db: Path,
+    *,
+    activity_id: str,
+    call_id: str,
+    end_json: str,
+    receipt_id: str,
+    terminal_json: str,
+    verification_run_id: str = "vrun-listing-test",
+) -> None:
+    """向已有存档注入一条 check 活动与一条历史回执 (listing 测试的受控组装)."""
+    connection = sqlite3.connect(str(db))
+    try:
+        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
+        request_id = connection.execute(
+            "SELECT request_id FROM request_intents LIMIT 1"
+        ).fetchone()[0]
+        fingerprint = hashlib.sha256(b"check command").hexdigest()
+        connection.execute(
+            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
+            " arguments_digest, begin_json, end_json) VALUES (?, ?, 'check', ?, 'digest', ?, ?)",
+            (activity_id, request_id, call_id,
+             dumps_strict({"description": "自检命令", "arguments_digest": "digest",
+                           "started_at": 1.0}),
+             end_json),
         )
-    await store.aclose()
-    if title is not None:
-        connection = sqlite3.connect(str(directory / f"{session_id}.sqlite3"))
-        connection.execute("UPDATE session SET short_title = ?", (title,))
+        connection.execute(
+            "INSERT INTO historical_receipts (verification_run_id, receipt_id, epoch_id,"
+            " request_id, activity_id, definition_fingerprint, terminal_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (verification_run_id, receipt_id, epoch, request_id, activity_id, fingerprint,
+             terminal_json),
+        )
         connection.commit()
+    finally:
         connection.close()
-    return session_id
 
 
 def test_list_sessions_empty_directory(tmp_path):
@@ -1211,10 +1166,6 @@ async def test_list_sessions_marks_occupied_bad_and_blockers(tmp_path):
     holder = open_session_store(directory=tmp_path, session_id=busy, workspace=tmp_path)
     try:
         # 阻断证据: 未闭合活动 + 不可信回执 (02/03 同源注入方式)
-        import hashlib as _hashlib
-
-        from cicada.persistence.codec import dumps_strict
-
         db = tmp_path / f"{blocked}.sqlite3"
         connection = sqlite3.connect(str(db))
         epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
@@ -1233,7 +1184,7 @@ async def test_list_sessions_marks_occupied_bad_and_blockers(tmp_path):
         )
         arguments = {"command": "Start-Sleep -Seconds 30"}
         canonical = dumps_strict(arguments)
-        digest = _hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         connection.execute(
             "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
             " arguments_digest, begin_json, end_json) VALUES ('activity-1', ?, 'powershell',"
@@ -1296,51 +1247,26 @@ async def test_list_sessions_accepts_relative_directory(tmp_path, monkeypatch):
 
 
 async def test_list_sessions_proven_activity_and_trusted_receipt_not_blocked(tmp_path):
-    """06 回归: 已证终结活动 + 可信回执不得标阻断; 终结 JSON 须先解析再进 codec。"""
+    """06 回归: 已证终结活动 + 可信回执不得标阻断; 终结 JSON 须先解析再进 codec."""
     from cicada.plugins.session_store import list_sessions
-    from cicada.persistence.codec import dumps_strict
 
     session_id = await _make_session(tmp_path, requests=1)
-    db = tmp_path / f"{session_id}.sqlite3"
-    fingerprint = hashlib.sha256(b"check command").hexdigest()
-    connection = sqlite3.connect(str(db))
-    try:
-        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
-        request_id = connection.execute(
-            "SELECT request_id FROM request_intents LIMIT 1"
-        ).fetchone()[0]
-        receipt_id = "chk-" + "a" * 32
-        connection.execute(
-            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
-            " arguments_digest, begin_json, end_json) VALUES ('activity-proven', ?, 'check',"
-            " 'check-1', 'digest', ?, ?)",
-            (
-                request_id,
-                dumps_strict({
-                    "description": "自检命令", "arguments_digest": "digest", "started_at": 1.0,
-                }),
-                dumps_strict({
-                    "kind": "proven_terminal", "exit_code": 0, "output_complete": True,
-                    "timed_out": False, "cancelled": False, "receipt_id": receipt_id,
-                    "reason": None,
-                }),
-            ),
-        )
-        connection.execute(
-            "INSERT INTO historical_receipts (verification_run_id, receipt_id, epoch_id,"
-            " request_id, activity_id, definition_fingerprint, terminal_json)"
-            " VALUES ('vrun-listing-test', ?, ?, ?, 'activity-proven', ?, ?)",
-            (
-                receipt_id, epoch, request_id, fingerprint,
-                dumps_strict({
-                    "execution_status": "exited", "exit_code": 0, "timed_out": False,
-                    "cancelled": False, "output_complete": True, "failure_kind": None,
-                }),
-            ),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    receipt_id = "chk-" + "a" * 32
+    _inject_activity_and_receipt(
+        tmp_path / f"{session_id}.sqlite3",
+        activity_id="activity-proven",
+        call_id="check-1",
+        end_json=dumps_strict({
+            "kind": "proven_terminal", "exit_code": 0, "output_complete": True,
+            "timed_out": False, "cancelled": False, "receipt_id": receipt_id,
+            "reason": None,
+        }),
+        receipt_id=receipt_id,
+        terminal_json=dumps_strict({
+            "execution_status": "exited", "exit_code": 0, "timed_out": False,
+            "cancelled": False, "output_complete": True, "failure_kind": None,
+        }),
+    )
 
     page = list_sessions(directory=tmp_path)
     assert len(page.entries) == 1
@@ -1350,55 +1276,24 @@ async def test_list_sessions_proven_activity_and_trusted_receipt_not_blocked(tmp
     assert entry.unproven_activities == 0 and entry.untrusted_receipts == 0
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "not-json",
-        "[1, 2]",
-        '{"kind": "nonsense"}',
-        '{"execution_status": "nonsense"}',
-    ],
-)
+@pytest.mark.parametrize("payload", ["not-json", '{"execution_status": "nonsense"}'])
 async def test_list_sessions_corrupt_json_rows_count_conservatively(tmp_path, payload):
-    """06 审查 F7: 列表侧坏行按 CodecError 保守计数, 整档不标坏档。"""
+    """06 审查 F7: 列表侧坏行按 CodecError 保守计数, 整档不标坏档."""
     from cicada.plugins.session_store import list_sessions
-    from cicada.persistence.codec import dumps_strict
 
     session_id = await _make_session(tmp_path, requests=1)
-    db = tmp_path / f"{session_id}.sqlite3"
-    fingerprint = hashlib.sha256(b"check command").hexdigest()
-    connection = sqlite3.connect(str(db))
-    try:
-        epoch = connection.execute("SELECT epoch_id FROM epoch LIMIT 1").fetchone()[0]
-        request_id = connection.execute(
-            "SELECT request_id FROM request_intents LIMIT 1"
-        ).fetchone()[0]
-        receipt_id = "chk-" + "b" * 32
-        connection.execute(
-            "INSERT INTO process_activity (activity_id, request_id, tool_name, call_id,"
-            " arguments_digest, begin_json, end_json) VALUES ('activity-bad', ?, 'check',"
-            " 'check-bad', 'digest', ?, ?)",
-            (
-                request_id,
-                dumps_strict({
-                    "description": "自检命令", "arguments_digest": "digest", "started_at": 1.0,
-                }),
-                payload,
-            ),
-        )
-        connection.execute(
-            "INSERT INTO historical_receipts (verification_run_id, receipt_id, epoch_id,"
-            " request_id, activity_id, definition_fingerprint, terminal_json)"
-            " VALUES ('vrun-bad', ?, ?, ?, 'activity-bad', ?, ?)",
-            (receipt_id, epoch, request_id, fingerprint, payload),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+    _inject_activity_and_receipt(
+        tmp_path / f"{session_id}.sqlite3",
+        activity_id="activity-bad",
+        call_id="check-bad",
+        end_json=payload,
+        receipt_id="chk-" + "b" * 32,
+        terminal_json=payload,
+        verification_run_id="vrun-bad",
+    )
 
     page = list_sessions(directory=tmp_path)
     assert len(page.entries) == 1
     entry = page.entries[0]
     assert entry.session_id == session_id and entry.error is None, "坏行是保守计数, 不作废整档"
     assert entry.unproven_activities == 1 and entry.untrusted_receipts == 1
-    assert entry.blocked

@@ -183,117 +183,100 @@ async def test_tool_calls_take_precedence_over_length():
     assert events[-1] == StreamDone("tool_use")
 
 
-async def test_http_404_carries_body_error_field():
-    body = b'{"error":"model \\"qwen3.5:9b\\" not found. For more information, check https://ollama.com"}'
-    model = make_model(ndjson_response(body, status_code=404), [])
-    events = await collect(model)
-    assert len(events) == 1
-    assert events[-1].stop_reason == "error"
-    assert "404" in events[-1].error
-    assert "not found" in events[-1].error
+class _FailingStream(httpx.AsyncByteStream):
+    """先交付一段数据再抛错的流替身."""
+
+    def __init__(self, chunk: bytes, error: Exception) -> None:
+        self._chunk = chunk
+        self._error = error
+
+    async def __aiter__(self):
+        yield self._chunk
+        raise self._error
 
 
-async def test_http_500_carries_body_error_field():
-    model = make_model(ndjson_response(b'{"error":"registry unavailable"}', status_code=500), [])
-    events = await collect(model)
-    assert len(events) == 1
-    assert events[-1].stop_reason == "error"
-    assert "500" in events[-1].error
-    assert "registry unavailable" in events[-1].error
-
-
-async def test_bad_ndjson_line_emits_prior_text_then_error():
-    body = ndjson(
-        {"message": {"role": "assistant", "content": "a"}, "done": False},
-        b"not-json",
-    )
-    model = make_model(ndjson_response(body), [])
-    events = await collect(model)
-    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
-    assert events[0].text == "a"
-    assert events[-1].stop_reason == "error"
-    assert "protocol error" in events[-1].error
-
-
-async def test_stream_without_done_line_reports_error():
-    body = b'{"message":{"role":"assistant","content":"a"},"done":false}\n'
-    model = make_model(ndjson_response(body), [])
-    events = await collect(model)
-    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
-    assert events[0].text == "a"
-    assert events[-1].stop_reason == "error"
-    assert "without a done line" in events[-1].error
-
-
-async def test_partial_final_line_without_done_reports_error():
-    body = b'{"message":{"role":"assistant","content":"a"},"done":false}\n{"message":{"role":"ass'
-    model = make_model(ndjson_response(body), [])
-    events = await collect(model)
-    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
-    assert events[0].text == "a"
-    assert events[-1].stop_reason == "error"
-    # 流末残留半行: 作为一行解析, 以坏行协议错误终结 (同样不会裸抛)
-    assert "protocol error" in events[-1].error
-
-
-async def test_connection_failure_reports_error():
-    model = make_model(httpx.ConnectError("connection refused"), [])
-    events = await collect(model)
-    assert len(events) == 1
-    assert events[-1].stop_reason == "error"
-    assert "connection refused" in events[-1].error
-
-
-async def test_read_timeout_reports_error():
-    model = make_model(httpx.ReadTimeout("timed out"), [])
-    events = await collect(model)
-    assert len(events) == 1
-    assert events[-1].stop_reason == "error"
-    assert "timed out" in events[-1].error
-
-
-async def test_stream_broken_midway_reports_error():
-    line = b'{"message":{"role":"assistant","content":"Hello"},"done":false}\n'
-
-    class BrokenStream(httpx.AsyncByteStream):
-        async def __aiter__(self):
-            yield line
-            raise httpx.ReadError("connection reset")
-
-    model = make_model(
-        httpx.Response(200, headers={"content-type": "application/x-ndjson"}, stream=BrokenStream()), []
-    )
-    events = await collect(model)
-    assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
-    assert events[0].text == "Hello"
-    assert events[-1].stop_reason == "error"
-    assert "connection reset" in events[-1].error
-
-
+# 各错误形态: (响应/异常工厂, 错误文本必含片段, 错误前已到达的正文)
 ERROR_SHAPES = {
-    "http_500": lambda: ndjson_response(b'{"error":"boom"}', 500),
-    "http_404": lambda: ndjson_response(b'{"error":"model not found"}', 404),
-    "bad_line": lambda: ndjson_response(b'{"message":{"content":"a"},"done":false}\nnot-json\n'),
-    "missing_done": lambda: ndjson_response(b'{"message":{"content":"a"},"done":false}\n'),
-    "protocol_bad_tool_call": lambda: ndjson_response(ndjson(
-        {"message": {"content": "", "tool_calls": [{"function": {"name": "t", "arguments": {}}}]}, "done": False},
-    )),
-    "connect_error": lambda: httpx.ConnectError("connection refused"),
-    "read_timeout": lambda: httpx.ReadTimeout("timed out"),
+    "http_500": (
+        lambda: ndjson_response(b'{"error":"registry unavailable"}', 500),
+        ("500", "registry unavailable"),
+        "",
+    ),
+    "http_404": (
+        lambda: ndjson_response(
+            b'{"error":"model \\"qwen3.5:9b\\" not found. For more information, check https://ollama.com"}',
+            404,
+        ),
+        ("404", "not found"),
+        "",
+    ),
+    "bad_line": (
+        lambda: ndjson_response(
+            b'{"message":{"role":"assistant","content":"a"},"done":false}\nnot-json\n'
+        ),
+        ("protocol error",),
+        "a",
+    ),
+    "missing_done": (
+        lambda: ndjson_response(
+            b'{"message":{"role":"assistant","content":"a"},"done":false}\n'
+        ),
+        ("without a done line",),
+        "a",
+    ),
+    "partial_final_line": (
+        lambda: ndjson_response(
+            b'{"message":{"role":"assistant","content":"a"},"done":false}\n{"message":{"role":"ass'
+        ),
+        ("protocol error",),
+        "a",
+    ),
+    "protocol_bad_tool_call": (
+        lambda: ndjson_response(ndjson(
+            {"message": {"content": "", "tool_calls": [{"function": {"name": "t", "arguments": {}}}]}, "done": False},
+        )),
+        (),
+        "",
+    ),
+    "connect_error": (lambda: httpx.ConnectError("connection refused"), ("connection refused",), ""),
+    "read_timeout": (lambda: httpx.ReadTimeout("timed out"), ("timed out",), ""),
+    "broken_midway": (
+        lambda: httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            stream=_FailingStream(
+                b'{"message":{"role":"assistant","content":"Hello"},"done":false}\n',
+                httpx.ReadError("connection reset"),
+            ),
+        ),
+        ("connection reset",),
+        "Hello",
+    ),
 }
 
 
 @pytest.mark.parametrize("shape", sorted(ERROR_SHAPES))
 async def test_all_error_shapes_yield_exactly_one_error_done(shape):
-    """不裸抛契约: 全部错误形态只产出恰好一个 StreamDone("error"), 无异常外泄."""
+    """不裸抛契约: 全部错误形态只产出恰好一个 StreamDone("error"), 无异常外泄.
+
+    各形态的错误文本片段与错误前已到达的正文一并钉住 (原按形态单测的断言并入本表).
+    """
+    factory, fragments, prior_text = ERROR_SHAPES[shape]
     seen: list[httpx.Request] = []
-    model = make_model(ERROR_SHAPES[shape](), seen)
+    model = make_model(factory(), seen)
     events = await collect(model)
     dones = [event for event in events if isinstance(event, StreamDone)]
     assert len(dones) == 1
     assert dones[0].stop_reason == "error"
     assert dones[0].error
+    for fragment in fragments:
+        assert fragment in dones[0].error
     assert events[-1] is dones[0]
+    if prior_text:
+        assert [type(event).__name__ for event in events] == ["TextDelta", "StreamDone"]
+        assert events[0].text == prior_text
+    else:
+        assert len(events) == 1
 
 
 async def test_cancelled_before_entry_sends_no_request():

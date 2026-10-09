@@ -7,10 +7,7 @@ import pytest
 from cicada.core.cancel import CancelToken
 from cicada.plugins.coding.inventory import GitInventory, InventoryError, inventory_plugin
 from cicada.plugins.coding.workspace import Workspace
-
-
-def git(root, *args, input=None):
-    return subprocess.run(["git", "-C", str(root), *args], input=input, capture_output=True, check=True).stdout
+from tests.support.plugins import git
 
 
 async def test_git_inventory_lists_tracked_deleted_and_nonignored_files(tmp_path):

@@ -19,14 +19,9 @@ from cicada.plugins.coding.snapshot import (
     snapshot_plugin,
 )
 from cicada.plugins.coding.workspace import Workspace
+from tests.support.plugins import git
 
 HELLO_SHA256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-
-
-def git(root, *args, input=None):
-    return subprocess.run(
-        ["git", "-C", str(root), *args], input=input, capture_output=True, check=True
-    ).stdout
 
 
 @pytest.fixture

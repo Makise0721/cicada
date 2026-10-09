@@ -1,5 +1,4 @@
 import asyncio
-import subprocess
 import time
 from pathlib import Path
 
@@ -8,6 +7,7 @@ from cicada.core.ports import ToolContext
 from cicada.plugins.coding.process import BoundedText
 from cicada.plugins.coding.tool_powershell import MAX_CONTENT_BYTES, PowerShellTool
 from cicada.plugins.coding.workspace import Workspace
+from tests.support.plugins import pid_alive, wait_pid_gone
 
 
 def make(tmp_path):
@@ -21,27 +21,12 @@ async def run(tool, cancel=None, **arguments):
     )
 
 
-def pid_alive(pid: int) -> bool:
-    out = subprocess.run(
-        ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True
-    ).stdout
-    return str(pid) in out
-
-
 async def wait_for_file(path, attempts: int = 100) -> bool:
     for _ in range(attempts):
         if path.exists():
             return True
         await asyncio.sleep(0.1)
     return path.exists()
-
-
-async def wait_pid_gone(pid: int, attempts: int = 30) -> bool:
-    for _ in range(attempts):
-        if not pid_alive(pid):
-            return True
-        await asyncio.sleep(0.1)
-    return not pid_alive(pid)
 
 
 def visible_tail(content: str) -> list[str]:

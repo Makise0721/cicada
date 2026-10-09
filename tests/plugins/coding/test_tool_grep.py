@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import subprocess
 from pathlib import Path
 
 import jsonschema
@@ -17,10 +16,7 @@ from cicada.plugins.coding.inventory import GitInventory
 from cicada.plugins.coding.search import MAX_CONTENT_BYTES
 from cicada.plugins.coding.tool_grep import GrepTool, grep_plugin
 from cicada.plugins.coding.workspace import Workspace
-
-
-def git(root: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+from tests.support.plugins import git
 
 
 @pytest.fixture
