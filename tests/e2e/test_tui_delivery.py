@@ -304,7 +304,60 @@ async def test_t07_finalizing_submit_silent(tmp_path):
 # --- T14 + T11: run_tui_session 首问 / 退出码 / 取消后关闭 ----------------------------
 
 
-async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path):
+@pytest.fixture
+def tui_lifecycle(monkeypatch):
+    """观察公开组合实际创建的组件和任务，不替换准入或输入逻辑。"""
+    import cicada.ui as ui
+
+    refs = {"requests": [], "submissions": asyncio.Queue()}
+    real_view = ui.ConversationView
+    real_frontend = ui.MainScreenFrontend
+
+    def make_view(session, **kwargs):
+        view = real_view(session, **kwargs)
+        refs["view"] = view
+        submit = view.on_submit
+
+        def observe_submit(text):
+            owned = view._gate._task
+            fact = {"text": text, "state": session.state,
+                    "reservation": view._gate.busy(),
+                    "task_done": owned.done() if owned is not None else None}
+            accepted = submit(text)
+            fact.update(accepted=accepted, exit_event=refs["frontend"]._exit_event.is_set())
+            if accepted and view._gate._task is not None:
+                refs["requests"].append(view._gate._task)
+            refs["submissions"].put_nowait(fact)
+            return accepted
+
+        view.on_submit = observe_submit
+        return view
+
+    def make_frontend(*args, **kwargs):
+        frontend = real_frontend(*args, **kwargs)
+        refs["frontend"] = frontend
+        run = frontend.run_async
+
+        async def observe_run():
+            refs["runner"] = asyncio.current_task()
+            return await run()
+
+        frontend.run_async = observe_run
+        return frontend
+
+    monkeypatch.setattr(ui, "ConversationView", make_view)
+    monkeypatch.setattr(ui, "MainScreenFrontend", make_frontend)
+    return refs
+
+
+def _tui_ready(session, lifecycle):
+    # idle 事件早于 execute 返回和任务 done 回调；三项事实齐全才发送下一命令。
+    return (session.state == "idle"
+            and all(task.done() for task in lifecycle["requests"])
+            and not lifecycle["view"]._gate.busy())
+
+
+async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path, tui_lifecycle):
     session = await open_application(
         make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}))
     )
@@ -315,19 +368,94 @@ async def test_t14_initial_prompt_submitted_once_exit_zero(tmp_path):
         )
         assert await wait_until(lambda: len(model_of(session).requests) == 1), "首问只提交一次"
         assert await wait_until(lambda: stage.contains("首问") and stage.contains("回答"))
-        # /exit 只在 idle 生效: 内容落屏早于状态翻转 (16ms 渲染节流), 先等 idle
-        assert await wait_until(lambda: session.state == "idle")
+        assert await wait_until(lambda: _tui_ready(session, tui_lifecycle))
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
         assert code == 0, "正常关闭取最后请求退出码"
         assert session.state == "closed"
+        assert len(model_of(session).requests) == 1
+        assert tui_lifecycle["requests"][0].done()
+        assert tui_lifecycle["runner"].done()
     finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         if session.state != "closed":
             await session.aclose()
 
 
-async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path):
+@pytest.mark.parametrize("draft", ["屏障草稿", "/exit"])
+async def test_t14_idle_before_owned_task_done_keeps_enter_silent(
+    tmp_path, monkeypatch, tui_lifecycle, draft,
+):
+    """真实 execute 已发完成事件，测试侧仅阻挡返回，固定复现旧 idle 等待窗。"""
+    session = await open_application(
+        make_config(_repo(tmp_path), script_json({"text": "回答", "stop": True}))
+    )
+    reached = asyncio.Event()
+    release = asyncio.Event()
+    execute = session.execute
+
+    async def held_execute(prompt):
+        outcome = await execute(prompt)
+        reached.set()
+        await release.wait()
+        return outcome
+
+    monkeypatch.setattr(session, "execute", held_execute)
+    stage = StageTerminal()
+    task = asyncio.create_task(
+        run_tui_session(session, initial_prompt="首问", terminal=stage.terminal)
+    )
+    facts = []
+    try:
+        await asyncio.wait_for(reached.wait(), timeout=10)
+        assert session.state == "idle", "旧等待条件此时已经满足"
+        owned = tui_lifecycle["requests"][0]
+        assert not owned.done() and tui_lifecycle["view"]._gate.busy()
+        facts.append(await asyncio.wait_for(tui_lifecycle["submissions"].get(), timeout=5))
+        stage.emit(text_keys(draft) + [ENTER])
+        blocked = await asyncio.wait_for(tui_lifecycle["submissions"].get(), timeout=5)
+        facts.append(blocked)
+        assert blocked == {"text": draft, "state": "idle", "reservation": True,
+                           "task_done": False, "accepted": False, "exit_event": False}
+        assert tui_lifecycle["view"].editor.get_text() == draft
+        assert await wait_until(lambda: stage.contains(draft))
+        assert len(model_of(session).requests) == 1
+        assert not task.done() and not tui_lifecycle["runner"].done()
+        assert "拒绝" not in stage.text()
+        assert not _tui_ready(session, tui_lifecycle), "idle 不能单独证明 UI 准入开放"
+
+        release.set()
+        assert await wait_until(lambda: _tui_ready(session, tui_lifecycle))
+        assert owned.done() and not tui_lifecycle["view"]._gate.busy()
+        if draft != "/exit":
+            stage.emit([CTRL_C])
+            assert await wait_until(lambda: tui_lifecycle["view"].editor.get_text() == "")
+            stage.emit(text_keys("/exit"))
+        stage.emit([ENTER])
+        accepted = await asyncio.wait_for(tui_lifecycle["submissions"].get(), timeout=5)
+        facts.append(accepted)
+        assert accepted["accepted"] and accepted["exit_event"]
+        assert accepted["state"] == "idle" and not accepted["reservation"]
+        assert await asyncio.wait_for(task, timeout=15) == 0
+        assert session.state == "closed"
+        assert len(model_of(session).requests) == len(tui_lifecycle["requests"]) == 1
+        assert owned.done() and tui_lifecycle["runner"].done()
+        assert tui_lifecycle["frontend"]._stopped
+        assert not tui_lifecycle["frontend"].ui_failures
+    finally:
+        print("T14_FACTS " + json.dumps(facts, ensure_ascii=False))
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path, tui_lifecycle):
     session = await open_application(
         make_config(_repo(tmp_path), script_json({"text": "慢慢回答", "stop": True}), chunks=4, delay=0.2)
     )
@@ -340,13 +468,18 @@ async def test_t11_cancel_yields_aborted_exit_code_and_closes(tmp_path):
         assert await wait_until(lambda: session.state == "executing")
         stage.emit([CTRL_C])
         assert await wait_until(lambda: stage.contains("已取消"))
-        assert await wait_until(lambda: session.state == "idle"), "取消后回 idle 再退出"
+        assert await wait_until(lambda: _tui_ready(session, tui_lifecycle)), "取消任务终结且准入开放后退出"
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
         assert code == 1, "取消请求的退出码 1 (aborted)"
         assert session.state == "closed"
+        assert tui_lifecycle["requests"][0].done()
+        assert tui_lifecycle["runner"].done()
     finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         if session.state != "closed":
             await session.aclose()
 
