@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from test_conversation_view import Harness, _prompt_info, _wait_until
@@ -16,24 +14,19 @@ from cicada.application import ApplicationConfig, ApplicationSession
 from cicada.budget import BudgetConfig
 from cicada.boot import bootstrap
 from cicada.context_policy import BudgetPolicy, ContextProjection
-from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
-from cicada.persistence.contracts import LaunchIdentity, StoredIdentity
+from cicada.core.ports import ModelMetrics, StreamDone
+from cicada.persistence.contracts import StoredIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.session_store import open_session_store
 from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui.main_screen import strip_terminal_sequences
 
-
-def _identity() -> LaunchIdentity:
-    return LaunchIdentity(
-        provider="fake", model="fake", base_url=None, think=None, options={},
-        max_turns=6, prompt_version="test", prompt_sha256="a" * 64,
-        instructions_sha256=None, checks_signature=None, sources={},
-    )
-
-
-def _budget() -> BudgetConfig:
-    return BudgetConfig(num_ctx=1_000_000, num_predict=2048)
+from tests.support.app import identity as _identity
+from tests.support.summary import (
+    GatedSummary as _GatedSummary,
+    ScriptedSummary,
+    budget as _budget,
+)
 
 
 def _config(tmp_path, model: FakeModel, *, budget: BudgetConfig | None = None) -> ApplicationConfig:
@@ -48,34 +41,9 @@ def _config(tmp_path, model: FakeModel, *, budget: BudgetConfig | None = None) -
     )
 
 
-class _ScriptedSummary:
-    """无门控摘要通道: 恒定正文 + 可得计量 (正常路径用)."""
-
-    def __init__(self, text: str = "较早请求的摘要正文") -> None:
-        self._text = text
-        self.requests = []
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        yield TextDelta(self._text)
-        yield StreamDone("stop", metrics=ModelMetrics(input_tokens=9, output_tokens=2))
-
-
-class _GatedSummary:
-    """门控摘要通道: 放行前挂起, 尊重协作取消。"""
-
-    def __init__(self) -> None:
-        self.gate = asyncio.Event()
-        self.requests = []
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        await self.gate.wait()
-        if cancel.cancelled:
-            yield StreamDone("aborted")
-            return
-        yield TextDelta("门控摘要正文")
-        yield StreamDone("stop", metrics=ModelMetrics(input_tokens=9, output_tokens=2))
+def _ScriptedSummary(text: str = "较早请求的摘要正文") -> ScriptedSummary:
+    """恒定计量替身 (本文件历史行为: 摘要恒带 ModelMetrics(9, 2))。"""
+    return ScriptedSummary(text, metrics=ModelMetrics(input_tokens=9, output_tokens=2))
 
 
 _UNSET = object()

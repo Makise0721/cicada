@@ -32,7 +32,7 @@ from cicada.context_policy import (
 )
 from cicada.core.events import ModelCallCompleted  # noqa: F401
 from cicada.core.messages import AssistantMessage, UserMessage
-from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
+from cicada.core.ports import ModelMetrics, StreamDone
 from cicada.persistence.codec import encode_messages
 from cicada.persistence.contracts import LaunchIdentity, StoredIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
@@ -41,9 +41,11 @@ from cicada.plugins.session_store import open_session_store
 from test_application import _prompt_info
 from test_persistence_application import _identity
 
-
-def _budget(num_ctx: int = 1_000_000) -> BudgetConfig:
-    return BudgetConfig(num_ctx=num_ctx, num_predict=2048)
+from tests.support.summary import (
+    GatedSummary as _GatedSummary,
+    ScriptedSummary as _ScriptedSummary,
+    budget as _budget,
+)
 
 
 def _config(tmp_path, model: FakeModel, *, budget: BudgetConfig | None = None) -> ApplicationConfig:
@@ -56,42 +58,6 @@ def _config(tmp_path, model: FakeModel, *, budget: BudgetConfig | None = None) -
         model_label="fake",
         budget=budget,
     )
-
-
-class _ScriptedSummary:
-    """无门控摘要通道: 恒定正文 + 可得计量 (正常路径用)."""
-
-    def __init__(self, text: str = "较早请求的摘要正文", metrics=None) -> None:
-        self._text = text
-        self._metrics = metrics
-        self.requests = []
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        yield TextDelta(self._text)
-        yield StreamDone("stop", metrics=self._metrics)
-
-
-class _GatedSummary:
-    """门控摘要通道: 放行前挂起, 可选忽略协作取消 (PA05 反例用)."""
-
-    def __init__(self, *, text: str = "门控摘要正文", ignore_cancel: bool = False) -> None:
-        self.gate = asyncio.Event()
-        self.cancel_seen = False
-        self.requests = []
-        self._text = text
-        self._ignore_cancel = ignore_cancel
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        await self.gate.wait()
-        if cancel.cancelled:
-            self.cancel_seen = True
-            if not self._ignore_cancel:
-                yield StreamDone("aborted")
-                return
-        yield TextDelta(self._text)
-        yield StreamDone("stop", metrics=ModelMetrics(input_tokens=9, output_tokens=2))
 
 
 async def _manual_persistent_session(

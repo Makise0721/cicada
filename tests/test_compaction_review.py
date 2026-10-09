@@ -25,7 +25,7 @@ from cicada.budget import BudgetConfig, estimate_input_components
 from cicada.boot import bootstrap
 from cicada.context_policy import BudgetPolicy
 from cicada.core.messages import AssistantMessage, UserMessage
-from cicada.core.ports import StreamDone, TextDelta, ToolCallEvent
+from cicada.core.ports import StreamDone
 from cicada.persistence.contracts import (
     PersistenceError,
     StorageWriteError,
@@ -96,27 +96,22 @@ class _FailingScript:
             yield event
 
 
-@pytest.mark.parametrize(
-    "events,failure",
-    [
-        ([StreamDone("length")], "length"),
-        ([StreamDone("error", "boom")], "error"),
-        ([ToolCallEvent("c1", "t", "{}"), StreamDone("tool_use")], "tool_use"),
-        ([StreamDone("stop")], "empty"),
-        ([TextDelta("z" * (17 * 1024)), StreamDone("stop")], "too_long"),
-    ],
-)
-async def test_summary_failure_classes_never_persist_or_switch(tmp_path, events, failure):
-    """A06 集成 (审查 02-F6): 摘要失败逐类 → 零落库、投影不变、屏障落定、健康存储不锁存."""
+async def test_summary_failure_never_persists_or_switches(tmp_path):
+    """A06 集成 (审查 02-F6): 摘要失败 → 零落库、投影不变、屏障落定、健康存储不锁存.
+
+    失败分类矩阵 (length/error/tool_use/empty/too_long/aborted) 由底层
+    test_context_projection 逐类覆盖; 应用层所有分类进入 _run_compaction
+    同一拒绝分支, 此处保留 error 类作集成代表。
+    """
     session, _main, _channel, store = await _manual_persistent_session(
         tmp_path, script=[[StreamDone("stop")], [StreamDone("stop")]],
-        channel=_FailingScript(events),
+        channel=_FailingScript([StreamDone("error", "boom")]),
     )
     try:
         await _two_committed_requests(session)
         with pytest.raises(RuntimeError, match="summary generation failed") as exc_info:
             await session.compact_context()
-        assert failure in str(exc_info.value)
+        assert "error" in str(exc_info.value)
         assert store.recovery_snapshot().summaries == (), "无摘要记录落库"
         assert session._context_projection.blocks == (), "投影不变"
         assert session._compact_done.done(), "屏障落定"

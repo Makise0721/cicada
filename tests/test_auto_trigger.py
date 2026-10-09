@@ -525,36 +525,12 @@ async def test_retry_success_considers_anchor_on_retried_request():
 
 
 
-class _ScriptedSummary:
-    """无门控摘要通道: 恒定正文 + 可得计量 (与 02 组合测试同型)."""
-
-    def __init__(self, text: str = "较早请求的摘要正文", metrics=None) -> None:
-        self._text = text
-        self._metrics = metrics
-        self.requests = []
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        yield TextDelta(self._text)
-        yield StreamDone("stop", metrics=self._metrics)
+from tests.support.summary import GatedSummary, ScriptedSummary as _ScriptedSummary
 
 
-class _GatedSummary:
-    """门控摘要通道: 放行前挂起, 尊重协作取消 (取消入口/close 组合用)."""
-
-    def __init__(self, text: str = "门控摘要正文") -> None:
-        self.gate = asyncio.Event()
-        self.requests = []
-        self._text = text
-
-    async def stream(self, request, cancel):
-        self.requests.append(request)
-        await self.gate.wait()
-        if cancel.cancelled:
-            yield StreamDone("aborted")
-            return
-        yield TextDelta(self._text)
-        yield StreamDone("stop")
+def _GatedSummary(text: str = "门控摘要正文") -> GatedSummary:
+    """门控摘要通道 (本文件历史行为: 终结事件不携带计量)。"""
+    return GatedSummary(text=text, metrics=None)
 
 
 class _LatchingModel(FakeModel):

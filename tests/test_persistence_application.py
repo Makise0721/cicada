@@ -20,9 +20,9 @@ from cicada.application import (
 from cicada.core.messages import UserMessage
 from cicada.persistence.contracts import LaunchIdentity, PersistenceError
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.prompting import PromptInfo
 
 from test_application import _repo, _script  # 复用既有工作区/剧本构造
+from tests.support.app import identity as _identity, prompt_info as _prompt_info
 
 
 def _texts(messages) -> list[str]:
@@ -33,23 +33,6 @@ def _texts(messages) -> list[str]:
         f"<tool:{m.result.name}>" if isinstance(m, ToolResultMessage) else m.text
         for m in messages
     ]
-
-
-def _identity(checks_signature: str | None = None) -> LaunchIdentity:
-    return LaunchIdentity(
-        provider="fake", model="fake", base_url=None, think=None, options={},
-        max_turns=6, prompt_version="test", prompt_sha256="a" * 64,
-        instructions_sha256=None, checks_signature=checks_signature, sources={},
-    )
-
-
-def _prompt_info(root: Path) -> PromptInfo:
-    import hashlib
-
-    return PromptInfo(
-        version="test", workspace=root, instructions_path=None,
-        instructions_sha256=None, prompt_sha256=hashlib.sha256(b"test").hexdigest(),
-    )
 
 
 def _config(root: Path, script: list, *, session_id: str | None):

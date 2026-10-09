@@ -11,10 +11,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -38,36 +35,11 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.prompting import PromptInfo
 from cicada.runtime.plugin import PluginDefinition
 
+from tests.support.app import git as _git, prompt_info as _prompt_info, repo as _repo, script as _script
+
 CHECK_COMMAND = "exit 0"
-
-
-def _git(root: Path, *args: str) -> bytes:
-    return subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, check=True
-    ).stdout
-
-
-def _repo(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    root.mkdir()
-    _git(root, "init", "-q")
-    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _git(root, "add", ".")
-    _git(root, "commit", "-q", "-m", "baseline")
-    return root
-
-
-def _prompt_info(root: Path) -> PromptInfo:
-    return PromptInfo(
-        version="test",
-        workspace=root,
-        instructions_path=None,
-        instructions_sha256=None,
-        prompt_sha256=hashlib.sha256(b"test").hexdigest(),
-    )
 
 
 def _config(root: Path, *, script: list, plan: VerificationPlan | None = None) -> ApplicationConfig:
@@ -88,13 +60,6 @@ def _plan(root: Path, command: str = CHECK_COMMAND) -> VerificationPlan:
         root=Path(os.path.realpath(root)),
         checks=(CheckDefinition("check-1", command, timeout_s=30.0),),
     )
-
-
-def _script(*entries: dict) -> list:
-    """经 parse_script 构建确定性 fake 剧本 (JSON dict -> StreamEvent 列表)."""
-    from cicada.__main__ import parse_script
-
-    return parse_script(json.dumps(list(entries)))
 
 
 class Collector:

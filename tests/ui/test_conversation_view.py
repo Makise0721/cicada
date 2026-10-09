@@ -11,10 +11,8 @@ reservation 先于 create_task、取消意图绑定本次任务、/clear 不擦�
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
-import subprocess
 from pathlib import Path
 
 from cicada.application import ApplicationConfig, RequestPhaseChanged, open_application
@@ -23,7 +21,6 @@ from cicada.core.ports import StreamDone, StreamEvent, TextDelta
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.prompting import PromptInfo
 from cicada.ui.admission import AdmissionGate
 from cicada.ui.conversation_view import ConversationView, build
 from cicada.ui.main_screen import strip_terminal_sequences, visible_width
@@ -37,37 +34,13 @@ from cicada.ui.transcript import (
 from cicada.ui.welcome import WelcomeEntry
 
 
-# --- 夹具 (与 tests/test_application.py 同构; ChunkedFakeModel 与 e2e 夹具同构) ----------
+# --- 夹具 (工作区/剧本/PromptInfo 单一来源在 tests.support.app; ChunkedFakeModel 与 e2e 夹具同构) ---
+
+from tests.support.app import prompt_info as _shared_prompt_info, repo as _repo, script as _script
 
 
-def _git(root: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(root), *args], capture_output=True, check=True)
-
-
-def _repo(tmp_path: Path) -> Path:
-    root = tmp_path / "repo"
-    root.mkdir()
-    _git(root, "init", "-q")
-    (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
-    _git(root, "add", ".")
-    _git(root, "commit", "-q", "-m", "baseline")
-    return root
-
-
-def _prompt_info(root: Path) -> PromptInfo:
-    return PromptInfo(
-        version="ticket02",
-        workspace=root,
-        instructions_path=None,
-        instructions_sha256=None,
-        prompt_sha256=hashlib.sha256(b"ticket02").hexdigest(),
-    )
-
-
-def _script(*entries: dict) -> list:
-    from cicada.__main__ import parse_script
-
-    return parse_script(json.dumps(list(entries)))
+def _prompt_info(root: Path):
+    return _shared_prompt_info(root, version="ticket02")
 
 
 def _config(root: Path, script: list, *, plan: VerificationPlan | None = None) -> ApplicationConfig:
