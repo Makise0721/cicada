@@ -211,3 +211,57 @@ async def test_creation_unknown_failure_retains_materials(tmp_path, monkeypatch)
         assert Path(retained).exists()
     assert not (ws.root / "u.txt").exists()
     assert "do not assume" in r.content
+
+
+async def test_created_then_externally_changed_reports_committed_mismatch(tmp_path, monkeypatch):
+    """创建提交后目标被外部改写: committed + current_matches=false, 不假报未写 (A06)."""
+    ws, tool, _ = make(tmp_path)
+    import cicada.plugins.coding.file_access as fa
+
+    real_read_all = fa._read_all
+    calls = {"n": 0}
+
+    def tampered_read(path):
+        data = real_read_all(path)
+        if path.name == "n.txt":  # 目标回读: 模拟创建后被外部改写
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return data + b"external\n"
+        return data
+
+    monkeypatch.setattr(fa, "_read_all", tampered_read)
+    r = await run(tool, path="n.txt", content="x")
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "committed"
+    assert mutation["current_matches"] is False
+    assert "[mutation=committed]" in r.content
+    assert "no longer matches" in r.content
+    assert (ws.root / "n.txt").read_bytes() == b"x"  # 已提交事实真实保留
+
+
+async def test_created_readback_failure_keeps_commit_visible(tmp_path, monkeypatch):
+    """创建提交后回读失败: committed/current_unverified 按错误报告, 提交不丢 (A07)."""
+    ws, tool, _ = make(tmp_path)
+    import cicada.plugins.coding.file_access as fa
+
+    real_read_all = fa._read_all
+    calls = {"n": 0}
+
+    def failing_readback(path):
+        if path.name == "r.txt":  # 只在提交后的目标回读处失败 (write_staged 不经 _read_all)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(32, "readback locked")
+        return real_read_all(path)
+
+    monkeypatch.setattr(fa, "_read_all", failing_readback)
+    r = await run(tool, path="r.txt", content="x")
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "committed"
+    assert mutation["reason"] == "current_unverified"
+    assert mutation["current_matches"] is None
+    assert "readback unavailable" in r.content
+    assert "the commit itself stands" in r.content
+    assert (ws.root / "r.txt").read_bytes() == b"x"
