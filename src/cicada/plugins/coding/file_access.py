@@ -381,18 +381,21 @@ class FileAccess:
         try:
             if native.reparse_ancestor(original) is not None \
                     or Path(os.path.realpath(original)) != target:
+                warning = self._cleanup_staging(staging, [staged])
                 return _outcome(
                     STATE_NOT_WRITTEN, "version_conflict", str(target),
                     f"target path changed during the operation: {original} no longer "
                     f"resolves to {target}; read it again before editing",
-                    before_stamp=before,
+                    cleanup_warning=warning, before_stamp=before,
                 )
-            if (target.stat().st_dev, target.stat().st_ino) != before.identity():
+            target_stat_now = target.stat()
+            if (target_stat_now.st_dev, target_stat_now.st_ino) != before.identity():
+                warning = self._cleanup_staging(staging, [staged])
                 return _outcome(
                     STATE_NOT_WRITTEN, "version_conflict", str(target),
                     f"target identity changed during the operation: {target}; "
                     "read it again before editing",
-                    before_stamp=before,
+                    cleanup_warning=warning, before_stamp=before,
                 )
             native.replace_file(target, staged, backup)
         except native.UnsupportedTargetError as exc:
@@ -402,10 +405,12 @@ class FileAccess:
         except native.NativePublishError as exc:
             return self._classify_replace_failure(target, staged, backup, staging, before, exc)
         except OSError as exc:
+            warning = self._cleanup_staging(staging, [staged])
             return _outcome(
                 STATE_NOT_WRITTEN, "publish_failed", str(target),
                 f"pre-publication recheck failed: {exc}",
-                winerror=getattr(exc, "winerror", None), before_stamp=before,
+                winerror=getattr(exc, "winerror", None), cleanup_warning=warning,
+                before_stamp=before,
             )
         return self._verify_commit(target, staging, staged, backup, before, new_bytes)
 
