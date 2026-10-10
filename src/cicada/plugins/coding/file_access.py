@@ -415,13 +415,20 @@ class FileAccess:
     ) -> MutationOutcome:
         backup_exists = backup.exists()
         staged_exists = staged.exists()
+        # 目标稳定等于原件: 身份一致; 可读时进一步核对字节, 被锁等不可读时
+        # 以 size+mtime 相等作为可达证据 (锁定的目标本身即未被改写的旁证)
         target_unchanged = False
         try:
             info = target.stat()
-            target_unchanged = (
-                (info.st_dev, info.st_ino) == before.identity()
-                and hashlib.sha256(_read_all(target)).hexdigest() == before.sha256
-            )
+            if (info.st_dev, info.st_ino) == before.identity():
+                try:
+                    target_unchanged = (
+                        hashlib.sha256(_read_all(target)).hexdigest() == before.sha256
+                    )
+                except OSError:
+                    target_unchanged = (
+                        info.st_size == before.st_size and info.st_mtime_ns == before.st_mtime_ns
+                    )
         except OSError:
             target_unchanged = False
         provable = (
