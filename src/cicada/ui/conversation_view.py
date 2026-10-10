@@ -337,11 +337,19 @@ class ConversationView:
                 self._model_stage = "waiting"
             self._current_turn[event.run_id] = event.turn_index
         elif isinstance(event, AssistantReasoningDelta):
-            if event.run_id == self._active_run_id:
+            if (
+                event.run_id == self._active_run_id
+                and event.turn_index == self._current_turn.get(event.run_id)
+                and self._model_stage is not None
+            ):
                 self._model_stage = "thinking"  # 空增量同样表达"正在思考"
             self.transcript.stream_reasoning_delta(event.run_id, event.turn_index, event.text)
         elif isinstance(event, AssistantTextDelta):
-            if event.run_id == self._active_run_id:
+            if (
+                event.run_id == self._active_run_id
+                and event.turn_index == self._current_turn.get(event.run_id)
+                and self._model_stage is not None
+            ):
                 self._model_stage = "answering"  # 内核只发布非空答案增量
             self.transcript.stream_assistant_delta(event.run_id, event.turn_index, event.text)
         elif isinstance(event, AssistantCompleted):

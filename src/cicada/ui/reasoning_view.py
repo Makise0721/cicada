@@ -25,7 +25,7 @@ from typing import Callable
 from cicada.core.messages import ReasoningContent
 from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle, current_style
-from cicada.ui.main_screen import visible_width, wrap_text_ansi
+from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
 _BODY_INDENT = "  "
@@ -81,7 +81,8 @@ class ReasoningBlock:
             self._text = ""  # 空增量也建立条目: 区分未返回字段与已收到空字段
         if not self._preview_capped:
             remaining = _PREVIEW_MAX_BYTES - self._preview_bytes
-            raw = text.encode("utf-8")
+            # 每个码点至少占一个字节；多取一个即可判定超限，编码成本有界。
+            raw = text[:remaining + 1].encode("utf-8")
             if len(raw) > remaining:
                 taken = raw[:remaining].decode("utf-8", "ignore")
                 self._text += taken
@@ -120,14 +121,15 @@ class ReasoningBlock:
         if not cleaned.strip():
             return [title]  # 空正文/纯空白: 事实在标题状态里, 不补空壳
         body: list[str] = []
-        content_width = max(1, width - visible_width(_BODY_INDENT))
+        indent = _BODY_INDENT[:max(0, width - 2)]
+        content_width = max(1, width - visible_width(indent))
         for logical in cleaned.split("\n"):
             for chunk in wrap_text_ansi(logical, content_width):
-                body.append(theme.fg(theme.MUTED_GRAY, _BODY_INDENT + chunk))
+                body.append(theme.fg(theme.MUTED_GRAY, indent + truncate_to_width(chunk, content_width)))
         if self._preview_capped:
             note = _PREVIEW_NOTE if self._preview_active else _PREVIEW_NOTE_SEALED
             for chunk in wrap_text_ansi(note, content_width):
-                body.append(theme.fg(theme.MUTED_GRAY, _BODY_INDENT + chunk))
+                body.append(theme.fg(theme.MUTED_GRAY, indent + truncate_to_width(chunk, content_width)))
         return [title, *body]
 
     def _title(self, width: int, expanded: bool) -> str:

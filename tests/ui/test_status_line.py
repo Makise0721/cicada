@@ -63,6 +63,40 @@ async def test_idle_has_no_status_line(tmp_path):
         await session.aclose()
 
 
+async def test_late_model_deltas_do_not_revive_or_replace_current_stage(tmp_path):
+    """完成轮次与旧轮次的迟到事件不能把状态行重新切到思考/输出。"""
+    from cicada.core.events import (
+        AssistantCompleted, AssistantReasoningDelta, AssistantTextDelta,
+        RunFinished, RunStarted, TurnStarted,
+    )
+    from cicada.core.messages import AssistantMessage
+
+    session, bundle, _ = await _open_view(tmp_path, _Clock())
+    view = bundle["view"]
+    try:
+        assert bundle["on_submit"]("你好")
+        project = view._project_agent_event
+        project(RunStarted("late-events"))
+        project(TurnStarted("late-events", 0))
+        project(AssistantCompleted("late-events", AssistantMessage(text="完成")))
+        for event_type in (AssistantReasoningDelta, AssistantTextDelta):
+            project(event_type("late-events", 0, "迟到"))
+            assert "正在执行" in strip_terminal_sequences(bundle["status_lines"](80)[0])
+        project(TurnStarted("late-events", 1))
+        for event_type in (AssistantReasoningDelta, AssistantTextDelta):
+            project(event_type("late-events", 0, "旧轮次"))
+            assert "等待模型" in strip_terminal_sequences(bundle["status_lines"](80)[0])
+        project(AssistantReasoningDelta("late-events", 1, ""))
+        assert "正在思考" in strip_terminal_sequences(bundle["status_lines"](80)[0])
+        project(AssistantTextDelta("late-events", 1, "当前答案"))
+        assert "正在输出" in strip_terminal_sequences(bundle["status_lines"](80)[0])
+        project(RunFinished("late-events", "stop"))
+        project(AssistantReasoningDelta("late-events", 1, "运行已结束"))
+        assert "正在执行" in strip_terminal_sequences(bundle["status_lines"](80)[0])
+    finally:
+        await session.aclose()
+
+
 @pytest.mark.asyncio
 async def test_status_line_extreme_narrow_width_takes_no_row(tmp_path):
     """审查 06-2: 宽度 < 4 时状态行不占行 (不产生防御截断噪音)。"""
