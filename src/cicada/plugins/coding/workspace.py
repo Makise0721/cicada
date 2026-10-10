@@ -127,7 +127,11 @@ class Workspace:
                         try:
                             return await asyncio.shield(task)
                         except asyncio.CancelledError:
-                            # 重复取消不提前放弃: 持有到真实结果才释放队列
+                            if task.done():
+                                # op 自身以 cancelled 终结 (当前无此来源): 无真实结果可保留,
+                                # 传播取消而不是忙转持有锁
+                                raise
+                            # 重复外层取消不提前放弃: 持有到真实结果才释放队列
                             _note_handled_cancel(on_caller_cancel)
         except asyncio.CancelledError:
             # 排队中取消: op 未启动, 位置放弃; 取消事实仍传递给回调方

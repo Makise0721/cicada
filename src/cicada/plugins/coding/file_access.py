@@ -216,8 +216,16 @@ class FileAccess:
                 on_caller_cancel=on_caller_cancel,
             )
         finally:
+            # 已取得真实结果后回收 watcher: 二次取消不得让结果被泛化取消吞掉
             watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
+            while True:
+                try:
+                    await asyncio.shield(asyncio.gather(watcher, return_exceptions=True))
+                    break
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        current.uncancel()
         if outcome is None:
             # 排队中取消: op 未启动, 令牌已设置
             return _outcome(
@@ -255,6 +263,13 @@ class FileAccess:
                             str(self._workspace.resolve(raw_path)), str(exc))
         original = self._workspace.resolve(raw_path)
         key = str(target).casefold()
+        # reserved staging 不允许 edit/write (C3): unknown 保留材料是证据
+        reserved_staging = self._workspace.root / ".cicada" / "mutations"
+        if target == reserved_staging or reserved_staging in target.parents:
+            return _outcome(
+                STATE_NOT_WRITTEN, "unsupported_target", str(target),
+                f"target is inside the reserved mutation staging area: {target}",
+            )
 
         try:
             target_stat = target.stat()

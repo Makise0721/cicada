@@ -687,3 +687,18 @@ async def test_committed_current_mismatch_is_error_not_falsely_unwritten(tmp_pat
     assert mutation["current_matches"] is False
     assert "[mutation=committed]" in r.content
     assert "no longer matches" in r.content
+
+
+async def test_reserved_staging_area_rejects_edit(tmp_path):
+    """.cicada/mutations 保留区不允许 edit: unknown 保留材料是证据 (C3)."""
+    ws, tool = make(tmp_path)
+    staged_dir = ws.root / ".cicada" / "mutations" / "deadbeef"
+    staged_dir.mkdir(parents=True)
+    f = staged_dir / "old.bak"
+    f.write_text("evidence\n", encoding="utf-8")
+    await read_basis(ws, str(f.relative_to(ws.root)))
+    r = await run(tool, path=str(f.relative_to(ws.root)), edits=[{"old_text": "evidence", "new_text": "x"}])
+    assert r.is_error
+    assert r.details["mutation"]["reason"] == "unsupported_target"
+    assert "reserved mutation staging" in r.content
+    assert f.read_text(encoding="utf-8") == "evidence\n"

@@ -310,3 +310,39 @@ async def test_metadata_alone_over_cap_is_explicit_error(tmp_path, monkeypatch):
     r = await run(tool, path="a.txt")
     assert r.is_error
     assert "128 byte output cap" in r.content
+
+
+async def test_read_changed_during_read_errors_and_registers_nothing(tmp_path, monkeypatch):
+    """读取过程中文件被换 (fstat 身份漂移) → read_changed 错误且不登记依据 (A01)."""
+    import cicada.plugins.coding.file_access as file_access_module
+    from cicada.plugins.coding.tool_edit import EditTool
+
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    real_fstat = os.fstat
+    calls = {"n": 0}
+
+    def drifting_fstat(fd):
+        info = real_fstat(fd)
+        calls["n"] += 1
+        if calls["n"] == 2:  # 读后 fstat: 模拟读取期间原件被替换 (身份漂移)
+            fields = list(info)
+            fields[1] = info.st_ino + 1  # st_ino
+            return os.stat_result(tuple(fields[:10]))
+        return info
+
+    monkeypatch.setattr(file_access_module.os, "fstat", drifting_fstat)
+    r = await run(tool, path="a.txt")
+    monkeypatch.undo()
+    assert r.is_error
+    assert "changed while being read" in r.content
+    # 未登记: 后续 edit 得到 read_required 而非版本核对
+    edit_tool = EditTool(ws)
+    r2 = await edit_tool.execute(
+        {"path": "a.txt", "edits": [{"old_text": "one", "new_text": "x"}]},
+        ToolContext(call_id="e1", cancel=CancelToken()),
+    )
+    assert r2.is_error
+    assert r2.details["mutation"]["reason"] == "read_required"
+    assert f.read_text(encoding="utf-8") == "one\n"
