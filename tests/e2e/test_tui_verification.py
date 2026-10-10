@@ -56,6 +56,11 @@ def _plan(root: Path, command: str, timeout_s: float = 30.0) -> VerificationPlan
     )
 
 
+def _read_call(call_id: str) -> dict:
+    """edit 的 read 前置 (文件修改可靠性 01)."""
+    return {"id": call_id, "name": "read", "arguments": {"path": "sample.py"}}
+
+
 def _edit_call(call_id: str, old: str, new: str) -> dict:
     return {"id": call_id, "name": "edit", "arguments": {
         "path": "sample.py",
@@ -88,7 +93,7 @@ async def test_t08_cumulative_changes_and_historical_pass_source(tmp_path):
     root = git_repo(tmp_path)
     plan = _plan(root, CHECK_COMMAND)
     script = script_json(
-        {"tool_calls": [_edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
+        {"tool_calls": [_read_call("r1"), _edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
          "tool_use": True},
         {"text": "第一轮检查完成", "stop": True},
         {"text": "第二轮只汇报，不再检查", "stop": True},
@@ -125,7 +130,7 @@ async def test_t08_latest_failure_and_stale_not_deliverable(tmp_path):
     plan = _plan(root, CHECK_COMMAND)
     # 请求 1 检查失败 (VALUE=3 不满足); 请求 2 通过后第三轮再改不重检 -> stale
     script = script_json(
-        {"tool_calls": [_edit_call("e1", "VALUE = 1", "VALUE = 3"), _check_call("c1")],
+        {"tool_calls": [_read_call("r1"), _edit_call("e1", "VALUE = 1", "VALUE = 3"), _check_call("c1")],
          "tool_use": True},
         {"text": "检查失败了", "stop": True},
         {"tool_calls": [_edit_call("e2", "VALUE = 3", "VALUE = 2"), _check_call("c2")],
@@ -228,7 +233,7 @@ async def test_t10_artifact_tamper_or_missing_shows_failure(tmp_path, mode):
     root = git_repo(tmp_path)
     plan = _plan(root, CHECK_COMMAND)
     script = script_json(
-        {"tool_calls": [_edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
+        {"tool_calls": [_read_call("r1"), _edit_call("e1", "VALUE = 1", "VALUE = 2"), _check_call("c1")],
          "tool_use": True},
         {"text": "第一轮通过", "stop": True},
         {"text": "第二轮汇报", "stop": True},

@@ -122,6 +122,8 @@ SCENARIO_A_SCRIPT = [
 SCENARIO_B_SCRIPT = [
     {"tool_calls": [{"id": "b1", "name": "check",
                      "arguments": {"action": "run", "check_id": CHECK_ID}}]},
+    # 场景 B 为独立进程: edit 前先 read 建立版本依据
+    {"tool_calls": [{"id": "b1r", "name": "read", "arguments": {"path": CONVERT_PATH}}]},
     {"tool_calls": [{"id": "b2", "name": "edit",
                      "arguments": {"path": CONVERT_PATH, "edits": list(CANONICAL_FIX_EDITS)}}]},
     {"tool_calls": [{"id": "b3", "name": "check",
@@ -166,7 +168,7 @@ SCENARIO_A_EXPECTED = {
 }
 
 SCENARIO_B_EXPECTED = {
-    "tool_sequence": ["check", "edit", "check", "edit"],
+    "tool_sequence": ["check", "read", "edit", "check", "edit"],
     "tool_error_count": 0,
     "receipt_statuses": ["failed", "passed"],
     "current_receipt_status": "passed",

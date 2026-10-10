@@ -142,6 +142,7 @@ def stage_script() -> str:
          "arguments": {"command": (
              "foreach ($i in 1..14) { Write-Output ('powershell-line-{0:D2}' -f $i) }"
          ), "timeout": 15}},
+        {"id": "r1", "name": "read", "arguments": {"path": "sample.py"}},
         {"id": "e1", "name": "edit", "arguments": {
             "path": "sample.py",
             "edits": [{"old_text": "VALUE = 1", "new_text": "VALUE = 2"}],

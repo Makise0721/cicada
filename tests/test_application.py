@@ -291,6 +291,7 @@ async def test_multi_request_shared_baseline_and_cumulative_artifacts(tmp_path):
     plan = _plan(root)
     session = await open_application(_config(root, script=_script(
         {"tool_calls": [
+            {"id": "r1", "name": "read", "arguments": {"path": "sample.py"}},
             {"id": "e1", "name": "edit", "arguments": {
                 "path": "sample.py",
                 "edits": [{"old_text": "VALUE = 1", "new_text": "VALUE = 2"}],

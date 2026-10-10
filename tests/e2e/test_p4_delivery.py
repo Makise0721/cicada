@@ -83,6 +83,11 @@ def edit_app(script_id: str, old: str, new: str) -> dict:
     return call(script_id, "edit", {"path": "app.py", "edits": [{"old_text": old, "new_text": new}]})
 
 
+def read_app(script_id: str) -> dict:
+    """edit 的 read 前置 (文件修改可靠性 01)."""
+    return call(script_id, "read", {"path": "app.py"})
+
+
 def run_check(script_id: str, check_id: str = "check-1") -> dict:
     return call(script_id, "check", {"action": "run", "check_id": check_id})
 
@@ -129,6 +134,7 @@ def test_dirty_baseline_and_multi_change_scope(tmp_path):
     # 脏基线: 任务开始前已有未提交修改; 基线以启动时真实内容为准
     (repo / "old.txt").write_text("dirty before run\n", encoding="utf-8", newline="\n")
     script = write_script(repo, [
+        read_app("r1"),
         edit_app("e1", "def build_run_summary(result):", "def build_run_summary(result, tools_ok=False):"),
         call("w1", "write", {"path": "new_file.txt", "content": "created\n"}),
         call("p1", "powershell", {"command": "Remove-Item old.txt"}),
@@ -153,6 +159,7 @@ def test_latest_failure_overrides_old_pass(tmp_path):
     repo = make_repo(tmp_path, app_content=APP_WITH_TOOLS_OK)
     script = write_script(repo, [
         run_check("c1"),
+        read_app("r1"),
         edit_app("e1", "def build_run_summary(result, tools_ok=False):", "def build_run_summary(result):"),
         run_check("c2"),
         stop("检查已通过。"),
@@ -170,6 +177,7 @@ def test_change_after_pass_leaves_receipt_stale(tmp_path):
     repo = make_repo(tmp_path, app_content=APP_WITH_TOOLS_OK)
     script = write_script(repo, [
         run_check("c1"),
+        read_app("r1"),
         edit_app("e1", '    return "summary"', '    return "summary"  # touched'),
         stop("检查已通过, 无进一步改动。"),
     ])
@@ -183,6 +191,7 @@ def test_change_after_pass_leaves_receipt_stale(tmp_path):
 def test_fake_underreporting_does_not_hide_real_changes(tmp_path):
     repo = make_repo(tmp_path)
     script = write_script(repo, [
+        read_app("r1"),
         edit_app("e1", "def build_run_summary(result):", "def build_run_summary(result, tools_ok=False):"),
         {"text": "我没有修改任何文件, 任务无法完成。", "stop": True},
     ])
@@ -198,6 +207,7 @@ def test_fake_underreporting_does_not_hide_real_changes(tmp_path):
 def test_multiple_checks_require_all_passed(tmp_path):
     repo = make_repo(tmp_path, extra={"notes.md": "notes\n"})
     script = write_script(repo, [
+        read_app("r1"),
         edit_app("e1", "def build_run_summary(result):", "def build_run_summary(result, tools_ok=False):"),
         run_check("c1"),
         call("c2", "check", {"action": "run", "check_id": "check-2"}),
@@ -239,6 +249,7 @@ def test_powershell_timeout_latch_survives_later_check_pass(tmp_path):
     repo = make_repo(tmp_path)
     script = write_script(repo, [
         call("p1", "powershell", {"command": "Start-Sleep -Seconds 8", "timeout": 2}),
+        read_app("r1"),
         edit_app("e1", "def build_run_summary(result):", "def build_run_summary(result, tools_ok=False):"),
         run_check("c1"),
         stop("全部检查已通过。"),
