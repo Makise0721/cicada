@@ -283,7 +283,10 @@ class EditTool:
         """元信息也计入最终预算; 已写入的编辑不能因反馈超限变成错误."""
         if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
             details = {**details, "metadata_truncated": True, "full_result_content": content}
-            parts = ["edit applied; metadata_truncated=true; full metadata retained in details."]
+            parts = [
+                "[mutation=committed] edit applied; "
+                "metadata_truncated=true; full metadata retained in details."
+            ]
             if details.get("full_diff_path") is not None:
                 artifact_path = json.dumps(details["full_diff_path"], ensure_ascii=False)
                 marker = f"[diff_truncated=true full_diff_path={artifact_path}; read it with the read tool]"
