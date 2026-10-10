@@ -1,9 +1,11 @@
 import asyncio
+import ctypes
 import json
 import os
 import subprocess
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -702,3 +704,51 @@ async def test_reserved_staging_area_rejects_edit(tmp_path):
     assert r.details["mutation"]["reason"] == "unsupported_target"
     assert "reserved mutation staging" in r.content
     assert f.read_text(encoding="utf-8") == "evidence\n"
+
+
+_GENERIC_READ = 0x80000000
+_OPEN_EXISTING = 3
+_INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+
+async def test_locked_target_proves_not_written_with_stat_evidence(tmp_path, monkeypatch):
+    """读后加锁注入: 目标不可读时以 size+mtime 旁证判未提交 (01 审查 note-2 交接)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    real_replace = file_commit_windows.replace_file
+    locked: dict = {}
+
+    def open_exclusive(path):
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+        ]
+        handle = kernel32.CreateFileW(
+            str(path), _GENERIC_READ, 0, None, _OPEN_EXISTING, 0, None
+        )
+        assert handle not in (None, 0, _INVALID_HANDLE), "cannot lock target in test"
+        return handle
+
+    def lock_then_replace(target, replacement, backup):
+        # 锁在发布前注入并保持到分类完成: 分类期目标不可读, 只能走 stat 级旁证
+        locked["handle"] = open_exclusive(target)
+        return real_replace(target, replacement, backup)
+
+    monkeypatch.setattr(file_commit_windows, "replace_file", lock_then_replace)
+    try:
+        r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "TWO"}])
+    finally:
+        if "handle" in locked:
+            ctypes.windll.kernel32.CloseHandle(locked["handle"])
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "not_written"
+    assert mutation["reason"] == "publish_failed"
+    assert mutation["winerror"] == file_commit_windows.ERROR_SHARING_VIOLATION
+    assert f.read_text(encoding="utf-8") == "one\n"
+    staging_root = ws.root / ".cicada" / "mutations"
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
