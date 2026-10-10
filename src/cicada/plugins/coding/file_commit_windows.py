@@ -3,7 +3,7 @@
 ctypes 显式声明 Unicode/Win32 类型与 use_last_error, 无第三方依赖.
 政策与结果分类归 file_access.py; 本模块只做原生机制 (契约 C3):
 - 首版范围: 本地盘符 NTFS、普通单链接、无 reparse/ADS;
-- 覆盖发布 ReplaceFileW flags=0 + 本次 backup; 创建分支 (MoveFileExW) 由票据 02 交付.
+- 覆盖发布 ReplaceFileW flags=0 + 本次 backup; 创建发布 MoveFileExW flags=0, 不覆盖同名竞争目标.
 """
 
 from __future__ import annotations
@@ -20,6 +20,11 @@ ERROR_PATH_NOT_FOUND = 3
 ERROR_ACCESS_DENIED = 5
 ERROR_SHARING_VIOLATION = 32
 ERROR_HANDLE_EOF = 38
+ERROR_FILE_EXISTS = 80
+ERROR_ALREADY_EXISTS = 183
+
+# 创建发布的明确同名错误 (C3); 结合完整新件/无 backup 可判 not_written/create_conflict.
+CREATE_EXISTS_WINERRORS = frozenset({ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS})
 
 # 只有同时具备实物证据 (目标仍等于原件/新件仍在/无 backup) 时才允许判未提交的
 # 文档化前置失败错误; 1176/1177 等一律保持 unknown.
@@ -51,6 +56,7 @@ _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 _kernel32 = None
 _ReplaceFileW = None
+_MoveFileExW = None
 _GetVolumeInformationW = None
 _FindFirstStreamW = None
 _FindNextStreamW = None
@@ -65,6 +71,10 @@ if sys.platform == "win32":
         wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID,
     ]
     _ReplaceFileW.restype = wintypes.BOOL
+
+    _MoveFileExW = _kernel32.MoveFileExW
+    _MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    _MoveFileExW.restype = wintypes.BOOL
 
     _GetVolumeInformationW = _kernel32.GetVolumeInformationW
     _GetVolumeInformationW.argtypes = [
@@ -149,8 +159,14 @@ def has_alternate_streams(path: Path) -> bool:
         _FindClose(handle)
 
 
-def check_mutation_target(original: Path, canonical: Path) -> None:
-    """修改支持范围: 本地盘符、原始路径与 canonical 均无 reparse、NTFS、普通单链接、无 ADS."""
+def check_mutation_target(
+    original: Path, canonical: Path, *, creating: bool = False
+) -> None:
+    """修改支持范围: 本地盘符、原始路径与 canonical 均无 reparse、NTFS、普通单链接、无 ADS.
+
+    creating=True 用于创建分支: 目标尚不存在, 跳过依赖 lstat 的
+    目录/普通文件/硬链接/ADS 核对, 其余 (盘符/reparse 祖先/NTFS) 照常.
+    """
     _require_windows()
     raw = str(canonical)
     if raw.startswith("\\\\") or len(canonical.drive) < 2 or not canonical.is_absolute():
@@ -167,6 +183,8 @@ def check_mutation_target(original: Path, canonical: Path) -> None:
     fs = volume_fs_name(canonical)
     if fs.upper() != "NTFS":
         raise UnsupportedTargetError(f"only local NTFS volumes are supported: {canonical} is {fs}")
+    if creating:
+        return
     try:
         info = canonical.lstat()
     except OSError as exc:
@@ -206,5 +224,15 @@ def replace_file(target: Path, replacement: Path, backup: Path) -> None:
     if not _ReplaceFileW(str(target), str(replacement), str(backup), 0, None, None):
         raise NativePublishError(
             f"ReplaceFileW(target={target}, replacement={replacement}, backup={backup})",
+            ctypes.get_last_error(),
+        )
+
+
+def create_file(target: Path, staged: Path) -> None:
+    """创建发布: MoveFileExW flags=0, 不用 REPLACE_EXISTING/COPY_ALLOWED, 同名即失败."""
+    _require_windows()
+    if not _MoveFileExW(str(staged), str(target), 0):
+        raise NativePublishError(
+            f"MoveFileExW(staged={staged}, target={target})",
             ctypes.get_last_error(),
         )
