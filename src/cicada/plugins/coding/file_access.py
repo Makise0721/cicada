@@ -2,8 +2,9 @@
 
 职责 (ADR 0010 / 契约 C1-C4):
 - read: 句柄稳定读取 + 成功结果的进程内版本登记 (4096 LRU, 不存正文);
-- mutate: 同路径队列内核对依据 -> 纯字节 transform -> 独占暂存 -> 单次原生发布,
+- mutate(edit/write): 同路径队列内核对依据 -> 纯字节 transform -> 独占暂存 -> 单次原生发布,
   区分 not_written / committed / unknown; 协程取消不掩盖已写事实;
+  write 对不存在的目标以 MoveFileExW flags=0 创建, 同名竞争不覆盖;
 - 版本依据只在当前进程内有效, 不接受模型/ToolResult/存储输入, 不持久化.
 """
 
@@ -193,9 +194,8 @@ class FileAccess:
         mode: Literal["edit", "write"],
     ) -> MutationOutcome:
         """队列化可靠修改; 外层协程取消不泛化真实结果 (契约 C2)."""
-        if mode != "edit":
-            # write 分支由票据 02 交付; tool_write 当前仍走旧路径
-            raise ValueError(f"mutation mode {mode!r} is not implemented yet")
+        if mode not in ("edit", "write"):
+            raise ValueError(f"unknown mutation mode {mode!r}")
         stop = threading.Event()
         cancelled = threading.Event()  # caller_cancelled 记录, loop 线程读写
 
@@ -211,7 +211,7 @@ class FileAccess:
         try:
             outcome = await self._workspace.mutate(
                 self._workspace.resolve(raw_path),
-                lambda: self._mutation_worker(raw_path, transform, stop),
+                lambda: self._mutation_worker(raw_path, transform, stop, mode=mode),
                 preserve_result_on_cancel=True,
                 on_caller_cancel=on_caller_cancel,
             )
@@ -247,9 +247,15 @@ class FileAccess:
         on_cancelled()
 
     async def _mutation_worker(
-        self, raw_path: str, transform: Callable[[bytes | None], bytes], stop: threading.Event
+        self,
+        raw_path: str,
+        transform: Callable[[bytes | None], bytes],
+        stop: threading.Event,
+        *,
+        mode: Literal["edit", "write"],
     ) -> MutationOutcome:
         """持有同路径队列: 核对依据 -> transform -> 线程内暂存与发布."""
+        verb = "writing" if mode == "write" else "editing"
         if stop.is_set():
             return _outcome(
                 STATE_NOT_WRITTEN, "cancelled_before_commit",
@@ -276,12 +282,41 @@ class FileAccess:
         except FileNotFoundError:
             entry = self._registry.pop(key, None)
             if entry is not None:
+                # 读到的原件已删除: 本次意图不能转创建 (C1); 失效后独立 write 可新建
                 return _outcome(
                     STATE_NOT_WRITTEN, "version_conflict", str(target),
                     f"file was deleted after it was last read: {target}; "
-                    "read it again (or recreate it) before modifying",
+                    f"read it again before {verb}",
                     before_stamp=entry,
                 )
+            if mode == "write":
+                # 创建分支: 目标不存在且无有效依据, 允许新建 (C1)
+                try:
+                    native.check_mutation_target(original, target, creating=True)
+                except native.UnsupportedTargetError as exc:
+                    return _outcome(STATE_NOT_WRITTEN, "unsupported_target",
+                                    str(target), str(exc))
+                try:
+                    new_bytes = transform(None)
+                except MutationRejected as exc:
+                    return _outcome(STATE_NOT_WRITTEN, exc.reason, str(target), str(exc))
+                if len(new_bytes) > MAX_FILE_BYTES:
+                    return _outcome(
+                        STATE_NOT_WRITTEN, "size_limit", str(target),
+                        f"write result exceeds the {MAX_FILE_BYTES} byte limit "
+                        f"({len(new_bytes)} bytes)",
+                    )
+                if stop.is_set():
+                    return _outcome(
+                        STATE_NOT_WRITTEN, "cancelled_before_commit", str(target),
+                        "cancelled before publication; file not modified",
+                        caller_cancelled=True,
+                    )
+                staging = self._workspace.root / ".cicada" / "mutations" / uuid.uuid4().hex
+                outcome = await asyncio.to_thread(
+                    self._publish_creation, staging, target, original, new_bytes, stop
+                )
+                return self._settle(outcome, key)
             return _outcome(STATE_NOT_WRITTEN, "not_found", str(target),
                             f"file not found: {target}")
         except OSError as exc:
@@ -295,7 +330,7 @@ class FileAccess:
         if entry is None:
             return _outcome(
                 STATE_NOT_WRITTEN, "read_required", str(target),
-                f"existing file must be read with the read tool before editing: {target}",
+                f"existing file must be read with the read tool before {verb}: {target}",
             )
         try:
             native.check_mutation_target(original, target)
@@ -313,14 +348,14 @@ class FileAccess:
         except FileAccessError as exc:
             self._registry.pop(key, None)
             return _outcome(STATE_NOT_WRITTEN, "version_conflict", str(target),
-                            f"{exc}; read the file again before editing",
+                            f"{exc}; read the file again before {verb}",
                             before_stamp=entry)
         current = snapshot.stamp
         if current.identity() != entry.identity() or current.sha256 != entry.sha256:
             self._registry.pop(key, None)
             return _outcome(
                 STATE_NOT_WRITTEN, "version_conflict", str(target),
-                f"file changed since it was last read: {target}; read it again before editing",
+                f"file changed since it was last read: {target}; read it again before {verb}",
                 before_stamp=entry,
             )
         try:
@@ -331,7 +366,7 @@ class FileAccess:
         if len(new_bytes) > MAX_FILE_BYTES:
             return _outcome(
                 STATE_NOT_WRITTEN, "size_limit", str(target),
-                f"edit result exceeds the {MAX_FILE_BYTES} byte limit ({len(new_bytes)} bytes)",
+                f"{mode} result exceeds the {MAX_FILE_BYTES} byte limit ({len(new_bytes)} bytes)",
                 before_stamp=entry,
             )
         if stop.is_set():
@@ -345,7 +380,10 @@ class FileAccess:
         outcome = await asyncio.to_thread(
             self._publish_replacement, staging, target, original, current, new_bytes, stop
         )
-        # 登记策略: 完整核对相符才更新; 冲突/未知/当前不符失效
+        return self._settle(outcome, key)
+
+    def _settle(self, outcome: MutationOutcome, key: str) -> MutationOutcome:
+        """登记策略: 完整核对相符才更新; 冲突/未知/当前不符失效."""
         verified = (
             outcome.state == STATE_COMMITTED
             and outcome.reason == "applied"
@@ -533,6 +571,138 @@ class FileAccess:
             STATE_COMMITTED, "applied", str(target), message,
             current_matches=True, cleanup_warning=warning,
             before_stamp=before, after_stamp=after_stamp,
+        )
+
+    # ---- 创建发布 (write 目标不存在; 工作线程内执行, 不触碰登记) ----
+
+    def _publish_creation(
+        self, staging: Path, target: Path, original: Path,
+        new_bytes: bytes, stop: threading.Event,
+    ) -> MutationOutcome:
+        staged = staging / "new.tmp"
+        # old.bak 是保留名且创建分支从不生成; "无 backup" 是 create_conflict 证据条件之一
+        backup = staging / "old.bak"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staging.mkdir(parents=True, exist_ok=False)
+            if os.stat(staging).st_dev != os.stat(target.parent).st_dev:
+                warning = self._cleanup_staging(staging, [staged])
+                return _outcome(
+                    STATE_NOT_WRITTEN, "unsupported_target", str(target),
+                    f"staging directory is not on the target volume: {target}",
+                    cleanup_warning=warning,
+                )
+            native.write_staged_file(staged, new_bytes)
+        except OSError as exc:
+            warning = self._cleanup_staging(staging, [staged])
+            return _outcome(
+                STATE_NOT_WRITTEN, "publish_failed", str(target),
+                f"cannot prepare staged file in {staging}: {exc}",
+                winerror=getattr(exc, "winerror", None), cleanup_warning=warning,
+            )
+        if stop.is_set():
+            warning = self._cleanup_staging(staging, [staged])
+            return _outcome(
+                STATE_NOT_WRITTEN, "cancelled_before_commit", str(target),
+                "cancelled before publication; file not modified",
+                caller_cancelled=True, cleanup_warning=warning,
+            )
+        # 发布前重新核对原路径绑定与祖先 reparse; 同名竞争交由 MoveFileExW flags=0 裁决
+        try:
+            if native.reparse_ancestor(original) is not None \
+                    or Path(os.path.realpath(original)) != target:
+                warning = self._cleanup_staging(staging, [staged])
+                return _outcome(
+                    STATE_NOT_WRITTEN, "version_conflict", str(target),
+                    f"target path changed during the operation: {original} no longer "
+                    f"resolves to {target}; read it again before writing",
+                    cleanup_warning=warning,
+                )
+            native.create_file(target, staged)
+        except native.UnsupportedTargetError as exc:
+            warning = self._cleanup_staging(staging, [staged])
+            return _outcome(STATE_NOT_WRITTEN, "unsupported_target", str(target), str(exc),
+                            cleanup_warning=warning)
+        except native.NativePublishError as exc:
+            return self._classify_create_failure(target, staged, backup, staging, new_bytes, exc)
+        except OSError as exc:
+            warning = self._cleanup_staging(staging, [staged])
+            return _outcome(
+                STATE_NOT_WRITTEN, "publish_failed", str(target),
+                f"pre-publication recheck failed: {exc}",
+                winerror=getattr(exc, "winerror", None), cleanup_warning=warning,
+            )
+        return self._verify_creation(target, staging, staged, new_bytes)
+
+    def _classify_create_failure(
+        self, target: Path, staged: Path, backup: Path, staging: Path,
+        new_bytes: bytes, exc: native.NativePublishError,
+    ) -> MutationOutcome:
+        """创建失败分类 (C3): 明确同名错误 + 完整新件仍在 + 无 backup 才可判未提交."""
+        try:
+            staged_ok = staged.stat().st_size == len(new_bytes)
+        except OSError:
+            staged_ok = False
+        provable = (
+            exc.winerror in native.CREATE_EXISTS_WINERRORS
+            and staged_ok
+            and not backup.exists()
+        )
+        if provable:
+            warning = self._cleanup_staging(staging, [staged, backup])
+            return _outcome(
+                STATE_NOT_WRITTEN, "create_conflict", str(target),
+                f"a target with the same name already exists; the new file was not "
+                f"created and the existing target was not overwritten: {exc}",
+                winerror=exc.winerror, cleanup_warning=warning,
+            )
+        retained = tuple(str(p) for p in (staged, backup, staging) if p.exists())
+        return _outcome(
+            STATE_UNKNOWN, "publish_failed", str(target),
+            f"creation failed after entering the native call; "
+            f"commit state cannot be proven: {exc}",
+            winerror=exc.winerror, retained_paths=retained,
+        )
+
+    def _verify_creation(
+        self, target: Path, staging: Path, staged: Path, new_bytes: bytes,
+    ) -> MutationOutcome:
+        """创建成功核对: 回读目标; 创建无 backup 可核, after stamp 取自实际 replacement."""
+        expected_sha = hashlib.sha256(new_bytes).hexdigest()
+        try:
+            readback = _read_all(target)
+            after_stat = target.stat()
+        except OSError as exc:
+            retained = tuple(str(p) for p in (staging,) if p.exists())
+            return _outcome(
+                STATE_COMMITTED, "current_unverified", str(target),
+                f"file was created, but the target readback failed "
+                f"({type(exc).__name__}: {exc}); re-read {target} to verify",
+                current_matches=None, retained_paths=retained,
+            )
+        if readback != new_bytes:
+            # 创建已提交, 但当前目标已被外部改写: 已写事实保留, 不假报未写
+            retained = tuple(str(p) for p in (staging,) if p.exists())
+            return _outcome(
+                STATE_COMMITTED, "applied", str(target),
+                f"file was created, but the target no longer matches the committed "
+                f"content (changed externally after commit): {target}",
+                current_matches=False, retained_paths=retained,
+            )
+        after_stamp = FileStamp(
+            key=str(target).casefold(),
+            st_dev=after_stat.st_dev, st_ino=after_stat.st_ino,
+            st_size=after_stat.st_size, st_mtime_ns=after_stat.st_mtime_ns,
+            sha256=expected_sha,
+        )
+        # 成功的 MoveFileExW 已把 new.tmp 移走: staging 只剩空目录
+        warning = self._cleanup_staging(staging, [staged])
+        message = "file created"
+        if warning:
+            message = f"file created; cleanup warning: {warning}"
+        return _outcome(
+            STATE_COMMITTED, "applied", str(target), message,
+            current_matches=True, cleanup_warning=warning, after_stamp=after_stamp,
         )
 
     def _cleanup_staging(self, staging: Path, known_files: list[Path]) -> str | None:
