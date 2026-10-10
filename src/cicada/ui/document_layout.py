@@ -26,6 +26,9 @@ ACTION_RESET = "reset"
 ACTION_JUMP_LATEST = "jump_latest"
 ACTION_EFFORT_CYCLE = "effort_cycle"  # 03 思考强度标记预留
 
+# 滚轮: 每个标准 notch 移动的物理行数 (C3)
+WHEEL_LINES_PER_NOTCH = 3
+
 # 目标身份首元素
 TARGET_GROUP = "group"      # ("group", scope, run_id, turn_index)
 TARGET_TOOL = "tool"        # ("tool", scope, run_id, turn_index, call_id)
@@ -257,6 +260,39 @@ class DocumentViewport:
         """「最新」动作: 恢复跟随 (与 End 同语义)。"""
         self.go_end()
 
+    def wheel_scroll(self, notches: int) -> None:
+        """滚轮 (02, C3): 每 notch 移动 WHEEL_LINES_PER_NOTCH 物理行。
+
+        notches 正 = 向文档头回看, 负 = 向尾部; 到达底部自动恢复跟随。
+        """
+        if notches:
+            self._scroll_by(notches * WHEEL_LINES_PER_NOTCH)
+
+    def frame_hits(self, width: int) -> tuple[HitSpan, ...]:
+        """最近一次 frame() 呈现窗口的帧行命中 (02, D5 同源)。
+
+        布局命中平移到帧内行 (scroll_top 为偏移), 只含实际呈现的标题/动作;
+        「有更新 · 最新」指示行整体可点。空窗口无命中。列沿用布局的
+        visible_width 规则 (CJK 双列、ANSI 零宽), 前端不再另算坐标。
+        """
+        if self._last_content_rows <= 0 or not self._last_layout.lines:
+            return ()
+        top = self.scroll_top
+        bottom = top + self._last_content_rows
+        hits = tuple(
+            HitSpan(hit.row - top, hit.start_column, hit.end_column, hit.action)
+            for hit in self._last_layout.hits
+            if top <= hit.row < bottom
+        )
+        if self.indicator_visible:
+            hits += (
+                HitSpan(
+                    self._last_content_rows, 0, width,
+                    DisplayAction(ACTION_JUMP_LATEST, (TARGET_LATEST,)),
+                ),
+            )
+        return hits
+
     def execute_selected(self) -> DisplayAction | None:
         """Enter: 执行选中的显示动作; 屏幕外旧目标不执行 (返回 None)。
 
@@ -457,6 +493,7 @@ __all__ = [
     "TARGET_REASONING",
     "TARGET_SKILL",
     "TARGET_TOOL",
+    "WHEEL_LINES_PER_NOTCH",
     "owner_action",
     "wrap_plain_entry",
 ]

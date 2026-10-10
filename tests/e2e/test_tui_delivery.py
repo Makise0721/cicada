@@ -185,9 +185,12 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path, m
         assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /"  # 提示符 + 草稿 (§C)
         stage.emit([ENTER])
         # /status 经菜单 Enter 执行: 40x8 跟随窗口只呈尾部, 首行 "状态: idle"
-        # 是同源文档事实 (紧凑交互 01)
+        # 是同源文档事实 (紧凑交互 01); 有色环境标签带 SGR, 内容事实剥样式后匹配
         assert await wait_until(
-            lambda: any("状态: idle" in line for line in views[0].document_lines(40))
+            lambda: any(
+                "状态: idle" in strip_terminal_sequences(line)
+                for line in views[0].document_lines(40)
+            )
         )
         assert len(model_of(session).requests) == 1
         stage.emit(text_keys("/exit") + [ENTER])
@@ -799,6 +802,83 @@ async def test_restore_errors_reported_on_stderr(tmp_path, capsys):
         captured = capsys.readouterr()
         assert "raw mode restore failed: injected" in captured.err, "stderr 如实留痕"
         assert session.state == "closed"
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_pointer_click_toggles_tool_group_in_production(tmp_path):
+    """票据 02 生产接线: PointerEvent 经 run_tui_session 命中同一视口动作.
+
+    点击单工具标题展开详情、再点收起; 点击不触碰草稿也不提交请求 (C2/C4)。
+    """
+    from cicada.ui.terminal_io import PointerEvent
+
+    root = git_repo(tmp_path)
+    session = await open_application(make_config(root, script_json(
+        {"tool_calls": [{"id": "r1", "name": "read", "arguments": {"path": "sample.py"}}],
+         "tool_use": True},
+        {"text": "读取完成。", "stop": True},
+    )))
+    stage = StageTerminal()
+    try:
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
+        try:
+            assert await wait_until(lambda: stage.contains("输入消息"))
+            stage.emit(text_keys("读一下 sample.py"))
+            stage.emit([ENTER])
+            assert await wait_until(lambda: stage.contains("读取") and session.state == "idle")
+            row = stage.vt.find_row("读取")
+            assert row is not None
+            geo = stage.terminal.geometry
+
+            def on_screen(needle: str) -> bool:
+                return any(needle in line for line in stage.vt.screen_text())
+
+            assert not on_screen("VALUE = 1"), "收起时不显示正文"
+            stage.emit([
+                PointerEvent("down", 2, row, geo, button="left"),
+                PointerEvent("up", 2, row, geo),
+            ])
+            assert await wait_until(lambda: on_screen("VALUE = 1")), "点击展开详情"
+            row = stage.vt.find_row("读取")  # 展开后标题被锚定到新屏幕行
+            assert row is not None
+            calls_before = len(model_of(session).requests)
+            stage.emit([
+                PointerEvent("down", 2, row, geo, button="left"),
+                PointerEvent("up", 2, row, geo),
+            ])
+            assert await wait_until(
+                lambda: not on_screen("VALUE = 1") and on_screen("读取")
+            ), "再点收起"
+            assert len(model_of(session).requests) == calls_before, "点击不触模型请求"
+        finally:
+            stage.emit(text_keys("/exit"))
+            stage.emit([ENTER])
+            assert await asyncio.wait_for(task, timeout=15) == 0
+    finally:
+        if session.state != "closed":
+            await session.aclose()
+
+
+async def test_mouse_setup_failure_falls_back_to_keyboard_with_hint(tmp_path):
+    """票据 02 (C4): 鼠标能力启用失败退键盘并给一次短提示, 不阻断会话。"""
+    session = await open_application(
+        make_config(tmp_path, script_json({"text": "回答结束。", "stop": True}))
+    )
+    stage = StageTerminal()
+    stage.terminal.mouse_setup_error = "mouse-enable-failed"
+    try:
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
+        try:
+            assert await wait_until(lambda: stage.contains("鼠标不可用（mouse-enable-failed）"))
+            assert stage.contains("F6 回看"), "提示含键盘回退入口"
+            stage.emit(text_keys("/exit"))
+            stage.emit([ENTER])
+            assert await asyncio.wait_for(task, timeout=15) == 0
+        finally:
+            if not task.done():
+                pass
     finally:
         if session.state != "closed":
             await session.aclose()

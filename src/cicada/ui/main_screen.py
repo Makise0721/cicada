@@ -392,6 +392,12 @@ class MainScreen:
         self._previous_viewport_top = 0
         self._cursor_shown = None
 
+    @property
+    def viewport_top(self) -> int:
+        """当前帧第 0 行对应的屏幕上方偏移 (02): 屏幕行 s 呈现帧行
+        viewport_top + s; 自有视口下帧 ≤ rows, 恒为 0。"""
+        return self._previous_viewport_top
+
     # --- 渲染 -----------------------------------------------------------------
 
     def render_once(self, columns: int, rows: int) -> None:
@@ -443,9 +449,11 @@ class MainScreen:
             self._previous_width = width
             self._previous_height = height
 
-        # 首帧: 假定干净屏幕, 直接追加不清屏
+        # 首帧/重置后: 锚定当前可见窗口并清屏重放 (C3 第一次呈现清该帧区域,
+        # ADR 0003: 进入时 shell 可见历史可能消失); 帧行与屏幕行自此对齐,
+        # 是 02 鼠标坐标映射的前提
         if not self._previous_lines and not width_changed and not height_changed:
-            full_render(False)
+            full_render(True)
             return
 
         # 宽度变化必 fullRender (折行全变); 高度变化同样 (视口对齐)

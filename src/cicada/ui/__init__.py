@@ -83,11 +83,20 @@ async def run_tui_session(
         view.handle_ctrl_t()  # 票据 01: 思考展开切换 + 既有立即渲染
         refs["frontend"].request_render_now()
 
+    def _mouse_unavailable_hint() -> None:
+        # 票据 02 (C4): 鼠标启用失败退键盘, 一次短提示经显示文档如实成条
+        error = getattr(terminal, "mouse_setup_error", None) or "unavailable"
+        view.transcript.append_system(
+            f"鼠标不可用（{error}）：已回退键盘操作（F6 回看，Ctrl+O/Ctrl+T 展开）。"
+        )
+        refs["frontend"].request_render_now()
+
     frontend = MainScreenFrontend(
         terminal,
         document_lines=view.document_lines,
         layout_document=view.layout_document,  # 紧凑交互 01: 同源布局 + 自有视口
         on_display_action=view.execute_display_action,
+        on_mouse_unavailable=_mouse_unavailable_hint,  # 紧凑交互 02: 键盘回退提示
         editor=view.editor,
         on_submit=view.on_submit,
         on_escape=view.handle_escape,

@@ -18,6 +18,14 @@ Copyright (c) 2025 Mario Zechner) 的 requestRender 合并 (16ms 最小间隔,
   (模态/模型菜单活跃时忽略), 文档焦点中 Up/Down 选动作、Enter 只执行可见
   选中动作、Esc 立即回草稿并消费, PageUp/PageDown/Home/End 回看; 文本/粘贴/
   换行键退出焦点后按原编辑行为处理。未注入 layout_document 保持旧整幅回放。
+- tui-compact-interaction 票据 02 (契约 C4/D5): 输入批次扩展 PointerEvent;
+  每次成功写入后保存该帧的命中图/几何/revision, 首帧由 renderer 锚定清屏
+  (屏幕行 = 帧行)。模态与菜单活跃时 pointer 被消费不穿透; 只有同目标左键
+  down/up、未拖动、无修饰符且目标仍命中同一区域才执行一次显示动作; 动作
+  执行/滚轮/几何不符/写失败/模态菜单切换/停止都使命中图立即失效, 动作执行
+  后本批后续 pointer 丢弃直至新帧成功。滚轮每 notch 移动 3 物理行, 小
+  delta 累积, 回看脱离跟随、到底恢复; 鼠标启用失败经 on_mouse_unavailable
+  给一次键盘回退提示, 双击第二按与未知输入安全消费。
 
 故障矩阵 (P10): 渲染写失败先记录 ui_failures 并尝试恢复终端一次, 再失败
 则置 terminal_failed 并请求退出; 尺寸读取失败沿用上次良好值; 输入读取
@@ -33,17 +41,36 @@ from prompt_toolkit.keys import Keys
 
 from cicada.ui.commands import SlashCommandMenu
 from cicada.ui import theme
-from cicada.ui.document_layout import DisplayAction, DocumentLayout, DocumentViewport
+from cicada.ui.document_layout import (
+    ACTION_JUMP_LATEST,
+    TARGET_LATEST,
+    DisplayAction,
+    DocumentLayout,
+    DocumentViewport,
+    HitSpan,
+)
 from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
-from cicada.ui.terminal_io import Terminal
+from cicada.ui.terminal_io import (
+    WHEEL_DELTA,
+    InputBatchItem,
+    PointerEvent,
+    Terminal,
+    TerminalGeometry,
+)
 from cicada.ui.display_style import DisplayStyle
 
 MIN_RENDER_INTERVAL_S = 1.0 / 60.0  # Pi MIN_RENDER_INTERVAL_MS = 16
 ESCAPE_PREFIX_TIMEOUT_S = 0.010  # Pi DEFAULT_ESCAPE_TIMEOUT_MS = 10
 WRITE_RETRY_DELAY_S = 0.2  # 写失败后的恢复重试延迟 (Windows 时钟粒度 ~15.6ms, 取整数量级)
+
+# pointer 派发结果 (02): none=消费无渲染, render=需立即渲染, poison=动作已
+# 执行, 同批后续 pointer 丢弃直至新帧成功 (C4)
+_POINTER_NONE = "none"
+_POINTER_RENDER = "render"
+_POINTER_POISON = "poison"
 
 
 class MainScreenFrontend:
@@ -71,6 +98,7 @@ class MainScreenFrontend:
         display_style: DisplayStyle | None = None,
         layout_document: Callable[[int, DisplayAction | None], DocumentLayout] | None = None,
         on_display_action: Callable[[DisplayAction], object] | None = None,
+        on_mouse_unavailable: Callable[[], None] | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
@@ -86,6 +114,7 @@ class MainScreenFrontend:
         self._on_ctrl_o = on_ctrl_o
         self._on_ctrl_t = on_ctrl_t
         self._on_exit = on_exit
+        self._on_mouse_unavailable = on_mouse_unavailable
         self._footer_lines = footer_lines
         self._command_menu = command_menu
         self._status_lines = status_lines
@@ -107,6 +136,15 @@ class MainScreenFrontend:
         self._escape_prefix_timeout = escape_prefix_timeout
         self._recovering = False
         self._frame_rows = 24  # 每帧 render_once 前快照 (帧合成内不重读尺寸)
+        # 票据 02 (C4/D5): 最近一次成功呈现帧的命中图/几何; pending 命中图
+        # 只在 render_once 成功返回后提升, 写失败即弃。_pending_left_down 是
+        # 待配对左键按下 (x, y, action) —— 流式更新后的配对以「目标身份与命中
+        # 区域仍相同」复核, 不绑 revision。滚轮小 delta 累积到标准 notch。
+        self._frame_hits: tuple[HitSpan, ...] | None = None
+        self._frame_geometry: TerminalGeometry | None = None
+        self._pending_frame_hits: tuple[HitSpan, ...] | None = None
+        self._pending_left_down: tuple[int, int, DisplayAction] | None = None
+        self._wheel_accumulator = 0
 
     # --- 帧合成 -----------------------------------------------------------------
 
@@ -156,6 +194,9 @@ class MainScreenFrontend:
             ))
             if reserve:
                 lines.append("")
+            # 票据 02 (D5 同源): 命中图来自同一次布局与呈现窗口; 是否有效
+            # 由 render 成败决定 (_do_render 提升或丢弃)
+            self._pending_frame_hits = self._viewport.frame_hits(width)
         else:
             lines = list(self._document_lines(width))
             if lines and strip_terminal_sequences(lines[-1]).strip():
@@ -241,12 +282,43 @@ class MainScreenFrontend:
             self._render_timer = None
 
     def _do_render(self) -> None:
-        try:
-            self._frame_rows = self._terminal.rows
-            self._screen.render_once(self._terminal.columns, self._frame_rows)
-        except Exception as exc:
+        exc = self._render_frame_captured()
+        if exc is not None:
             self.ui_failures.append('login render failed' if self.sensitive_input_used else f"render failed: {exc!r}")
             self._attempt_recovery()
+
+    def _snapshot_geometry(self) -> TerminalGeometry:
+        """一次几何快照: columns/rows/origin 同源, 帧合成与命中图共用 (C4)。"""
+        geometry = getattr(self._terminal, "geometry", None)
+        if isinstance(geometry, TerminalGeometry):
+            return geometry
+        return TerminalGeometry(self._terminal.columns, self._terminal.rows)
+
+    def _render_frame_captured(self, *, reset: bool = False) -> Exception | None:
+        """渲染一帧并管理命中图生命周期 (02, C4): 几何一次快照, 写入成功才
+        提升本帧命中图与几何; 失败立即全部失效 (写出的屏幕不可信, 陈旧坐标
+        不得受理)。返回捕获的异常或 None。"""
+        geometry = self._snapshot_geometry()
+        try:
+            if reset:
+                self._screen.reset_render_state()
+            self._frame_rows = geometry.rows
+            self._pending_frame_hits = None
+            self._screen.render_once(geometry.columns, geometry.rows)
+        except Exception as exc:
+            self._invalidate_pointer_frame()
+            return exc
+        self._frame_hits = self._pending_frame_hits
+        self._pending_frame_hits = None
+        self._frame_geometry = geometry
+        return None
+
+    def _invalidate_pointer_frame(self) -> None:
+        """命中图与待配对按下立即失效 (C4): 写失败/模态菜单切换/滚动/停止。"""
+        self._frame_hits = None
+        self._frame_geometry = None
+        self._pending_frame_hits = None
+        self._pending_left_down = None
 
     def _attempt_recovery(self) -> None:
         """写失败恢复: 重置渲染状态并延迟重试一次 (瞬时故障可恢复);
@@ -260,24 +332,38 @@ class MainScreenFrontend:
         self._recovering = False
         if self._stopped:
             return
-        try:
-            self._frame_rows = self._terminal.rows
-            self._screen.reset_render_state()
-            self._screen.render_once(self._terminal.columns, self._frame_rows)
-        except Exception as exc:
+        exc = self._render_frame_captured(reset=True)
+        if exc is not None:
             self.terminal_failed = True
             self.ui_failures.append('login terminal write failed permanently' if self.sensitive_input_used else f"terminal write failed permanently: {exc!r}")
             self._exit_event.set()
 
     # --- 输入 --------------------------------------------------------------------
 
-    def _on_input_batch(self, keys: list) -> None:
-        for key in keys:
-            modal_was_open = self._modal_active()
-            self._dispatch_key(key)
-            if modal_was_open and not self._modal_active():
-                break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
-        self.request_render_now()
+    def _on_input_batch(self, items: list[InputBatchItem]) -> None:
+        capture_before = self._pointer_capture_active()
+        poisoned = False
+        needs_render = False
+        for item in items:
+            if isinstance(item, PointerEvent):
+                if poisoned:
+                    continue  # 动作执行后的同批旧 pointer 丢弃直至新帧成功 (C4)
+                outcome = self._dispatch_pointer(item)
+                if outcome == _POINTER_POISON:
+                    poisoned = True
+                    needs_render = True
+                elif outcome == _POINTER_RENDER:
+                    needs_render = True
+            else:
+                modal_was_open = self._modal_active()
+                self._dispatch_key(item)
+                needs_render = True
+                if modal_was_open and not self._modal_active():
+                    break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
+        if capture_before != self._pointer_capture_active():
+            self._invalidate_pointer_frame()  # 模态/菜单切换: 命中图立即失效 (C4)
+        if needs_render:
+            self.request_render_now()
 
     def request_render_now(self) -> None:
         """输入路径: 跳过节流定时器立即渲染 (输入延迟敏感)。"""
@@ -294,6 +380,9 @@ class MainScreenFrontend:
             return
         self._sync_command_menu()
         data = key.data
+        # 原生鼠标 KeyPress (上游文本解析产物): 安全消费, 不写入编辑器 (C4)
+        if key.key is Keys.WindowsMouseEvent:
+            return
         # Ctrl+C / Ctrl+D: 与 Escape 前缀无关, 直接派发
         if key.key in (Keys.ControlC,) or data == "\x03":
             if self._on_ctrl_c is not None:
@@ -431,6 +520,104 @@ class MainScreenFrontend:
         if data and not data.startswith("\x1b") and all(ord(ch) >= 32 or ch == "\t" for ch in data):
             self._editor.insert_text(data)
 
+    # --- 指针派发 (票据 02, C4/D5) --------------------------------------------------
+
+    def _pointer_capture_active(self) -> bool:
+        """模态与菜单先取得输入: 活跃时 pointer 被消费, 不穿透文档 (C4)。"""
+        if self._modal_active() or self._model_menu_active():
+            return True
+        return self._command_menu is not None and self._command_menu.selected is not None
+
+    def _dispatch_pointer(self, event: PointerEvent) -> str:
+        """指针事件派发。返回 _POINTER_NONE/_POINTER_RENDER/_POINTER_POISON。
+
+        几何与呈现帧不符的事件忽略等待新帧; 只有同一目标上的左键 down/up、
+        未拖动且修饰符为空才执行一次显示动作; 执行后命中图失效并毒化本批。
+        点击不改编辑器/文档焦点, 不触碰草稿。
+        """
+        if self._pointer_capture_active():
+            self._pending_left_down = None
+            return _POINTER_NONE
+        if self._viewport is None:
+            return _POINTER_NONE  # 旧整幅回放无自有视口: pointer 安全消费
+        if event.kind == "cancel":
+            self._pending_left_down = None  # 失焦/取消: 清除按下 (后端可观察时)
+            return _POINTER_NONE
+        if (
+            self._frame_hits is None
+            or self._frame_geometry is None
+            or event.geometry != self._frame_geometry
+        ):
+            # 无有效帧或几何不一致: 等新帧; 陈旧按下不可信, 一并丢弃
+            self._pending_left_down = None
+            return _POINTER_NONE
+        if event.kind == "move":
+            pending = self._pending_left_down
+            if pending is not None and (
+                (event.x, event.y) != (pending[0], pending[1])
+                or event.button not in ("none", "left")
+            ):
+                self._pending_left_down = None  # 拖出/其他按钮: 清除按下 (C4)
+            return _POINTER_NONE
+        if event.kind == "wheel":
+            return self._dispatch_wheel(event)
+        if event.kind == "down":
+            if event.double_click:
+                self._pending_left_down = None  # 原生双击第二按: 消费不配对
+            elif event.modifiers or event.button != "left":
+                self._pending_left_down = None  # 修饰拖动归宿主选择; 非左键不配对
+            else:
+                action = self._hit_action_at(event.x, event.y)
+                self._pending_left_down = (event.x, event.y, action) if action is not None else None
+            return _POINTER_NONE
+        if event.kind == "up":
+            pending = self._pending_left_down
+            self._pending_left_down = None
+            if pending is None or event.modifiers:
+                return _POINTER_NONE
+            x, y, action = pending
+            if (event.x, event.y) != (x, y):
+                return _POINTER_NONE  # 拖出又拖回/位移释放: 无动作 (C4)
+            # 流式帧更新: 仅当目标身份与命中区域仍相同 (几何已同) 才执行
+            if self._hit_action_at(x, y) != action:
+                return _POINTER_NONE
+            return self._execute_pointer_action(action)
+        return _POINTER_NONE  # 未知种类: 安全消费
+
+    def _dispatch_wheel(self, event: PointerEvent) -> str:
+        """滚轮: 清除未完成配对, 小 delta 累积到 notch 后移动 3 行 (C3/C4)。"""
+        self._pending_left_down = None
+        self._wheel_accumulator += event.wheel_delta
+        notches = int(self._wheel_accumulator / WHEEL_DELTA)  # 截断到零: 累积小 delta
+        self._wheel_accumulator -= notches * WHEEL_DELTA
+        if not notches:
+            return _POINTER_NONE
+        self._viewport.wheel_scroll(notches)
+        self._frame_hits = None  # 视口位移后命中行失效, 等新帧 (C4)
+        return _POINTER_RENDER
+
+    def _hit_action_at(self, x: int, y: int) -> DisplayAction | None:
+        """帧行命中查询 (帧内 0 基行/列): 命中最窄区域; 正文无动作。"""
+        if self._frame_hits is None:
+            return None
+        best: HitSpan | None = None
+        for span in self._frame_hits:
+            if span.row == y and span.start_column <= x < span.end_column:
+                if best is None or (
+                    span.end_column - span.start_column
+                ) < (best.end_column - best.start_column):
+                    best = span
+        return best.action if best is not None else None
+
+    def _execute_pointer_action(self, action: DisplayAction) -> str:
+        """执行命中的显示动作; 命中图失效, 本批后续 pointer 丢弃 (C4)。"""
+        if action.kind == ACTION_JUMP_LATEST and action.target_id == (TARGET_LATEST,):
+            self._viewport.jump_to_latest()  # 视口内部消费, 同 End 语义
+        elif self._on_display_action is not None:
+            self._on_display_action(action)  # 只读显示动作; 未知/失效目标静默
+        self._invalidate_pointer_frame()
+        return _POINTER_POISON
+
     def _handle_enter(self) -> None:
         """受理制提交: on_submit 返回 False = 拒绝 (草稿保留, 02 准入语义);
         True/None = 接受 (清空草稿)。空白草稿直接清空不派发。"""
@@ -510,6 +697,11 @@ class MainScreenFrontend:
 
     # --- 生命周期 ---------------------------------------------------------------------
 
+    def _on_terminal_resize(self) -> None:
+        """尺寸/origin 变化: 命中图立即失效 (C4), 渲染按新几何重排。"""
+        self._invalidate_pointer_frame()
+        self.request_render()
+
     async def run_async(self) -> list[str]:
         """运行至退出; 返回停止时的恢复错误列表 (空 = 干净恢复)。
 
@@ -519,7 +711,11 @@ class MainScreenFrontend:
         """
         loop = asyncio.get_running_loop()
         try:
-            self._terminal.start(self._on_input_batch, lambda: self.request_render())
+            self._terminal.start(self._on_input_batch, self._on_terminal_resize)
+            mouse_error = getattr(self._terminal, "mouse_setup_error", None)
+            if mouse_error and self._on_mouse_unavailable is not None:
+                # 鼠标能力启用失败: 一次键盘回退短提示 (C4), 不阻断会话
+                self._on_mouse_unavailable()
             self._last_render_at = loop.time()
             self.request_render_now()
             while not self._exit_event.is_set():
@@ -544,6 +740,7 @@ class MainScreenFrontend:
             self._stopped = True
             self._cancel_render_timer()
             self._disarm_escape_prefix()
+            self._invalidate_pointer_frame()  # 停止: 命中图与待配对按下立即失效 (C4)
             self._write_stop_sequence()
             stop_errors = self._terminal.stop()
             if self.sensitive_input_used and stop_errors:

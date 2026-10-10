@@ -95,11 +95,13 @@ def render(screen: MainScreen, columns: int, rows: int) -> None:
     screen.render_once(columns, rows)
 
 
-def test_first_render_appends_without_clear():
+def test_first_render_clears_and_homes():
     vt, writes, doc, screen = build()
     doc.lines = ["第一行", "second"]
     render(screen, 20, 10)
-    assert "\x1b[2J" not in "".join(writes)  # 首帧不清屏
+    # 票据 02 (C3): 首帧锚定可见窗口并清屏重放, 帧行与屏幕行对齐 (鼠标坐标映射前提)
+    assert "\x1b[2J\x1b[H\x1b[3J" in "".join(writes)
+    assert screen.viewport_top == 0
     assert vt.screen_text() == ["第一行", "second"]
 
 
