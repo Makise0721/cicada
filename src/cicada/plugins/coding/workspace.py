@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
+    from cicada.plugins.coding.file_access import FileAccess
     from cicada.runtime.plugin import PluginContext
 
 from cicada.runtime.plugin import PluginDefinition
@@ -29,6 +30,15 @@ class PathNotAllowedError(WorkspaceError):
     """写入目标在 workspace root 之外."""
 
 
+def _note_handled_cancel(on_caller_cancel: Callable[[], None] | None) -> None:
+    """已决意吞掉协程取消换真实结果: 通知回调方并理平取消记账."""
+    if on_caller_cancel is not None:
+        on_caller_cancel()
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        task.uncancel()
+
+
 @dataclass
 class Workspace:
     """root 与 output_dir 在构造时完成 canonical 化."""
@@ -37,6 +47,14 @@ class Workspace:
     output_dir: Path
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False, compare=False)
     _output_seq: "itertools.count[int]" = field(default_factory=itertools.count, repr=False, compare=False)
+    files: "FileAccess" = field(init=False, repr=False, compare=False)
+    """进程内文件访问 Module: 版本依据/队列/暂存/发布 (file_access.py)."""
+
+    def __post_init__(self) -> None:
+        # 延迟导入打破 workspace -> file_access -> workspace 的模块环
+        from cicada.plugins.coding.file_access import FileAccess
+
+        self.files = FileAccess(self)
 
     @classmethod
     def create(cls, root: Path) -> Workspace:
@@ -67,24 +85,55 @@ class Workspace:
         """写入沿用同一 canonical 边界；此方法本身不创建文件."""
         return self.resolve_within_root(raw)
 
-    async def mutate(self, path: Path, op: Callable[[], Awaitable[T]]) -> T:
+    async def mutate(
+        self,
+        path: Path,
+        op: Callable[[], Awaitable[T]],
+        *,
+        preserve_result_on_cancel: bool = False,
+        on_caller_cancel: Callable[[], None] | None = None,
+    ) -> T | None:
         """同 canonical 路径串行执行 op, 不同路径并行.
 
         op 一旦开始不被取消抢占 (shield 后等待其完成才释放队列);
         等待队列的调用方被取消时放弃其位置, op 不会执行.
+
+        preserve_result_on_cancel=True (FileAccess 修改路径): 外层协程取消
+        不再向上抛 CancelledError, 而是经 on_caller_cancel 记录后继续
+        shield/drain 到 op 的真实结果; 排队中取消则不启动 op, 调用回调后
+        返回 None. 默认 False 保持旧的取消/异常语义不变.
         """
         lock = self._locks.setdefault(self._queue_key(path), asyncio.Lock())
-        async with lock:
-            task = asyncio.ensure_future(op())
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                # 取消路径上 op 自身的异常不掩盖取消信号
+        if not preserve_result_on_cancel:
+            async with lock:
+                task = asyncio.ensure_future(op())
                 try:
-                    await task
-                except BaseException:
-                    pass
-                raise
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    # 取消路径上 op 自身的异常不掩盖取消信号
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise
+        try:
+            async with lock:
+                task = asyncio.ensure_future(op())
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    _note_handled_cancel(on_caller_cancel)
+                    while True:
+                        try:
+                            return await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            # 重复取消不提前放弃: 持有到真实结果才释放队列
+                            _note_handled_cancel(on_caller_cancel)
+        except asyncio.CancelledError:
+            # 排队中取消: op 未启动, 位置放弃; 取消事实仍传递给回调方
+            if on_caller_cancel is not None:
+                on_caller_cancel()
+            return None
 
     def new_output_file(self, label: str) -> Path:
         """在 output_dir 分配一个唯一文件路径 (label 净化后作文件名一部分)."""
