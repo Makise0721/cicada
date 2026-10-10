@@ -39,25 +39,45 @@ _PREVIEW_NOTE_SEALED = "预览已截断"
 class ReasoningBlock:
     """一条助手轮次的思考块: 记录四态 + 流中预览 + 标题降级 + 净化排版。
 
-    expand_getter 返回当前显示文档的思考展开 bool; 未注入时恒为展开
+    expand_getter 返回当前显示文档的思考展开默认值; 未注入时恒为展开
     (与工具/Skill 正文同一约定, 避免无展开手段的调用者看不到内容),
     生产组合 (transcript) 恒注入, 初始收起。
+    票据 01 (契约 C2): 逐项展开覆盖 (_override) 优先于文档默认值; Ctrl+T
+    统一全部思考与后续默认值并清除逐项覆盖; 选中态只改标题标记 (> 一列)。
     """
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
         self._expand_getter = expand_getter
+        self._override: bool | None = None  # 逐项展开覆盖 (点击/键盘动作)
         self._text: str | None = None  # None = 无记录无预览; str 含完整空串/空预览
         self._complete = False
         self._preview_active = False  # ~ 态: 流中预览未获完成记录
         self._preview_bytes = 0
         self._preview_capped = False
         self._version = 0  # 记录替换即递增, 进渲染缓存键
-        self._render_cache: tuple[int, DisplayStyle, bool, int, list[str]] | None = None
+        self._render_cache: tuple[int, DisplayStyle, bool, bool, int, list[str]] | None = None
 
     @property
     def has_record(self) -> bool:
         """是否有思考记录或预览 (缺失记录省略整块)。"""
         return self._text is not None
+
+    def is_expanded(self) -> bool:
+        """有效展开状态: 逐项覆盖优先, 否则文档默认值 (未注入恒展开)。"""
+        if self._override is not None:
+            return self._override
+        return True if self._expand_getter is None else bool(self._expand_getter())
+
+    def toggle(self) -> None:
+        """逐项开关 (票据 01): 只覆盖本块, 下一次 Ctrl+T 重新统一。"""
+        self._override = not self.is_expanded()
+        self._version += 1
+
+    def clear_override(self) -> None:
+        """Ctrl+T 统一: 清除逐项覆盖, 回到文档默认值。"""
+        if self._override is not None:
+            self._override = None
+            self._version += 1
 
     def set_record(self, reasoning: ReasoningContent | None) -> None:
         """完成/恢复的权威记录替换 (含预览原位替换); None 撤掉已有显示。"""
@@ -100,21 +120,21 @@ class ReasoningBlock:
             self._complete = False
             self._version += 1
 
-    def render(self, width: int) -> list[str]:
+    def render(self, width: int, *, selected: bool = False) -> list[str]:
         """按当前宽度排版; 缺失记录返回空, 收起只有标题行, 每行列宽 <= width。"""
         if not self.has_record:
             return []
-        expanded = True if self._expand_getter is None else bool(self._expand_getter())
+        expanded = self.is_expanded()
         style = current_style()
         cached = self._render_cache
-        if cached is not None and cached[:4] == (width, style, expanded, self._version):
-            return list(cached[4])
-        lines = self._render_lines(width, expanded)
-        self._render_cache = (width, style, expanded, self._version, list(lines))
+        if cached is not None and cached[:5] == (width, style, expanded, selected, self._version):
+            return list(cached[5])
+        lines = self._render_lines(width, expanded, selected)
+        self._render_cache = (width, style, expanded, selected, self._version, list(lines))
         return lines
 
-    def _render_lines(self, width: int, expanded: bool) -> list[str]:
-        title = theme.fg(theme.MUTED_GRAY, self._title(width, expanded))
+    def _render_lines(self, width: int, expanded: bool, selected: bool) -> list[str]:
+        title = theme.fg(theme.MUTED_GRAY, self._title(width, expanded, selected))
         if not expanded:
             return [title]  # 收起只占标题行 (规格 D2)
         cleaned = sanitize_display(self._text or "")
@@ -132,8 +152,9 @@ class ReasoningBlock:
                 body.append(theme.fg(theme.MUTED_GRAY, indent + truncate_to_width(chunk, content_width)))
         return [title, *body]
 
-    def _title(self, width: int, expanded: bool) -> str:
-        """四级标题降级 (D2): >=14 完整文字, 6-13 "思考 X", 2-5 "RX", 1 列 "X"。"""
+    def _title(self, width: int, expanded: bool, selected: bool) -> str:
+        """四级标题降级 (D2): >=14 完整文字, 6-13 "思考 X", 2-5 "RX", 1 列 "X"。
+        折叠标记一列: 选中 > / 展开 - / 收起 + (C2, plain 策略同样可辨认)。"""
         code = "~" if self._preview_active else ("=" if self._complete else "!")
         if width < 6:
             return f"R{code}" if width >= 2 else code
@@ -145,7 +166,7 @@ class ReasoningBlock:
             else "思考 已完成" if self._text else self._empty_status(width)
         )
         title = status
-        marked = ("-" if expanded else "+") + " " + status
+        marked = (">" if selected else ("-" if expanded else "+")) + " " + status
         if visible_width(marked) <= width:
             title = marked  # 折叠标记仅在放得下时加入
         hint = _COLLAPSE_HINT if expanded else _EXPAND_HINT

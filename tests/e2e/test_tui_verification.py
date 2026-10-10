@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from cicada.application import open_application
+import cicada.ui as ui
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
     CheckDefinition,
@@ -38,6 +39,11 @@ from tui_fixture import (
     text_keys,
     wait_until,
 )
+from prompt_toolkit.key_binding.key_processor import KeyPress
+from prompt_toolkit.keys import Keys
+
+F6 = KeyPress(Keys.F6, "\x1b[17~")
+HOME = KeyPress(Keys.Home, "\x1b[H")
 
 CHECK_COMMAND = (
     "if ((Get-Content -LiteralPath sample.py -Raw) -like '*VALUE = 2*') "
@@ -167,7 +173,7 @@ async def test_t08_latest_failure_and_stale_not_deliverable(tmp_path):
 # --- T09: process_uncertain 锁存 / 清空保留 / 编码被拒但 idle 命令可用 ---------------------------
 
 
-async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path):
+async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path, monkeypatch):
     root = git_repo(tmp_path)
     plan = _plan(root, "Start-Sleep -Seconds 5", timeout_s=0.5)
     script = script_json(
@@ -176,6 +182,15 @@ async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path):
     )
     session = await open_application(make_config(root, script, chunks=1, plan=plan))
     stage = StageTerminal()
+    views = []
+    original_view = ui.ConversationView
+
+    def capture_view(*args, **kwargs):
+        instance = original_view(*args, **kwargs)
+        views.append(instance)
+        return instance
+
+    monkeypatch.setattr(ui, "ConversationView", capture_view)
     try:
         task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
         await _run_until_idle(session, stage, "跑一个会超时的检查", requests=1)
@@ -201,7 +216,10 @@ async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path):
         assert "进程终结未知（锁存）" in stage.flat()
         stage.emit(text_keys("/clear"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.text().count("已清空模型历史") >= 2)
+        # 第二次清空确认: 视口只呈窗口, 累计计数是同源文档事实 (紧凑交互 01)
+        assert await wait_until(
+            lambda: "".join(views[0].document_lines(100)).count("已清空模型历史") >= 2
+        )
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
@@ -437,8 +455,12 @@ async def test_t13_visible_output_has_no_control_codes(tmp_path, monkeypatch, no
             await session.aclose()
 
 
-async def test_t06_unstarted_tool_completion_after_model_error(tmp_path):
-    """模型错误路径: 无 ToolStarted 的 ToolCompleted 以终态卡显示内核固定文本."""
+async def test_t06_unstarted_tool_completion_after_model_error(tmp_path, monkeypatch):
+    """模型错误路径: 无 ToolStarted 的 ToolCompleted 以终态卡显示内核固定文本.
+
+    紧凑交互 01 起工具卡默认收起为一行概括 (类别 + 参数 + 状态后缀);
+    内核闭合文本在有界详情内, 经 F6 键盘回看展开后 VT 可见 (契约 C1/C2)。
+    """
     root = git_repo(tmp_path)
     script = script_json(
         {"tool_calls": [{"id": "g1", "name": "glob", "arguments": {"pattern": "**/*.py"}}],
@@ -446,12 +468,26 @@ async def test_t06_unstarted_tool_completion_after_model_error(tmp_path):
     )
     session = await open_application(make_config(root, script, chunks=1))
     stage = StageTerminal()
+    views = []
+    original_view = ui.ConversationView
+
+    def capture_view(*args, **kwargs):
+        instance = original_view(*args, **kwargs)
+        views.append(instance)
+        return instance
+
+    monkeypatch.setattr(ui, "ConversationView", capture_view)
     try:
         task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
         await _run_until_idle(session, stage, "触发模型错误", requests=1)
         flat = stage.flat()
-        assert "glob" in flat, "工具卡可见"
-        assert "model stream failed; tool call not executed" in flat, "内核闭合文本如实显示"
+        assert "查找文件" in flat and "**/*.py" in flat, "工具卡标题可见"
+        assert "失败" in flat, "终态状态后缀可见"
+        # 展开唯一工具卡详情: F6 文档焦点 + Home 文档头 + Enter 执行选中动作
+        stage.emit([F6, HOME, ENTER])
+        assert await wait_until(
+            lambda: "model stream failed; tool call not executed" in stage.flat()
+        ), "内核闭合文本如实显示"
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)

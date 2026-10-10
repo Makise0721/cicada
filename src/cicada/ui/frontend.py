@@ -12,6 +12,12 @@ Copyright (c) 2025 Mario Zechner) 的 requestRender 合并 (16ms 最小间隔,
   安全消费控制键不写入文本。
 - Ctrl+C/Ctrl+D/Enter 的语义回调由宿主注入 (01 演示: Enter 提交到
   on_submit, Ctrl+D 空草稿退出); 本模块不接真实模型。
+- tui-compact-interaction 票据 01 (契约 C3): 注入 layout_document 时前端持有
+  DocumentViewport 自有视口——呈现帧 ≤ terminal.rows, 文档窗口 = rows 扣除
+  状态/编辑/菜单/底栏后的余量, 默认跟随底部; F6 在编辑器/文档焦点间切换
+  (模态/模型菜单活跃时忽略), 文档焦点中 Up/Down 选动作、Enter 只执行可见
+  选中动作、Esc 立即回草稿并消费, PageUp/PageDown/Home/End 回看; 文本/粘贴/
+  换行键退出焦点后按原编辑行为处理。未注入 layout_document 保持旧整幅回放。
 
 故障矩阵 (P10): 渲染写失败先记录 ui_failures 并尝试恢复终端一次, 再失败
 则置 terminal_failed 并请求退出; 尺寸读取失败沿用上次良好值; 输入读取
@@ -26,6 +32,8 @@ from typing import Callable
 from prompt_toolkit.keys import Keys
 
 from cicada.ui.commands import SlashCommandMenu
+from cicada.ui import theme
+from cicada.ui.document_layout import DisplayAction, DocumentLayout, DocumentViewport
 from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
@@ -61,11 +69,17 @@ class MainScreenFrontend:
         on_model_confirm: Callable[[str], None] | None = None,
         modal: LoginModal | None = None,
         display_style: DisplayStyle | None = None,
+        layout_document: Callable[[int, DisplayAction | None], DocumentLayout] | None = None,
+        on_display_action: Callable[[DisplayAction], object] | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
         self._editor = editor
         self._document_lines = document_lines
+        # 紧凑交互 01 (C3): 注入同源布局即启用自有视口 (帧 ≤ rows); 否则旧回放
+        self._layout_document = layout_document
+        self._on_display_action = on_display_action
+        self._viewport = DocumentViewport() if layout_document is not None else None
         self._on_submit = on_submit
         self._on_escape = on_escape
         self._on_ctrl_c = on_ctrl_c
@@ -104,34 +118,70 @@ class MainScreenFrontend:
         if self._modal_active():
             self.sensitive_input_used = True
             return self._modal.render(width, self._frame_rows)
-        lines = list(self._document_lines(width))
-        if lines and strip_terminal_sequences(lines[-1]).strip():
-            lines.append("")  # 输出与编辑器上边框之间留一行。
-        status = self._status_lines(width) if self._status_lines is not None else []
-        lines.extend(status)  # 状态行: 文档与编辑器之间 (规格 §F), 空闲时 0 行
         # 帧内不重读终端尺寸: rows 用本帧 render_once 前的快照, 避免一帧内
         # viewport 用旧尺寸而编辑器/底栏行数用新尺寸 (缩放恰落排版期间)
         rows = self._frame_rows
+        status = self._status_lines(width) if self._status_lines is not None else []
         # 设计 §4: 编辑器正文 1–5 行; 低高度 (8 行) 时 1–3 行, 剩余给对话
         max_rows = min(5, max(3, int(rows * 0.3)))
         footer = self._footer_lines(width, rows) if self._footer_lines is not None else []
-        self._sync_command_menu()
-        menu_budget = min(4, max(0, rows - len(footer) - 3))
-        if self._model_menu_active():
-            # 模型菜单 (DeepSeek 04) 与斜线菜单共用编辑器下方槽位; 两者不会同时打开
-            menu = self._model_menu.render(width, menu_budget)
+        if self._document_focused():
+            menu: list[str] = []  # 文档焦点期间斜线菜单不同步不渲染 (C3)
         else:
-            menu = (
-                self._command_menu.render(width, menu_budget)
-                if self._command_menu is not None else []
-            )
+            self._sync_command_menu()
+            menu_budget = min(4, max(0, rows - len(footer) - 3))
+            if self._model_menu_active():
+                # 模型菜单 (DeepSeek 04) 与斜线菜单共用编辑器下方槽位; 两者不会同时打开
+                menu = self._model_menu.render(width, menu_budget)
+            else:
+                menu = (
+                    self._command_menu.render(width, menu_budget)
+                    if self._command_menu is not None else []
+                )
         if menu or status:
             # 菜单/状态行与底栏先留空间，低窗口仍保留编辑光标所在的正文行。
             max_rows = max(1, min(max_rows, rows - len(menu) - len(footer) - len(status) - 2))
-        lines.extend(self._editor.render(width, max_rows))
+        editor_lines = self._editor.render(width, max_rows)
+        fixed = len(status) + len(editor_lines) + len(menu) + len(footer)
+        if self._layout_document is not None and self._viewport is not None:
+            # 自有视口 (紧凑交互 01, C3): 呈现帧 ≤ rows; 文档窗口是固定部之外
+            # 的余量, 跟随/回看/锚定与「有更新 · 最新」指示归 DocumentViewport
+            layout = self._layout_document(width, self._viewport.selection)
+            reserve = 1 if layout.lines else 0  # 文档与编辑器上边框之间留一行
+            doc_height = max(0, rows - fixed - reserve)
+            if doc_height == 0:
+                reserve = 0  # 无文档窗口时不留间隔行: 帧 ≤ rows (C3, 低高度+菜单)
+            lines = list(self._viewport.frame(
+                layout, doc_height, theme.fg(theme.MUTED_GRAY, "有更新 · 最新")
+            ))
+            if reserve:
+                lines.append("")
+        else:
+            lines = list(self._document_lines(width))
+            if lines and strip_terminal_sequences(lines[-1]).strip():
+                lines.append("")  # 输出与编辑器上边框之间留一行。
+        lines.extend(status)  # 状态行: 文档与编辑器之间 (规格 §F), 空闲时 0 行
+        lines.extend(editor_lines)
         lines.extend(menu)
         lines.extend(footer)
         return lines
+
+    def _document_focused(self) -> bool:
+        return self._viewport is not None and self._viewport.focus
+
+    def _sync_viewport_layout(self) -> None:
+        """导航/执行键派生前同步渲染一帧, 让视口读到当前布局。
+
+        正常渲染经节流推迟 (call_soon/call_later), 同一批按键里上一个动作
+        (如开详情) 的布局要等下一 tick 才进视口; 此时导航键会按过期布局
+        移动选择/锚定 (实测竞态: 展开详情后紧跟 Down 选错目标)。同步一帧
+        对齐状态; 无变化时 render_once 无增量写出, 成本可忽略。
+        """
+        if self._stopped or self._viewport is None:
+            return
+        self._cancel_render_timer()
+        self._render_requested = False
+        self._do_render()
 
     def _sync_command_menu(self) -> None:
         if self._command_menu is not None:
@@ -268,6 +318,52 @@ class MainScreenFrontend:
             if self._on_ctrl_t is not None:
                 self._on_ctrl_t()
             return
+        # F6: 编辑器/文档焦点切换 (紧凑交互 01, C2/C3); 模态已在上方接管,
+        # 模型菜单活跃时忽略; 未注入 layout_document (无自有视口) 安全消费
+        if key.key is Keys.F6:
+            if self._viewport is not None and not self._model_menu_active():
+                if self._viewport.focus:
+                    self._viewport.exit_focus()
+                else:
+                    if self._command_menu is not None:
+                        self._command_menu.dismiss()  # 焦点期间菜单不同步不渲染
+                    self._sync_viewport_layout()
+                    self._viewport.enter_focus()
+            return
+        # 文档焦点键位 (C2): Up/Down 选动作, Enter 只执行可见选中动作 (绝不
+        # 提交草稿), PageUp/PageDown/Home/End 翻看, Esc 立即回草稿并消费;
+        # 文本/粘贴/换行等其余键退出焦点后按原编辑行为继续分发
+        if self._document_focused():
+            if key.key is Keys.Escape or (data == "\x1b" and len(data) == 1):
+                self._viewport.exit_focus()
+                return
+            if key.key in (Keys.Up, Keys.Down, Keys.PageUp, Keys.PageDown, Keys.Home, Keys.End):
+                self._sync_viewport_layout()
+            if key.key is Keys.Up:
+                self._viewport.move_selection(-1)
+                return
+            if key.key is Keys.Down:
+                self._viewport.move_selection(1)
+                return
+            if key.key is Keys.PageUp:
+                self._viewport.page(-1)
+                return
+            if key.key is Keys.PageDown:
+                self._viewport.page(1)
+                return
+            if key.key is Keys.Home:
+                self._viewport.go_home()
+                return
+            if key.key is Keys.End:
+                self._viewport.go_end()
+                return
+            if key.key in (Keys.ControlM,) or data == "\r":
+                self._sync_viewport_layout()
+                action = self._viewport.execute_selected()
+                if action is not None and self._on_display_action is not None:
+                    self._on_display_action(action)
+                return
+            self._viewport.exit_focus()
         # Escape 前缀状态机: Escape 后窗口内 Enter = Alt+Enter 换行
         if key.key is Keys.Escape or (data == "\x1b" and len(data) == 1):
             self._arm_escape_prefix()

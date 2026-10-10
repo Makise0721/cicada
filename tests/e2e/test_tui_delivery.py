@@ -21,7 +21,9 @@ from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
 from cicada.application import ApplicationSession, open_application
+import cicada.ui as ui
 from cicada.ui import MainScreenFrontend, run_tui_session
+from cicada.ui.main_screen import strip_terminal_sequences
 from tui_fixture import (
     CTRL_C,
     ENTER,
@@ -39,12 +41,32 @@ DRAFT_KEYS = [KeyPress(ch, ch) for ch in "忙碌草稿"]
 
 
 @pytest.mark.parametrize("columns, rows", [(10, 8), (100, 36)])
-async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_path, columns, rows):
-    """真实 VT 主屏: 回答、信息分组和输入框彼此分开，缩放后仍保留全文。"""
+async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_path, columns, rows, monkeypatch):
+    """真实 VT 主屏: 回答、信息分组和输入框彼此分开，缩放后仍保留全文。
+
+    紧凑交互 01 起前端持有自有视口 (帧 ≤ rows): 屏幕只呈现文档窗口,
+    "保留全文"与分组顺序是同源文档事实, 经 view.document_lines 核对;
+    屏幕级断言只留窗口内真实可见事实 (无 SGR 碎片、光标在输入行)。
+    """
     session = await open_application(
         make_config(tmp_path, script_json({"text": "回答结束。", "stop": True}), chunks=1)
     )
     stage = StageTerminal(columns, rows)
+    views = []
+    original_view = ui.ConversationView
+
+    def capture_view(*args, **kwargs):
+        instance = original_view(*args, **kwargs)
+        views.append(instance)
+        return instance
+
+    monkeypatch.setattr(ui, "ConversationView", capture_view)
+
+    def doc_lines(width: int = 100) -> list[str]:
+        return [
+            strip_terminal_sequences(line).rstrip() for line in views[0].document_lines(width)
+        ]
+
     try:
         task = asyncio.ensure_future(run_tui_session(
             session, terminal=stage.terminal,
@@ -61,21 +83,23 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         await asyncio.sleep(0.05)
         stage.emit(text_keys("/status"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("会话信息"))
+        assert await wait_until(lambda: any("会话信息" in line for line in doc_lines())), (
+            "命令输出进入同源文档 (窗口可能只呈尾部)"
+        )
         stage.emit(text_keys("/help"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("命令帮助"))
-        compact = "".join(stage.text().split())
+        assert await wait_until(lambda: any("命令帮助" in line for line in doc_lines()))
+        compact = "".join("".join(doc_lines()).split())
         assert "清空模型历史（已显示记录保留）" in compact
-        assert "a" * 64 in compact, "窄窗换行保留完整 hash"
+        assert "a" * 64 in compact, "窄窗换行保留完整 hash (文档级)"
         assert not re.search(r"\[[0-9;]+m", stage.text()), "不能显示被拆开的 SGR 碎片"
         cursor_row = stage.vt.cursor_row
         # 输入行现在有 › 提示符与空态占位 (tui-aesthetics §C); 光标仍在该行
         assert "›" in stage.vt.screen_text()[cursor_row], "硬件光标仍在输入行"
-        # 同一文档在宽窗口重新排版，检查实际屏幕而非渲染器内部状态。
+        # 同一文档在宽窗口重新排版，分组顺序与留白是同源文档事实 (视口只呈窗口)。
         stage.set_size(100, 45)
         assert await wait_until(lambda: stage.contains("命令帮助"))
-        lines = [line.rstrip() for line in stage.visible_lines()]
+        lines = doc_lines()
         answer = lines.index(" 回答结束。")
         info = lines.index(" 会话信息")
         help_title = lines.index(" 命令帮助")
@@ -90,7 +114,7 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         assert any(line.startswith(" /help") and "显示本帮助" in line for line in lines)
         assert lines[help_title - 1] == ""
         last_body = next(i for i, line in enumerate(lines) if "//内容" in line)
-        assert lines[last_body + 1] == "", "命令输出与编辑器边框之间留白"
+        assert lines[last_body + 1] == "", "命令输出与后续条目之间留白"
         assert len(model_of(session).requests) == 1
         assert len(session.history) == 2, "显示命令不进入模型历史"
         stage.emit(text_keys("/exit"))
@@ -130,24 +154,41 @@ async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
             await session.aclose()
 
 
-async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path):
+async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path, monkeypatch):
     session = await open_application(make_config(
         tmp_path, script_json({"text": "完成回答", "stop": True}), chunks=2, delay=0.05
     ))
     stage = StageTerminal(columns=40, rows=8)
+    views = []
+    original_view = ui.ConversationView
+
+    def capture_view(*args, **kwargs):
+        instance = original_view(*args, **kwargs)
+        views.append(instance)
+        return instance
+
+    monkeypatch.setattr(ui, "ConversationView", capture_view)
     task = asyncio.create_task(run_tui_session(session, terminal=stage.terminal))
     try:
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("问题") + [ENTER])
         assert await wait_until(lambda: session.state == "executing")
         stage.emit(text_keys("/") + [KeyPress(Keys.Down, "\x1b[B"), ENTER])
-        assert await wait_until(lambda: session.state == "idle" and stage.contains("完成回答"))
+        # 完成渲染是同源文档事实 (40x8 菜单打开时文档窗口 0 行, 屏幕无可呈)
+        assert await wait_until(
+            lambda: session.state == "idle"
+            and any("完成回答" in line for line in views[0].document_lines(40))
+        )
         assert not stage.contains("状态: idle")
         assert len(model_of(session).requests) == 1
         assert "→ status" in "\n".join(stage.vt.screen_text())
         assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /"  # 提示符 + 草稿 (§C)
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle"))
+        # /status 经菜单 Enter 执行: 40x8 跟随窗口只呈尾部, 首行 "状态: idle"
+        # 是同源文档事实 (紧凑交互 01)
+        assert await wait_until(
+            lambda: any("状态: idle" in line for line in views[0].document_lines(40))
+        )
         assert len(model_of(session).requests) == 1
         stage.emit(text_keys("/exit") + [ENTER])
         assert await asyncio.wait_for(task, timeout=5) == 0

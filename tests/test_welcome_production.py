@@ -19,6 +19,7 @@ from prompt_toolkit.keys import Keys
 import cicada.ui
 from cicada import __main__ as cli
 from cicada.plugins.user_config import FileUserConfigStore
+from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.ui.terminal_io import FakeTerminal
 from test_cli import _CaptureStream
 from test_user_config_startup import invoke, requests, write_config
@@ -79,7 +80,11 @@ class MainProbeTerminal(FakeTerminal):
     def seen(self, needle: str) -> bool:
         if self.vt.find_row(needle) is not None:
             return True
-        return any(needle in line for line in self.vt.history_text())
+        if any(needle in line for line in self.vt.history_text()):
+            return True
+        # 自有视口 (紧凑交互 01): 帧 ≤ rows 不产生滚动历史, 曾被窗口呈现的行
+        # 只留在累计写出流; 剥离控制序列后检索即"曾上屏"语义
+        return needle in strip_terminal_sequences(self.output_text)
 
     async def wait_seen(self, needle: str, timeout: float = 15.0) -> None:
         deadline = asyncio.get_running_loop().time() + timeout

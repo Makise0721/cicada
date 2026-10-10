@@ -20,7 +20,7 @@ import time
 
 from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage, UserMessage
 from cicada.persistence.contracts import InterruptedRequest, RestoredRequest, SummaryRecord
-from cicada.ui.tool_view import ToolCardEntry, ToolDocument
+from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
 from cicada.ui.transcript import Transcript
 
 RESTORED_RUN_PREFIX = "restored"
@@ -134,18 +134,24 @@ def _add_tool_card(
     arguments_json: str | None,
     result: ToolResult | None,
 ) -> None:
-    """挂一张工具卡; check 工具带旧检查归属行 (receipt/运行来源, 只显示)。"""
+    """挂一张工具卡; check 工具带旧检查归属行 (receipt/运行来源, 只显示)。
+
+    同一轮次的多张卡共享一个组条目 (票据 01, C1): 只在新建组时挂
+    ToolGroupEntry; 模型已声明但存档无结果的中断轮调用以未确认入组,
+    不伪造完成也不伪造输出。
+    """
     if result is not None:
         content = result.content
         is_error = result.is_error
         details = result.details
         display_name = result.name
+        unconfirmed = False
     else:
-        # 模型发起了调用但存档没有对应结果 (中断轮): 以无输出终态卡如实显示
         content = ""
-        is_error = True
+        is_error = False
         details = None
         display_name = name
+        unconfirmed = True
     artifact = None
     if display_name == "check" and isinstance(details, dict):
         receipt_id = details.get("receipt_id")
@@ -155,7 +161,7 @@ def _add_tool_card(
                 receipt=receipt_id,
                 run=(verification_run_id if isinstance(verification_run_id, str) and verification_run_id else "不可得"),
             )
-    index = tools.add_completed_card(
+    index, created = tools.add_completed_card(
         run_id=key,
         turn_index=turn,
         call_id=call_id,
@@ -164,8 +170,11 @@ def _add_tool_card(
         content=content,
         is_error=is_error,
         artifact=artifact,
+        details=details,
+        unconfirmed=unconfirmed,
     )
-    transcript.add_entry(ToolCardEntry(tools, index))
+    if created:
+        transcript.add_entry(ToolGroupEntry(tools, index))
 
 
 __all__ = [

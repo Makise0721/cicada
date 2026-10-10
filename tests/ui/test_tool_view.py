@@ -1,4 +1,4 @@
-"""票据 03 聚焦检查: 工具原位卡片与输出展开 (P04/P05/相关 P11)。
+"""紧凑工具显示聚焦检查 (tui-compact-interaction 票据 01; 契约 C1/C2)。
 
 事件驱动场景用固定 fake 事件序列: 内核事件的真实形状 (core/events.py),
 经 AgentEventReceived 包装 — 与 application.ApplicationSession._on_core_event
@@ -26,6 +26,7 @@ from cicada.application import (
 )
 from cicada.core.events import (
     AssistantCompleted,
+    RunFinished,
     RunStarted,
     ToolCompleted,
     ToolStarted,
@@ -36,10 +37,8 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.prompting import PromptInfo
 from cicada.ui.main_screen import strip_terminal_sequences, visible_width
 from cicada.ui.tool_view import (
-    PREVIEW_LINES,
-    TOOL_BG_ERROR,
-    TOOL_BG_PENDING,
-    TOOL_BG_SUCCESS,
+    INITIAL_OUTPUT_LINES,
+    MORE_OUTPUT_STEP,
     ToolDocument,
 )
 
@@ -49,6 +48,11 @@ RUN = "run-7"
 # 会话场景剧本 = 1 次用户请求, 2 个模型轮次 (工具轮 + 回答轮), 1 次工具调用
 SCENARIO_MODEL_CALLS = 2
 SCENARIO_TOOL_CALLS = 1
+
+# 规格配色 (独立字面量来源: tui-aesthetics spec.md §B)
+ACCENT_RUNNING = "\x1b[38;2;129;162;190m"  # #81a2be
+ACCENT_ERROR = "\x1b[38;2;204;102;102m"    # #cc6666
+OUTPUT_FG = "\x1b[38;2;168;168;168m"       # #a8a8a8
 
 
 def feed(doc: ToolDocument, *events: object) -> None:
@@ -65,7 +69,24 @@ def started_card(doc: ToolDocument, *, call: str = "t1", name: str = "read", run
     feed(doc, RunStarted(run), TurnStarted(run, turn), ToolStarted(run, call, name))
 
 
-# --- P04: 开始→终态原位更新 ------------------------------------------------------------------
+def live_key(call: str = "t1", run: str = RUN, turn: int = 0) -> tuple[str, str, int, str]:
+    return ("live", run, turn, call)
+
+
+def completed_card(doc: ToolDocument, *, call: str = "t1", name: str = "read",
+                   content: str = "ok", is_error: bool = False,
+                   details: dict | None = None) -> None:
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        ToolStarted(RUN, call, name),
+        ToolCompleted(RUN, ToolResult(call_id=call, name=name, content=content,
+                                      is_error=is_error, details=details)),
+    )
+
+
+# --- C1: 开始→终态原位更新与配对 ------------------------------------------------------------------
 
 
 def test_started_then_completed_updates_same_entry():
@@ -76,9 +97,9 @@ def test_started_then_completed_updates_same_entry():
     assert (entry.run_id, entry.turn_index, entry.call_id) == (RUN, 0, "t1")
     assert entry.status == "running"
 
-    running_lines = doc.render_lines(80)
-    assert any(TOOL_BG_PENDING in line for line in running_lines)
-    assert not any(TOOL_BG_SUCCESS in line for line in running_lines)
+    running_plain = plain_lines(doc, 80)
+    assert len(running_plain) == 2  # 前导空行 + 单工具标题行 (收起)
+    assert any("· 进行中" in line for line in running_plain)
 
     feed(doc, ToolCompleted(RUN, ToolResult(call_id="t1", name="read", content="hello")))
     # 同一条目: 数量与身份不变, 状态与输出原位更新
@@ -87,9 +108,9 @@ def test_started_then_completed_updates_same_entry():
     assert (done.run_id, done.turn_index, done.call_id) == (RUN, 0, "t1")
     assert done.status == "success" and done.output_text == "hello"
 
-    done_lines = doc.render_lines(80)
-    assert any(TOOL_BG_SUCCESS in line for line in done_lines)
-    assert not any(TOOL_BG_PENDING in line for line in done_lines)
+    collapsed = plain_lines(doc, 80)
+    assert not any("hello" in line for line in collapsed)  # 收起不显示输出
+    doc.toggle_tool(live_key())
     assert any("hello" in line for line in plain_lines(doc, 80))
 
 
@@ -124,6 +145,10 @@ def test_reused_call_id_across_turns_not_merged():
     entries = doc.entries
     assert len(entries) == 2
     assert [(entry.turn_index, entry.output_text) for entry in entries] == [(0, "first"), (1, "second")]
+    # 两轮各成一组 (组键含 turn_index); 展开两组后输出各出现一次
+    assert len(doc.groups) == 2
+    doc.toggle_tool(live_key(turn=0))
+    doc.toggle_tool(live_key(turn=1))
     lines = plain_lines(doc, 80)
     assert sum("first" in line for line in lines) == 1
     assert sum("second" in line for line in lines) == 1
@@ -161,13 +186,13 @@ def test_missing_start_cancelled_result_annotated():
     )
     entry = doc.entries[0]
     assert entry.status == "error" and entry.cancelled and entry.is_error
-    rendered = doc.render_lines(80)
-    assert any(TOOL_BG_ERROR in line for line in rendered)
-    assert not any(TOOL_BG_PENDING in line for line in rendered)
+    collapsed = plain_lines(doc, 80)
+    assert any("· 已取消" in line for line in collapsed)  # 收起可辨认 (C2)
+    doc.toggle_tool(live_key(call="t2"))
     assert any("cancelled during execution" in line for line in plain_lines(doc, 80))
 
 
-def test_error_result_without_cancel_keeps_error_background_only():
+def test_error_result_shows_failure_suffix_without_cancel():
     doc = ToolDocument()
     started_card(doc, call="t1", name="edit")
     feed(
@@ -178,6 +203,8 @@ def test_error_result_without_cancel_keeps_error_background_only():
     )
     entry = doc.entries[0]
     assert entry.status == "error" and not entry.cancelled
+    assert any("· 失败" in line for line in plain_lines(doc, 80))
+    doc.toggle_tool(live_key())
     assert any("tool raised: boom" in line for line in plain_lines(doc, 80))
 
 
@@ -206,18 +233,100 @@ def test_cards_keep_arrival_order_and_in_place_update_does_not_reorder():
         ToolCompleted(RUN, ToolResult(call_id="t2", name="glob", content="g1")),
     )
     assert [entry.call_id for entry in doc.entries] == ["t1", "t2", "t3"]
+    doc.toggle_group(("live", RUN, 0))
+    doc.toggle_group(("live", RUN, 1))
     lines = plain_lines(doc, 80)
     positions = [
-        next(index for index, line in enumerate(lines) if name in line)
-        for name in ("read", "glob", "edit")
+        next(index for index, line in enumerate(lines) if verb in line)
+        for verb in ("读取", "查找文件", "修改文件")
     ]
     assert positions == sorted(positions), "条目按到达序稳定排列"
 
 
-# --- P05: 默认 10 行预览与 Ctrl+O 展开/收起只改展示 --------------------------------------------
+# --- C1: 组登记与封存 (等待/未确认不伪造完成) --------------------------------------------------------
 
 
-def test_preview_default_10_lines_and_expand_toggle_display_only():
+def test_assistant_completed_registers_whole_group_waiting():
+    doc = ToolDocument()
+    message = AssistantMessage(
+        text="",
+        tool_calls=(
+            ToolCall(id="t1", name="read", arguments_json=json.dumps({"path": "a.py"})),
+            ToolCall(id="t2", name="read", arguments_json=json.dumps({"path": "b.py"})),
+        ),
+    )
+    feed(doc, RunStarted(RUN), TurnStarted(RUN, 0), AssistantCompleted(RUN, message))
+    # 登记整组: 两个等待态子项, 组已存在 (不漏不重复)
+    assert len(doc.groups) == 1
+    assert doc.groups[0].call_ids == ("t1", "t2")
+    assert [entry.status for entry in doc.entries] == ["waiting", "waiting"]
+    header = next(line for line in plain_lines(doc, 80) if line.strip())
+    assert "读取文件 · 2 次" in header and "2 进行中" in header  # 未终结计数 (C2)
+    feed(doc, ToolCompleted(RUN, ToolResult(call_id="t2", name="read", content="b")))
+    # ToolCompleted 只更新对应子项; t1 保持等待
+    assert [entry.status for entry in doc.entries] == ["waiting", "success"]
+    feed(doc, RunFinished(RUN, "stop"))
+    # 请求封存: 无结果子项标未确认, 不伪造完成
+    assert [entry.status for entry in doc.entries] == ["unconfirmed", "success"]
+    header = next(line for line in plain_lines(doc, 80) if line.strip())
+    assert "1 未确认" in header
+
+
+def test_mutation_unknown_counted_as_unconfirmed():
+    doc = ToolDocument()
+    completed_card(
+        doc, name="edit", content="ok",
+        details={"mutation": {"state": "unknown"}},
+    )
+    entry = doc.entries[0]
+    assert entry.status == "success"  # 结构化 unknown 不改终态事实
+    assert any("· 未确认" in line for line in plain_lines(doc, 80))  # 收起按未确认归类
+
+
+# --- C2: 紧凑状态表与有界详情 ------------------------------------------------------------------------
+
+
+def test_collapsed_group_is_single_line_with_counts():
+    doc = ToolDocument()
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        ToolStarted(RUN, "t1", "read"),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name="read", content="r1")),
+        ToolStarted(RUN, "t2", "edit"),
+        ToolCompleted(RUN, ToolResult(call_id="t2", name="edit", content="boom", is_error=True)),
+    )
+    lines = plain_lines(doc, 80)
+    body = [line for line in lines if line.strip()]
+    assert len(body) == 1, "多工具组收起只占一物理行"
+    assert "调用工具 · 2 次" in body[0] and "1 失败" in body[0]
+    assert body[0].startswith("+")
+
+
+def test_group_expand_lists_children_without_detail():
+    doc = ToolDocument()
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        ToolStarted(RUN, "t1", "read"),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name="read", content="row-1")),
+        ToolStarted(RUN, "t2", "read"),
+        ToolCompleted(RUN, ToolResult(call_id="t2", name="read", content="row-2")),
+    )
+    doc.toggle_group(("live", RUN, 0))
+    lines = plain_lines(doc, 80)
+    body = [line for line in lines if line.strip()]
+    assert len(body) == 3  # 组头 + 两个子工具短行
+    assert "读取文件 · 2 次" in body[0]
+    assert not any("row-1" in line for line in lines)  # 打开组只露列表, 不自动显示正文
+    doc.toggle_tool(live_key(call="t2"))
+    lines = plain_lines(doc, 80)
+    assert any("row-2" in line for line in lines) and not any("row-1" in line for line in lines)
+
+
+def test_detail_budget_paging_and_reset():
     doc = ToolDocument()
     body = [f"line-{index}" for index in range(1, 26)]  # 25 行输出
     body.append("[truncated=true reason=lines next_offset=26]")  # read 工具截断脚注形态
@@ -231,30 +340,106 @@ def test_preview_default_10_lines_and_expand_toggle_display_only():
     entries_before = doc.entries
 
     collapsed = doc.render_lines(200)
-    # 布局: 空行 + 上背景行 + 标题 + 前 10 行 + 折叠提示 + 下背景行
-    assert len(collapsed) == 1 + 1 + 1 + PREVIEW_LINES + 1 + 1
+    assert len(collapsed) == 2  # 空行 + 标题; 收起不 wrap 大结果
     collapsed_plain = [strip_terminal_sequences(line) for line in collapsed]
-    assert not any("line-11" in line for line in collapsed_plain)
-    # 工具自身截断脚注在未展示的行里: 收起时不伪造出现
-    assert not any("[truncated=true" in line for line in collapsed_plain)
-    hint_rows = [line for line in collapsed_plain if "还有" in line and "Ctrl+O" in line]
-    assert len(hint_rows) == 1 and "16" in hint_rows[0]  # 26 行收到, 显示 10 行
+    assert not any("line-1" in line for line in collapsed_plain)
 
-    doc.toggle_expand()
-    assert doc.expanded
-    expanded = doc.render_lines(200)
-    # 展开: 已收到的 26 行全部显示, 不显示任何未收到的字节
-    assert len(expanded) == 1 + 1 + 1 + len(body) + 1
-    expanded_plain = [strip_terminal_sequences(line) for line in expanded]
-    assert any("line-25" in line for line in expanded_plain)
-    assert any("[truncated=true reason=lines next_offset=26]" in line for line in expanded_plain)
-    assert not any("line-26" in line for line in expanded_plain)
+    key = live_key()
+    doc.toggle_tool(key)
+    opened = plain_lines(doc, 200)
+    # 详情: 标题 + 至多 6 输出物理行 + 「更多」分页动作
+    assert len(opened) == 1 + 1 + INITIAL_OUTPUT_LINES + 1
+    assert any("line-6" in line for line in opened)
+    assert not any("line-7" in line for line in opened)
+    # 工具自身截断脚注在未展示的行里: 初始预览不伪造出现
+    assert not any("[truncated=true" in line for line in opened)
+    assert opened[-1].strip() == "更多"
 
-    doc.toggle_expand()
-    assert not doc.expanded
+    doc.tool_output_more(key)  # 同一展开过程累加预算 (+20)
+    more = plain_lines(doc, 200)
+    assert any("line-25" in line for line in more)  # 26 行全部披露 (6+20 >= 26)
+    assert any("[truncated=true reason=lines next_offset=26]" in line for line in more)
+    assert not any("line-26" in line for line in more)  # 不显示未收到的字节
+    assert more[-1].strip() == "收起详情"
+
+    doc.tool_output_reset(key)  # 恢复初次预览 (与刚打开时同一布局)
+    assert plain_lines(doc, 200) == opened
+
+    doc.toggle_tool(key)  # 收起
     assert doc.render_lines(200) == collapsed
     # 切换只改展示: 条目快照逐字段不变
     assert doc.entries == entries_before
+
+
+def test_reopen_detail_resets_budget():
+    doc = ToolDocument()
+    completed_card(doc, content="\n".join(f"row-{i}" for i in range(30)))
+    key = live_key()
+    doc.toggle_tool(key)
+    doc.tool_output_more(key)
+    assert any("row-25" in line for line in plain_lines(doc, 80))
+    doc.toggle_tool(key)  # 收起
+    doc.toggle_tool(key)  # 再打开: 预算回初始 6 行 (C2)
+    reopened = plain_lines(doc, 80)
+    assert any("row-5" in line for line in reopened)
+    assert not any("row-6" in line for line in reopened)
+
+
+def test_params_limited_to_two_physical_rows():
+    doc = ToolDocument()
+    message = AssistantMessage(
+        text="",
+        tool_calls=(ToolCall(
+            id="t1", name="powershell",
+            arguments_json=json.dumps({"command": "Get-Content 很长的中文参数 " * 20}),
+        ),),
+    )
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        AssistantCompleted(RUN, message),
+        ToolStarted(RUN, "t1", "powershell"),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name="powershell", content="first-output")),
+    )
+    doc.toggle_tool(live_key())
+    lines = plain_lines(doc, 40)
+    assert any("参数:" in line for line in lines)
+    output_row = next(index for index, line in enumerate(lines) if "first-output" in line)
+    assert output_row <= 4  # 空行+标题+至多 2 参数物理行之后即是输出
+
+
+def test_ctrl_o_unifies_groups_and_resets_detail():
+    doc = ToolDocument()
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        ToolStarted(RUN, "t1", "read"),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name="read", content="\n".join(f"a{i}" for i in range(30)))),
+        ToolStarted(RUN, "t2", "glob"),
+        ToolCompleted(RUN, ToolResult(call_id="t2", name="glob", content="g1")),
+        TurnStarted(RUN, 1),
+        ToolStarted(RUN, "t3", "edit"),
+        ToolCompleted(RUN, ToolResult(call_id="t3", name="edit", content="e1")),
+    )
+    collapsed = doc.render_lines(80)
+    doc.toggle_group(("live", RUN, 0))
+    doc.toggle_tool(live_key(call="t1"))
+    doc.tool_output_more(live_key(call="t1"))
+    assert doc.toggle_expand() is True  # Ctrl+O: 统一全部组/单工具为展开
+    plain = plain_lines(doc, 80)
+    # C2: 组打开只露列表, 子工具详情重置收起 (逐项覆盖被统一)
+    assert any("读取" in line for line in plain) and any("查找文件" in line for line in plain)
+    assert not any("a0" in line for line in plain)
+    assert all(group.expanded for group in doc.groups)
+    # 单工具组 (turn 1) 展开即详情, 最多初始预览
+    assert any("e1" in line for line in plain)
+    doc.toggle_tool(live_key(call="t1"))  # 再开详情: 预算已回初始 6 行
+    assert any("a5" in line for line in plain_lines(doc, 80))
+    assert not any("a6" in line for line in plain_lines(doc, 80))
+    assert doc.toggle_expand() is False  # 再次统一: 全部收起
+    assert doc.render_lines(80) == collapsed
 
 
 def test_external_ansi_in_output_is_sanitized():
@@ -266,103 +451,52 @@ def test_external_ansi_in_output_is_sanitized():
             RUN, ToolResult(call_id="t1", name="read", content="\x1b[31mred\x1b[0m text")
         ),
     )
+    doc.toggle_tool(live_key())
     rendered = doc.render_lines(80)
     assert not any("\x1b[31m" in line for line in rendered)
     assert any("red text" in line for line in plain_lines(doc, 80))
 
 
-# --- tui-aesthetics 02: 状态符号 / 强调条 / 层次 (规格 §B, 字面量断言不复算实现) --------------
-
-# 规格 §B 配色 (独立字面量来源: spec.md)
-ACCENT_RUNNING = "\x1b[38;2;129;162;190m"  # #81a2be
-ACCENT_SUCCESS = "\x1b[38;2;181;189;104m"  # #b5bd68
-ACCENT_ERROR = "\x1b[38;2;204;102;102m"    # #cc6666
-BAR_RUNNING = "\x1b[48;2;129;162;190m"
-BAR_SUCCESS = "\x1b[48;2;181;189;104m"
-BAR_ERROR = "\x1b[48;2;204;102;102m"
-CARD_BG_RUNNING = "\x1b[48;2;34;34;44m"    # #22222c
-CARD_BG_SUCCESS = "\x1b[48;2;31;36;25m"    # #1f2419
-CARD_BG_ERROR = "\x1b[48;2;43;28;28m"      # #2b1c1c
-OUTPUT_FG = "\x1b[38;2;168;168;168m"       # #a8a8a8
-HINT_FG = "\x1b[38;2;127;127;127m"         # #7f7f7f
+# --- 外观纪律 (tui-aesthetics 规格 §B / 紧凑交互 C2: 无大背景, 标记一列) -------------------------------
 
 
-def completed_card(doc: ToolDocument, *, name: str = "read", content: str = "ok", is_error: bool = False,
-                   with_args: bool = True) -> None:
-    events: list[object] = [RunStarted(RUN), TurnStarted(RUN, 0)]
-    if with_args:
-        events.append(AssistantCompleted(RUN, AssistantMessage(
-            text="",
-            tool_calls=(ToolCall(id="t1", name=name, arguments_json=json.dumps({"path": "src/app.py"})),),
-        )))
-    events += [
-        ToolStarted(RUN, "t1", name),
-        ToolCompleted(RUN, ToolResult(call_id="t1", name=name, content=content, is_error=is_error)),
-    ]
-    feed(doc, *events)
-
-
-def test_success_card_title_glyph_accent_and_bar():
+def test_collapsed_rows_have_no_card_background():
     doc = ToolDocument()
     completed_card(doc)
-    lines = doc.render_lines(80)
-    assert lines[0] == ""  # 卡前分隔空行不变
-    title = strip_terminal_sequences(lines[2])
-    assert title.startswith("   √ read") and "src/app.py" in title  # 强调条 2 列 + 1 空格
-    assert ACCENT_SUCCESS in lines[2] and "\x1b[1m" in lines[2]  # 标题状态色加粗
-    assert HINT_FG in lines[2]  # 参数摘要降灰
-    # 全部卡片行 (含上下背景填充行) 以成功色强调条 + 卡背景开头
-    for line in lines[1:]:
-        assert line.startswith(BAR_SUCCESS + "  " + CARD_BG_SUCCESS)
+    completed_card(doc, call="t2", name="edit", content="boom", is_error=True)
+    for line in doc.render_lines(80):
+        assert "\x1b[48;" not in line, "不再为每个工具绘制大背景"
 
 
-def test_error_and_running_card_variants():
+def test_marker_and_suffix_accents():
     doc = ToolDocument()
-    completed_card(doc, name="powershell", content="boom", is_error=True)
+    completed_card(doc, call="t1", name="edit", content="boom", is_error=True)
     lines = doc.render_lines(80)
-    assert "× powershell" in strip_terminal_sequences(lines[2])
-    assert ACCENT_ERROR in lines[2]
-    assert lines[1].startswith(BAR_ERROR + "  " + CARD_BG_ERROR)
+    title = lines[1]
+    plain = strip_terminal_sequences(title)
+    assert plain.startswith("+ ") and "· 失败" in plain
+    assert ACCENT_ERROR in title  # 失败类别着色 (标记与后缀)
 
     pending = ToolDocument()
     started_card(pending, name="glob")
-    running_lines = pending.render_lines(80)
-    assert "● glob" in strip_terminal_sequences(running_lines[2])
-    assert ACCENT_RUNNING in running_lines[2]
-    assert running_lines[1].startswith(BAR_RUNNING + "  " + CARD_BG_RUNNING)
+    running_title = pending.render_lines(80)[1]
+    assert "· 进行中" in strip_terminal_sequences(running_title)
+    assert ACCENT_RUNNING in running_title
 
 
-def test_output_dimmed_and_fold_hint_darker():
+def test_output_dimmed_and_paging_hint():
     doc = ToolDocument()
-    body = "\n".join(f"line-{i}" for i in range(20))
-    completed_card(doc, content=body)
+    completed_card(doc, content="\n".join(f"line-{i}" for i in range(20)))
+    doc.toggle_tool(live_key())
     lines = doc.render_lines(80)
     output_rows = [line for line in lines if "line-0" in strip_terminal_sequences(line)]
     assert output_rows and all(OUTPUT_FG in line for line in output_rows)
-    hint_rows = [line for line in lines if "Ctrl+O" in strip_terminal_sequences(line)]
-    assert len(hint_rows) == 1 and HINT_FG in hint_rows[0]
+    paging = strip_terminal_sequences(lines[-1])
+    assert paging.strip() == "更多"
 
 
-def test_card_rows_have_single_terminal_reset():
-    """卡行只在末尾复位: 内部 \\x1b[0m 会连带清掉卡片背景 (嵌套样式纪律, 规格 §B)。"""
-    doc = ToolDocument()
-    completed_card(doc)
-    for line in doc.render_lines(80)[1:]:
-        assert line.count("\x1b[0m") == 1 and line.endswith("\x1b[0m")
+# --- 相关 P11: 可见列宽不破版 (含极窄降级) -------------------------------------------------------------
 
-
-def test_narrow_card_drops_bar_but_keeps_background():
-    doc = ToolDocument()
-    completed_card(doc, with_args=False)
-    for width in (1, 5):
-        lines = doc.render_lines(width)
-        assert all(visible_width(line) <= width for line in lines)
-        body = [line for line in lines if line]
-        assert body and all(BAR_SUCCESS not in line for line in body)
-        assert all(CARD_BG_SUCCESS in line for line in body)
-
-
-# --- 相关 P11: 可见列宽不破版 ------------------------------------------------------------------
 
 @pytest.mark.parametrize("width", [1, 8, 40, 160])
 def test_every_rendered_line_within_width(width: int):
@@ -400,6 +534,23 @@ def test_every_rendered_line_within_width(width: int):
     assert all(visible_width(line) <= width for line in doc.render_lines(width))
 
 
+def test_narrow_header_keeps_counts_as_symbols():
+    doc = ToolDocument()
+    feed(
+        doc,
+        RunStarted(RUN),
+        TurnStarted(RUN, 0),
+        ToolStarted(RUN, "t1", "read"),
+        ToolCompleted(RUN, ToolResult(call_id="t1", name="read", content="r1")),
+        ToolStarted(RUN, "t2", "edit"),
+        ToolCompleted(RUN, ToolResult(call_id="t2", name="edit", content="boom", is_error=True)),
+    )
+    wide = next(line for line in plain_lines(doc, 80) if line.strip())
+    assert "1 失败" in wide
+    narrow = next(line for line in plain_lines(doc, 14) if line.strip())
+    assert "!1" in narrow  # 极窄: 计数退化为符号形式, 不被标题挤掉 (C2)
+
+
 # --- 共享 fake 事件场景: 真实 ApplicationSession 驱动 ---------------------------------------------
 
 
@@ -423,7 +574,7 @@ async def test_session_cards_update_and_toggle_keeps_request_and_tool_counts(tmp
     root = tmp_path / "repo"
     root.mkdir()
     (root / "sample.py").write_text("VALUE = 1\n", encoding="utf-8")
-    # 12 个模块文件: 让 glob 输出超过 10 行, 收起/展开呈现可观察差异
+    # 12 个模块文件: 让 glob 输出超过 6 行初始预览, 收起/展开呈现可观察差异
     for index in range(12):
         (root / f"mod_{index:02d}.py").write_text(f"# mod {index}\n", encoding="utf-8")
     # glob 依赖 GitInventory: 与 tests/test_application.py 的 _repo 同口径建仓
@@ -473,21 +624,32 @@ async def test_session_cards_update_and_toggle_keeps_request_and_tool_counts(tmp
     assert len(entries) == 1
     assert (entries[0].run_id, entries[0].turn_index, entries[0].call_id) == ("run-1", 0, "c1")
     assert entries[0].status == "success" and entries[0].name == "glob"
-    # 参数摘要来自真实 AssistantCompleted 的 arguments_json
+    # 参数摘要来自真实 AssistantCompleted 的 arguments_json; 单工具收起为一行标题
     lines = plain_lines(doc, 80)
     assert any("**/*.py" in line for line in lines)
-    assert any(TOOL_BG_SUCCESS in line for line in doc.render_lines(80))
+    assert len([line for line in lines if line.strip()]) == 1
 
     # fake 场景常数: 一次请求、一次工具调用; 展开/收起前后不得变化
     model = session._app.agent._model
     assert isinstance(model, FakeModel)
     collapsed = doc.render_lines(80)
     updates_before = len(updates)
-    doc.toggle_expand()
+    doc.toggle_expand()  # Ctrl+O: 单工具直接开详情 (6 行初始预览 + 分页动作)
     expanded = doc.render_lines(80)
-    doc.toggle_expand()
+    expanded_plain = [strip_terminal_sequences(line) for line in expanded]
+    assert any("mod_00.py" in line for line in expanded_plain)  # 初始 6 行预览
+    assert not any("sample.py" in line for line in expanded_plain)  # 字母序第 13 行, 未披露
+    assert any("更多" in line for line in expanded_plain)  # 13 个 py 文件超出 6 行预览
+    key = ("live", "run-1", 0, "c1")
+    doc.tool_output_more(key)  # 「更多」每次 +20 输出物理行 (长路径折行, 两次必全覆盖)
+    doc.tool_output_more(key)
+    assert any("sample.py" in line for line in plain_lines(doc, 80))
+    doc.tool_output_reset(key)  # 「收起详情」恢复 6 行初始预览
+    reset_plain = plain_lines(doc, 80)
+    assert not any("sample.py" in line for line in reset_plain)
+    assert any("更多" in line for line in reset_plain)
+    doc.toggle_expand()  # 统一收起后渲染回到最初收起态
     assert doc.render_lines(80) == collapsed
-    assert expanded != collapsed
     assert len(model.requests) == SCENARIO_MODEL_CALLS
     tool_started = [
         update.event

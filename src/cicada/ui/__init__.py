@@ -7,6 +7,8 @@ ToolDocument (03 工具卡) + CheckProjection (05 检查事实) + FooterComponen
 
 组合层职责:
 - 编辑器聚焦 (硬件光标/IME 跟随) 与 Ctrl+O 工具展开接线 (toggle + 立即帧);
+  紧凑交互票据 01: 注入同源 layout_document 与 execute_display_action,
+  前端自有文档视口 (帧 ≤ rows、F6 文档焦点、键盘回看) 随之启用;
 - 生命周期: frontend 退出 (正常或不可恢复失败) 后 await session.aclose()
   (本函数是唯一 close owner); 关闭结果观察者与 ConversationView 订阅保留到
   ApplicationClosed 送达 (session 收尾清空观察者) 再退订;
@@ -84,6 +86,8 @@ async def run_tui_session(
     frontend = MainScreenFrontend(
         terminal,
         document_lines=view.document_lines,
+        layout_document=view.layout_document,  # 紧凑交互 01: 同源布局 + 自有视口
+        on_display_action=view.execute_display_action,
         editor=view.editor,
         on_submit=view.on_submit,
         on_escape=view.handle_escape,

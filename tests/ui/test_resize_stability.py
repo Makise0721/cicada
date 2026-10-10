@@ -17,6 +17,7 @@ from cicada.models import ModelOption
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.ui.main_screen import CURSOR_MARKER, strip_terminal_sequences, visible_width
+from cicada.ui.document_layout import ACTION_MORE, TARGET_TOOL, DisplayAction
 from cicada.ui.welcome import WelcomeEntry
 from tests.e2e.tui_fixture import StageTerminal, text_keys, wait_until, ENTER, CTRL_C, CTRL_D, CTRL_O
 from test_conversation_view import _config, _repo
@@ -146,6 +147,15 @@ async def test_running_and_expanded_document_roundtrip(style, tmp_path, monkeypa
         assert session.state != "idle" and h.view._gate.busy()
         h.stage.emit([CTRL_O])
         assert h.view.tools.expanded
+        # 紧凑交互 01 (C2): 展开为 6 行初始预览, 其余经「更多」动作分页披露
+        key = ("live", "run-1", 0, "resize-tool")
+        preview = "".join(h.view.document_lines(96))
+        assert "resize-output-06" in preview and "resize-output-07" not in preview
+        more = DisplayAction(ACTION_MORE, (TARGET_TOOL, *key))
+        h.view.execute_display_action(more)
+        h.view.execute_display_action(more)
+        document = "".join(h.view.document_lines(96))
+        assert all(f"resize-output-{i:02}" in document for i in range(1, 15))
         h.stage.emit([KeyPress(Keys.BracketedPaste, "中文草稿\n第二行草稿abc")])
         # 光标置于非末尾，缩放不能重置编辑位置。
         h.view.editor.move_cursor(0, -2)

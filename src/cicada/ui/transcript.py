@@ -33,6 +33,19 @@ from cicada.core.ports import ModelMetrics
 from cicada.skills import SkillInvocation, decode_skill_request
 from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle, current_style
+from cicada.ui.document_layout import (
+    ACTION_TOGGLE,
+    TARGET_ASSISTANT,
+    TARGET_ENTRY,
+    TARGET_REASONING,
+    TARGET_SKILL,
+    DisplayAction,
+    EntryAnchor,
+    EntryLayout,
+    DocumentLayout,
+    HitSpan,
+    wrap_plain_entry,
+)
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.reasoning_view import ReasoningBlock
 from cicada.ui.rendering import sanitize_display
@@ -95,8 +108,10 @@ class SkillRequestEntry(UserEntry):
 
     只在 append_user 解码成功时使用; text 保留完整封装原文本 (UserEntry 契约),
     显示派生自记录数据, 不读当前 Skill 文件 (恢复共用同一条目)。默认收起正文,
-    展开状态经只读 getter 取全局展开标志 (与工具输出共用 Ctrl+O); 未注入
+    展开状态经只读 getter 取全局展开默认 (与工具输出共用 Ctrl+O); 未注入
     getter 时完整显示正文, 避免无展开手段的调用者看不到内容。
+    票据 01 (契约 C1/C2): 逐项展开覆盖优先于全局默认; 标题行带折叠标记并
+    持 toggle 命中 (目标 ("skill", display_id)), 正文不生成动作。
     """
 
     def __init__(
@@ -106,40 +121,74 @@ class SkillRequestEntry(UserEntry):
         super().__init__(text)
         self.invocation = invocation
         self._expand_getter = expand_getter
-        self._render_cache: tuple[int, bool, DisplayStyle, list[str]] | None = None
+        self._override: bool | None = None  # 逐项展开覆盖 (票据 01)
+        self._render_cache: tuple[int, bool, bool, DisplayStyle, list[str], tuple[int, int]] | None = None
+
+    def is_expanded(self) -> bool:
+        if self._override is not None:
+            return self._override
+        return True if self._expand_getter is None else bool(self._expand_getter())
+
+    def toggle(self) -> None:
+        """逐项开关 (票据 01): 只覆盖本条目, 下一次 Ctrl+O 重新统一。"""
+        self._override = not self.is_expanded()
+
+    def set_expanded(self, expanded: bool) -> None:
+        """Ctrl+O 统一 (票据 01): 现有 Skill 与后续默认值同为该开合状态。"""
+        self._override = expanded
 
     def render(self, width: int) -> list[str]:
-        expanded = True if self._expand_getter is None else bool(self._expand_getter())
+        return list(self.layout(width).lines)
+
+    def layout(
+        self, width: int, selected: DisplayAction | None = None, display_id: int = 0
+    ) -> EntryLayout:
+        expanded = self.is_expanded()
+        action = DisplayAction(ACTION_TOGGLE, (TARGET_SKILL, display_id))
+        is_selected = selected == action
         cached = self._render_cache
         style = current_style()
-        if cached is not None and cached[:3] == (width, expanded, style):
-            return list(cached[3])
-        lines = self._render_lines(width, expanded)
-        self._render_cache = (width, expanded, style, list(lines))
-        return lines
+        if cached is not None and cached[:4] == (width, expanded, is_selected, style):
+            lines, (header_start, header_rows) = list(cached[4]), cached[5]
+        else:
+            lines, header_start, header_rows = self._render_lines(width, expanded, is_selected)
+            self._render_cache = (width, expanded, is_selected, style, list(lines), (header_start, header_rows))
+        hits = tuple(
+            HitSpan(row, 0, width, action)
+            for row in range(header_start, min(header_start + header_rows, len(lines)))
+        )
+        anchors = tuple(
+            None if row == 0 else EntryAnchor((TARGET_SKILL, display_id), row)
+            for row in range(len(lines))
+        )
+        return EntryLayout(tuple(lines), hits, anchors)
 
-    def _render_lines(self, width: int, expanded: bool) -> list[str]:
+    def _render_lines(self, width: int, expanded: bool, selected: bool) -> tuple[list[str], int, int]:
+        """返回 (显示行, 标题起始行, 标题行数); 标题行是同源命中的唯一区域。"""
         invocation = self.invocation
         # 用户任务部分: 与普通用户消息同一背景盒样式
         lines = ["", *theme.user_message_lines(invocation.task, width)]
+        header_start = len(lines)
         # 标题整体显示清理后才换行 (wrap_text_ansi 契约要求调用方先剥 ANSI):
         # source_path 是记录文本, 存档/粘贴可携带任意控制序列 (审查处置 F2)
+        marker = ">" if selected else ("-" if expanded else "+")
         header = sanitize_display(
-            f"Skill 文档 {invocation.name}（{invocation.source_path}）"
+            f"{marker} Skill 文档 {invocation.name}（{invocation.source_path}）"
             + (f" · sha256:{invocation.body_sha256[:12]}" if expanded else "")
         )
-        for chunk in wrap_text_ansi(header, max(1, width)):
+        header_chunks = wrap_text_ansi(header, max(1, width))
+        for chunk in header_chunks:
             lines.append(theme.fg(theme.MD_CODE, chunk))
         if not expanded:
             for chunk in wrap_text_ansi("正文已收起 · Ctrl+O 展开完整文档", max(1, width)):
                 lines.append(theme.fg(theme.MUTED_GRAY, chunk))
-            return lines
+            return lines, header_start, len(header_chunks)
         # 正文来自记录: 规范换行后显示清理, 与工具输出同一纪律 (不执行外部序列)
         body = sanitize_display(
             invocation.body.replace("\r\n", "\n").replace("\r", "\n")
         )
         lines.extend(_wrap_with_prefix("  ", body, width))
-        return lines
+        return lines, header_start, len(header_chunks)
 
 
 class AssistantEntry:
@@ -165,7 +214,14 @@ class AssistantEntry:
         self._render_cache: tuple[str, int, DisplayStyle, list[str]] | None = None
 
     def render(self, width: int) -> list[str]:
-        reasoning_lines = self.reasoning.render(width)  # 思考块自带缓存与样式
+        return list(self.layout(width).lines)
+
+    def layout(
+        self, width: int, selected: DisplayAction | None = None, display_id: int = 0
+    ) -> EntryLayout:
+        """同源布局 (票据 01): 思考标题行持 toggle 命中, 锚点区分思考/答案。"""
+        reasoning_action = DisplayAction(ACTION_TOGGLE, (TARGET_REASONING, self.run_id, self.turn_index))
+        reasoning_lines = self.reasoning.render(width, selected=selected == reasoning_action)
         cleaned = sanitize_display(self.text)
         if cleaned:
             cached = self._render_cache
@@ -180,12 +236,24 @@ class AssistantEntry:
         elif reasoning_lines:
             lines = []  # 完成无正文但有思考: 空行 + 思考块
         else:
-            return []  # 完成但无正文 (如错误路径): 事实由错误/取消条目表达
+            return EntryLayout((), (), ())  # 完成但无正文: 事实由错误/取消条目表达
         # 统一前导空行; 思考块在答案前 (票据 01: 思考、答案、终结标注)
         result = ["", *reasoning_lines, *lines]
+        assistant_rows = len(lines)
         if self.finalized and self.stop_reason == "length":
             result.append(theme.fg(theme.MUTED_GRAY, LENGTH_NOTE))
-        return result
+            assistant_rows += 1
+        anchors: list[EntryAnchor | None] = [None]
+        anchors += [
+            EntryAnchor((TARGET_REASONING, self.run_id, self.turn_index), row)
+            for row in range(len(reasoning_lines))
+        ]
+        anchors += [
+            EntryAnchor((TARGET_ASSISTANT, self.run_id, self.turn_index), row)
+            for row in range(assistant_rows)
+        ]
+        hits = (HitSpan(1, 0, width, reasoning_action),) if reasoning_lines else ()
+        return EntryLayout(tuple(result), hits, tuple(anchors))
 
 
 class SystemEntry:
@@ -240,6 +308,8 @@ class Transcript:
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
         self._entries: list[TranscriptEntry] = []
+        self._entry_ids: list[int] = []  # 与 _entries 平行的显示序号 (只追加, 稳定身份)
+        self._next_display_id = 0
         self._assistant_index: dict[tuple[str, int], AssistantEntry] = {}
         self._expand_getter = expand_getter
         self._reasoning_expanded = False
@@ -254,13 +324,18 @@ class Transcript:
 
     # --- 条目管理 ----------------------------------------------------------------
 
+    def _add(self, entry: TranscriptEntry) -> None:
+        self._entries.append(entry)
+        self._entry_ids.append(self._next_display_id)
+        self._next_display_id += 1
+
     def entries(self) -> list[TranscriptEntry]:
         """当前条目快照 (顺序即文档顺序), 供测试与诊断。"""
         return list(self._entries)
 
     def add_entry(self, entry: TranscriptEntry) -> None:
         """追加任意条目 (票据 03 的工具条目经此挂载, 保持文档顺序稳定)。"""
-        self._entries.append(entry)
+        self._add(entry)
 
     def append_user(self, text: str) -> UserEntry:
         """用户条目: 中立解码器识别 Skill 显式请求封装 (local-skills-v1 票据 03)。
@@ -274,25 +349,25 @@ class Transcript:
             entry = SkillRequestEntry(text, invocation, expand_getter=self._expand_getter)
         else:
             entry = UserEntry(text)
-        self._entries.append(entry)
+        self._add(entry)
         return entry
 
     def append_system(self, text: str) -> SystemEntry:
         entry = SystemEntry(text)
-        self._entries.append(entry)
+        self._add(entry)
         return entry
 
     def append_information(self, title: str, sections: list[tuple[str, list[str]]]) -> None:
-        self._entries.append(InformationEntry(title, sections))
+        self._add(InformationEntry(title, sections))
 
     def append_error(self, text: str) -> ErrorEntry:
         entry = ErrorEntry(text)
-        self._entries.append(entry)
+        self._add(entry)
         return entry
 
     def append_cancelled(self) -> CancelledEntry:
         entry = CancelledEntry()
-        self._entries.append(entry)
+        self._add(entry)
         return entry
 
     # --- 助手条目原位更新 -----------------------------------------------------------
@@ -358,8 +433,36 @@ class Transcript:
         entry.reasoning.set_record(message.reasoning)
 
     def toggle_reasoning(self) -> None:
-        """Ctrl+T (票据 01): 切换本文档全部思考块展开状态; 只改显示。"""
+        """Ctrl+T (票据 01): 切换本文档全部思考块展开状态; 只改显示。
+
+        逐项覆盖 (紧凑交互票据 01) 随之清除, 现有与后续思考块同为新默认。
+        """
         self._reasoning_expanded = not self._reasoning_expanded
+        for entry in self._entries:
+            if isinstance(entry, AssistantEntry):
+                entry.reasoning.clear_override()
+
+    def toggle_reasoning_item(self, run_id: str, turn_index: int) -> bool:
+        """逐项开关指定思考块 (紧凑交互票据 01); 条目缺失或无记录返回 False。"""
+        entry = self._assistant_index.get((run_id, turn_index))
+        if entry is None or not entry.reasoning.has_record:
+            return False
+        entry.reasoning.toggle()
+        return True
+
+    def set_skills_expanded(self, expanded: bool) -> None:
+        """Ctrl+O 统一 (紧凑交互票据 01): 现有 Skill 条目与该标志同步。"""
+        for entry in self._entries:
+            if isinstance(entry, SkillRequestEntry):
+                entry.set_expanded(expanded)
+
+    def toggle_skill(self, display_id: int) -> bool:
+        """逐项开关指定 Skill 条目 (紧凑交互票据 01); 条目缺失返回 False。"""
+        for entry, entry_id in zip(self._entries, self._entry_ids):
+            if entry_id == display_id and isinstance(entry, SkillRequestEntry):
+                entry.toggle()
+                return True
+        return False
 
     def _assistant_entry(self, run_id: str, turn_index: int) -> AssistantEntry:
         key = (run_id, turn_index)
@@ -370,7 +473,7 @@ class Transcript:
                 reasoning_expand_getter=lambda: self._reasoning_expanded,
             )
             self._assistant_index[key] = entry
-            self._entries.append(entry)
+            self._add(entry)
         return entry
 
     # --- 请求终结与计量 ---------------------------------------------------------------
@@ -423,17 +526,45 @@ class Transcript:
 
     # --- 渲染 ----------------------------------------------------------------------
 
-    def render(self, width: int) -> list[str]:
-        """整份文档按当前宽度排版; 每行可见列宽 <= width。
+    def layout(self, width: int, selected: DisplayAction | None = None) -> DocumentLayout:
+        """整份文档同源布局 (紧凑交互票据 01, 契约 C3): 文字/命中/锚点同一次排版。
 
-        条目自带 1 行前导空行; 文档起始处的前导空行丢弃 (首屏顶部不留白)。
+        有 layout 方法的条目 (AssistantEntry/SkillRequestEntry/ToolGroupEntry)
+        直接产出片段, 其余条目 wrap_plain_entry 只持锚点身份; 首部前导空行
+        丢弃, 命中行同步下移。
         """
         lines: list[str] = []
-        for entry in self._entries:
-            lines.extend(entry.render(width))
-        while lines and lines[0] == "":
-            lines.pop(0)
-        return _fit(lines, width)
+        hits: list[HitSpan] = []
+        anchors: list[EntryAnchor | None] = []
+        for entry, display_id in zip(self._entries, self._entry_ids):
+            layout_method = getattr(entry, "layout", None)
+            if callable(layout_method):
+                piece = layout_method(width, selected=selected, display_id=display_id)
+            else:
+                piece = wrap_plain_entry(entry.render(width), (TARGET_ENTRY, display_id))
+            offset = len(lines)
+            lines.extend(piece.lines)
+            hits.extend(
+                HitSpan(hit.row + offset, hit.start_column, hit.end_column, hit.action)
+                for hit in piece.hits
+            )
+            anchors.extend(piece.anchors)
+        dropped = 0
+        while dropped < len(lines) and lines[dropped] == "":
+            dropped += 1
+        if dropped:
+            del lines[:dropped]
+            del anchors[:dropped]
+            hits = [
+                HitSpan(hit.row - dropped, hit.start_column, hit.end_column, hit.action)
+                for hit in hits
+                if hit.row >= dropped
+            ]
+        return DocumentLayout(tuple(_fit(lines, width)), tuple(hits), tuple(anchors))
+
+    def render(self, width: int) -> list[str]:
+        """整份文档按当前宽度排版; 每行可见列宽 <= width (同源布局兼容出口)。"""
+        return list(self.layout(width).lines)
 
 
 __all__ = [

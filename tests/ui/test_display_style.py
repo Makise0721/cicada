@@ -25,7 +25,7 @@ from cicada.ui.login_wizard import LoginWizard
 from cicada.ui.main_screen import CURSOR_MARKER, strip_terminal_sequences, visible_width
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.terminal_io import FakeTerminal
-from cicada.ui.tool_view import ToolCardEntry, ToolDocument
+from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
 from cicada.ui.transcript import AssistantEntry, InformationEntry, SkillRequestEntry, UserEntry
 from test_conversation_view import _config, _repo, _wait_until
 
@@ -68,6 +68,10 @@ def test_all_components_follow_explicit_environment(mode, width, tmp_path):
     tools.apply(ToolStarted("r", "pending", "read"))
     tools.apply(ToolCompleted("r", ToolResult("ok", "glob", "输出正文")))
     tools.apply(ToolCompleted("r", ToolResult("bad", "edit", "失败原因", is_error=True)))
+    # 紧凑组 (票据 01): 打开组列表与两张终态卡详情, 输出正文才进入显示行
+    tools.toggle_expand()
+    tools.toggle_tool(("live", "r", 0, "ok"))
+    tools.toggle_tool(("live", "r", 0, "bad"))
     wizard = LoginWizard(FileUserConfigStore(tmp_path / "user").read_view())
     with style.use():
         groups = {
@@ -87,7 +91,7 @@ def test_all_components_follow_explicit_environment(mode, width, tmp_path):
             assert_style(lines, mode)
             assert all(visible_width(line) <= width for line in lines), name
         flat = "\n".join(strip_terminal_sequences(line) for line in groups["tools"])
-        assert all(glyph in flat for glyph in ("●", "√", "×"))
+        assert all(glyph in flat for glyph in ("+", "-"))  # 折叠标记一列可辨认
         assert "输出正文" in flat and "失败原因" in flat
         assert any("→ " in line for line in groups["slash"])
         assert any("→ " in line for line in groups["models"])
@@ -105,7 +109,7 @@ def test_render_caches_do_not_mix_styles_or_environment(monkeypatch):
     entry.text = "### 缓存标题\n\n**正文**"
     tools = ToolDocument()
     tools.apply(ToolCompleted("r", ToolResult("ok", "read", "缓存输出")))
-    card = ToolCardEntry(tools, 0)
+    card = ToolGroupEntry(tools, 0)
     skill = SkillRequestEntry("record", SkillInvocation(1, "demo", "C:/demo/SKILL.md", "C:/demo",
                                                        "a" * 64, "正文", "b" * 64, "任务"), lambda: False)
     rendered = {}

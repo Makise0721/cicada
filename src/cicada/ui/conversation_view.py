@@ -15,7 +15,8 @@
   回调 (宿主传 frontend.request_render 合并节流)。
 - 正常对话不出现内部 phase 标签; 诊断细节归 /status (只读 diagnostics 对象
   经 build(diagnostics=...) 注入, 本模块默认只给已发布事实)。
-- 工具卡经 ToolDocument 投影并按到达序挂载显示文档 (add_entry); 检查事实经
+- 工具组经 ToolDocument 投影 (tui-compact-interaction 票据 01): 同一模型轮次
+  聚合为一个紧凑组, 新建组经 add_entry 挂载显示文档; 检查事实经
   CheckProjection 消费 RequestCompleted.outcome; /status 汇集检查事实与注入
   诊断并施加有界限额。
 - 票据 05: 订阅前先把恢复快照 (restored_requests/restored_interrupted) 投影
@@ -42,6 +43,11 @@
 - thinking-budget-visibility 票据 03: 底栏经 FooterComponent budget 回调
   常驻"最近预算"（总需求/上限/近似标记/输入来源；待评估/未启用/超限如实
   降级）；/help 增加一句口径说明。只读 session.budget, 不新增刷新任务。
+- tui-compact-interaction 票据 01 (契约 C1-C3): layout_document 是同源布局
+  出口 (lines/hits/anchors 同一次排版), document_lines 只是其兼容包装;
+  execute_display_action 执行组/工具/思考/Skill 的 toggle 与工具分页动作
+  (F6 键盘与 02 鼠标共用入口), Ctrl+O 统一工具组与 Skill 开合, 逐项动作
+  只覆盖当前条目。
 """
 
 from __future__ import annotations
@@ -97,7 +103,18 @@ from cicada.ui.login_wizard import LoginModal
 from cicada.user_config import LoginSubmission, UserConfigError
 from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
-from cicada.ui.tool_view import ToolCardEntry, ToolDocument
+from cicada.ui.document_layout import (
+    ACTION_MORE,
+    ACTION_RESET,
+    ACTION_TOGGLE,
+    TARGET_GROUP,
+    TARGET_REASONING,
+    TARGET_SKILL,
+    TARGET_TOOL,
+    DisplayAction,
+    DocumentLayout,
+)
+from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
 from cicada.ui.transcript import Transcript
 from cicada.ui.welcome import build_welcome_entry
 from cicada.ui.display_style import DisplayStyle
@@ -221,6 +238,8 @@ class ConversationView:
             # 票据 02: 请求级终结封存该运行预览 (RunFinished 已封存则幂等);
             # 防御 RunFinished 缺席时仍清活动状态
             self.transcript.finish_reasoning_previews(outcome.result.run_id)
+            # 紧凑交互 01 (C1): 请求终结封存无结果工具子项为未确认 (幂等)
+            self.tools.seal_run(outcome.result.run_id)
             if outcome.result.run_id == self._active_run_id:
                 self._model_stage = None
                 self._active_run_id = None
@@ -308,10 +327,12 @@ class ConversationView:
     def _seal_active_run(self) -> None:
         """票据 02/A07 异常关闭兜底: 封存当前运行未完成预览并清活动阶段。
 
-        幂等; 无活动运行时只清状态, 不新建条目、不制造规范记录。
+        幂等; 无活动运行时只清状态, 不新建条目、不制造规范记录。紧凑交互 01
+        (C1): 同运行无结果工具子项一并封存为未确认, 不伪造完成。
         """
         if self._active_run_id is not None:
             self.transcript.finish_reasoning_previews(self._active_run_id)
+            self.tools.seal_run(self._active_run_id)
         self._active_run_id = None
         self._model_stage = None
 
@@ -368,20 +389,60 @@ class ConversationView:
                 self._active_run_id = None
         elif isinstance(event, ModelCallCompleted):
             self.transcript.add_metrics(event.metrics)
-        # 工具卡与检查回执收集: 全部内核事件过一遍 (各自过滤)
+        # 工具组与检查回执收集: 全部内核事件过一遍 (各自过滤)
         self._checks.observe_event(event)
-        before = len(self.tools.entries)
+        # 紧凑交互 01 (C1): 组只在创建时挂载一个显示条目, 子项更新原位重排
+        before = len(self.tools.groups)
         self.tools.apply(event)
-        new_entries = self.tools.entries
-        for index in range(before, len(new_entries)):
-            self.transcript.add_entry(ToolCardEntry(self.tools, index))
+        groups = self.tools.groups
+        for index in range(before, len(groups)):
+            self.transcript.add_entry(ToolGroupEntry(self.tools, index))
 
     # --- MainScreenFrontend 注入面 ----------------------------------------------------
 
     def document_lines(self, width: int) -> list[str]:
-        """01 冻结的显示文档替换点: 整份文档按当前宽度排版。"""
+        """01 冻结的显示文档替换点: 同源布局 lines 的兼容包装 (C3)。"""
         with self.display_style.use():
             return self.transcript.render(width)
+
+    def layout_document(
+        self, width: int, selected: DisplayAction | None = None
+    ) -> DocumentLayout:
+        """同源文档布局 (紧凑交互 01, C3): 整份文档一次排版的 lines/hits/anchors。
+
+        selected 是文档焦点当前选中的显示动作 (标题/分页标记着色与命中同帧)。
+        """
+        with self.display_style.use():
+            return self.transcript.layout(width, selected)
+
+    def execute_display_action(self, action: DisplayAction) -> bool:
+        """执行显示动作 (紧凑交互 01: F6 Enter 与 02 鼠标点击共用入口)。
+
+        只改展示状态 (组/工具/思考/Skill toggle、工具分页), 不触请求、工具或
+        草稿; 未知/失效目标静默返回 False。jump_latest 由视口内部消费, 不到这里。
+        """
+        kind = action.kind
+        target = action.target_id
+        handled = False
+        if kind == ACTION_TOGGLE and target[:1] == (TARGET_GROUP,) and len(target) == 4:
+            self.tools.toggle_group(target[1:4])
+            handled = True
+        elif kind == ACTION_TOGGLE and target[:1] == (TARGET_TOOL,) and len(target) == 5:
+            self.tools.toggle_tool(target[1:5])
+            handled = True
+        elif kind == ACTION_MORE and target[:1] == (TARGET_TOOL,) and len(target) == 5:
+            self.tools.tool_output_more(target[1:5])
+            handled = True
+        elif kind == ACTION_RESET and target[:1] == (TARGET_TOOL,) and len(target) == 5:
+            self.tools.tool_output_reset(target[1:5])
+            handled = True
+        elif kind == ACTION_TOGGLE and target[:1] == (TARGET_REASONING,) and len(target) == 3:
+            handled = self.transcript.toggle_reasoning_item(target[1], target[2])
+        elif kind == ACTION_TOGGLE and target[:1] == (TARGET_SKILL,) and len(target) == 2:
+            handled = self.transcript.toggle_skill(target[1])
+        if handled and self._on_update is not None:
+            self._on_update()
+        return handled
 
     # --- 状态行 (tui-aesthetics 规格 §F) ---------------------------------------------
 
@@ -507,8 +568,10 @@ class ConversationView:
             self._gate.arm_pending_cancel()
 
     def handle_ctrl_o(self) -> None:
-        """Ctrl+O 接缝 (票据 05): 切换工具输出展开; 只改展示, 不触请求或工具。"""
-        self.tools.toggle_expand()
+        """Ctrl+O (紧凑交互 01, C2): 统一所有工具组/单工具/Skill 为同一开合状态
+        并作为后续默认值; 只改展示, 不触请求或工具。"""
+        expanded = self.tools.toggle_expand()
+        self.transcript.set_skills_expanded(expanded)
 
     def handle_ctrl_t(self) -> None:
         """Ctrl+T 接缝 (票据 01): 切换思考块展开; 只改显示状态, 不触请求或草稿。
@@ -540,6 +603,8 @@ class ConversationView:
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
                 ("快捷键", [
                     "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
+                    "F6 文档回看：Up/Down 选择 · Enter 展开/分页 · Esc 返回"
+                    "（PageUp/PageDown/Home/End 翻看）",
                 ]),
                 ("预算", [
                     "底栏「最近预算」为最近一次评估的总需求（输入＋输出预留＋安全余量，"
@@ -990,6 +1055,8 @@ def build(
     )
     return {
         "document_lines": view.document_lines,
+        "layout_document": view.layout_document,  # 紧凑交互 01: 同源布局 (C3)
+        "on_display_action": view.execute_display_action,  # 紧凑交互 01: 显示动作执行
         "on_submit": view.on_submit,
         "on_escape": view.handle_escape,
         "on_ctrl_c": view.handle_ctrl_c,

@@ -104,6 +104,10 @@ def test_tool_cards_namespaced_and_check_attribution():
     assert len(entries) == 1
     assert entries[0].run_id.startswith("restored:r-1"), "工具卡键命名空间化"
     assert entries[0].status == "success"
+    # 紧凑交互 01 (C2): 恢复默认收起, 归属行在详情内; 逐项展开后可见
+    collapsed = "\n".join(transcript.render(80))
+    assert "历史检查回执" not in collapsed
+    tools.toggle_tool(("restored", "restored:r-1", 0, "c1"))
     rendered = "\n".join(transcript.render(80))
     assert "历史检查回执 chk-abc123" in rendered, "旧检查归属可读"
     assert "不适用于当前验证运行" in rendered
