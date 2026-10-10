@@ -1,4 +1,8 @@
-"""edit 工具: 批量精确替换, 任一编辑非法则整体不写盘; 成功结果附有界 diff."""
+"""edit 工具: 批量精确替换 + 版本前置 + 可靠提交; 任一编辑非法则整体不写盘.
+
+已有文件必须先经 read 建立进程内版本依据; 读后变化会被拒绝并要求重读.
+提交事实由 FileAccess 单次原生发布给出, committed 不得假报未写, unknown 不掩盖.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,12 @@ from typing import TYPE_CHECKING, Any
 
 from cicada.core.messages import ToolResult
 from cicada.core.ports import ToolContext, ToolSpec
-from cicada.plugins.coding.workspace import PathNotAllowedError, Workspace
+from cicada.plugins.coding.file_access import (
+    STATE_COMMITTED,
+    MutationOutcome,
+    MutationRejected,
+)
+from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginDefinition
 
 if TYPE_CHECKING:
@@ -17,10 +26,6 @@ if TYPE_CHECKING:
 
 BOM = b"\xef\xbb\xbf"
 MAX_CONTENT_BYTES = 50 * 1024  # applied 头 + diff 的 UTF-8 总预算
-
-
-class _EditInvalid(Exception):
-    """可预期编辑失败 (由 execute 映射为 is_error 结果, 不向内核抛出)."""
 
 
 class EditTool:
@@ -32,11 +37,12 @@ class EditTool:
         return ToolSpec(
             name="edit",
             description=(
-                "对文件做批量精确替换. 全部 old_text 在原始内容上匹配且必须唯一; "
-                "任一编辑非法则整体不写入. 成功结果先给出 applied/路径/替换数/"
-                "first_changed_line, 再附 unified diff; 总输出不超过 50 KiB UTF-8, "
-                "超限时完整 diff 写入 workspace 的 .cicada/outputs/ 唯一文件, "
-                "结果标 diff_truncated=true 并给出可 read 的路径."
+                "对文件做批量精确替换. 已有文件必须先用 read 读取: 未读过会被拒绝, "
+                "读取后文件被改动也会因版本不一致被拒绝, 需重新 read. "
+                "全部 old_text 在原始内容上匹配且必须唯一; 任一编辑非法则整体不写入. "
+                "成功结果先给出 applied/路径/替换数/first_changed_line, 再附 unified diff; "
+                "总输出不超过 50 KiB UTF-8, 超限时完整 diff 写入 workspace 的 "
+                ".cicada/outputs/ 唯一文件, 结果标 diff_truncated=true 并给出可 read 的路径."
             ),
             parameters={
                 "type": "object",
@@ -63,37 +69,170 @@ class EditTool:
 
     async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         edits = arguments["edits"]
-        try:
-            path = self._workspace.resolve_for_write(arguments["path"])
-        except PathNotAllowedError as exc:
-            return self._error(ctx, str(exc))
-        if not path.exists():
-            return self._error(ctx, f"file not found: {path}")
+        captured: dict[str, str] = {}
 
+        def transform(original: bytes) -> bytes:
+            return self._transform(original, edits, captured)
+
+        outcome = await self._workspace.files.mutate(
+            arguments["path"], transform, ctx.cancel, mode="edit"
+        )
+        return self._render(ctx, outcome, len(edits), captured)
+
+    # ---- 纯字节转换 (队列内核对依据后调用; 可预期失败抛 MutationRejected) ----
+
+    def _transform(self, original: bytes, edits: list[dict[str, str]], captured: dict[str, str]) -> bytes:
+        has_bom = original.startswith(BOM)
         try:
-            diff, first_changed_line = await self._workspace.mutate(
-                path, lambda: self._apply(path, edits)
-            )
-        except _EditInvalid as exc:
-            return self._error(ctx, str(exc))
+            text = (original[3:] if has_bom else original).decode("utf-8")
         except UnicodeDecodeError:
-            return self._error(ctx, f"file is not valid UTF-8 text: {path}")
+            raise MutationRejected("invalid_utf8", "file is not valid UTF-8 text") from None
+
+        # 恢复为文件首个换行风格: 取最早出现的换行字符, \r 后紧跟 \n 才算 CRLF;
+        # 混合换行文件整体归一为首个风格 (既定语义)
+        p_cr = text.find("\r")
+        p_lf = text.find("\n")
+        if p_cr == -1 and p_lf == -1:
+            newline = "\n"
+        elif p_lf == -1 or (p_cr != -1 and p_cr < p_lf):
+            newline = "\r\n" if text.startswith("\r\n", p_cr) else "\r"
+        else:
+            newline = "\n"
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        spans: list[tuple[int, int, str]] = []
+        for index, edit in enumerate(edits):
+            old = edit["old_text"].replace("\r\n", "\n").replace("\r", "\n")
+            new = edit["new_text"].replace("\r\n", "\n").replace("\r", "\n")
+            if old == "":
+                raise MutationRejected("invalid_edit", f"edit {index}: old_text must not be empty")
+            if new == old:
+                raise MutationRejected(
+                    "invalid_edit", f"edit {index}: new_text is identical to old_text"
+                )
+            count = normalized.count(old)
+            if count == 0:
+                raise MutationRejected(
+                    "invalid_edit", f"edit {index}: old_text not found in file"
+                )
+            if count > 1:
+                raise MutationRejected(
+                    "invalid_edit",
+                    f"edit {index}: old_text matches {count} times in file; make it unique",
+                )
+            start = normalized.find(old)
+            spans.append((start, start + len(old), new))
+
+        spans.sort(key=lambda span: span[0])
+        for (s1, e1, _), (s2, _, _) in zip(spans, spans[1:]):
+            if s2 < e1:
+                raise MutationRejected(
+                    "invalid_edit",
+                    f"edits overlap between offsets {s1}..{e1} and {s2}; rejected",
+                )
+
+        applied = normalized
+        for start, end, new in reversed(spans):
+            applied = applied[:start] + new + applied[end:]
+
+        captured["original"] = normalized
+        captured["applied"] = applied
+        out_text = applied.replace("\n", newline) if newline != "\n" else applied
+        return (BOM if has_bom else b"") + out_text.encode("utf-8")
+
+    # ---- 结果渲染 (契约 C4: 真实状态优先, 提交事实先于附属成败) ----
+
+    def _render(
+        self, ctx: ToolContext, outcome: MutationOutcome, count: int, captured: dict[str, str]
+    ) -> ToolResult:
+        path = Path(outcome.canonical_path)
+        display = self._display(path)
+        mutation = {
+            "version": 1,
+            "state": outcome.state,
+            "reason": outcome.reason,
+            "canonical_path": outcome.canonical_path,
+            "current_matches": outcome.current_matches,
+            "caller_cancelled": outcome.caller_cancelled,
+            "winerror": outcome.winerror,
+            "retained_paths": list(outcome.retained_paths),
+            "cleanup_warning": outcome.cleanup_warning,
+        }
+        details: dict[str, Any] = {"mutation": mutation}
+
+        if outcome.state != STATE_COMMITTED:
+            parts = [f"[mutation={outcome.state}] {outcome.message or outcome.reason}"]
+            if outcome.retained_paths:
+                parts.append("retained materials: " + "; ".join(outcome.retained_paths))
+            if outcome.state == "unknown":
+                parts.append(
+                    f"do not assume the file was or was not modified; "
+                    f"read {display} again before any further change"
+                )
+            elif outcome.reason == "read_required":
+                parts.append(f"read {display} with the read tool first, then edit")
+            elif outcome.reason == "version_conflict":
+                parts.append(f"read {display} again, then edit with fresh content")
+            elif outcome.reason == "cancelled_before_commit":
+                parts.append("the file was not modified; retry after the cancellation")
+            content = "\n".join(parts)
+            return self._error_result(ctx, content, details)
+
+        diff, first_changed_line = self._diff(
+            path, captured.get("original", ""), captured.get("applied", "")
+        )
         header = (
-            f"edit applied: {self._display(path)}, {len(edits)} replacement(s), "
+            f"[mutation=committed] edit applied: {display}, {count} replacement(s), "
             f"first changed line {first_changed_line}"
         )
-        details = {"diff": diff, "first_changed_line": first_changed_line}
-        if diff == "":
-            # 语义上罕见 (new==old 已在校验拒绝), 仍明示而不是静默
-            return self._success_result(
-                ctx, f"{header}\n(no text differences)",
-                {**details, "diff_truncated": False},
+        details.update({"diff": diff, "first_changed_line": first_changed_line})
+        warning = self._commit_warning(outcome)
+        if warning is None:
+            if diff == "":
+                # 语义上罕见 (new==old 已在校验拒绝), 仍明示而不是静默
+                return self._success_result(
+                    ctx, f"{header}\n(no text differences)",
+                    {**details, "diff_truncated": False},
+                )
+            if len(header.encode("utf-8")) + 1 + len(diff.encode("utf-8")) <= MAX_CONTENT_BYTES:
+                return self._success_result(
+                    ctx, f"{header}\n{diff}", {**details, "diff_truncated": False},
+                )
+            return self._spill_diff(ctx, path, header, diff, details)
+
+        # committed 但需按错误报告: 短头 + warning 优先, diff 只给有界预览
+        parts = [header, warning]
+        if outcome.retained_paths:
+            parts.append("retained materials: " + "; ".join(outcome.retained_paths))
+        used = sum(len(part.encode("utf-8")) + 1 for part in parts)
+        parts.append(f"re-read {display} to observe the current state")
+        used += len(parts[-1].encode("utf-8")) + 1
+        preview = self._bounded_preview(diff, MAX_CONTENT_BYTES - used)
+        if preview:
+            parts.append(preview)
+        return self._error_result(ctx, "\n".join(parts), details)
+
+    @staticmethod
+    def _commit_warning(outcome: MutationOutcome) -> str | None:
+        if outcome.reason == "conflict_at_commit":
+            return (
+                "commit-window conflict: the replaced original did not match the verified "
+                "version; materials retained"
             )
-        if len(header.encode("utf-8")) + 1 + len(diff.encode("utf-8")) <= MAX_CONTENT_BYTES:
-            return self._success_result(
-                ctx, f"{header}\n{diff}", {**details, "diff_truncated": False},
+        if outcome.current_matches is False:
+            return "target no longer matches the committed content (changed externally after commit)"
+        if outcome.current_matches is None:
+            return "target readback unavailable; the commit itself stands"
+        return None
+
+    @staticmethod
+    def _error_result(ctx: ToolContext, content: str, details: dict) -> ToolResult:
+        if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
+            content = (
+                content.encode("utf-8")[:MAX_CONTENT_BYTES].decode("utf-8", errors="ignore")
             )
-        return self._spill_diff(ctx, path, header, diff, details)
+        return ToolResult(call_id=ctx.call_id, name="edit", content=content, is_error=True,
+                          details=details)
 
     def _spill_diff(
         self, ctx: ToolContext, path: Path, header: str, diff: str, details: dict
@@ -185,59 +324,6 @@ class EditTool:
             used += need
         return "\n".join(out)
 
-    async def _apply(self, path, edits: list[dict[str, str]]) -> tuple[str, int]:
-        """读-验证-改-写 原子地跑在同文件队列内, 避免并发丢更新."""
-        data = path.read_bytes()
-        has_bom = data.startswith(BOM)
-        try:
-            text = (data[3:] if has_bom else data).decode("utf-8")
-        except UnicodeDecodeError:
-            raise
-
-        # 恢复为文件首个换行风格: 取最早出现的换行字符, \r 后紧跟 \n 才算 CRLF;
-        # 混合换行文件整体归一为首个风格 (既定语义)
-        p_cr = text.find("\r")
-        p_lf = text.find("\n")
-        if p_cr == -1 and p_lf == -1:
-            newline = "\n"
-        elif p_lf == -1 or (p_cr != -1 and p_cr < p_lf):
-            newline = "\r\n" if text.startswith("\r\n", p_cr) else "\r"
-        else:
-            newline = "\n"
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-
-        spans: list[tuple[int, int, str]] = []
-        for index, edit in enumerate(edits):
-            old = edit["old_text"].replace("\r\n", "\n").replace("\r", "\n")
-            new = edit["new_text"].replace("\r\n", "\n").replace("\r", "\n")
-            if old == "":
-                raise _EditInvalid(f"edit {index}: old_text must not be empty")
-            if new == old:
-                raise _EditInvalid(f"edit {index}: new_text is identical to old_text")
-            count = normalized.count(old)
-            if count == 0:
-                raise _EditInvalid(f"edit {index}: old_text not found in {path}")
-            if count > 1:
-                raise _EditInvalid(
-                    f"edit {index}: old_text matches {count} times in {path}; make it unique"
-                )
-            start = normalized.find(old)
-            spans.append((start, start + len(old), new))
-
-        spans.sort(key=lambda span: span[0])
-        for (s1, e1, _), (s2, _, _) in zip(spans, spans[1:]):
-            if s2 < e1:
-                raise _EditInvalid(f"edits overlap between offsets {s1}..{e1} and {s2}; rejected")
-
-        applied = normalized
-        for start, end, new in reversed(spans):
-            applied = applied[:start] + new + applied[end:]
-
-        out_text = applied.replace("\n", newline) if newline != "\n" else applied
-        path.write_bytes((BOM if has_bom else b"") + out_text.encode("utf-8"))
-
-        return self._diff(path, normalized, applied)
-
     def _diff(self, path, original: str, applied: str) -> tuple[str, int]:
         old_lines = original.split("\n")
         new_lines = applied.split("\n")
@@ -260,10 +346,6 @@ class EditTool:
             return str(path.relative_to(self._workspace.root))
         except ValueError:
             return str(path)
-
-    @staticmethod
-    def _error(ctx: ToolContext, message: str) -> ToolResult:
-        return ToolResult(call_id=ctx.call_id, name="edit", content=message, is_error=True)
 
 
 def edit_plugin() -> PluginDefinition:

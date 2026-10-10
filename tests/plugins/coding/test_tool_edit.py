@@ -1,11 +1,15 @@
 import asyncio
 import json
+import os
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ToolContext
+from cicada.plugins.coding import file_commit_windows
 from cicada.plugins.coding.tool_edit import MAX_CONTENT_BYTES, EditTool
 from cicada.plugins.coding.tool_read import ReadTool
 from cicada.plugins.coding.workspace import PathNotAllowedError, Workspace
@@ -20,6 +24,14 @@ def make(tmp_path):
 
 async def run(tool, **arguments):
     return await tool.execute(arguments, ToolContext(call_id="c1", cancel=CancelToken()))
+
+
+async def read_basis(ws: Workspace, path: str):
+    """read 前置 fixture: 成功读取以登记版本依据."""
+    r = await ReadTool(ws).execute(
+        {"path": path}, ToolContext(call_id="rd", cancel=CancelToken())
+    )
+    assert not r.is_error, r.content
 
 
 def apply_hunks(original: str, patch: str) -> str:
@@ -51,18 +63,23 @@ async def test_single_replacement(tmp_path):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
     r = await run(tool, path="a.txt", edits=[{"old_text": "two", "new_text": "TWO"}])
     assert not r.is_error
     assert f.read_text(encoding="utf-8") == "one\nTWO\nthree\n"
     assert r.details["first_changed_line"] == 2
     assert r.details["diff_truncated"] is False
+    assert r.details["mutation"]["state"] == "committed"
+    assert r.details["mutation"]["reason"] == "applied"
     assert "full_diff_path" not in r.details
     assert "-two" in r.details["diff"]
     assert "+TWO" in r.details["diff"]
     assert apply_hunks("one\ntwo\nthree\n", r.details["diff"]) == "one\nTWO\nthree\n"
-    # 模型可见 content: applied/路径/替换数/first_changed_line 在前, diff 在后
+    # 模型可见 content: [mutation=committed] + applied/路径/替换数/first_changed_line 在前, diff 在后
     lines = r.content.split("\n")
-    assert lines[0] == "edit applied: a.txt, 1 replacement(s), first changed line 2"
+    assert lines[0] == (
+        "[mutation=committed] edit applied: a.txt, 1 replacement(s), first changed line 2"
+    )
     assert lines[1].startswith("--- a/a.txt")
     assert lines[2].startswith("+++ b/a.txt")
     assert "@@" in lines[3]
@@ -74,6 +91,7 @@ async def test_batch_non_overlapping(tmp_path):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_text("aa\nbb\ncc\ndd\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
     r = await run(
         tool,
         path="a.txt",
@@ -93,6 +111,7 @@ async def test_invalid_edits_rejected_and_file_unchanged(tmp_path):
     f = ws.root / "a.txt"
     original = b"dup\ndup\nabcd\nend\n"
     f.write_bytes(original)
+    await read_basis(ws, "a.txt")
 
     cases = [
         ({"old_text": "nope", "new_text": "x"}, "not found"),
@@ -112,6 +131,8 @@ async def test_invalid_edits_rejected_and_file_unchanged(tmp_path):
             edits = [edits]
         r = await run(tool, path="a.txt", edits=edits)
         assert r.is_error, f"expected error for {edits}"
+        assert r.details["mutation"]["state"] == "not_written"
+        assert r.details["mutation"]["reason"] == "invalid_edit"
         assert expected_fragment in r.content, r.content
         assert f.read_bytes() == original  # 任一非法 → 整体不写盘
 
@@ -120,6 +141,7 @@ async def test_lf_roundtrip_preserves_trailing_no_newline(tmp_path):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_bytes(b"keep1\nold\nkeep2")
+    await read_basis(ws, "a.txt")
     r = await run(tool, path="a.txt", edits=[{"old_text": "old", "new_text": "new"}])
     assert not r.is_error
     assert f.read_bytes() == b"keep1\nnew\nkeep2"
@@ -129,6 +151,7 @@ async def test_crlf_preserved_and_lf_old_text_matches(tmp_path):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    await read_basis(ws, "a.txt")
     r = await run(
         tool,
         path="a.txt",
@@ -142,6 +165,7 @@ async def test_bom_preserved(tmp_path):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_bytes(BOM + "x\ny\n".encode("utf-8"))
+    await read_basis(ws, "a.txt")
     r = await run(tool, path="a.txt", edits=[{"old_text": "y", "new_text": "z"}])
     assert not r.is_error
     assert f.read_bytes() == BOM + "x\nz\n".encode("utf-8")
@@ -153,11 +177,13 @@ async def test_mixed_newline_normalized_to_first_style(tmp_path):
     f = ws.root / "a.txt"
     # 首个换行是 LF: 全文件归一为 LF, 不因后文出现 CRLF 而整体改写为 CRLF
     f.write_bytes(b"a\nb\r\nc\n")
+    await read_basis(ws, "a.txt")
     r = await run(tool, path="a.txt", edits=[{"old_text": "c", "new_text": "C"}])
     assert not r.is_error
     assert f.read_bytes() == b"a\nb\nC\n"
     # 首个换行是裸 CR: 全文件归一为 CR
     f.write_bytes(b"a\rb\nc\r")
+    await read_basis(ws, "a.txt")
     r2 = await run(tool, path="a.txt", edits=[{"old_text": "c", "new_text": "C"}])
     assert not r2.is_error
     assert f.read_bytes() == b"a\rb\rC\r"
@@ -186,14 +212,16 @@ async def test_missing_file(tmp_path):
 
 
 async def test_concurrent_edits_no_lost_update(tmp_path):
+    """同文件并发 edit 经队列串行: 本进程提交会更新依据, 两笔按序生效, 不丢更新."""
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_text("l1\nl2\nl3\nl4\nl5\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
     results = await asyncio.gather(
         run(tool, path="a.txt", edits=[{"old_text": "l2", "new_text": "L2"}]),
         run(tool, path="A.TXT", edits=[{"old_text": "l4", "new_text": "L4"}]),
     )
-    assert all(not r.is_error for r in results)
+    assert all(not r.is_error for r in results), [r.content for r in results]
     assert f.read_text(encoding="utf-8") == "l1\nL2\nl3\nL4\nl5\n"
 
 
@@ -210,6 +238,7 @@ def big_edit_args(ws: Workspace, count: int = 4000):
 async def test_large_diff_spills_to_artifact_and_is_readable(tmp_path):
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
+    await read_basis(ws, "big.txt")
     r = await run(tool, path="big.txt", edits=edits)
     assert not r.is_error
     # 文件已改
@@ -244,6 +273,7 @@ async def test_artifact_write_failure_still_reports_applied(tmp_path, monkeypatc
     """文件已改但 artifact 写失败 (junction 越界): 不回滚、不谎称未改."""
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
+    await read_basis(ws, "big.txt")
     original_resolve = ws.resolve_for_write
 
     def guarded(raw: str):
@@ -258,7 +288,7 @@ async def test_artifact_write_failure_still_reports_applied(tmp_path, monkeypatc
     assert not r.is_error
     # edit 已生效且未被回滚
     assert f.read_text(encoding="utf-8") == expected_text
-    assert r.content.startswith("edit applied: big.txt, 1 replacement(s)")
+    assert r.content.startswith("[mutation=committed] edit applied: big.txt, 1 replacement(s)")
     assert "edit applied; full diff unavailable" in r.content
     assert "re-read the edited file" in r.content
     assert len(r.content.encode("utf-8")) <= MAX_CONTENT_BYTES
@@ -273,10 +303,11 @@ async def test_empty_diff_is_stated_explicitly(tmp_path, monkeypatch):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
     monkeypatch.setattr(tool, "_diff", lambda path, original, applied: ("", 1))
     r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "two"}])
     assert not r.is_error
-    assert r.content.startswith("edit applied: a.txt, 1 replacement(s)")
+    assert r.content.startswith("[mutation=committed] edit applied: a.txt, 1 replacement(s)")
     assert "no text differences" in r.content
     assert r.details["diff_truncated"] is False
 
@@ -284,6 +315,7 @@ async def test_empty_diff_is_stated_explicitly(tmp_path, monkeypatch):
 async def test_spilled_artifact_paths_are_unique(tmp_path):
     ws, tool = make(tmp_path)
     f, edits, _ = big_edit_args(ws)
+    await read_basis(ws, "big.txt")
     first = await run(tool, path="big.txt", edits=edits)
     # 反向再改一次, 同样产生超大 diff
     revert = [{"old_text": e["new_text"], "new_text": e["old_text"]} for e in edits]
@@ -295,6 +327,7 @@ async def test_spilled_artifact_paths_are_unique(tmp_path):
 async def test_long_header_keeps_success_content_bounded_and_artifact_readable(tmp_path, monkeypatch):
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
+    await read_basis(ws, "big.txt")
     display = tool._display
     long_name = "宽🎉" * 10000
     monkeypatch.setattr(tool, "_display", lambda path: long_name if path == f else display(path))
@@ -317,6 +350,7 @@ async def test_long_header_keeps_success_content_bounded_and_artifact_readable(t
 async def test_long_artifact_error_is_bounded_after_edit_applied(tmp_path, monkeypatch):
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
+    await read_basis(ws, "big.txt")
     original_resolve = ws.resolve_for_write
     error_text = "失败🎉" * 10000
 
@@ -341,6 +375,7 @@ async def test_empty_diff_with_long_header_is_bounded(tmp_path, monkeypatch):
     ws, tool = make(tmp_path)
     f = ws.root / "a.txt"
     f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
     monkeypatch.setattr(tool, "_display", lambda path: "汉" * 18000)
     monkeypatch.setattr(tool, "_diff", lambda path, original, applied: ("", 1))
     result = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "two"}])
@@ -369,3 +404,174 @@ def test_wide_path_metadata_fallback_stays_within_byte_cap(tmp_path, monkeypatch
     assert result.details["metadata_truncated"] is True
     assert "metadata_truncated=true" in result.content
     assert "edit applied" in result.content and "full diff unavailable" in result.content
+
+
+# ---- 版本前置与取消 (文件修改可靠性 01 的关键回归) ----
+
+
+async def test_edit_requires_prior_read(tmp_path):
+    """未读过 → read_required, 文件不变 (A02)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\ntwo\n", encoding="utf-8")
+    r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "x"}])
+    assert r.is_error
+    assert r.details["mutation"]["state"] == "not_written"
+    assert r.details["mutation"]["reason"] == "read_required"
+    assert "read" in r.content
+    assert f.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+async def test_edit_rejects_external_change_since_read(tmp_path):
+    """读后其他区域被外部改动 → version_conflict (局部匹配不足以放行), 重读后可编辑."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("keep\nold\nkeep\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    # 外部改动未读区域: old_text 仍唯一匹配, 但依据已失效
+    f.write_text("CHANGED\nold\nkeep\n", encoding="utf-8")
+    r = await run(tool, path="a.txt", edits=[{"old_text": "old", "new_text": "new"}])
+    assert r.is_error
+    assert r.details["mutation"]["reason"] == "version_conflict"
+    assert f.read_text(encoding="utf-8") == "CHANGED\nold\nkeep\n"
+    await read_basis(ws, "a.txt")
+    r2 = await run(tool, path="a.txt", edits=[{"old_text": "old", "new_text": "new"}])
+    assert not r2.is_error
+    assert f.read_text(encoding="utf-8") == "CHANGED\nnew\nkeep\n"
+
+
+async def test_edit_rejects_original_deleted_after_read(tmp_path):
+    """读到的原件被删除 → 拒绝且不转创建 (A02)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    f.unlink()
+    r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "x"}])
+    assert r.is_error
+    assert r.details["mutation"]["reason"] == "version_conflict"
+    assert not f.exists()
+
+
+async def test_continuous_edits_update_basis(tmp_path):
+    """成功提交并核对相符后依据更新, 连续 edit 无需重新 read (A02)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("a\nb\nc\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    r1 = await run(tool, path="a.txt", edits=[{"old_text": "a", "new_text": "A"}])
+    assert not r1.is_error
+    r2 = await run(tool, path="a.txt", edits=[{"old_text": "b", "new_text": "B"}])
+    assert not r2.is_error
+    assert f.read_text(encoding="utf-8") == "A\nB\nc\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case-insensitive path alias")
+async def test_case_alias_shares_basis(tmp_path):
+    """大小写别名共享同一依据与队列 (A02)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    r = await run(tool, path="A.TXT", edits=[{"old_text": "one", "new_text": "1"}])
+    assert not r.is_error
+    assert f.read_text(encoding="utf-8") == "1\n"
+
+
+async def test_sliced_read_registers_full_version_basis(tmp_path):
+    """切片读取登记完整字节版本, 不代表模型读完, 但足以作为编辑依据 (A01)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    r = await ReadTool(ws).execute(
+        {"path": "a.txt", "offset": 2, "limit": 1},
+        ToolContext(call_id="rd", cancel=CancelToken()),
+    )
+    assert not r.is_error
+    # 编辑切片之外的行 1 仍被接受: 依据是整份字节而非所读行
+    r2 = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "ONE"}])
+    assert not r2.is_error
+    assert f.read_text(encoding="utf-8") == "ONE\ntwo\nthree\n"
+
+
+async def test_cancelled_before_publish_leaves_file_unchanged(tmp_path):
+    """令牌已取消 (含排队/核对阶段) → 未提交, 文件不变 (A04)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    token = CancelToken()
+    token.cancel()
+    r = await tool.execute(
+        {"path": "a.txt", "edits": [{"old_text": "one", "new_text": "x"}]},
+        ToolContext(call_id="c1", cancel=token),
+    )
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "not_written"
+    assert mutation["reason"] == "cancelled_before_commit"
+    assert mutation["caller_cancelled"] is True
+    assert f.read_text(encoding="utf-8") == "one\n"
+
+
+async def test_cancel_during_publish_returns_committed_result(tmp_path, monkeypatch):
+    """原生调用进入后取消不中断发布: 真实 committed 结果被保留, 令牌仍置位 (A04)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\ntwo\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    entered = asyncio.Event()
+    real_replace = file_commit_windows._ReplaceFileW
+
+    def slow_replace(target, replacement, backup, flags, exclude, reserved):
+        entered.set()
+        time.sleep(0.25)  # 已进入的不可中断窗口
+        return real_replace(target, replacement, backup, flags, exclude, reserved)
+
+    monkeypatch.setattr(file_commit_windows, "_ReplaceFileW", slow_replace)
+    token = CancelToken()
+    task = asyncio.create_task(
+        tool.execute(
+            {"path": "a.txt", "edits": [{"old_text": "two", "new_text": "TWO"}]},
+            ToolContext(call_id="c1", cancel=token),
+        )
+    )
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    task.cancel()
+    result = await task  # 不抛 CancelledError: 已取得文件结果
+    assert not result.is_error
+    mutation = result.details["mutation"]
+    assert mutation["state"] == "committed"
+    assert mutation["reason"] == "applied"
+    assert mutation["caller_cancelled"] is True
+    assert f.read_text(encoding="utf-8") == "one\nTWO\n"
+    assert token.cancelled  # 工具接住取消后仍使既有令牌置位
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junction")
+async def test_edit_rejects_junction_alias_path(tmp_path):
+    """原始路径穿越 reparse 点 → unsupported_target, 即便 canonical 目标合法 (A06)."""
+    ws, tool = make(tmp_path)
+    target_dir = ws.root / "real"
+    target_dir.mkdir()
+    f = target_dir / "a.txt"
+    f.write_text("x\n", encoding="utf-8")
+    alias = ws.root / "alias"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(alias), str(target_dir)], capture_output=True
+    )
+    if result.returncode != 0:
+        pytest.skip("junction creation unavailable on this host")
+    try:
+        # read 允许穿透 junction (只读范围保持), 登记的是真实路径依据
+        await read_basis(ws, "alias\\a.txt")
+        r = await run(tool, path="alias\\a.txt", edits=[{"old_text": "x", "new_text": "y"}])
+        assert r.is_error
+        assert r.details["mutation"]["reason"] == "unsupported_target"
+        assert f.read_text(encoding="utf-8") == "x\n"
+        # 用真实路径编辑同一依据 → 成功
+        r2 = await run(tool, path="real\\a.txt", edits=[{"old_text": "x", "new_text": "y"}])
+        assert not r2.is_error
+        assert f.read_text(encoding="utf-8") == "y\n"
+    finally:
+        alias.rmdir()  # 只删 junction 本身

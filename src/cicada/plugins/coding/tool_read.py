@@ -1,12 +1,17 @@
-"""read 工具: UTF-8 文本文件行切片读取, 来源头/续读 footer 有界, 二进制拒绝."""
+"""read 工具: UTF-8 文本文件行切片读取, 来源头/续读 footer 有界, 二进制拒绝.
+
+成功读取经 FileAccess 稳定核对并登记进程内版本依据 (edit 的前置).
+"""
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from cicada.core.messages import ToolResult
 from cicada.core.ports import ToolContext, ToolSpec
+from cicada.plugins.coding.file_access import FileAccessError
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginDefinition
 
@@ -44,7 +49,8 @@ class ReadTool:
                 "(canonical 绝对路径/实际行范围/总行数), 正文行带行号前缀, "
                 "结尾 footer 给出截断状态、原因与 next_offset 续读; "
                 "最终输出 (头/正文/footer) 不超过 50 KiB UTF-8, 超长单行只返回部分字符 "
-                "并以 partial 标记 + powershell 字节读取提示说明."
+                "并以 partial 标记 + powershell 字节读取提示说明. "
+                "成功读取会为后续 edit 登记该文件的进程内版本依据."
             ),
             parameters={
                 "type": "object",
@@ -60,12 +66,12 @@ class ReadTool:
 
     async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         raw = arguments["path"]
-        path = self._workspace.resolve(raw).resolve()
-        if not path.exists():
-            return self._error(ctx, f"file not found: {path}")
-        if path.is_dir():
-            return self._error(ctx, f"path is a directory: {path}")
-        data = path.read_bytes()
+        try:
+            snapshot = await self._workspace.files.read(raw, ctx.cancel)
+        except FileAccessError as exc:
+            return self._error(ctx, str(exc))
+        data = snapshot.data
+        path = Path(snapshot.canonical_path)
         if b"\x00" in data or any(data.startswith(magic) for magic in _BINARY_MAGIC):
             return self._error(ctx, f"binary content is not readable: {path}")
         try:
@@ -77,7 +83,9 @@ class ReadTool:
         total_lines = len(lines)
         offset = arguments.get("offset", 1)
         limit = min(arguments.get("limit", MAX_LINES), MAX_LINES)
-        if offset > total_lines:
+        # 空文件 offset=1 成功 (start_line=end_line=0); 其余越界仍拒绝
+        start_line = offset if total_lines else 0
+        if offset > max(total_lines, 1):
             return self._error(ctx, f"offset {offset} beyond end of file ({total_lines} lines)")
 
         source = json.dumps(str(path), ensure_ascii=False)
@@ -143,7 +151,7 @@ class ReadTool:
             next_offset = index + 1
 
         end_line = index  # 下一条未读行的 0 基序号即末条已读行的 1 基行号
-        header = f"[file={source} lines={offset}-{end_line} total_lines={total_lines}]"
+        header = f"[file={source} lines={start_line}-{end_line} total_lines={total_lines}]"
         if not truncated:
             footer = _NO_TRUNC_FOOTER
         elif partial_last_line:
@@ -151,6 +159,8 @@ class ReadTool:
         else:
             footer = f"[truncated=true reason={reason} next_offset={next_offset}]"
         content = "\n".join([header, *out_lines, footer])
+        # 成功生成结果才登记版本依据; 此后至返回不再有 await
+        self._workspace.files.remember_read(snapshot)
         return ToolResult(
             call_id=ctx.call_id,
             name="read",
@@ -161,9 +171,10 @@ class ReadTool:
                 "next_offset": next_offset,
                 "truncation_reason": reason,
                 "path": str(path),
-                "start_line": offset,
+                "start_line": start_line,
                 "end_line": end_line,
                 "partial_last_line": partial_last_line,
+                "version_observed": True,
             },
         )
 

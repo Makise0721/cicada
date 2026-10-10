@@ -56,7 +56,14 @@ async def test_outside_root_rejected(tmp_path):
 async def test_edit_after_write_reads_new_content(tmp_path):
     ws, write_tool, edit_tool = make(tmp_path)
     r1 = await run(write_tool, path="a.txt", content="v1\nv2\nv3\n")
-    r2 = await run(edit_tool, path="A.TXT", edits=[{"old_text": "v2", "new_text": "V2"}])
+    # write 不建立版本依据: edit 前仍需 read (大小写别名读取即可)
+    from cicada.plugins.coding.tool_read import ReadTool
+
+    basis = await ReadTool(ws).execute(
+        {"path": "A.TXT"}, ToolContext(call_id="rd", cancel=CancelToken())
+    )
+    assert not basis.is_error
+    r2 = await run(edit_tool, path="a.txt", edits=[{"old_text": "v2", "new_text": "V2"}])
     assert not r1.is_error and not r2.is_error
     assert (ws.root / "a.txt").read_text(encoding="utf-8") == "v1\nV2\nv3\n"
 
@@ -64,11 +71,21 @@ async def test_edit_after_write_reads_new_content(tmp_path):
 async def test_concurrent_write_and_edit_serialized_no_corruption(tmp_path):
     ws, write_tool, edit_tool = make(tmp_path)
     (ws.root / "a.txt").write_text("v1\nv2\nv3\n", encoding="utf-8")
+    from cicada.plugins.coding.tool_read import ReadTool
+
+    basis = await ReadTool(ws).execute(
+        {"path": "a.txt"}, ToolContext(call_id="rd", cancel=CancelToken())
+    )
+    assert not basis.is_error
     results = await asyncio.gather(
         run(write_tool, path="a.txt", content="v1\nv2\nv3\nv4\n"),
         run(edit_tool, path="A.TXT", edits=[{"old_text": "v2", "new_text": "V2"}]),
     )
-    assert all(not r.is_error for r in results), results
+    # 队列串行, 无交错损坏; write 无条件覆盖, edit 若后入队则依据已失效被拒绝
+    write_result, edit_result = results
+    assert not write_result.is_error
+    assert not edit_result.is_error or (
+        edit_result.details["mutation"]["reason"] == "version_conflict"
+    )
     final = (ws.root / "a.txt").read_text(encoding="utf-8")
-    # 队列串行: 终态必为两种合法串行结果之一, 无交错损坏
-    assert final in ("v1\nv2\nv3\nv4\n", "v1\nV2\nv3\nv4\n")
+    assert final == "v1\nv2\nv3\nv4\n"

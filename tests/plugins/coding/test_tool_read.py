@@ -46,6 +46,7 @@ async def test_basic_slice_has_source_header_and_footer(tmp_path):
         "start_line": 1,
         "end_line": 3,
         "partial_last_line": False,
+        "version_observed": True,
     }
     r2 = await run(tool, path="a.txt", offset=2, limit=1)
     # limit=1 只取一行, 其后仍有内容 → lines 截断并给出续读位置
@@ -130,6 +131,27 @@ async def test_absolute_path_outside_root_is_readable(tmp_path):
     assert r.content == expected_content(
         outside, 1, 1, 1, ["1\text"], "[truncated=false next_offset=none]"
     )
+
+
+async def test_empty_file_reads_and_registers_basis(tmp_path):
+    """空文件 offset=1 成功且登记依据; offset>1 仍拒绝 (A01)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "empty.txt"
+    f.write_bytes(b"")
+    r = await run(tool, path="empty.txt")
+    assert not r.is_error
+    assert r.details["total_lines"] == 0
+    assert r.details["start_line"] == 0
+    assert r.details["end_line"] == 0
+    assert r.details["truncated"] is False
+    assert r.details["next_offset"] is None
+    assert r.details["version_observed"] is True
+    assert r.content == expected_content(
+        f, 0, 0, 0, [], "[truncated=false next_offset=none]"
+    )
+    r2 = await run(tool, path="empty.txt", offset=2)
+    assert r2.is_error
+    assert "offset" in r2.content
 
 
 async def test_offset_beyond_eof(tmp_path):
