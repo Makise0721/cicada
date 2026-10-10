@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -520,7 +521,7 @@ async def test_cancel_during_publish_returns_committed_result(tmp_path, monkeypa
     f = ws.root / "a.txt"
     f.write_text("one\ntwo\n", encoding="utf-8")
     await read_basis(ws, "a.txt")
-    entered = asyncio.Event()
+    entered = threading.Event()  # 发布运行在 worker 线程
     real_replace = file_commit_windows._ReplaceFileW
 
     def slow_replace(target, replacement, backup, flags, exclude, reserved):
@@ -536,7 +537,11 @@ async def test_cancel_during_publish_returns_committed_result(tmp_path, monkeypa
             ToolContext(call_id="c1", cancel=token),
         )
     )
-    await asyncio.wait_for(entered.wait(), timeout=5)
+    for _ in range(500):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set()
     task.cancel()
     result = await task  # 不抛 CancelledError: 已取得文件结果
     assert not result.is_error
@@ -575,3 +580,110 @@ async def test_edit_rejects_junction_alias_path(tmp_path):
         assert f.read_text(encoding="utf-8") == "y\n"
     finally:
         alias.rmdir()  # 只删 junction 本身
+
+
+async def test_queued_cancel_returns_not_written_without_worker(tmp_path, monkeypatch):
+    """排队中取消: op 不启动, 返回 not_written 结果而非 CancelledError (A04)."""
+    import cicada.plugins.coding.file_access as file_access_module
+
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    entered = threading.Event()
+    release = threading.Event()  # 发布运行在 worker 线程, 用线程事件
+    real_replace = file_commit_windows._ReplaceFileW
+
+    def held_replace(target, replacement, backup, flags, exclude, reserved):
+        entered.set()
+        release.wait(timeout=5)  # 第一笔持有队列
+        return real_replace(target, replacement, backup, flags, exclude, reserved)
+
+    monkeypatch.setattr(file_commit_windows, "_ReplaceFileW", held_replace)
+    first = asyncio.create_task(
+        tool.execute(
+            {"path": "a.txt", "edits": [{"old_text": "one", "new_text": "1"}]},
+            ToolContext(call_id="c1", cancel=CancelToken()),
+        )
+    )
+    for _ in range(500):  # 等待第一笔进入发布 (线程事件无 async wait)
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set()
+    token2 = CancelToken()
+    second = asyncio.create_task(
+        tool.execute(
+            {"path": "a.txt", "edits": [{"old_text": "one", "new_text": "2"}]},
+            ToolContext(call_id="c2", cancel=token2),
+        )
+    )
+    await asyncio.sleep(0.05)  # 第二笔进入队列等待
+    second.cancel()  # 排队中取消: 不抢占在途第一笔, 自身未启动
+    result = await second
+    assert result.is_error
+    mutation = result.details["mutation"]
+    assert mutation["state"] == "not_written"
+    assert mutation["reason"] == "cancelled_before_commit"
+    assert mutation["caller_cancelled"] is True
+    assert token2.cancelled
+    release.set()
+    first_result = await asyncio.wait_for(first, timeout=5)
+    assert not first_result.is_error
+    assert f.read_text(encoding="utf-8") == "1\n"
+
+
+async def test_publish_error_1176_stays_unknown_with_retained_materials(tmp_path, monkeypatch):
+    """无法证明未提交的原生失败 (1176) 保持 unknown, 材料保留, 依据失效 (A06)."""
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+
+    def failing_replace(target, replacement, backup):
+        raise file_commit_windows.NativePublishError("ReplaceFileW", 1176)
+
+    monkeypatch.setattr(file_commit_windows, "replace_file", failing_replace)
+    r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "x"}])
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "unknown"
+    assert mutation["reason"] == "publish_failed"
+    assert mutation["winerror"] == 1176
+    assert mutation["retained_paths"], "unknown 必须保留材料路径"
+    for path in mutation["retained_paths"]:
+        assert Path(path).exists()
+    assert f.read_text(encoding="utf-8") == "one\n"
+    # 依据已失效: 不重读直接再 edit 仍被 read_required 拒绝
+    r2 = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "x"}])
+    assert r2.is_error
+    assert r2.details["mutation"]["reason"] == "read_required"
+
+
+async def test_committed_current_mismatch_is_error_not_falsely_unwritten(tmp_path, monkeypatch):
+    """提交成功但回读不符: committed+current_matches=false, is_error, 不假报未写 (A06)."""
+    import cicada.plugins.coding.file_access as fa
+
+    ws, tool = make(tmp_path)
+    f = ws.root / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    await read_basis(ws, "a.txt")
+    real_read_all = fa._read_all
+    readback_calls = {"count": 0}
+
+    def tampered_read(path):
+        data = real_read_all(path)
+        if path.name == "a.txt":  # 目标回读: 模拟提交后被外部改写
+            readback_calls["count"] += 1
+            if readback_calls["count"] == 1:
+                return data + b"external\n"
+        return data
+
+    monkeypatch.setattr(fa, "_read_all", tampered_read)
+    r = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "TWO"}])
+    assert r.is_error
+    mutation = r.details["mutation"]
+    assert mutation["state"] == "committed"
+    assert mutation["current_matches"] is False
+    assert "[mutation=committed]" in r.content
+    assert "no longer matches" in r.content
