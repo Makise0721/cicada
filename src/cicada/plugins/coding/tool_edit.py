@@ -77,7 +77,31 @@ class EditTool:
         outcome = await self._workspace.files.mutate(
             arguments["path"], transform, ctx.cancel, mode="edit"
         )
-        return self._render(ctx, outcome, len(edits), captured)
+        try:
+            return self._render(ctx, outcome, len(edits), captured)
+        except Exception as exc:
+            # 结果排版是附属操作: 不能让核心把已经提交的事实泛化成 tool raised。
+            mutation = {
+                "version": 1, "state": outcome.state, "reason": outcome.reason,
+                "canonical_path": outcome.canonical_path,
+                "current_matches": outcome.current_matches,
+                "caller_cancelled": outcome.caller_cancelled, "winerror": outcome.winerror,
+                "retained_paths": list(outcome.retained_paths),
+                "cleanup_warning": outcome.cleanup_warning,
+            }
+            parts = [f"[mutation={outcome.state}] {outcome.canonical_path}; {outcome.reason}",
+                     f"result presentation unavailable: {type(exc).__name__}; re-read the file"]
+            if outcome.cleanup_warning:
+                parts.append(f"cleanup warning: {outcome.cleanup_warning}")
+            if outcome.retained_paths:
+                parts.append("retained materials: " + "; ".join(outcome.retained_paths))
+            content = "\n".join(parts).encode("utf-8")[:MAX_CONTENT_BYTES].decode("utf-8", errors="ignore")
+            return ToolResult(
+                call_id=ctx.call_id, name="edit", content=content,
+                is_error=outcome.state != STATE_COMMITTED or outcome.current_matches is not True
+                         or outcome.reason == "conflict_at_commit",
+                details={"mutation": mutation, "presentation_warning": type(exc).__name__},
+            )
 
     # ---- 纯字节转换 (队列内核对依据后调用; 可预期失败抛 MutationRejected) ----
 
@@ -162,6 +186,8 @@ class EditTool:
 
         if outcome.state != STATE_COMMITTED:
             parts = [f"[mutation={outcome.state}] {outcome.message or outcome.reason}"]
+            if outcome.cleanup_warning:
+                parts.append(f"cleanup warning: {outcome.cleanup_warning}")
             if outcome.retained_paths:
                 parts.append("retained materials: " + "; ".join(outcome.retained_paths))
             if outcome.state == "unknown":
@@ -185,6 +211,8 @@ class EditTool:
             f"[mutation=committed] edit applied: {display}, {count} replacement(s), "
             f"first changed line {first_changed_line}"
         )
+        if outcome.cleanup_warning:
+            header += f"; cleanup warning: {outcome.cleanup_warning}"
         details.update({"diff": diff, "first_changed_line": first_changed_line})
         warning = self._commit_warning(outcome)
         if warning is None:

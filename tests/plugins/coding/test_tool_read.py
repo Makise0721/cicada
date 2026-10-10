@@ -346,3 +346,30 @@ async def test_read_changed_during_read_errors_and_registers_nothing(tmp_path, m
     assert r2.is_error
     assert r2.details["mutation"]["reason"] == "read_required"
     assert f.read_text(encoding="utf-8") == "one\n"
+
+async def test_in_place_change_during_read_registers_nothing(tmp_path, monkeypatch):
+    from cicada.plugins.coding.tool_edit import EditTool
+    ws, tool = make(tmp_path)
+    target = ws.root / "a.txt"
+    target.write_bytes(b"one\n")
+    real_read = os.read
+    changed = False
+
+    def changing_read(fd, size):
+        nonlocal changed
+        data = real_read(fd, size)
+        if not changed:
+            changed = True
+            with target.open("ab") as handle:
+                handle.write(b"two\n")
+        return data
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "read", changing_read)
+        result = await run(tool, path="a.txt")
+    assert result.is_error and "changed while being read" in result.content
+    result = await EditTool(ws).execute(
+        {"path": "a.txt", "edits": [{"old_text": "one", "new_text": "x"}]},
+        ToolContext(call_id="edit", cancel=CancelToken()),
+    )
+    assert result.details["mutation"]["reason"] == "read_required"

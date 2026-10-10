@@ -1287,3 +1287,97 @@ async def test_close_during_request_run_commit_still_saved(tmp_path):
     finally:
         if session.state != "closed":
             await session.aclose()
+
+async def test_file_mutation_clear_and_resume_require_current_process_read(tmp_path):
+    """A08: 历史与新增 mutation JSON 可恢复, 读取资格只属当前 Workspace."""
+    from cicada.core.messages import ToolResultMessage
+    root = _repo(tmp_path)
+    def call(name, arguments):
+        return {"tool_calls": [{"id": name, "name": name, "arguments": arguments}]}
+    session = await open_application(_config(root, _script(
+        call("read", {"path": "sample.py"}), {"text": "read", "stop": True},
+        call("edit", {"path": "sample.py", "edits": [{"old_text": "1", "new_text": "2"}]}),
+        {"text": "edited", "stop": True},
+    ), session_id=None))
+    await session.execute("read")
+    await session.clear_context()
+    result = await session.execute("edit after clear")
+    mutation = next(m.result for m in result.result.messages if isinstance(m, ToolResultMessage))
+    assert mutation.details["mutation"]["state"] == "committed"
+    assert result.persistence.saved
+    sid = session.persistence.session_id
+    await session.aclose()
+
+    resumed = await open_application(_config(root, _script(
+        call("write", {"path": "sample.py", "content": "VALUE = 3\n"}),
+        {"text": "refused", "stop": True},
+        call("read", {"path": "sample.py"}),
+        call("write", {"path": "sample.py", "content": "VALUE = 3\n"}),
+        {"text": "updated", "stop": True},
+    ), session_id=sid))
+    restored = [m.result for m in resumed.history if isinstance(m, ToolResultMessage)]
+    assert restored[-1].details["mutation"] == mutation.details["mutation"]
+    refused = await resumed.execute("write without fresh read")
+    facts = [m.result for m in refused.result.messages if isinstance(m, ToolResultMessage)]
+    assert facts[-1].details["mutation"]["reason"] == "read_required"
+    assert (root / "sample.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    updated = await resumed.execute("read then write")
+    assert updated.persistence.saved
+    assert (root / "sample.py").read_bytes() == b"VALUE = 3\n"
+    await resumed.aclose()
+
+
+async def test_cancelled_native_creation_preserves_application_history_and_saved_fact(tmp_path, monkeypatch):
+    """A09: 发布中 Task.cancel 不能泛化已写结果, 核心不再请求后续模型轮次."""
+    from cicada.plugins.coding import file_commit_windows as native
+    from cicada.core.events import ToolCompleted
+    from cicada.ui.tool_view import ToolDocument
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(
+        {"tool_calls": [{"id": "write", "name": "write",
+                         "arguments": {"path": "created.txt", "content": "created"}}]},
+        {"text": "must not run", "stop": True},
+    ), session_id=None))
+    entered, release = threading.Event(), threading.Event()
+    real_create = native.create_file
+    updates = []
+    session.subscribe(updates.append)
+    document = ToolDocument()
+    session.subscribe(document.apply)
+
+    def blocked_create(*args):
+        entered.set()
+        assert release.wait(10)
+        return real_create(*args)
+
+    monkeypatch.setattr(native, "create_file", blocked_create)
+    task = asyncio.create_task(session.execute("create then cancel"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        assert not task.done()
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(task, 10)
+    assert outcome.result.stop_reason == "aborted" and outcome.persistence.saved
+    assert len(session._app.agent._model.requests) == 1
+    tool_result = next(m.result for m in session.history if isinstance(m, ToolResultMessage))
+    assert tool_result.details["mutation"]["state"] == "committed"
+    assert tool_result.details["mutation"]["caller_cancelled"]
+    forwarded = [u.event.result for u in updates
+                 if isinstance(u, AgentEventReceived) and isinstance(u.event, ToolCompleted)]
+    assert forwarded[-1].details == tool_result.details
+    assert len(document.entries) == 1
+    assert document.entries[0].output_text.startswith("[mutation=committed]")
+    assert document.entries[0].status == "success"
+    sid = session.persistence.session_id
+    workspace = session._app.runtime.capability("coding.workspace")
+    assert all(not lock.locked() for lock in workspace._locks.values())
+    await session.aclose()
+    resumed = await open_application(_config(root, _script(), session_id=sid))
+    restored = next(m.result for m in resumed.history if isinstance(m, ToolResultMessage))
+    assert restored.details == tool_result.details
+    assert resumed.restored_requests[-1].outcome.stop_reason == "aborted"
+    await resumed.aclose()

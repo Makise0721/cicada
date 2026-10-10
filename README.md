@@ -87,4 +87,6 @@ uv run --frozen python -m pytest -q                  # 完整套件
 
 ## 当前范围
 
+文件修改支持 Windows 本地 NTFS 普通文件；已有文件先 `read`，读后变化拒绝覆盖，新建同名冲突不覆盖。恢复会话后须重新读取；工具结果区分未提交、已提交和未知，未知保留暂存材料供核对。
+
 工具顺序执行；普通模式最多 50 轮、检查模式最多 25 轮模型循环。预算估计为启发式（无精确 tokenizer），插件热替换尚未提供；运行时模型选择经 `/model` 菜单（Flash/Pro，保留对话历史与检查状态）。DeepSeek 已完成离线协议/工具/保存恢复检查，真实账号与模型质量未测；含思考的摘要输入以完整引用进入压缩。扩展：新模型实现 `ModelPort`、新工具实现 `Tool`（[src/cicada/core/ports.py](src/cicada/core/ports.py)），经 [PluginDefinition](src/cicada/runtime/plugin.py) 声明依赖后由 [boot.py](src/cicada/boot.py) 装配。

@@ -172,9 +172,13 @@ class FileAccess:
             and (closed.st_dev, closed.st_ino) == identity
             and (after.st_dev, after.st_ino) == identity
         )
+        data = b"".join(chunks)
+        stable = stable and all(
+            (info.st_size, info.st_mtime_ns) == (opened.st_size, opened.st_mtime_ns)
+            for info in (before, closed, after)
+        ) and len(data) == opened.st_size
         if not stable:
             raise FileAccessError(f"file changed while being read: {path}; read it again")
-        data = b"".join(chunks)
         stamp = FileStamp(
             key=str(path).casefold(),
             st_dev=opened.st_dev, st_ino=opened.st_ino,
@@ -223,6 +227,7 @@ class FileAccess:
                     await asyncio.shield(asyncio.gather(watcher, return_exceptions=True))
                     break
                 except asyncio.CancelledError:
+                    on_caller_cancel()
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         current.uncancel()
@@ -405,8 +410,12 @@ class FileAccess:
     ) -> MutationOutcome:
         staged = staging / "new.tmp"
         backup = staging / "old.bak"
+        owned = False
         try:
+            self._check_staging(staging)
             staging.mkdir(parents=True, exist_ok=False)
+            owned = True
+            self._check_staging(staging)
             if os.stat(staging).st_dev != os.stat(target).st_dev:
                 warning = self._cleanup_staging(staging, [staged])
                 return _outcome(
@@ -415,8 +424,10 @@ class FileAccess:
                     cleanup_warning=warning, before_stamp=before,
                 )
             native.write_staged_file(staged, new_bytes)
+        except native.UnsupportedTargetError as exc:
+            return _outcome(STATE_NOT_WRITTEN, "unsupported_target", str(target), str(exc))
         except OSError as exc:
-            warning = self._cleanup_staging(staging, [staged])
+            warning = self._cleanup_staging(staging, [staged]) if owned else None
             return _outcome(
                 STATE_NOT_WRITTEN, "publish_failed", str(target),
                 f"cannot prepare staged file in {staging}: {exc}",
@@ -432,6 +443,7 @@ class FileAccess:
             )
         # 发布前重新核对: 原路径绑定、祖先 reparse、目标身份仍未变化
         try:
+            self._check_staging(staging)
             if native.reparse_ancestor(original) is not None \
                     or Path(os.path.realpath(original)) != target:
                 warning = self._cleanup_staging(staging, [staged])
@@ -582,9 +594,13 @@ class FileAccess:
         staged = staging / "new.tmp"
         # old.bak 是保留名且创建分支从不生成; "无 backup" 是 create_conflict 证据条件之一
         backup = staging / "old.bak"
+        owned = False
         try:
+            self._check_staging(staging)
             target.parent.mkdir(parents=True, exist_ok=True)
             staging.mkdir(parents=True, exist_ok=False)
+            owned = True
+            self._check_staging(staging)
             if os.stat(staging).st_dev != os.stat(target.parent).st_dev:
                 warning = self._cleanup_staging(staging, [staged])
                 return _outcome(
@@ -593,8 +609,10 @@ class FileAccess:
                     cleanup_warning=warning,
                 )
             native.write_staged_file(staged, new_bytes)
+        except native.UnsupportedTargetError as exc:
+            return _outcome(STATE_NOT_WRITTEN, "unsupported_target", str(target), str(exc))
         except OSError as exc:
-            warning = self._cleanup_staging(staging, [staged])
+            warning = self._cleanup_staging(staging, [staged]) if owned else None
             return _outcome(
                 STATE_NOT_WRITTEN, "publish_failed", str(target),
                 f"cannot prepare staged file in {staging}: {exc}",
@@ -609,6 +627,7 @@ class FileAccess:
             )
         # 发布前重新核对原路径绑定与祖先 reparse; 同名竞争交由 MoveFileExW flags=0 裁决
         try:
+            self._check_staging(staging)
             if native.reparse_ancestor(original) is not None \
                     or Path(os.path.realpath(original)) != target:
                 warning = self._cleanup_staging(staging, [staged])
@@ -705,18 +724,39 @@ class FileAccess:
             current_matches=True, cleanup_warning=warning, after_stamp=after_stamp,
         )
 
+    def _check_staging(self, staging: Path) -> None:
+        """只接受程序分配的同卷目录; 路径别名不能成为暂存或清理授权."""
+        assigned_root = self._workspace.root / ".cicada" / "mutations"
+        if staging.parent != assigned_root or len(staging.name) != 32 \
+                or any(c not in "0123456789abcdef" for c in staging.name):
+            raise native.UnsupportedTargetError(f"unassigned staging path: {staging}")
+        if native.reparse_ancestor(staging) is not None \
+                or Path(os.path.realpath(staging)) != staging:
+            raise native.UnsupportedTargetError(f"staging crosses a reparse point: {staging}")
+        ancestor = staging
+        while not ancestor.exists():
+            ancestor = ancestor.parent
+        if ancestor.stat().st_dev != self._workspace.root.stat().st_dev:
+            raise native.UnsupportedTargetError(f"staging is not on the workspace volume: {staging}")
+
     def _cleanup_staging(self, staging: Path, known_files: list[Path]) -> str | None:
         """只删本次记录的确切材料与空 staging 目录; 不递归、不删父目录."""
         warnings: list[str] = []
         for path in known_files:
             try:
+                self._check_staging(staging)
+                if path.parent != staging or path.name not in ("new.tmp", "old.bak") \
+                        or native.reparse_ancestor(path) is not None \
+                        or Path(os.path.realpath(path)) != path:
+                    raise native.UnsupportedTargetError(f"unassigned cleanup path: {path}")
                 if path.exists():
                     path.unlink()
-            except OSError as exc:
+            except (OSError, native.UnsupportedTargetError) as exc:
                 warnings.append(f"{path}: {exc}")
         try:
+            self._check_staging(staging)
             if staging.is_dir() and not any(staging.iterdir()):
                 staging.rmdir()
-        except OSError as exc:
+        except (OSError, native.UnsupportedTargetError) as exc:
             warnings.append(f"{staging}: {exc}")
         return "; ".join(warnings) or None

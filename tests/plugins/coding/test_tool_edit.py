@@ -752,3 +752,75 @@ async def test_locked_target_proves_not_written_with_stat_evidence(tmp_path, mon
     assert f.read_text(encoding="utf-8") == "one\n"
     staging_root = ws.root / ".cicada" / "mutations"
     assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+async def test_staging_junction_cannot_publish_or_cleanup_external_material(tmp_path):
+    from cicada.plugins.coding.tool_write import WriteTool
+    ws, tool = make(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = ws.root / ".cicada" / "mutations"
+    proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(outside)], capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    assigned = alias / ("a" * 32)
+    evidence = outside / ("a" * 32)
+    evidence.mkdir()
+    (evidence / "new.tmp").write_bytes(b"keep")
+    try:
+        result = await run(WriteTool(ws), path="new.txt", content="x")
+        assert result.details["mutation"]["reason"] == "unsupported_target"
+        assert not (ws.root / "new.txt").exists()
+        assert sorted(p.name for p in outside.iterdir()) == ["a" * 32]
+        assert ws.files._cleanup_staging(assigned, [assigned / "new.tmp"])
+        assert (evidence / "new.tmp").read_bytes() == b"keep"
+    finally:
+        alias.rmdir()
+
+
+async def test_diff_failure_and_cleanup_warning_preserve_committed_fact(tmp_path, monkeypatch):
+    ws, tool = make(tmp_path)
+    (ws.root / "a.txt").write_bytes(b"one\n")
+    await read_basis(ws, "a.txt")
+    monkeypatch.setattr(ws.files, "_cleanup_staging", lambda *args: "cleanup denied")
+    result = await run(tool, path="a.txt", edits=[{"old_text": "one", "new_text": "two"}])
+    assert not result.is_error and "cleanup warning: cleanup denied" in result.content
+
+    def fail_diff(*args):
+        raise RuntimeError("presentation failed")
+
+    monkeypatch.setattr(tool, "_diff", fail_diff)
+    result = await run(tool, path="a.txt", edits=[{"old_text": "two", "new_text": "three"}])
+    assert not result.is_error and result.details["mutation"]["state"] == "committed"
+    assert result.content.startswith("[mutation=committed]")
+    assert "presentation unavailable" in result.content and "cleanup denied" in result.content
+    assert (ws.root / "a.txt").read_bytes() == b"three\n"
+
+
+async def test_cancel_during_watcher_cleanup_sets_token_and_preserves_result(tmp_path, monkeypatch):
+    from cicada.plugins.coding.tool_write import WriteTool
+    ws, _ = make(tmp_path)
+    token = CancelToken()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_watcher(cancel, on_cancelled):
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(ws.files, "_watch_cancel_token", slow_watcher)
+    task = asyncio.create_task(WriteTool(ws).execute(
+        {"path": "new.txt", "content": "x"}, ToolContext(call_id="write", cancel=token),
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    result = await asyncio.wait_for(task, 5)
+    assert token.cancelled and result.details["mutation"]["caller_cancelled"]
+    assert result.details["mutation"]["state"] == "committed"
+    assert (ws.root / "new.txt").read_bytes() == b"x"

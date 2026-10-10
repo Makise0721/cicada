@@ -84,6 +84,8 @@ class WriteTool:
 
         if outcome.state != STATE_COMMITTED:
             parts = [f"[mutation={outcome.state}] {outcome.message or outcome.reason}"]
+            if outcome.cleanup_warning:
+                parts.append(f"cleanup warning: {outcome.cleanup_warning}")
             if outcome.retained_paths:
                 parts.append("retained materials: " + "; ".join(outcome.retained_paths))
             if outcome.state == "unknown":

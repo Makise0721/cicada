@@ -701,3 +701,58 @@ async def test_subscribe_observer_errors_recorded_not_fatal(tmp_path):
     assert outcome.exit_code == 0
     assert any(isinstance(e, RuntimeError) for e in session.observer_errors)
     await session.aclose()
+
+@pytest.mark.parametrize("cross_deadline", [False, True])
+async def test_active_close_owns_native_file_worker_until_actual_finish(tmp_path, monkeypatch, cross_deadline):
+    """文件发布跨关闭监督时直接核对 worker/锁, 不把 close 当成 completion 保存."""
+    import threading
+    import cicada.application as app_module
+    from cicada.core.messages import ToolResultMessage
+    from cicada.plugins.coding import file_commit_windows as native
+    from cicada.plugins.coding.tool_read import ReadTool
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, script=_script(
+        {"tool_calls": [{"id": "write", "name": "write",
+                         "arguments": {"path": "created.txt", "content": "created"}}]},
+        {"text": "must not run", "stop": True},
+    )))
+    workspace = session._app.runtime.capability("coding.workspace")
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    real_create = native.create_file
+    def blocked_create(*args):
+        entered.set()
+        assert release.wait(10)
+        try:
+            return real_create(*args)
+        finally:
+            finished.set()
+    monkeypatch.setattr(native, "create_file", blocked_create)
+    if cross_deadline:
+        monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.05)
+    task = asyncio.create_task(session.execute("active close"))
+    close_task = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        close_task = asyncio.create_task(session.aclose())
+        if cross_deadline:
+            await asyncio.wait_for(close_task, 5)
+            assert session._close_problems and session.state == "closed"
+            assert not finished.is_set() and not task.done()
+            assert any(lock.locked() for lock in workspace._locks.values())
+        else:
+            await asyncio.sleep(0)
+            assert not close_task.done()
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(task, 10)
+    await asyncio.wait_for(close_task, 5)
+    assert finished.is_set() and all(not lock.locked() for lock in workspace._locks.values())
+    assert outcome.result.stop_reason == "aborted" and len(session._app.agent._model.requests) == 1
+    tool_results = [m.result for m in outcome.result.messages if isinstance(m, ToolResultMessage)]
+    assert len(tool_results) == 1 and tool_results[0].call_id == "write"
+    assert tool_results[0].details["mutation"]["state"] == "committed"
+    assert tool_results[0].details["mutation"]["caller_cancelled"]
+    assert session.state == "closed"
+    result = await ReadTool(workspace).execute(
+        {"path": "created.txt"}, ToolContext(call_id="after", cancel=CancelToken()))
+    assert not result.is_error and "created" in result.content

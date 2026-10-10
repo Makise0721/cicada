@@ -177,6 +177,8 @@ async def test_creation_path_change_rejected(tmp_path, monkeypatch):
 
     def flip_after_target_checks(path):
         # 放行创建支持性核对 (original+canonical 两次), 只在发布前重核对时触发
+        if path != ws.root / "p.txt":
+            return None
         calls["n"] += 1
         return None if calls["n"] <= 2 else f"{path}\\junction"
 

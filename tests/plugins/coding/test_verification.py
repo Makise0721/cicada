@@ -828,3 +828,34 @@ async def test_verification_plugin_runs_a_real_check_through_bootstrap(repo):
     assert "check" in {tool.spec.name for tool in (app.agent._tools).values()}
     assert (await app.agent.run("run the required check")).stop_reason == "stop"
     await app.aclose()
+
+async def test_file_mutations_use_actual_snapshot_without_granting_receipt_authority(repo, monkeypatch):
+    from cicada.core.ports import ToolContext
+    from cicada.plugins.coding.tool_read import ReadTool
+    from cicada.plugins.coding.tool_write import WriteTool
+    from cicada.plugins.coding import file_commit_windows as native
+    workspace, verifier = build(repo, CheckDefinition("check-1", "exit 0"))
+    await verifier.initialize(CancelToken())
+    receipt = await verifier.run_check("check-1", CancelToken())
+    before = await verifier.refresh(CancelToken())
+    assert before.checks[0].freshness == "current"
+    ctx = ToolContext(call_id="write", cancel=CancelToken())
+    refused = await WriteTool(workspace).execute({"path": "sample.py", "content": "changed"}, ctx)
+    assert refused.details["mutation"]["reason"] == "read_required"
+    assert (await verifier.refresh(CancelToken())).snapshot_ref == before.snapshot_ref
+    read = await ReadTool(workspace).execute({"path": "sample.py"}, ctx)
+    assert not read.is_error
+    committed = await WriteTool(workspace).execute({"path": "sample.py", "content": "changed"}, ctx)
+    assert committed.details["mutation"]["state"] == "committed"
+    after = await verifier.refresh(CancelToken())
+    assert after.snapshot_ref != before.snapshot_ref and after.checks[0].freshness == "stale"
+    assert after.receipts == (receipt,) and not after.process_uncertain
+    def unknown_create(*args):
+        raise native.NativePublishError("injected creation failure", 5)
+    monkeypatch.setattr(native, "create_file", unknown_create)
+    unknown = await WriteTool(workspace).execute({"path": "unknown.txt", "content": "unknown"}, ctx)
+    assert unknown.details["mutation"]["state"] == "unknown"
+    assert unknown.details["mutation"]["retained_paths"]
+    retained = await verifier.refresh(CancelToken())
+    assert retained.snapshot_ref == after.snapshot_ref and retained.receipts == (receipt,)
+    assert not retained.process_uncertain and retained.checks[0].freshness == "stale"
