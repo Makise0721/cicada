@@ -36,6 +36,7 @@ TARGET_REASONING = "reasoning"  # ("reasoning", run_id, turn_index)
 TARGET_SKILL = "skill"      # ("skill", display_id)
 TARGET_ENTRY = "entry"      # ("entry", display_id) — 无动作条目的锚点身份
 TARGET_LATEST = "latest"    # ("latest",) — 「有更新 · 最新」
+TARGET_EFFORT = "effort"    # ("effort",) — 底栏思考强度标记 (03; 徽标点击)
 TARGET_ASSISTANT = "assistant"  # ("assistant", run_id, turn_index)
 
 
@@ -490,6 +491,7 @@ __all__ = [
     "TARGET_ENTRY",
     "TARGET_GROUP",
     "TARGET_LATEST",
+    "TARGET_EFFORT",
     "TARGET_REASONING",
     "TARGET_SKILL",
     "TARGET_TOOL",

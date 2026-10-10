@@ -76,6 +76,29 @@ class ModelBinding:
     validate_request: Callable[[ModelRequest], None]
 
 
+@dataclass(frozen=True)
+class ReasoningEffortState:
+    """当前会话思考强度的已生效状态 (C5); current=None 表示思考关闭."""
+
+    levels: tuple[str, ...]          # 支持档位; 空元组 = 无该能力
+    current: str | None              # 实际生效档位; None = 关闭
+    enabled: bool                    # False = provider 不支持强度切换
+
+
+@runtime_checkable
+class ReasoningEffortPort(Protocol):
+    """可选思考强度能力 (03, C5): 从最新 binding 的普通模型取得, 不保留过期 provider.
+
+    prepare 纯本地: 复用模型/端点/客户端/凭据与其他普通参数, 不发网络、
+    不读写用户配置; 摘要模型始终禁用思考。
+    """
+
+    @property
+    def reasoning_efforts(self) -> tuple[str, ...]: ...
+
+    def prepare_reasoning_effort(self, effort: str) -> ModelBinding: ...
+
+
 @runtime_checkable
 class ModelSelectionPort(Protocol):
     @property

@@ -48,6 +48,12 @@
   execute_display_action 执行组/工具/思考/Skill 的 toggle 与工具分页动作
   (F6 键盘与 02 鼠标共用入口), Ctrl+O 统一工具组与 Skill 开合, 逐项动作
   只覆盖当前条目。
+- tui-compact-interaction 票据 03 (契约 C5/C6): Shift+Tab 与点击底栏徽标
+  共用 handle_shift_tab 同步准入入口——屏障内静默, 阻断态短路, 目标只由
+  UI 计算 (关闭→第一档/循环/同值 no-op), 受理同步置 model 屏障后建任务;
+  ReasoningEffortChanged 投影确认条目, 失败有界成条; 底栏徽标事实经
+  FooterComponent effort 回调读取 session.reasoning_effort, 事务目标只作
+  pending 展示, 不伪造已生效。
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ from cicada.application import (
     ModelChanged,
     LoginCompleted,
     OperationBusy,
+    ReasoningEffortChanged,
     RequestCompleted,
     RequestPhaseChanged,
 )
@@ -104,9 +111,11 @@ from cicada.user_config import LoginSubmission, UserConfigError
 from cicada.ui.restore_view import project_restored_history
 from cicada.ui.theme import FooterComponent
 from cicada.ui.document_layout import (
+    ACTION_EFFORT_CYCLE,
     ACTION_MORE,
     ACTION_RESET,
     ACTION_TOGGLE,
+    TARGET_EFFORT,
     TARGET_GROUP,
     TARGET_REASONING,
     TARGET_SKILL,
@@ -162,6 +171,9 @@ class ConversationView:
         self._compact_task: asyncio.Task | None = None
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
+        # 票据 03: 思考强度等待任务的强引用与事务目标 (底栏 pending 展示事实)
+        self._effort_task: asyncio.Task | None = None
+        self._effort_pending: str | None = None
         self.model_menu = ModelMenu()
         self.login_modal = LoginModal(self._cancel_login, self._submit_login,
                                       display_style=self.display_style)
@@ -206,6 +218,7 @@ class ConversationView:
             session.config.model_label,
             self.transcript.metrics_fact,
             budget=lambda: self._session.budget,
+            effort=self._effort_badge_facts,
             display_style=self.display_style,
         )
 
@@ -301,6 +314,15 @@ class ConversationView:
                       if update.identity.think else 'off')
             self.transcript.append_system(
                 f"已应用登录配置：{update.identity.model} · 思考={effort}"
+                "（仅影响后继请求；对话、摘要与验证状态保留）。"
+            )
+        elif isinstance(update, ReasoningEffortChanged):
+            # 票据 03 (C5/D9): 只表达强度变化, 不解释为登录或模型名称变化;
+            # previous/current 均为已生效状态, pending 事实随之清除
+            self._effort_pending = None
+            self.transcript.append_system(
+                f"思考强度：{self._effort_label(update.previous.current)} → "
+                f"{self._effort_label(update.current.current)}"
                 "（仅影响后继请求；对话、摘要与验证状态保留）。"
             )
         elif isinstance(update, ContextCompacted):
@@ -440,6 +462,9 @@ class ConversationView:
             handled = self.transcript.toggle_reasoning_item(target[1], target[2])
         elif kind == ACTION_TOGGLE and target[:1] == (TARGET_SKILL,) and len(target) == 2:
             handled = self.transcript.toggle_skill(target[1])
+        elif kind == ACTION_EFFORT_CYCLE and target == (TARGET_EFFORT,):
+            self.handle_shift_tab()  # 徽标点击与 Shift+Tab 共用同一同步准入入口 (C6)
+            handled = True
         if handled and self._on_update is not None:
             self._on_update()
         return handled
@@ -478,6 +503,8 @@ class ConversationView:
             return "正在清空…"
         if self._gate.compacting:
             return "正在压缩…"
+        if self._effort_pending is not None and self._gate.model_selecting:
+            return "正在切换思考强度…"  # 票据 03: 真实忙碌状态, 不提前宣称新值已生效
         if self._gate.model_selecting:
             return "正在切换模型…"
         if self._session.state == "cancelling":
@@ -580,6 +607,84 @@ class ConversationView:
         """
         self.transcript.toggle_reasoning()
 
+    def handle_shift_tab(self) -> None:
+        """Shift+Tab / 点击底栏徽标 (票据 03, C6): 同步准入后循环思考强度.
+
+        忙碌/收尾/模态/菜单/屏障内静默 (is_enter_barrier, 不排队); view-only/
+        storage_failed/process_uncertain 同步短路并短提示, 不建任务; 不支持的
+        模型一次短提示且原值不动。目标只由本层计算 (关闭→第一档, 已启用循环,
+        同值 no-op); 受理前同步置 model 屏障 (先于任务创建), 连续输入不并发;
+        准备/提交/再次校验归应用事务, 失败保留旧值。
+        """
+        if is_enter_barrier(self._session, self._gate):
+            return
+        persistence = self._session.persistence
+        if (
+            self._session.view_only_reason is not None
+            or self._session.has_process_uncertain()
+            or (persistence is not None and persistence.storage_failed is not None)
+        ):
+            self.transcript.append_system("会话状态不允许切换思考强度。")
+        else:
+            state = self._session.reasoning_effort
+            target = self._next_effort_target(state) if state.enabled else None
+            if state.enabled and target is not None and target != state.current:
+                self._gate.note_model_started()
+                self._effort_pending = target
+                self._sync_spinner()
+                self._effort_task = asyncio.get_running_loop().create_task(
+                    self._run_effort_cycle(target)
+                )
+            elif not state.enabled:
+                self.transcript.append_system("当前模型不支持思考强度切换。")
+        if self._on_update is not None:
+            self._on_update()
+
+    @staticmethod
+    def _next_effort_target(state) -> str | None:
+        """UI 仅计算目标 (C5): 关闭→第一档; 已启用按 levels 顺序循环。"""
+        if not state.levels:
+            return None
+        if state.current is None or state.current not in state.levels:
+            return state.levels[0]
+        return state.levels[(state.levels.index(state.current) + 1) % len(state.levels)]
+
+    @staticmethod
+    def _effort_label(current: str | None) -> str:
+        return "关闭" if current is None else current
+
+    def _effort_badge_facts(self) -> tuple[str | None, str | None] | None:
+        """底栏思考强度徽标事实 (C6): (生效档位|None=关闭, 事务目标); 不支持 None.
+
+        pending 只是展示事实, 底栏文案仍以生效档位开头, 不伪造已生效。
+        """
+        state = self._session.reasoning_effort
+        if not state.enabled:
+            return None
+        return (state.current, self._effort_pending)
+
+    async def _run_effort_cycle(self, target: str) -> None:
+        """等待思考强度事务落定 (03); 成功确认由 ReasoningEffortChanged 投影追加.
+
+        落定 (成功/失败/取消) 都释放屏障并清 pending; 失败显示有界原因
+        (ModelSelectionError 不含凭据/请求历史), 取消如实传播。
+        """
+        try:
+            await self._session.set_reasoning_effort(target)
+        except Exception as exc:
+            self._gate.note_model_settled()
+            self._effort_pending = None
+            self.transcript.append_error(f"思考强度切换失败: {exc}")
+            if self._on_update is not None:
+                self._on_update()
+            return
+        except BaseException:
+            self._gate.note_model_settled()
+            self._effort_pending = None
+            raise
+        self._gate.note_model_settled()
+        self._effort_pending = None
+
     def handle_exit(self) -> None:
         """退出回调 (Ctrl+D 与 /exit 共用): 仅 idle 且无 reservation 时执行。"""
         if is_enter_barrier(self._session, self._gate):
@@ -603,6 +708,7 @@ class ConversationView:
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
                 ("快捷键", [
                     "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
+                    "Shift+Tab 或点击底栏思考标记：循环 low/high/max（关闭时先启用 low）",
                     "F6 文档回看：Up/Down 选择 · Enter 展开/分页 · Esc 返回"
                     "（PageUp/PageDown/Home/End 翻看）",
                 ]),
@@ -1069,6 +1175,8 @@ def build(
         "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
         "model_menu": view.model_menu,  # DeepSeek 04: /model 目录 (契约 C7)
         "on_model_confirm": view.confirm_model_selection,
+        "on_shift_tab": view.handle_shift_tab,  # 票据 03: 思考强度循环 (C6)
+        "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
         "modal": view.login_modal,
     }
 

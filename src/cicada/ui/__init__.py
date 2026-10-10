@@ -105,6 +105,8 @@ async def run_tui_session(
         on_ctrl_t=_toggle_reasoning,
         on_exit=view.handle_exit,
         footer_lines=view.footer.render,
+        footer_badge_spans=lambda: view.footer.badge_spans,  # 票据 03: 徽标命中列
+        on_shift_tab=view.handle_shift_tab,  # 票据 03: 思考强度循环 (C6)
         command_menu=SlashCommandMenu(),
         status_lines=view.status_lines,
         model_menu=view.model_menu,

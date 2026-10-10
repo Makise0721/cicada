@@ -60,7 +60,7 @@ from cicada.core.messages import (
 from cicada.core.ports import ModelRequest, ToolSpec
 from cicada.models import (
     ConfigurationRequest, ModelBinding, ModelConfigurationPort, ModelOption, ModelRoute,
-    ModelSelectionPort, SafeModelIdentity,
+    ModelSelectionPort, ReasoningEffortPort, ReasoningEffortState, SafeModelIdentity,
 )
 from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
@@ -340,6 +340,19 @@ class ConfigurationChanged:
     epoch_id: str | None
 
 
+@dataclass(frozen=True)
+class ReasoningEffortChanged:
+    """思考强度切换已生效 (03, C5); previous/current 为已生效状态, 非请求目标.
+
+    只表达强度变化: 不触发登录收尾 (ConfigurationChanged 保留), 不宣称模型
+    名称变化 (ModelChanged 保留), 也不向 history 添加 UserMessage。
+    """
+
+    previous: ReasoningEffortState
+    current: ReasoningEffortState
+    epoch_id: str | None
+
+
 class ModelSelectionError(RuntimeError):
     """本地模型选择被拒绝; 有界原因, 无请求历史或凭据."""
 
@@ -370,7 +383,7 @@ class ApplicationClosed:
 ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
-    | LoginCompleted | ApplicationClosed
+    | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
 )
 
 
@@ -706,15 +719,39 @@ class ApplicationSession:
     def model_options(self) -> tuple[ModelOption, ...]:
         return self._model_selection.options if self._model_selection is not None else ()
 
-    async def select_model(self, option_id: str) -> None:
+    def _reasoning_capability(self) -> ReasoningEffortPort | None:
+        """最新 binding 的普通模型强度能力 (C5); 每次从当前路由取, 不缓存过期 provider。"""
+        route = self._model_route
+        model = route.binding.model if route is not None else None
+        return model if isinstance(model, ReasoningEffortPort) else None
+
+    @property
+    def reasoning_effort(self) -> ReasoningEffortState:
+        """当前思考强度状态 (03, C5): 只读, current 从实际安全身份取值。
+
+        think 关闭 (或身份无档位) 为 None; 无能力 provider 为 enabled=False,
+        不以 UI 猜测。
+        """
+        capability = self._reasoning_capability()
+        if capability is None or self._model_route is None:
+            return ReasoningEffortState((), None, enabled=False)
+        identity = self._model_route.binding.identity
+        current = dict(identity.options).get("reasoning_effort") if identity.think is True else None
+        return ReasoningEffortState(tuple(capability.reasoning_efforts), current, enabled=True)
+
+    def _check_model_transaction_admission(self, blocked: str) -> None:
+        """select_model 与 set_reasoning_effort 共用的独占事务准入 (C6)."""
         if self._login_in_flight:
             raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
-            raise ModelSelectionError("model selection requires an idle, open session")
+            raise ModelSelectionError(f"{blocked} requires an idle, open session")
         if self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
             raise ModelSelectionError("another operation is in progress")
         if self._view_only_reason or self._storage_failed or self._process_uncertain:
-            raise ModelSelectionError("model selection is blocked by the session state")
+            raise ModelSelectionError(f"{blocked} is blocked by the session state")
+
+    async def select_model(self, option_id: str) -> None:
+        self._check_model_transaction_admission("model selection")
         if self._model_selection is None or self._model_route is None:
             raise ModelSelectionError("model selection is unavailable for this provider")
         if option_id not in {option.id for option in self.model_options}:
@@ -783,6 +820,109 @@ class ApplicationSession:
             self._model_in_flight = False
             if self._model_done is not None and not self._model_done.done():
                 self._model_done.set_result(None)
+
+    async def set_reasoning_effort(self, level: str) -> None:
+        """思考强度切换事务 (03, C5/C6): 与 select_model 同型的独占模型事务.
+
+        准入一致; 从最新 binding 准备 (普通参数/客户端/凭据保留, 摘要禁用思考),
+        用当前历史投影/工具/system prompt 复核请求资格; 有持久配置先经现有
+        submit_model_change 提交, 完成后一次同步发布新 binding/epoch/事件。
+        准备/提交失败保留旧值; 接受后取消等待真实事务结果, 提交成功仍发布。
+        """
+        self._check_model_transaction_admission("reasoning effort selection")
+        capability = self._reasoning_capability()
+        if capability is None or self._model_route is None:
+            raise ModelSelectionError("reasoning effort is unavailable for this provider")
+        efforts = capability.reasoning_efforts
+        if not isinstance(level, str) or level not in efforts:
+            raise ModelSelectionError("unknown reasoning effort level")
+        previous = self.reasoning_effort
+        if previous.current == level:
+            return  # 同值已启用 no-op: 不置忙碌、不建任务、不发事件
+        self._model_in_flight = True
+        self._model_done = asyncio.get_running_loop().create_future()
+        try:
+            try:
+                binding = capability.prepare_reasoning_effort(level)
+                binding.validate_request(ModelRequest(
+                    messages=self._context_projection.project(self._history),
+                    tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
+                ))
+            except ValueError as exc:
+                raise ModelSelectionError(
+                    "reasoning effort change rejected by configuration or history") from exc
+            persistence = self._config.persistence
+            identity = None
+            if persistence is not None:
+                safe = binding.identity
+                sources = {**persistence.identity.sources, "reasoning_effort": "selection"}
+                if previous.current is None:
+                    # think 由关闭转启用: 身份来源对 think 同样标 selection (C6)
+                    sources["think"] = "selection"
+                identity = replace(persistence.identity, provider=safe.provider, model=safe.model,
+                    base_url=safe.base_url, think=safe.think, options=dict(safe.options),
+                    max_request_bytes=safe.max_request_bytes, sources=sources)
+                persistence = replace(persistence, identity=identity)
+            new_config = replace(self._config, model_label=binding.identity.model,
+                                 budget=binding.budget, persistence=persistence)
+            self._notify(OperationBusy(operation="model"))
+            if self._store is None:
+                if self._closing or self._closed:
+                    raise ModelSelectionError(
+                        "application is closing; reasoning effort change was not accepted")
+                await self._finish_reasoning_effort_change(binding, new_config, None, previous)
+                return
+            # 接受前唯一取消点; close 封口后不能把新事务排进队列。
+            await asyncio.sleep(0)
+            if self._closing or self._closed:
+                raise ModelSelectionError(
+                    "application is closing; reasoning effort change was not accepted")
+            snapshot = self._store.recovery_snapshot()
+            assert identity is not None and snapshot.identity is not None
+            try:
+                submission = self._store.submit_model_change(
+                    StoredIdentity(identity, snapshot.identity.tool_fingerprint),
+                    expected_epoch_id=self._epoch_id or "",
+                )
+            except PersistenceError as exc:
+                if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                    self._latch_storage_failed(str(exc))
+                raise ModelSelectionError(
+                    "reasoning effort change was not accepted by storage") from exc
+            # 强引用覆盖事务和内存发布; close 等待同一完整生产者 (与 select_model 同规则)。
+            self._model_task = asyncio.create_task(
+                self._finish_reasoning_effort_change(binding, new_config, submission, previous)
+            )
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(self._model_task)
+                    break
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError()
+        finally:
+            self._model_in_flight = False
+            if self._model_done is not None and not self._model_done.done():
+                self._model_done.set_result(None)
+
+    async def _finish_reasoning_effort_change(
+        self, binding: ModelBinding, config: ApplicationConfig,
+        submission: ModelChangeSubmission | None, previous: ReasoningEffortState,
+    ) -> None:
+        epoch_id = self._epoch_id
+        if submission is not None:
+            try:
+                epoch_id = await submission.wait()
+            except PersistenceError as exc:
+                # 已接受提交的真实存储失败: 保留旧绑定并沿原 storage_failed 锁存
+                self._latch_storage_failed(str(exc))
+                raise ModelSelectionError(
+                    "reasoning effort change failed to persist; previous effort is unchanged"
+                ) from exc
+        self._publish_binding(binding, config, epoch_id)
+        self._notify(ReasoningEffortChanged(previous, self.reasoning_effort, epoch_id))
 
     async def _finish_model_change(
         self, binding: ModelBinding, config: ApplicationConfig,

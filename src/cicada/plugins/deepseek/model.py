@@ -11,7 +11,9 @@ from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelRequest, StreamDone, StreamEvent
 from cicada.models import ConfigurationRequest, ModelBinding, ModelOption
-from cicada.plugins.deepseek.protocol import BASE_URL, MODEL_IDS, REQUEST_LIMIT, DeepSeekConfig, build_request
+from cicada.plugins.deepseek.protocol import (
+    BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request,
+)
 from cicada.plugins.deepseek.sse import Completion, ProtocolError, SSEDecoder
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=60, write=30, pool=10)
@@ -83,6 +85,21 @@ class DeepSeekModel:
 
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
+        return DeepSeekModel(self.client, config, self._api_key).initial_binding
+
+    @property
+    def reasoning_efforts(self) -> tuple[str, ...]:
+        return REASONING_EFFORTS
+
+    def prepare_reasoning_effort(self, effort: str) -> ModelBinding:
+        """思考强度准备 (03, C5): 纯本地, 复用 client/凭据与普通参数.
+
+        普通模型显式 think=true 并设置档位; initial_binding 的摘要通道保持
+        think=false (摘要思考禁用)。不合法档位按 ValueError 拒绝, 零网络。
+        """
+        if effort not in REASONING_EFFORTS:
+            raise ValueError(f"unknown reasoning effort: {effort!r}")
+        config = replace(self.config, think=True, reasoning_effort=effort)
         return DeepSeekModel(self.client, config, self._api_key).initial_binding
 
     def prepare_configuration(self, request: ConfigurationRequest) -> ModelBinding:

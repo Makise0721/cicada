@@ -319,6 +319,10 @@ class FooterComponent:
     budget 回调 (契约 C5) 返回应用只读预算快照, 每次 render 至多读取一次;
     行 2 以最近预算为先, 完整累计放得下才追加。低高度 (rows < 12) 单行以
     预算为先, 模型名仅在预算段完整保留时加入, 累计与工作区让位 (规格 D6)。
+    effort 回调 (03, C6) 返回 (生效档位|None=关闭, 事务目标档位) 或 None=
+    不支持; None 时不绘制徽标。徽标挂在模型右段 (「模型 · 思考 low」),
+    放不下先缩写 (R:low/R:off, 只留当前值) 再整体省略; 事务目标不伪造已
+    生效, 缩写不含目标。实际渲染的徽标列区间记入 badge_spans 供帧命中。
     未注入 budget 的独立旧调用者保持原 两行/单行计量 行为。
     """
 
@@ -329,6 +333,7 @@ class FooterComponent:
         metrics: Callable[[], tuple[int | None, bool, int | None, bool]],
         *,
         budget: Callable[[], BudgetSnapshot | None] | None = None,
+        effort: Callable[[], tuple[str | None, str | None] | None] | None = None,
         display_style: DisplayStyle | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else current_style()
@@ -336,6 +341,8 @@ class FooterComponent:
         self._model_label = model_label
         self._metrics = metrics
         self._budget = budget
+        self._effort = effort
+        self.badge_spans: tuple[tuple[int, int, int], ...] = ()
 
     def set_model_label(self, label: str | None) -> None:
         """模型选择发布后更新底栏为有效配置 (DeepSeek 04/契约 C7); 启动诊断不受影响。"""
@@ -365,6 +372,33 @@ class FooterComponent:
                 return level
         return truncate_to_width(levels[-1], width)
 
+    def _right_segment(self, model: str, available: int) -> tuple[str, int, int] | None:
+        """模型 + 思考强度徽标右段 (C6); 返回 (文本, 徽标起列偏移, 徽标列宽)。
+
+        完整徽标放不下先缩写, 再省略徽标只留模型; 返回的偏移/列宽只在文本
+        完整保留时有效 (调用方在右段被截断时不得生成命中)。
+        """
+        right = model
+        offset = -1
+        badge_width = 0
+        facts = self._effort() if self._effort is not None else None
+        if facts is not None:
+            current, pending = facts
+            full = "思考关闭" if current is None else f"思考 {current}"
+            if pending is not None:
+                full = f"{full} → {pending}"  # 旧值仍为当前值, 不伪造已生效 (C6)
+            short = "R:off" if current is None else f"R:{current}"
+            for badge in (full, short):
+                candidate = f"{model} · {badge}"
+                if visible_width(candidate) + 2 <= available:
+                    offset = visible_width(model) + 3
+                    badge_width = visible_width(badge)
+                    right = candidate
+                    break
+        if offset < 0 and visible_width(right) + 2 > available:
+            return None  # 模型段自身放不下: 右段整体让位
+        return (right, offset, badge_width)
+
     def render(self, width: int, rows: int) -> list[str]:
         with self.display_style.use():
             return self._render(width, rows)
@@ -372,24 +406,33 @@ class FooterComponent:
     def _render(self, width: int, rows: int) -> list[str]:
         dim = FOOTER_DIM
         model = self._model_label or "不可得"
+        self.badge_spans = ()  # 命中列只属于本次渲染; 每帧重算 (D5 同源)
         if self._budget is None:
             # 未注入预算回调的旧调用者: 原底栏行为 (契约 C5 兼容)
             stats_left = self._stats_left()
             if rows < 12:
-                # 低高度: 单行 计量左 + 模型右, 工作区行让位
                 return [fg(dim, _line_with_right(stats_left, model, width))]
-            # 模型是当前状态事实: 右端优先保留, 工作区路径按剩余宽度截断
             first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
             return [fg(dim, first), fg(dim, truncate_to_width(stats_left, width, "..."))]
         snapshot = self._budget()  # 契约 C5: 每 render 至多读取一次
         budget_seg = self._budget_segment(snapshot, width)
         if rows < 12:
-            # 低高度单行: 预算段完整保留优先, 模型放得下才右对齐加入 (D6)
-            if visible_width(budget_seg) + 2 + visible_width(model) <= width:
-                return [fg(dim, _line_with_right(budget_seg, model, width))]
+            # 低高度单行: 预算段完整保留优先, 模型/徽标放得下才右对齐加入 (D6);
+            # available 不含间隔列——_right_segment 内部自带 min_padding 2 (与
+            # 基线 budget+2+model<=width 同口径, 审查 03-F1)
+            right = self._right_segment(model, width - visible_width(budget_seg))
+            if right is not None:
+                text, offset, badge_width = right
+                self._record_badge(0, text, offset, badge_width, width)
+                return [fg(dim, _line_with_right(budget_seg, text, width))]
             return [fg(dim, truncate_to_width(budget_seg, width))]
         # 行 1 维持工作区/模型; 行 2 预算为先, 完整累计放得下才追加 (D6)
-        first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
+        right = self._right_segment(model, width)
+        if right is None:
+            right = (model, -1, 0)
+        text, offset, badge_width = right
+        first = _line_with_right(format_workspace(self._workspace), text, width, keep_right=True)
+        self._record_badge(0, text, offset, badge_width, width)
         second = budget_seg
         stats_left = self._stats_left()
         if stats_left:
@@ -397,6 +440,18 @@ class FooterComponent:
             if visible_width(combined) <= width:
                 second = combined
         return [fg(dim, first), fg(dim, second)]
+
+    def _record_badge(
+        self, row: int, text: str, offset: int, badge_width: int, width: int
+    ) -> None:
+        """右段完整保留时记录徽标列区间 (C6); 被裁掉的徽标无 hit。"""
+        if offset < 0 or badge_width <= 0:
+            return
+        text_width = visible_width(text)
+        if text_width + 2 > width:
+            return  # keep_right 分支未走 (右段被截断): 无命中
+        start = width - text_width + offset
+        self.badge_spans = ((row, start, start + badge_width),)
 
 
 def _line_with_right(left: str, right: str, width: int, *, keep_right: bool = False) -> str:

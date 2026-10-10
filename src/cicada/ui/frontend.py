@@ -26,6 +26,11 @@ Copyright (c) 2025 Mario Zechner) 的 requestRender 合并 (16ms 最小间隔,
   后本批后续 pointer 丢弃直至新帧成功。滚轮每 notch 移动 3 物理行, 小
   delta 累积, 回看脱离跟随、到底恢复; 鼠标启用失败经 on_mouse_unavailable
   给一次键盘回退提示, 双击第二按与未知输入安全消费。
+- tui-compact-interaction 票据 03 (契约 C5/C6): Shift+Tab (Keys.BackTab) 交
+  on_shift_tab 思考强度循环 (模态接管; 菜单/模型菜单活跃时归控件, 不透传,
+  不改焦点或草稿); 底栏徽标的实际呈现列区间由 FooterComponent 经
+  footer_badge_spans 提供并并入同一帧命中图, 点击徽标走 on_display_action
+  的 effort_cycle, 与键盘共用同一同步准入入口。
 
 故障矩阵 (P10): 渲染写失败先记录 ui_failures 并尝试恢复终端一次, 再失败
 则置 terminal_failed 并请求退出; 尺寸读取失败沿用上次良好值; 输入读取
@@ -42,7 +47,9 @@ from prompt_toolkit.keys import Keys
 from cicada.ui.commands import SlashCommandMenu
 from cicada.ui import theme
 from cicada.ui.document_layout import (
+    ACTION_EFFORT_CYCLE,
     ACTION_JUMP_LATEST,
+    TARGET_EFFORT,
     TARGET_LATEST,
     DisplayAction,
     DocumentLayout,
@@ -99,6 +106,8 @@ class MainScreenFrontend:
         layout_document: Callable[[int, DisplayAction | None], DocumentLayout] | None = None,
         on_display_action: Callable[[DisplayAction], object] | None = None,
         on_mouse_unavailable: Callable[[], None] | None = None,
+        on_shift_tab: Callable[[], None] | None = None,
+        footer_badge_spans: Callable[[], tuple[tuple[int, int, int], ...]] | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
@@ -115,6 +124,9 @@ class MainScreenFrontend:
         self._on_ctrl_t = on_ctrl_t
         self._on_exit = on_exit
         self._on_mouse_unavailable = on_mouse_unavailable
+        # 票据 03: Shift+Tab 思考强度循环 (准入/事务归组合层); 底栏徽标命中列
+        self._on_shift_tab = on_shift_tab
+        self._footer_badge_spans = footer_badge_spans
         self._footer_lines = footer_lines
         self._command_menu = command_menu
         self._status_lines = status_lines
@@ -204,7 +216,18 @@ class MainScreenFrontend:
         lines.extend(status)  # 状态行: 文档与编辑器之间 (规格 §F), 空闲时 0 行
         lines.extend(editor_lines)
         lines.extend(menu)
+        footer_base = len(lines)
         lines.extend(footer)
+        if footer and self._footer_badge_spans is not None:
+            # 票据 03 (C6): 本次成功呈现的底栏徽标列区间并入同一帧命中图;
+            # FooterComponent 已按"右段完整保留"过滤, 被裁掉的徽标无 span
+            badge_action = DisplayAction(ACTION_EFFORT_CYCLE, (TARGET_EFFORT,))
+            hits = list(self._pending_frame_hits or ())
+            hits.extend(
+                HitSpan(footer_base + row, start, end, badge_action)
+                for row, start, end in self._footer_badge_spans()
+            )
+            self._pending_frame_hits = tuple(hits)
         return lines
 
     def _document_focused(self) -> bool:
@@ -406,6 +429,17 @@ class MainScreenFrontend:
         if key.key is Keys.ControlT or data == "\x14":
             if self._on_ctrl_t is not None:
                 self._on_ctrl_t()
+            return
+        # Shift+Tab (BackTab, 票据 03/C6): 主会话思考强度循环, 不改焦点或草稿;
+        # 模态已在上接管; 菜单/模型菜单活跃时归当前控件所有, 不向主会话透传。
+        # 置于文档焦点与文本插入之前: 文档模式不当作反向焦点导航, "\t" 不进草稿
+        if key.key is Keys.BackTab or data == "\x1b[Z":
+            if (
+                self._on_shift_tab is not None
+                and not self._model_menu_active()
+                and (self._command_menu is None or self._command_menu.selected is None)
+            ):
+                self._on_shift_tab()
             return
         # F6: 编辑器/文档焦点切换 (紧凑交互 01, C2/C3); 模态已在上方接管,
         # 模型菜单活跃时忽略; 未注入 layout_document (无自有视口) 安全消费
