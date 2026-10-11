@@ -1,16 +1,20 @@
 """拥有响应生命周期的 DeepSeek SSE ModelPort；零自动 HTTP 重试。"""
 
 import asyncio
+import hashlib
+import json
 import time
 from collections.abc import AsyncIterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import httpx
 
 from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelRequest, StreamDone, StreamEvent
-from cicada.models import ConfigurationRequest, ModelBinding, ModelOption
+from cicada.models import (
+    CacheRequestObservation, ConfigurationRequest, ModelBinding, ModelOption, SafeModelIdentity,
+)
 from cicada.plugins.deepseek.protocol import (
     BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request,
 )
@@ -18,6 +22,39 @@ from cicada.plugins.deepseek.sse import Completion, ProtocolError, SSEDecoder
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=60, write=30, pool=10)
 CALL_DEADLINE_S = 300.0
+
+
+@dataclass(frozen=True)
+class _RequestShape:
+    """上次实际发送的不可逆形状摘要 (契约 C7); 不保存正文副本或历史。
+
+    identity 变化在本实现中表现为新普通路由实例的首调用, 不推测服务端身份。
+    """
+
+    identity: SafeModelIdentity
+    system: str | None
+    tools: str | None
+    messages: tuple[str, ...]  # 核心映射消息摘要, 不含 leading system 与派生尾部
+    tail: str | None
+
+
+def _digest(value) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _request_shape(request: ModelRequest, identity: SafeModelIdentity, body: dict) -> _RequestShape:
+    """最终 provider 映射的形状摘要; 只覆盖实际发送内容 (契约 C7)."""
+    messages = body["messages"]
+    start = 1 if messages and messages[0].get("role") == "system" else 0
+    end = len(messages) - 1 if request.request_context else len(messages)
+    return _RequestShape(
+        identity=identity,
+        system=_digest(messages[0]) if start else None,
+        tools=_digest(body["tools"]) if "tools" in body else None,
+        messages=tuple(_digest(message) for message in messages[start:end]),
+        tail=_digest(messages[-1]) if request.request_context else None,
+    )
 
 
 async def _wait_operation(operation, cancel: CancelToken, deadline: float):
@@ -69,6 +106,16 @@ class DeepSeekModel:
         self.client = client
         self.config = config
         self._api_key = api_key
+        # 缓存 03 (契约 C7): 每实例一份比较基线与最新观察; 换模型/强度/配置
+        # 准备出的新实例从空开始, 不持久、不跨进程恢复。
+        self._observation: CacheRequestObservation | None = None
+        self._send_sequence = 0
+        self._shape_baseline: _RequestShape | None = None
+
+    @property
+    def cache_observation(self) -> CacheRequestObservation | None:
+        """最近一次实际发送相对前次的本地形状观察; 未观察或诊断失败为 None."""
+        return self._observation
 
     @property
     def options(self) -> tuple[ModelOption, ...]:
@@ -120,6 +167,50 @@ class DeepSeekModel:
         key = self._api_key if request.credential_action == "keep" else request.credential.reveal()
         return DeepSeekModel(self.client, config, key).initial_binding
 
+    def _record_observation(self, request: ModelRequest, body: dict) -> None:
+        """缓存 03 (契约 C7): client.send 实际启动的同步接缝调用一次。
+
+        sequence 按本实例实际发送尝试递增; 本地资格拒绝、字节守卫与取消前零
+        send 不会到达本方法, 发送后失败仍保留观察。诊断异常不改变发送或终结:
+        显示不可得并清空比较基线, 下次可观察发送为 first_request, 不假称前次。
+        """
+        self._send_sequence += 1
+        try:
+            shape = _request_shape(request, self.config.identity, body)
+            baseline = self._shape_baseline
+            if baseline is None or baseline.identity != shape.identity:
+                observation = CacheRequestObservation(
+                    self._send_sequence, ("first_request",), None)
+            else:
+                changes: list[str] = []
+                if shape.system != baseline.system:
+                    changes.append("system_changed")
+                if shape.tools != baseline.tools:
+                    changes.append("tools_changed")
+                if shape.messages != baseline.messages:
+                    prefix = len(baseline.messages)
+                    if (len(shape.messages) > prefix
+                            and shape.messages[:prefix] == baseline.messages):
+                        changes.append("messages_extended")
+                    else:
+                        changes.append("messages_replaced")
+                if shape.tail != baseline.tail:
+                    changes.append("request_context_changed")
+                if not changes:
+                    changes = ["unchanged"]
+                preserved = 0
+                for sent, previous in zip(shape.messages, baseline.messages):
+                    if sent != previous:
+                        break
+                    preserved += 1
+                observation = CacheRequestObservation(
+                    self._send_sequence, tuple(changes), preserved)
+            self._shape_baseline = shape
+            self._observation = observation
+        except Exception:
+            self._shape_baseline = None
+            self._observation = None
+
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
         if cancel.cancelled:
             yield StreamDone("aborted")
@@ -138,6 +229,9 @@ class DeepSeekModel:
                 timeout=DEFAULT_TIMEOUT)
             if len(built.content) > self.config.max_request_bytes:
                 raise ProtocolError("request exceeds byte limit; not sent")
+            # 缓存 03 (契约 C7): 观察只在通过本地验证与字节守卫且 send 实际启动
+            # 的同步接缝更新一次, 不能提前到 build_request; 发送后失败仍保留。
+            self._record_observation(request, body)
             response = await _wait_operation(self.client.send(built, stream=True), cancel, deadline)
             if not response.is_success:
                 # 不读取错误 body；状态码本身足以分类且不会回显服务提供的秘密。

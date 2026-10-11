@@ -59,8 +59,9 @@ from cicada.core.messages import (
 )
 from cicada.core.ports import ModelRequest, ToolSpec
 from cicada.models import (
-    ConfigurationRequest, ModelBinding, ModelConfigurationPort, ModelOption, ModelRoute,
-    ModelSelectionPort, ReasoningEffortPort, ReasoningEffortState, SafeModelIdentity,
+    CacheDiagnosticsPort, CacheRequestObservation, ConfigurationRequest, ModelBinding,
+    ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ReasoningEffortPort,
+    ReasoningEffortState, SafeModelIdentity,
 )
 from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
@@ -919,6 +920,19 @@ class ApplicationSession:
             if record.context_generation == generation
         )
         return restored + committed
+
+    @property
+    def cache_observation(self) -> CacheRequestObservation | None:
+        """当前普通路由的可选只读发送观察 (缓存 03, 契约 C7); 无能力/未观察为 None.
+
+        只读当前普通 binding 的模型能力, 不拿摘要实例; 换模型/强度的新 binding
+        观察从空开始, 恢复进程不持久观察, clear/压缩由下一次实际比较表达替换。
+        """
+        route = self._model_route
+        model = route.binding.model if route is not None else None
+        if isinstance(model, CacheDiagnosticsPort):
+            return model.cache_observation
+        return None
 
     def latch_storage_failure(self, detail: str) -> None:
         """活动包装器等生产者的公开锁存入口; 幂等, 首次失败固定原因."""

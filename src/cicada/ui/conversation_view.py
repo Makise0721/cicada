@@ -1008,7 +1008,11 @@ class ConversationView:
         sections = [
             ("会话", session_lines),
             *self._budget_sections(),
-            ("计量", [self.transcript.metrics_summary(), self.transcript.cache_summary()]),
+            ("计量", [
+                self.transcript.metrics_summary(),
+                self.transcript.cache_summary(),
+                self._observation_line(),
+            ]),
             ("检查", self._checks.status_lines()),
             ("配置", [*diagnostics, *self._session.login_status]),
         ]
@@ -1016,23 +1020,35 @@ class ConversationView:
         clipped_sections = [
             (heading, [clip_status_field(row) for row in rows]) for heading, rows in sections
         ]
-        # 新缓存行不挤掉原有检查/阻断事实。超限先省略缓存行，再沿用原裁剪。
+        # 新缓存/发送诊断行不挤掉原有检查/阻断事实。超限先省略这些行，再沿用原裁剪。
         cache_omitted = False
+        observation_omitted = False
         fields = [row for _, rows in clipped_sections for row in rows]
         if len(fields) > STATUS_MAX_LINES or len("\n".join(fields).encode("utf-8")) > STATUS_MAX_BYTES:
-            clipped_sections = [
-                (heading, [row for row in rows if not (
-                    (heading == "计量" and row.startswith("缓存（"))
-                    or (heading == "摘要" and row.startswith("已提交摘要缓存:"))
-                )])
-                for heading, rows in clipped_sections
-            ]
-            cache_omitted = True
+            limited: list[tuple[str, list[str]]] = []
+            for heading, rows in clipped_sections:
+                kept: list[str] = []
+                for row in rows:
+                    if heading == "计量" and row.startswith("缓存（"):
+                        cache_omitted = True
+                    elif heading == "计量" and row.startswith("发送诊断:"):
+                        observation_omitted = True
+                    elif heading == "摘要" and row.startswith("已提交摘要缓存:"):
+                        cache_omitted = True
+                    else:
+                        kept.append(row)
+                limited.append((heading, kept))
+            clipped_sections = limited
         fields = [row for _, rows in clipped_sections for row in rows]
         total = "\n".join(fields)
+        omitted = "/".join(
+            name for flag, name in (
+                (cache_omitted, "缓存计量"), (observation_omitted, "发送诊断"),
+            ) if flag
+        )
         if len(fields) <= STATUS_MAX_LINES and len(total.encode("utf-8")) <= STATUS_MAX_BYTES:
-            if cache_omitted:
-                clipped_sections.append(("", ["…[缓存计量因状态页限额省略]"]))
+            if omitted:
+                clipped_sections.append(("", [f"…[{omitted}因状态页限额省略]"]))
             return clipped_sections
         kept, original_lines, original_bytes, truncated = clip_lines(
             total, STATUS_MAX_LINES, STATUS_MAX_BYTES,
@@ -1048,9 +1064,33 @@ class ConversationView:
             offset += count
         notes = truncation_note(kept, original_lines, original_bytes, truncated)
         if notes:
-            suffix = "（缓存计量因状态页限额省略）" if cache_omitted else ""
+            suffix = f"（{omitted}因状态页限额省略）" if omitted else ""
             result.append(("", [note + suffix for note in notes]))
         return result
+
+    def _observation_line(self) -> str:
+        """缓存 03 (契约 C7): 最近实际发送相对前次的本地形状变化行。
+
+        无能力/未观察显示不可得; 只显示发送次数、变化与保留前导消息数,
+        不显示正文、hash、凭据或回执, 不作为服务端 token 前缀或命中证明。
+        """
+        observation = self._session.cache_observation
+        if observation is None:
+            return "发送诊断: 不可得"
+        labels = {
+            "first_request": "首次可观察",
+            "system_changed": "system变化",
+            "tools_changed": "工具变化",
+            "messages_extended": "历史延长",
+            "messages_replaced": "历史替换",
+            "request_context_changed": "尾部变化",
+            "unchanged": "与上次相同",
+        }
+        parts = [f"第{observation.sequence}次发送"]
+        parts.extend(labels.get(code, code) for code in observation.changes)
+        if observation.preserved_messages is not None:
+            parts.append(f"保留前导消息 {observation.preserved_messages} 条")
+        return f"发送诊断: {' · '.join(parts)}（本地对比，非服务端命中）"
 
     # --- 预算与摘要段 (04, A12) ------------------------------------------------------
 

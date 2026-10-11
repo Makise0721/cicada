@@ -111,6 +111,34 @@ class ModelSelectionPort(Protocol):
 
 
 @dataclass(frozen=True)
+class CacheRequestObservation:
+    """最近一次实际发送相对前次的本地形状观察 (缓存 03, 契约 C7).
+
+    sequence 按本实例实际 HTTP 发送尝试递增 (本地拒绝与取消前零 send 不计);
+    changes 是冻结变化码; preserved_messages 为完全相同的前导映射消息数
+    (不含 leading system 与派生尾部), 首次可观察发送为 None。
+    不携带正文、hash、凭据或回执。
+    """
+
+    sequence: int
+    changes: tuple[str, ...]
+    preserved_messages: int | None
+
+
+@runtime_checkable
+class CacheDiagnosticsPort(Protocol):
+    """可选只读发送观察能力 (缓存 03, 契约 C7); 不扩大 ModelPort 必备方法.
+
+    变化码冻结为 first_request、system_changed、tools_changed、
+    messages_extended、messages_replaced、request_context_changed、unchanged;
+    观察由 provider 在实际发送启动的同步接缝更新, 不持久、不跨进程恢复。
+    """
+
+    @property
+    def cache_observation(self) -> CacheRequestObservation | None: ...
+
+
+@dataclass(frozen=True)
 class ConfigurationRequest:
     """登录应用的准备请求: 目标安全身份 + 短期凭据动作; 秘密不进入身份或历史."""
 

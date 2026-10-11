@@ -1,6 +1,7 @@
 """DeepSeek Chat Completion 的本地配置、只读资格校验与请求白名单。"""
 
 from dataclasses import dataclass
+from typing import Any
 
 from cicada.core.messages import AssistantMessage, ToolResultMessage, UserMessage, validate_history_structure
 from cicada.core.ports import ModelRequest
@@ -63,6 +64,19 @@ class DeepSeekConfig:
                 raise ValueError("DeepSeek thinking tool history is missing reasoning")
 
 
+def _canonical_schema_copy(value: Any) -> Any:
+    """缓存 03 (契约 C3): 深拷贝并递归按键排序对象; 数组顺序保持语义不动.
+
+    每次 prepare 最终 body 都按本次 request.tools 原序列执行, 已准备 body
+    不受调用方后续 dict 修改影响; 相同输入生成相同编码。
+    """
+    if isinstance(value, dict):
+        return {key: _canonical_schema_copy(value[key]) for key in sorted(value)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_schema_copy(item) for item in value]
+    return value
+
+
 def build_request(request: ModelRequest, config: DeepSeekConfig) -> dict:
     config.validate_request(request)
     messages = []
@@ -93,7 +107,10 @@ def build_request(request: ModelRequest, config: DeepSeekConfig) -> dict:
     if config.think:
         body["reasoning_effort"] = config.reasoning_effort
     if request.tools:
+        # 缓存 03 (契约 C3): 按本次 request.tools 原序列映射, 复制 schema 并
+        # 确定性编码对象键; 禁止 adapter 缓存首次 tools 屏蔽后续输入变化。
         body["tools"] = [{"type": "function", "function": {
-            "name": t.name, "description": t.description, "parameters": t.parameters}}
+            "name": t.name, "description": t.description,
+            "parameters": _canonical_schema_copy(t.parameters)}}
             for t in request.tools]
     return body

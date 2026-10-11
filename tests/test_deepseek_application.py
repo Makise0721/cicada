@@ -97,6 +97,43 @@ async def test_tools_new_user_restart_and_nonthinking_summary_use_real_bindings(
         await again.aclose()
 
 
+async def test_cache_observation_tracks_normal_route_and_resets_on_restore(tmp_path):
+    """缓存 03 (契约 C7): 应用只读能力接普通路由; 摘要通道不覆盖; 恢复进程从空开始."""
+    root = _repo(tmp_path)
+    answers = iter([response("", "第一答"), response("", "第二答"), response(None, "旧记录摘要"),
+                    response("", "压缩后一答"), response("", "恢复后一答")])
+    def handle(req):
+        return httpx.Response(200, content=next(answers))
+    session = await open_application(config(root, httpx.MockTransport(handle)))
+    try:
+        assert session.cache_observation is None, "未发送前无观察"
+        await session.execute("第一问")
+        first = session.cache_observation
+        assert (first.sequence, first.changes, first.preserved_messages) == (
+            1, ("first_request",), None)
+        await session.execute("第二问")
+        second = session.cache_observation
+        assert (second.sequence, second.changes, second.preserved_messages) == (
+            2, ("messages_extended",), 1), "稳定历史保留, 延长如实表达"
+        await session.compact_context()
+        assert session.cache_observation is second, "摘要调用不覆盖普通路由观察"
+        await session.execute("压缩后一问")
+        replaced = session.cache_observation
+        assert replaced.sequence == 3 and "messages_replaced" in replaced.changes, (
+            "压缩后的连续性由下一次实际比较表达替换, 不保存虚构连续")
+        session_id = session.persistence.session_id
+    finally:
+        await session.aclose()
+    restored = await open_application(config(root, httpx.MockTransport(handle), session_id))
+    try:
+        assert restored.cache_observation is None, "恢复进程不持久观察"
+        await restored.execute("恢复后一问")
+        after = restored.cache_observation
+        assert (after.sequence, after.changes) == (1, ("first_request",)), "新普通路由从首调用起"
+    finally:
+        await restored.aclose()
+
+
 @pytest.mark.parametrize("failure", ["error", "length", "missing-tool"])
 async def test_incompatible_archive_refused_before_reliable_begin(tmp_path, failure):
     root = _repo(tmp_path)

@@ -14,7 +14,9 @@ import pytest
 from test_compact_command import _ScriptedSummary, _manual_session
 from test_conversation_view import Harness, _wait_until
 
+from cicada.application import open_application
 from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
+from cicada.models import CacheRequestObservation
 from cicada.persistence.contracts import StorageWriteError
 from cicada.ui.checks import STATUS_MAX_LINES
 from cicada.ui.main_screen import strip_terminal_sequences, visible_width
@@ -338,6 +340,56 @@ async def test_status_summary_duration_unknown_without_unit(tmp_path):
         await session.aclose()
         if store is not None:
             await store.aclose()
+
+
+async def test_status_request_observation_line_and_missing_capability(tmp_path):
+    """缓存 03 (契约 C7): 无能力显示不可得; 有观察显示本地变化行, 不显示正文/hash."""
+    session, _m, _c, _s = await _manual_session(
+        tmp_path, script=[[StreamDone("stop")], [StreamDone("stop")]], store=False
+    )
+    harness = Harness(session)
+    try:
+        rendered = _status_render(harness)
+        assert "发送诊断: 不可得" in rendered, "无观察能力的模型如实显示不可得"
+        observation = CacheRequestObservation(3, ("messages_extended", "request_context_changed"), 4)
+
+        class _ObservedModel:
+            @property
+            def cache_observation(self):
+                return observation
+
+        from cicada.budget import BudgetConfig
+        from cicada.models import ModelBinding, ModelRoute, SafeModelIdentity
+        identity = SafeModelIdentity("fake", "fake-model", None, None)
+        session._model_route = ModelRoute(ModelBinding(
+            model=_ObservedModel(), summary_model=_ObservedModel(), identity=identity,
+            summary_identity=identity, budget=BudgetConfig(131072, 32768),
+            summary_budget=BudgetConfig(131072, 2048), validate_request=lambda request: None,
+        ))
+        rendered = _status_render(harness)
+        assert ("发送诊断: 第3次发送 · 历史延长 · 尾部变化 · 保留前导消息 4 条"
+                "（本地对比，非服务端命中）") in rendered
+    finally:
+        await session.aclose()
+        harness.close()
+
+
+async def test_status_omits_cache_and_observation_rows_first_over_limit(tmp_path):
+    """缓存 03 验收6: 状态页超限先省略缓存/发送诊断行并标注, 既有阻断事实保留."""
+    from cicada.ui.conversation_view import ConversationView
+    from test_conversation_view import _config, _repo, _script
+    session = await open_application(_config(_repo(tmp_path), _script()))
+    view = ConversationView(session, diagnostics=lambda: [f"诊断{i}: 原始值" for i in range(20)])
+    try:
+        assert view.on_submit("/status") is True
+        lines = [strip_terminal_sequences(line).strip() for line in view.document_lines(100)]
+        assert "发送诊断: 不可得" not in lines, "发送诊断行先于既有事实省略"
+        assert not any(line.startswith("缓存（") for line in lines), "缓存计量行一并先省略"
+        assert any("缓存计量/发送诊断因状态页限额省略" in line for line in lines), "省略有显式标注"
+        assert "状态: idle" in lines and "计量: 不可得" in lines, "既有会话/计量事实保留"
+    finally:
+        view.close()
+        await session.aclose()
 
 
 async def test_status_budget_sections_stay_bounded_and_width_safe(tmp_path):

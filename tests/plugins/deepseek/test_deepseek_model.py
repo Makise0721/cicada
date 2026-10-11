@@ -12,9 +12,11 @@ from cicada.core.cancel import CancelToken
 from cicada.core.messages import AssistantMessage, ReasoningContent, UserMessage
 from cicada.core.ports import ModelRequest, ReasoningDelta, StreamDone, TextDelta, ToolCallEvent, ToolSpec
 from cicada.plugins.deepseek import DeepSeekConfig, DeepSeekModel
+from cicada.plugins.deepseek.protocol import build_request
 
 KEY = "test-secret-never-log"
 REQUEST = ModelRequest((UserMessage("任务"),), (ToolSpec("read", "read", {"type": "object"}),))
+CTX = '<cicada-verification-context version="1">\n{"blocked":false}\n</cicada-verification-context>'
 
 
 def frame(delta=None, finish=None, usage=None):
@@ -383,3 +385,119 @@ async def test_data_after_done_is_rejected_regardless_of_network_slice(separate)
         events = [e async for e in DeepSeekModel(client, DeepSeekConfig(), KEY).stream(REQUEST, CancelToken())]
     assert events[-1].stop_reason == "error"
     assert not any(isinstance(e, ToolCallEvent) for e in events) and stream.closed
+
+
+async def test_send_observation_tracks_shape_changes_and_preserved_prefix():
+    """缓存 03 (契约 C7): 首发观察、相同/延长/替换/尾部与工具顺序变化及保留前导数."""
+    requests = []
+    def handle(req):
+        requests.append(req)
+        return httpx.Response(200, stream=BytesStream(frame(finish="stop") + DONE))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(), KEY)
+
+        async def send(request):
+            events = [e async for e in model.stream(request, CancelToken())]
+            assert events[-1].stop_reason == "stop"
+
+        def facts():
+            observation = model.cache_observation
+            return (observation.sequence, observation.changes, observation.preserved_messages)
+
+        await send(REQUEST)
+        assert facts() == (1, ("first_request",), None)
+        await send(REQUEST)
+        assert facts() == (2, ("unchanged",), 1)
+        await send(replace(REQUEST, request_context=CTX))
+        assert facts() == (3, ("request_context_changed",), 1), "稳定历史全部保留, 只标尾部变化"
+        grown = replace(REQUEST, request_context=CTX,
+                        messages=(UserMessage("任务"), AssistantMessage("答案")))
+        await send(grown)
+        assert facts() == (4, ("messages_extended",), 1)
+        rewritten = replace(grown, messages=(UserMessage("任务"), AssistantMessage("改写")))
+        await send(rewritten)
+        assert facts() == (5, ("messages_replaced",), 1)
+        diverged = replace(rewritten, messages=(UserMessage("其他"), AssistantMessage("改写")))
+        await send(diverged)
+        assert facts() == (6, ("messages_replaced",), 0), "无共同前导时如实为 0"
+        write = ToolSpec("write", "write", {"type": "object"})
+        rebased = replace(diverged, system_prompt="规则", tools=(REQUEST.tools[0], write))
+        await send(rebased)
+        assert set(model.cache_observation.changes) == {"system_changed", "tools_changed"}
+        assert (model.cache_observation.sequence, model.cache_observation.preserved_messages) == (7, 2)
+        swapped = replace(rebased, tools=(write, REQUEST.tools[0]))
+        await send(swapped)
+        assert facts() == (8, ("tools_changed",), 2), "顺序集合相同不能掩盖工具序列变化"
+
+
+def test_tools_schema_canonical_copy_and_mutation_immunity():
+    """缓存 03 (契约 C3): 复制 schema 并确定性编码对象键, 数组顺序保持, 外部修改不回灌."""
+    parameters = {"required": ["b", "a"], "type": "object",
+                  "properties": {"b": {"type": "string"}, "a": {"type": "integer"}}}
+    body = build_request(
+        ModelRequest((UserMessage("任务"),), (ToolSpec("read", "read", parameters),)),
+        DeepSeekConfig())
+    prepared = body["tools"][0]["function"]["parameters"]
+    assert list(prepared) == ["properties", "required", "type"], "对象键递归排序"
+    assert list(prepared["properties"]) == ["a", "b"]
+    assert prepared["required"] == ["b", "a"], "数组顺序保持语义"
+    serialized = json.dumps(body, ensure_ascii=False)
+    parameters["properties"]["a"] = {"type": "mutated"}
+    parameters["extra"] = 1
+    assert json.dumps(body, ensure_ascii=False) == serialized, "外部 dict 修改不影响已准备 body"
+    reordered = {"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "string"}},
+                 "required": ["b", "a"]}
+    again = build_request(
+        ModelRequest((UserMessage("任务"),), (ToolSpec("read", "read", reordered),)),
+        DeepSeekConfig())
+    assert json.dumps(again, ensure_ascii=False) == serialized, "相同输入不同键序生成相同 body"
+
+
+async def test_observation_requires_actual_send_and_survives_send_failure():
+    """缓存 03 (契约 C7): 本地拒绝与字节守卫零 send 不更新; 发送后失败仍保留; 新实例从空起."""
+    sent = []
+    def fail(req):
+        sent.append(req)
+        return httpx.Response(500)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(), KEY)
+        events = [e async for e in model.stream(
+            replace(REQUEST, request_context="x", tools=()), CancelToken())]
+        assert events[-1].stop_reason == "error" and sent == [] and model.cache_observation is None
+        guarded = DeepSeekModel(client, DeepSeekConfig(max_request_bytes=10), KEY)
+        events = [e async for e in guarded.stream(REQUEST, CancelToken())]
+        assert events[-1].stop_reason == "error" and sent == [] and guarded.cache_observation is None
+        for sequence, changes in ((1, ("first_request",)), (2, ("unchanged",))):
+            events = [e async for e in model.stream(REQUEST, CancelToken())]
+            assert events[-1].stop_reason == "error" and len(sent) == sequence
+            assert (model.cache_observation.sequence, model.cache_observation.changes) == (
+                sequence, changes), "发送后失败仍保留观察并可比较"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as client:
+        assert DeepSeekModel(client, DeepSeekConfig(), KEY).cache_observation is None, "新实例不继承基线"
+
+
+async def test_observation_failure_clears_baseline_keeps_send_result(monkeypatch):
+    """缓存 03 (契约 C7): 诊断异常不改变发送终结, 清空基线后下次为 first_request 且序列不回退."""
+    import cicada.plugins.deepseek.model as module
+    original = module._request_shape
+    calls = {"count": 0}
+    def flaky(request, identity, body):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise RuntimeError("observation boom")
+        return original(request, identity, body)
+    monkeypatch.setattr(module, "_request_shape", flaky)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, stream=BytesStream(frame(finish="stop") + DONE)))) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(), KEY)
+        for send_number in range(1, 4):
+            events = [e async for e in model.stream(REQUEST, CancelToken())]
+            assert events[-1].stop_reason == "stop", "诊断异常不改变发送终结"
+            observation = model.cache_observation
+            if send_number == 2:
+                assert observation is None, "诊断失败显示不可得"
+            elif send_number == 1:
+                assert (observation.sequence, observation.changes) == (1, ("first_request",))
+            else:
+                assert (observation.sequence, observation.changes,
+                        observation.preserved_messages) == (3, ("first_request",), None), "不假称紧邻前次"
