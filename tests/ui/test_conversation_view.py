@@ -36,6 +36,49 @@ from cicada.ui.welcome import WelcomeEntry
 
 # --- 夹具 (工作区/剧本/PromptInfo 单一来源在 tests.support.app; ChunkedFakeModel 与 e2e 夹具同构) ---
 
+
+async def test_diff_page_consumes_input_and_returns_without_model_history(tmp_path):
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.ui.commands import SlashCommandMenu
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.terminal_io import FakeTerminal, PointerEvent
+
+    root = _repo(tmp_path)
+    (root / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+    session = await open_application(_config(root, []))
+    terminal = FakeTerminal(80, 24)
+    bundle = build(session)
+    view = bundle["view"]
+    frontend = MainScreenFrontend(
+        terminal, document_lines=view.document_lines, layout_document=view.layout_document,
+        editor=view.editor, on_submit=view.on_submit, on_display_action=view.execute_display_action,
+        review=view.review_view, command_menu=SlashCommandMenu(),
+    )
+    enter = KeyPress(Keys.ControlM, "\r")
+    try:
+        view.editor.set_text("/diff")
+        frontend._on_input_batch([enter, KeyPress("x", "x"), enter])
+        await view.review_view._task
+        assert view.review_view.active and view.editor.is_empty()
+        frontend._do_render()
+        span = next(h for h in frontend._frame_hits if h.action.target_id[1] == "file")
+        frontend._on_input_batch([
+            PointerEvent("down", span.start_column, span.row, terminal.geometry, button="left"),
+            PointerEvent("up", span.start_column, span.row, terminal.geometry, button="left"),
+            KeyPress(Keys.BracketedPaste, "must not enter the draft"), KeyPress(Keys.BackTab, "\x1b[Z"),
+        ])
+        await view.review_view._task
+        assert "+VALUE = 2" in view.review_view.preview.text
+        frontend._on_input_batch([KeyPress(Keys.Escape, "\x1b"), KeyPress("y", "y"), enter])
+        assert not view.review_view.active and not session.review_active
+        assert view.editor.is_empty() and session.history == ()
+        assert not any(isinstance(entry, UserEntry) for entry in view.transcript.entries())
+    finally:
+        frontend._stopped = True
+        await session.aclose()
+        view.close()
+
 from tests.support.app import prompt_info as _shared_prompt_info, repo as _repo, script as _script
 
 

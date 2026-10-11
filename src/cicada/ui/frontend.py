@@ -58,6 +58,7 @@ from cicada.ui.editor import Editor
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
+from cicada.ui.review_view import ReviewView
 from cicada.ui.terminal_io import (
     WHEEL_DELTA,
     InputBatchItem,
@@ -105,6 +106,7 @@ class MainScreenFrontend:
         on_mouse_unavailable: Callable[[], None] | None = None,
         on_shift_tab: Callable[[], None] | None = None,
         footer_badge_spans: Callable[[], tuple[tuple[int, int, int], ...]] | None = None,
+        review: ReviewView | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
@@ -129,6 +131,7 @@ class MainScreenFrontend:
         self._model_menu = model_menu
         self._on_model_confirm = on_model_confirm
         self._modal = modal
+        self._review = review
         self.sensitive_input_used = False
         self.ui_failures: list[str] = []
         self.terminal_failed = False
@@ -161,6 +164,10 @@ class MainScreenFrontend:
             return self._compose_frame_lines(width)
 
     def _compose_frame_lines(self, width: int) -> list[str]:
+        if self._review_active():
+            layout = self._review.layout(width, self._frame_rows)
+            self._pending_frame_hits = layout.hits
+            return list(layout.lines)
         if self._modal_active():
             self.sensitive_input_used = True
             return self._modal.render(width, self._frame_rows)
@@ -305,6 +312,8 @@ class MainScreenFrontend:
     def _do_render(self) -> None:
         exc = self._render_frame_captured()
         if exc is not None:
+            if self._review_active():
+                self._review.cancel()
             self.ui_failures.append('login render failed' if self.sensitive_input_used else f"render failed: {exc!r}")
             self._attempt_recovery()
 
@@ -366,6 +375,8 @@ class MainScreenFrontend:
         poisoned = False
         needs_render = False
         for item in items:
+            review_before = self._review_active()
+            generation_before = self._review.generation if self._review is not None else 0
             if isinstance(item, PointerEvent):
                 if poisoned:
                     continue  # 动作执行后的同批旧 pointer 丢弃直至新帧成功 (C4)
@@ -381,6 +392,12 @@ class MainScreenFrontend:
                 needs_render = True
                 if modal_was_open and not self._modal_active():
                     break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
+            if self._review is not None and self._review.generation != generation_before:
+                self._invalidate_pointer_frame()
+                poisoned = True
+            if review_before != self._review_active():
+                self._invalidate_pointer_frame()
+                break  # 开启/退出页面消费同批余键和旧坐标。
         if capture_before != self._pointer_capture_active():
             self._invalidate_pointer_frame()  # 模态/菜单切换: 命中图立即失效 (C4)
         if needs_render:
@@ -394,6 +411,10 @@ class MainScreenFrontend:
         self._render_immediate()
 
     def _dispatch_key(self, key) -> None:
+        if self._review_active():
+            self._disarm_escape_prefix()
+            self._review.handle(key)
+            return
         if self._modal_active():
             self.sensitive_input_used = True
             self._disarm_escape_prefix()
@@ -553,6 +574,8 @@ class MainScreenFrontend:
 
     def _pointer_capture_active(self) -> bool:
         """模态与菜单先取得输入: 活跃时 pointer 被消费, 不穿透文档 (C4)。"""
+        if self._review_active():
+            return False  # 审阅提供自己的同源命中图，菜单不能抢走本页输入。
         if self._modal_active() or self._model_menu_active():
             return True
         return self._command_menu is not None and self._command_menu.selected is not None
@@ -567,7 +590,7 @@ class MainScreenFrontend:
         if self._pointer_capture_active():
             self._pending_left_down = None
             return _POINTER_NONE
-        if self._viewport is None:
+        if self._viewport is None and not self._review_active():
             return _POINTER_NONE  # 旧整幅回放无自有视口: pointer 安全消费
         if event.kind == "cancel":
             self._pending_left_down = None  # 失焦/取消: 清除按下 (后端可观察时)
@@ -621,7 +644,10 @@ class MainScreenFrontend:
         self._wheel_accumulator -= notches * WHEEL_DELTA
         if not notches:
             return _POINTER_NONE
-        self._viewport.wheel_scroll(notches)
+        if self._review_active():
+            self._review.wheel(notches)
+        else:
+            self._viewport.wheel_scroll(notches)
         self._frame_hits = None  # 视口位移后命中行失效, 等新帧 (C4)
         return _POINTER_RENDER
 
@@ -671,6 +697,8 @@ class MainScreenFrontend:
         result = self._on_submit(submitted)
         if result is False:
             return  # 拒绝: 草稿保留 (实际接受前不伪造用户条目)
+        if self._review_active():
+            return  # 应用准入成功后才消费 /diff；失败仍保留原编辑器状态。
         if self._modal_active():
             return  # 模态输入期间聊天草稿/光标/撤销栈保持原样。
         self._editor.clear()
@@ -715,6 +743,9 @@ class MainScreenFrontend:
     def _modal_active(self) -> bool:
         return self._modal is not None and self._modal.is_open
 
+    def _review_active(self) -> bool:
+        return self._review is not None and self._review.active
+
     def _confirm_model_menu(self) -> None:
         """模型菜单 Enter: 收起并把 option ID 交回组合层 (屏障/任务归组合层与应用)。"""
         if self._model_menu is None:
@@ -757,6 +788,8 @@ class MainScreenFrontend:
                     self.ui_failures.append('login terminal input failed')
                     self._exit_event.set()
         finally:
+            if self._review_active():
+                self._review.cancel()
             # 终态冲刷: 退出前的待渲染请求 (如 gate 错误条目) 在收尾前落屏一次,
             # 不随 _stopped 丢弃 (规格: 终态事件不丢弃); 失败照常记录不阻断收尾
             if self._render_requested:

@@ -42,6 +42,44 @@ from tests.support.app import git as _git, prompt_info as _prompt_info, repo as 
 CHECK_COMMAND = "exit 0"
 
 
+async def test_review_cancel_keeps_lease_until_owned_reader_finishes(tmp_path):
+    from cicada.review import ReviewError, ReviewSnapshot
+
+    session = await open_application(_config(_repo(tmp_path), script=[]))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class SlowReader:
+        async def capture(self, review_id, cancel):
+            entered.set()
+            await cancel.wait()
+            await release.wait()  # 模拟收到取消但资源还没落定。
+            return ReviewSnapshot(review_id, "fixture", "2026-10-11T00:00:00Z", (), ())
+
+    session._review_reader = SlowReader()
+    caller = asyncio.create_task(session.open_review())
+    try:
+        await entered.wait()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert session.review_active
+        with pytest.raises(ReviewError) as error:
+            await session.open_review()
+        assert error.value.kind == "busy"
+        with pytest.raises(RuntimeError, match="review"):
+            await session.execute("cannot bypass the reader lease")
+        closing = asyncio.create_task(session.aclose())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        release.set()
+        await closing
+        assert not session.review_active
+        assert session.history == ()
+    finally:
+        release.set()
+        await session.aclose()
+
+
 def _config(root: Path, *, script: list, plan: VerificationPlan | None = None) -> ApplicationConfig:
     return ApplicationConfig(
         workspace=root,

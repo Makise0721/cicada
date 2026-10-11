@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from cicada.core.cancel import CancelToken
 from cicada.plugins.coding.workspace import Workspace, WorkspaceError
+from cicada.plugins.coding.git_io import GitIOError, read_git
 from cicada.runtime.plugin import PluginContext, PluginDefinition
 
 INVENTORY_CAPABILITY = "coding.inventory"
@@ -185,59 +186,13 @@ class GitInventory:
         return True, (), directory
 
     async def _git(self, arguments: tuple[str, ...], cancel: CancelToken, budget: int) -> bytes:
-        environment = {k: v for k, v in os.environ.items() if k.upper() not in {
-            "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"}}
-        environment.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
         try:
-            process = await asyncio.create_subprocess_exec(
-                "git", "-c", "core.fsmonitor=false", "-C", str(self.workspace.root), *arguments,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=environment)
-        except FileNotFoundError as exc:
-            raise InventoryError("git_unavailable", "Git executable is unavailable") from exc
-        except OSError as exc:
-            raise InventoryError("git_launch_failed", f"cannot launch Git: {exc}") from exc
-
-        async def read_stdout() -> bytes:
-            output = bytearray()
-            while chunk := await process.stdout.read(4096):
-                if len(output) + len(chunk) > budget:
-                    raise InventoryError("output_limit", f"Git stdout exceeds {self.max_output_bytes} bytes")
-                output.extend(chunk)
-            return bytes(output)
-
-        async def read_stderr() -> bytes:
-            tail = b""
-            while chunk := await process.stderr.read(4096):
-                tail = (tail + chunk)[-4096:]
-            return tail
-
-        readers = [asyncio.create_task(read_stdout()), asyncio.create_task(read_stderr()),
-                   asyncio.create_task(process.wait())]
-        operation = asyncio.gather(*readers)
-        cancellation = asyncio.create_task(cancel.wait())
-        try:
-            done, _ = await asyncio.wait((operation, cancellation), return_when=asyncio.FIRST_COMPLETED)
-            if cancellation in done:
-                cancel.throw_if_cancelled()
-            output, stderr, returncode = await operation
-            if returncode:
-                raise InventoryError("git_failed", f"Git failed ({returncode}): {stderr.decode('utf-8', 'replace')}")
+            output, _, _ = await read_git(self.workspace.root, arguments, cancel, budget)
             return output
-        finally:
-            cancellation.cancel()
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            operation.cancel()
-            for reader in readers:
-                reader.cancel()
-            await asyncio.gather(operation, cancellation, *readers, return_exceptions=True)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=1)
-            except TimeoutError:
-                pass  # 已请求 kill；清理不无限延长查询。
+        except GitIOError as exc:
+            message = (f"Git stdout exceeds {self.max_output_bytes} bytes"
+                       if exc.kind == "output_limit" else str(exc))
+            raise InventoryError(exc.kind, message) from exc
 
 
 def inventory_plugin() -> PluginDefinition:

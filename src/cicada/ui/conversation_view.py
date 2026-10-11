@@ -91,6 +91,7 @@ from cicada.core.events import (
     ToolStarted,
     TurnStarted,
 )
+from cicada.ui.review_view import ACTION_REVIEW, ReviewView
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
 from cicada.ui.checks import (
     PROCESS_UNCERTAIN_LABEL,
@@ -167,6 +168,7 @@ class ConversationView:
         self.transcript = Transcript(expand_getter=lambda: self.tools.expanded)
         self._gate = AdmissionGate(session)
         self._gate.on_error = self._on_gate_error
+        self.review_view = ReviewView(session, self._editor, self._review_updated, self.transcript.append_error)
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
         self._compact_task: asyncio.Task | None = None
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
@@ -224,8 +226,17 @@ class ConversationView:
 
     # --- 生命周期 -----------------------------------------------------------------
 
+    def _review_updated(self) -> None:
+        if self.review_view.active:
+            self._gate.note_review_started()
+        else:
+            self._gate.note_review_settled()
+        if self._on_update:
+            self._on_update()
+
     def close(self) -> None:
         """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
+        self.review_view.cancel()
         self._unsubscribe()
         self.login_modal.dismiss()
         self._session.cancel_login()
@@ -438,6 +449,10 @@ class ConversationView:
         只改展示状态 (组/工具/思考/Skill toggle、工具分页), 不触请求、工具或
         草稿; 未知/失效目标静默返回 False。jump_latest 由视口内部消费, 不到这里。
         """
+        if action.kind == ACTION_REVIEW:
+            return self.review_view.execute(action)
+        if self.review_view.active:
+            return False
         kind = action.kind
         target = action.target_id
         handled = False
@@ -568,6 +583,9 @@ class ConversationView:
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
         取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self.review_view.active:
+            self.review_view.cancel()
+            return
         if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
         if cancel_if_active(self._session):
@@ -582,6 +600,9 @@ class ConversationView:
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
         持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self.review_view.active:
+            self.review_view.cancel()
+            return
         if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
         if cancel_if_active(self._session):
@@ -592,6 +613,8 @@ class ConversationView:
     def handle_ctrl_o(self) -> None:
         """Ctrl+O (紧凑交互 01, C2): 统一所有工具组/单工具/Skill 为同一开合状态
         并作为后续默认值; 只改展示, 不触请求或工具。"""
+        if self.review_view.active:
+            return
         expanded = self.tools.toggle_expand()
         self.transcript.set_skills_expanded(expanded)
 
@@ -744,6 +767,13 @@ class ConversationView:
         if command == "/exit":
             self.handle_exit()
             return True
+        if command.startswith("/diff") and (len(command) == 5 or command[5].isspace()):
+            if command != "/diff":
+                self.transcript.append_system("用法：/diff（不接受参数）")
+                return True
+            if self.model_menu.is_open or self.login_modal.is_open:
+                return False
+            return self.review_view.open()
         if command == "/model":
             return self._open_model_menu()
         if command.startswith('/login') and (len(command) == 6 or command[6].isspace()):
@@ -1163,6 +1193,7 @@ def build(
         "on_shift_tab": view.handle_shift_tab,  # 票据 03: 思考强度循环 (C6)
         "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
         "modal": view.login_modal,
+        "review": view.review_view,
     }
 
 

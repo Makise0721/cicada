@@ -98,6 +98,10 @@ from cicada.run_policy import (
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
 from cicada.plugins.ollama import OllamaModel, classify_context_overflow
 from cicada.plugins.coding.inventory import inventory_plugin
+from cicada.plugins.coding.change_review import (
+    CHANGE_REVIEW_CAPABILITY, ChangeReview, change_review_plugin,
+)
+from cicada.review import ReviewError, ReviewPreview, ReviewSnapshot
 from cicada.plugins.coding.process import process_plugin
 from cicada.plugins.coding.tool_check import check_plugin
 from cicada.plugins.coding.tool_edit import edit_plugin
@@ -157,6 +161,7 @@ def default_definitions(
     definitions: list[PluginDefinition] = [
         workspace_plugin(workspace),
         inventory_plugin(),
+        change_review_plugin(),
         process_plugin(),
         read_plugin(),
         edit_plugin(),
@@ -479,6 +484,7 @@ class ApplicationSession:
         summary_route: ModelRoute | None = None,
         login_store_factory: Callable[[], UserConfigStore] | None = None,
         login_environment: Callable[[], str | None] | None = None,
+        review_reader: ChangeReview | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -488,6 +494,12 @@ class ApplicationSession:
         self._model_selection = model_selection
         self._model_route = model_route
         self._summary_route = summary_route
+        self._review_reader = review_reader
+        self._review_active = False
+        self._review_id: str | None = None
+        self._review_snapshot: ReviewSnapshot | None = None
+        self._review_token: CancelToken | None = None
+        self._review_task: asyncio.Task | None = None
         # 04 (C6): 最新接受的配置准备源; 发布时按结构能力更新, 不从启动缓存准备
         self._model_configuration: ModelConfigurationPort | None = None
         if model_route is not None and isinstance(model_route.binding.model, ModelConfigurationPort):
@@ -567,6 +579,83 @@ class ApplicationSession:
         self._unsubscribe_core = app.agent.subscribe(self._on_core_event)
 
     # --- 只读快照 ------------------------------------------------------------------
+
+    @property
+    def review_active(self) -> bool:
+        return self._review_active
+
+    def _check_review_admission(self) -> None:
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+        if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
+                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
+                or any(task is not None and not task.done() for task in producers)):
+            raise ReviewError("busy", "审阅需要空闲会话，等当前操作实际结束后再打开。")
+        if self._review_active and self._review_id is None:
+            raise ReviewError("busy", "审阅正在取消清理。")
+        if self._review_reader is None:
+            raise ReviewError("unavailable", "当前组合没有审阅能力。")
+
+    async def open_review(self) -> ReviewSnapshot:
+        """同步准入、占住页面 lease 后派发一个受拥有读取；刷新不排队。"""
+        self._check_review_admission()
+        self._review_active = True
+        review_id = uuid.uuid4().hex
+        self._review_id = review_id
+        self._review_snapshot = None
+        token = CancelToken()
+        try:
+            snapshot = await self._review_io(self._review_reader.capture(review_id, token), token)
+            if self._review_id != review_id or self._closing:
+                raise ReviewError("inactive", "审阅已关闭。")
+            snapshot = replace(snapshot, checks_state="not_enabled" if self._config.plan is None else "not_recorded")
+            self._review_snapshot = snapshot
+            return snapshot
+        except BaseException:
+            self.cancel_review()
+            raise
+
+    async def read_review(self, review_id: str, target_id: str) -> ReviewPreview:
+        snapshot = self._review_snapshot
+        if not self._review_active or self._review_id != review_id or snapshot is None:
+            raise ReviewError("inactive", "审阅观察已失效，请刷新。")
+        if not any(item.item_id == target_id for item in snapshot.items):
+            raise ReviewError("invalid_target", "未知审阅目标。")
+        if self._review_task is not None and not self._review_task.done():
+            raise ReviewError("busy", "上一项读取尚未结束。")
+        token = CancelToken()
+        result = await self._review_io(self._review_reader.read_file(snapshot, target_id, token), token)
+        if self._review_id != review_id or self._review_snapshot is not snapshot or self._closing:
+            raise ReviewError("inactive", "审阅已关闭或刷新。")
+        return result
+
+    async def _review_io(self, operation, token: CancelToken):
+        task = asyncio.create_task(operation)
+        self._review_task = task
+        self._review_token = token
+        task.add_done_callback(self._review_io_settled)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self.cancel_review()
+            raise
+
+    def _review_io_settled(self, task: asyncio.Task) -> None:
+        # 取走迟到异常；即使 caller 被取消，reader/worker 仍由应用持有。
+        if not task.cancelled():
+            task.exception()
+        if self._review_task is task:
+            self._review_token = None
+            if self._review_id is None:
+                self._review_active = False
+
+    def cancel_review(self) -> None:
+        self._review_id = None
+        self._review_snapshot = None
+        if self._review_token is not None:
+            self._review_token.cancel()
+        if self._review_task is None or self._review_task.done():
+            self._review_active = False
 
     @property
     def state(self) -> SessionStateName:
@@ -741,6 +830,8 @@ class ApplicationSession:
 
     def _check_model_transaction_admission(self, blocked: str) -> None:
         """select_model 与 set_reasoning_effort 共用的独占事务准入 (C6)."""
+        if self.review_active:
+            raise ModelSelectionError("review is in progress")
         if self._login_in_flight:
             raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
@@ -962,6 +1053,8 @@ class ApplicationSession:
             self._model_configuration = binding.model
 
     async def execute(self, prompt: str) -> RequestOutcome:
+        if self.review_active:
+            raise RuntimeError("review is in progress; execute is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; execute is refused")
         if self._model_in_flight:
@@ -1378,6 +1471,8 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
+        if self.review_active:
+            raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; clear is refused")
         if self._model_in_flight:
@@ -1400,6 +1495,8 @@ class ApplicationSession:
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
         清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
+        if self.review_active:
+            raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; clear is refused")
         if self._model_in_flight:
@@ -1476,6 +1573,8 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
+        if self.review_active:
+            raise RuntimeError("review is in progress; compact is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; compact is refused")
         if self._model_in_flight:
@@ -1801,7 +1900,7 @@ class ApplicationSession:
         return lines
 
     def _check_login_admission(self) -> None:
-        if (self._closing or self._closed or self._state != 'idle' or
+        if (self.review_active or self._closing or self._closed or self._state != 'idle' or
                 self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
             raise UserConfigError('login', 'operation-in-progress')
 
@@ -1992,6 +2091,7 @@ class ApplicationSession:
         """幂等关闭; 重复调用共享同一次关闭任务和结果, 不重复 stop."""
         if self._close_task is None:
             self._closing = True
+            self.cancel_review()
             self._cancel_login_save()
             self.cancel_login()
             self._close_task = asyncio.get_running_loop().create_task(self._close())
@@ -2016,7 +2116,7 @@ class ApplicationSession:
         # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
         # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
         producers = [
-            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done)
+            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done, self._review_task)
             if done is not None and not done.done()
         ]
         if producers and self._cancel_token is not None:
@@ -2032,6 +2132,14 @@ class ApplicationSession:
                     "the active operation did not finalize before the close supervision deadline"
                 )
                 break  # 截止时间已耗尽; 未完成生产者保持强引用与关闭诊断
+            except asyncio.CancelledError:
+                if producer is not self._review_task or not producer.done():
+                    raise
+                # reader 的协作取消是正常页面收尾，不取消应用 close。
+            except Exception:
+                if producer is not self._review_task:
+                    raise
+                self._close_problems.append("review reading failed during close")
         # 配置接受后不能在 COMMIT 与内存发布之间释放 store/client 或观察者。
         # 监督超时记录诊断, 不能替代事务明确结果; model 生产者仍受拥有。
         if self._model_done is not None and not self._model_done.done():
@@ -2613,6 +2721,7 @@ async def open_application(
                 summary_route=policy_state.get("summary_route"),
                 context_projection=context_projection,
                 login_store_factory=login_store_factory, login_environment=login_environment,
+                review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
@@ -2640,6 +2749,7 @@ async def open_application(
             summary_route=policy_state.get("summary_route"),
             context_projection=context_projection,
             login_store_factory=login_store_factory, login_environment=login_environment,
+                review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
         )
     if plan is None:
         return session

@@ -24,6 +24,7 @@ SLASH_COMMANDS = (
     SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
     SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill"),
+    SlashCommand("/diff", "审阅工作区差异"),
     SlashCommand("/model", "选择模型（仅影响后继请求）"),
     SlashCommand("/login", "保存登录配置（可在空闲 DeepSeek 会话保存并应用）"),
     SlashCommand("/compact", "摘要较早对话以释放上下文（需持久会话）"),
