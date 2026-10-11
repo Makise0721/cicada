@@ -4,7 +4,7 @@ Cicada 是一个面向 Windows 的 Python coding agent：通过模型循环调�
 
 ## 环境要求
 
-Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据优先来自 `DEEPSEEK_API_KEY`，也可使用用户文件引用的凭据；Ollama 需本地服务（剧本模式不需要）；TUI 的 UI 依赖为可选组，仅 `--tui` 需要。
+Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据优先来自 `DEEPSEEK_API_KEY`，也可使用用户文件引用的凭据；Ollama 需本地服务（剧本模式不需要）；交互界面需要 `tui` 可选依赖组。
 
 ## 快速开始
 
@@ -13,7 +13,11 @@ git clone https://github.com/Makise0721/cicada.git
 Set-Location cicada
 $env:UV_CACHE_DIR = Join-Path $PWD '.uv-cache'
 uv sync --frozen --python 3.12
-uv sync --extra tui   # 仅 --tui 需要
+uv sync --extra tui   # 交互界面依赖
+
+$env:UV_TOOL_DIR = Join-Path $PWD '.cicada\tool-envs'
+uv tool install --editable '.[tui]' --python 3.12
+uv tool update-shell   # 首次安装后重新打开终端
 
 $env:DEEPSEEK_API_KEY = '<your-key>'   # 凭据不写入会话存档
 ```
@@ -30,6 +34,8 @@ uv run --frozen python -m cicada --workspace .\sandbox '请用 write 创建 hell
 uv run --frozen python -m cicada --workspace .\sandbox --script .\demo-script.json '执行文件写入和读取演示'
 ```
 
+安装后，在任意工作区目录输入 `cicada` 即进入交互界面，使用已保存的用户配置；`cicada '任务'` 执行单次任务，`cicada --tui '首问'` 带首问进入交互。源码更新自动生效，无需重新安装。
+
 ## 带指定检查的编码任务
 
 `--check-command`（可重复，最多 8 条）固定"必须通过什么检查"：模型只能用 `check` 工具运行启动者声明的命令，不能替换命令或超时。程序独立维护验证事实——基线快照、检查回执（最近一次尝试取代旧 PASS，任何文件变化使旧回执过时）、独立变更证据——并给出交付判定：全部条件满足退出码 `0`；模型正常 stop 但条件不满足为 `3`，不依赖模型自然语言汇报。超时/取消/输出未 EOF 永久锁存 `process_uncertain`，后续新 PASS 不能清除。检查模式要求 `--workspace` 是 Git 工作树根目录、`--num-ctx` ≥ 32768，最多 25 轮；DeepSeek 输出默认上限 32768、请求体上限 2 MiB；显式 Ollama 检查模式输出预留 2048、请求体上限 65536 字节。
@@ -43,7 +49,8 @@ uv run --frozen python -m cicada --workspace .\repo --check-command 'python chec
 `--tui` 进入同进程连续对话终端（Pi 式主屏：启动欢迎快照（Pi 风格段组，窄窗/无色自动降级）、原位流式更新、思考块默认收起（点击展开）、工具按轮次聚合一行摘要（点击逐层展开，`Ctrl+O` 统一开合、`F6` 键盘回看、滚轮浏览）、`Shift+Tab` 或点击底栏徽标切换思考强度（low/high/max，仅影响后继请求）、忙碌可编辑草稿、斜线命令菜单与 `/model` 模型选择、空闲 `/diff` 只读改动审阅页（未暂存/已暂存/未跟踪三组与检查记录，点击浏览、Esc 返回）、忙碌状态行动画、协作取消）：
 
 ```powershell
-uv run --frozen python -m cicada --tui --workspace .\sandbox
+Set-Location .\sandbox
+cicada
 ```
 
 持久会话覆盖单次 CLI 与 TUI：

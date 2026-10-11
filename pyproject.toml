@@ -9,6 +9,9 @@ dependencies = [
     "pyyaml>=6.0.1",
 ]
 
+[project.scripts]
+cicada = "cicada.__main__:console_main"
+
 [project.optional-dependencies]
 # TUI 第一版 (探针裁决的发布版本): 仅交互终端入口需要, 无 UI 模式不导入
 tui = [

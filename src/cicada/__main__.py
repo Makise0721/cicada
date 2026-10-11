@@ -986,12 +986,17 @@ async def _run_tui(
     return 3 if view_only else code
 
 
-def main(*, user_config_store: UserConfigStore | None = None) -> int:
+def main(*, user_config_store: UserConfigStore | None = None,
+         interactive_default: bool = False) -> int:
     # 与 powershell 工具一致: 入口输出统一 UTF-8, 不随控制台代码页变化
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
-        prog="cicada", description="Cicada coding agent",
+        prog="cicada", description=(
+            "Cicada coding agent：无任务参数时启动交互终端，工作区默认为当前目录；"
+            "位置 prompt 用于单次任务，--tui 可将其作为首问。"
+            if interactive_default else "Cicada coding agent"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''DeepSeek 用户默认配置：读取当前用户 ~/.cicada/config.toml，不会读取工作区配置。
 新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
@@ -1104,7 +1109,15 @@ credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
         "prompt", nargs="?", default=None,
         help="交给 agent 的 prompt (单次模式必填; --tui 可作首问)",
     )
-    return asyncio.run(_run(parser.parse_args(), user_config_store=user_config_store))
+    args = parser.parse_args()
+    if interactive_default and args.prompt is None and args.skill is None and not args.list_sessions:
+        args.tui = True
+    return asyncio.run(_run(args, user_config_store=user_config_store))
+
+
+def console_main() -> int:
+    """已安装的 cicada 命令：无任务时进入 TUI，沿用模块入口的全部启动校验。"""
+    return main(interactive_default=True)
 
 
 if __name__ == "__main__":
