@@ -261,7 +261,7 @@ class ChangeReview:
             filter_reason = "special_path"
         groups = []
         items = []
-        aliases: dict[str, str] = {}
+        aliases: dict[str, tuple[str, str]] = {}
         for group in GROUPS:
             observation.checkpoint()
             if group == "unstaged" and filter_reason:
@@ -284,7 +284,11 @@ class ChangeReview:
                         await asyncio.sleep(0)
                         observation.checkpoint()
                     path = _path(raw)
-                    if aliases.setdefault(path.casefold(), path) != path:
+                    # 别名检查沿用 inventory 的并列现存清单语义；name-status 派生的
+                    # 同 casefold 删除＋新增对是 --no-renames 对大小写改名的展开，
+                    # 按 C2 必须保留为两个条目而不是整组拒绝。
+                    previous = aliases.setdefault(path.casefold(), (path, status))
+                    if previous[0] != path and {previous[1], status} != {"D", "A"}:
                         raise GitIOError("alias_conflict", "case-insensitive path aliases")
                     if not self._included(path):
                         continue
@@ -302,9 +306,18 @@ class ChangeReview:
         if before != after:
             raise GitIOError("stale", "HEAD/index changed during observation")
         if filter_basis != "unknown":
-            final_filter, _ = await self._filters(observation, filter_paths)
-            if final_filter != filter_basis:
-                groups = [ReviewGroupState(g.group, "unknown", "stale") if g.group == "unstaged" else g
+            degraded = None
+            try:
+                final_filter, _ = await self._filters(observation, filter_paths)
+            except (GitIOError, OSError) as exc:
+                final_filter = None
+                degraded = getattr(exc, "kind", "unreadable")
+            if degraded is not None or final_filter != filter_basis:
+                reason = degraded or "stale"
+                # 重核对自身失败（如元数据预算耗尽）时无法续证 unstaged 的 filter
+                # 保证：只降级该组，已完整的其他组保留（C3）。
+                groups = [ReviewGroupState(g.group, "unknown", reason)
+                          if g.group == "unstaged" and g.state == "complete" else g
                           for g in groups]
                 items = [item for item in items if item.group != "unstaged"]
         return ReviewSnapshot(review_id, str(self.workspace.root), _now(), tuple(groups), tuple(items),
