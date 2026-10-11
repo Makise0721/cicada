@@ -64,7 +64,7 @@ def _artifact_reason(exc: BaseException) -> str:
         return "over_limit"
     if kind == "stale":
         return "changed"
-    if isinstance(exc, TimeoutError):
+    if kind == "timeout" or isinstance(exc, TimeoutError):
         return "timeout"
     return "unreadable"
 

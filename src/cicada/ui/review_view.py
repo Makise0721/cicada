@@ -293,6 +293,8 @@ class ReviewView:
             self._pane = "list"
         elif operation == "back_checks" and self.checks is not None:
             self._pane = "checks"
+            # 返回详情重建正文：工件窗格覆盖过的 body 不能带进检查窗格。
+            self._set_body(self._checks_lines(self.checks))
         elif operation == "checks" and self.snapshot is not None:
             if target != self.snapshot.checks_target_id:
                 return False
