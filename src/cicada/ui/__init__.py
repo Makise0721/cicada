@@ -79,15 +79,11 @@ async def run_tui_session(
         view.handle_ctrl_o()
         refs["frontend"].request_render_now()
 
-    def _toggle_reasoning() -> None:
-        view.handle_ctrl_t()  # 票据 01: 思考展开切换 + 既有立即渲染
-        refs["frontend"].request_render_now()
-
     def _mouse_unavailable_hint() -> None:
         # 票据 02 (C4): 鼠标启用失败退键盘, 一次短提示经显示文档如实成条
         error = getattr(terminal, "mouse_setup_error", None) or "unavailable"
         view.transcript.append_system(
-            f"鼠标不可用（{error}）：已回退键盘操作（F6 回看，Ctrl+O/Ctrl+T 展开）。"
+            f"鼠标不可用（{error}）：已回退键盘操作（F6 回看，Ctrl+O 展开）。"
         )
         refs["frontend"].request_render_now()
 
@@ -102,7 +98,6 @@ async def run_tui_session(
         on_escape=view.handle_escape,
         on_ctrl_c=view.handle_ctrl_c,
         on_ctrl_o=_toggle_tools,
-        on_ctrl_t=_toggle_reasoning,
         on_exit=view.handle_exit,
         footer_lines=view.footer.render,
         footer_badge_spans=lambda: view.footer.badge_spans,  # 票据 03: 徽标命中列

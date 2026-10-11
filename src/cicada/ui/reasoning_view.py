@@ -29,8 +29,6 @@ from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_an
 from cicada.ui.rendering import sanitize_display
 
 _BODY_INDENT = "  "
-_EXPAND_HINT = " · Ctrl+T 展开"
-_COLLAPSE_HINT = " · Ctrl+T 收起"
 _PREVIEW_MAX_BYTES = 8192
 _PREVIEW_NOTE = "预览已截断；完成后可展开完整记录"
 _PREVIEW_NOTE_SEALED = "预览已截断"
@@ -42,8 +40,8 @@ class ReasoningBlock:
     expand_getter 返回当前显示文档的思考展开默认值; 未注入时恒为展开
     (与工具/Skill 正文同一约定, 避免无展开手段的调用者看不到内容),
     生产组合 (transcript) 恒注入, 初始收起。
-    票据 01 (契约 C2): 逐项展开覆盖 (_override) 优先于文档默认值; Ctrl+T
-    统一全部思考与后续默认值并清除逐项覆盖; 选中态只改标题标记 (> 一列)。
+    票据 01 (契约 C2): 逐项展开覆盖 (_override) 优先于文档默认值; 选中态只改
+    标题标记 (> 一列)。04 用户裁决移除 Ctrl+T 统一切换, 点击/文档焦点为唯一入口。
     """
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
@@ -69,15 +67,10 @@ class ReasoningBlock:
         return True if self._expand_getter is None else bool(self._expand_getter())
 
     def toggle(self) -> None:
-        """逐项开关 (票据 01): 只覆盖本块, 下一次 Ctrl+T 重新统一。"""
+        """逐项开关 (票据 01): 只覆盖本块; 04 用户裁决移除 Ctrl+T 统一切换,
+        覆盖只由下一次逐项点击改回。"""
         self._override = not self.is_expanded()
         self._version += 1
-
-    def clear_override(self) -> None:
-        """Ctrl+T 统一: 清除逐项覆盖, 回到文档默认值。"""
-        if self._override is not None:
-            self._override = None
-            self._version += 1
 
     def set_record(self, reasoning: ReasoningContent | None) -> None:
         """完成/恢复的权威记录替换 (含预览原位替换); None 撤掉已有显示。"""
@@ -169,9 +162,6 @@ class ReasoningBlock:
         marked = (">" if selected else ("-" if expanded else "+")) + " " + status
         if visible_width(marked) <= width:
             title = marked  # 折叠标记仅在放得下时加入
-        hint = _COLLAPSE_HINT if expanded else _EXPAND_HINT
-        if visible_width(title + hint) <= width:
-            title += hint
         return title
 
     @staticmethod

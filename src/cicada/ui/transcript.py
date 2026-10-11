@@ -16,7 +16,8 @@
   工具输出共享), 未注入时完整显示正文。解码失败保持原 UserEntry。
 - 思考块 (thinking-budget-visibility 票据 01): 助手条目内答案前独立呈现
   message.reasoning (ui/reasoning_view), 缺失省略; 展开状态是本文档唯一
-  bool (toggle_reasoning, Ctrl+T), 初始收起, 区别于工具/Skill 的 expand_getter。
+  bool, 初始收起, 区别于工具/Skill 的 expand_getter (04 用户裁决移除
+  Ctrl+T 统一切换, 逐项点击为唯一入口)。
 - 思考流中预览 (票据 02): stream_reasoning_delta 把只读思考增量送入同一条目
   的有界预览 (空增量也建立条目); finish_reasoning_previews 按 run_id 幂等封存
   未完成预览并登记终结运行, 迟到增量不复活。
@@ -302,8 +303,9 @@ class Transcript:
     expand_getter (local-skills-v1 票据 03): 只读展开标志 getter, 生产组合注入
     工具文档的全局展开状态 (Ctrl+O 同时影响工具输出与 Skill 正文); 未注入时
     SkillRequestEntry 完整显示正文。
-    思考展开 (票据 01): 本文档唯一 bool, 初始 false, Ctrl+T 切换全部现有与
-    后续思考块; /clear 保留显示文档因此保留该状态, 新建/恢复文档自然重置。
+    思考展开 (票据 01): 本文档唯一 bool, 初始 false (文档默认收起; 04 用户
+    裁决移除 Ctrl+T 统一切换后不再变化, 逐项覆盖由点击维护); /clear 保留
+    显示文档因此保留该状态, 新建/恢复文档自然重置。
     """
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
@@ -431,16 +433,6 @@ class Transcript:
         entry.stop_reason = message.stop_reason
         entry.error = message.error
         entry.reasoning.set_record(message.reasoning)
-
-    def toggle_reasoning(self) -> None:
-        """Ctrl+T (票据 01): 切换本文档全部思考块展开状态; 只改显示。
-
-        逐项覆盖 (紧凑交互票据 01) 随之清除, 现有与后续思考块同为新默认。
-        """
-        self._reasoning_expanded = not self._reasoning_expanded
-        for entry in self._entries:
-            if isinstance(entry, AssistantEntry):
-                entry.reasoning.clear_override()
 
     def toggle_reasoning_item(self, run_id: str, turn_index: int) -> bool:
         """逐项开关指定思考块 (紧凑交互票据 01); 条目缺失或无记录返回 False。"""

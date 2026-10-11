@@ -33,9 +33,8 @@
   ModelChanged 刷新底栏有效模型并追加确认条目, 失败有界成条, closing 不重开。
   思考正文不进入普通答案 (transcript 只渲染 message.text 为答案)。
 - thinking-budget-visibility 票据 01: 完成／恢复 message.reasoning 经
-  ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认收起);
-  handle_ctrl_t 只切换本文档思考展开状态, 经 build() 的 on_ctrl_t 与生产
-  组装接 MainScreenFrontend。
+  ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认收起); 04 用户
+  裁决移除 Ctrl+T 切换, 点击/文档焦点为唯一展开入口。
 - thinking-budget-visibility 票据 02: AssistantReasoningDelta 进有界思考
   预览 (transcript.stream_reasoning_delta); 状态行按真实事件区分等待模型/
   思考/输出, 屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
@@ -51,7 +50,8 @@
 - tui-compact-interaction 票据 03 (契约 C5/C6): Shift+Tab 与点击底栏徽标
   共用 handle_shift_tab 同步准入入口——屏障内静默, 阻断态短路, 目标只由
   UI 计算 (关闭→第一档/循环/同值 no-op), 受理同步置 model 屏障后建任务;
-  ReasoningEffortChanged 投影确认条目, 失败有界成条; 底栏徽标事实经
+  ReasoningEffortChanged 只清 pending (04 用户裁决: 切换不发确认条目, 底栏
+  徽标即生效值), 失败有界成条; 底栏徽标事实经
   FooterComponent effort 回调读取 session.reasoning_effort, 事务目标只作
   pending 展示, 不伪造已生效。
 """
@@ -318,13 +318,8 @@ class ConversationView:
             )
         elif isinstance(update, ReasoningEffortChanged):
             # 票据 03 (C5/D9): 只表达强度变化, 不解释为登录或模型名称变化;
-            # previous/current 均为已生效状态, pending 事实随之清除
+            # 04 用户裁决: 切换成功不发确认条目, 底栏徽标即生效值, 仅清 pending
             self._effort_pending = None
-            self.transcript.append_system(
-                f"思考强度：{self._effort_label(update.previous.current)} → "
-                f"{self._effort_label(update.current.current)}"
-                "（仅影响后继请求；对话、摘要与验证状态保留）。"
-            )
         elif isinstance(update, ContextCompacted):
             # 02: 压缩切换成功; 确认条目 + 兜底释放屏障 (主释放由等待任务 finally)
             self._gate.note_compact_settled()
@@ -600,13 +595,6 @@ class ConversationView:
         expanded = self.tools.toggle_expand()
         self.transcript.set_skills_expanded(expanded)
 
-    def handle_ctrl_t(self) -> None:
-        """Ctrl+T 接缝 (票据 01): 切换思考块展开; 只改显示状态, 不触请求或草稿。
-
-        忙碌/finalizing 一样可切换 (A02); 模态键位由前端优先处理, 不经此入口。
-        """
-        self.transcript.toggle_reasoning()
-
     def handle_shift_tab(self) -> None:
         """Shift+Tab / 点击底栏徽标 (票据 03, C6): 同步准入后循环思考强度.
 
@@ -650,10 +638,6 @@ class ConversationView:
             return state.levels[0]
         return state.levels[(state.levels.index(state.current) + 1) % len(state.levels)]
 
-    @staticmethod
-    def _effort_label(current: str | None) -> str:
-        return "关闭" if current is None else current
-
     def _effort_badge_facts(self) -> tuple[str | None, str | None] | None:
         """底栏思考强度徽标事实 (C6): (生效档位|None=关闭, 事务目标); 不支持 None.
 
@@ -665,7 +649,7 @@ class ConversationView:
         return (state.current, self._effort_pending)
 
     async def _run_effort_cycle(self, target: str) -> None:
-        """等待思考强度事务落定 (03); 成功确认由 ReasoningEffortChanged 投影追加.
+        """等待思考强度事务落定 (03); 成功经 ReasoningEffortChanged 清 pending.
 
         落定 (成功/失败/取消) 都释放屏障并清 pending; 失败显示有界原因
         (ModelSelectionError 不含凭据/请求历史), 取消如实传播。
@@ -709,7 +693,7 @@ class ConversationView:
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
                 ("快捷键", [
                     "点击工具/思考/Skill 标题逐层展开；滚轮回看，点「最新」返回",
-                    "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
+                    "Ctrl+O 工具/Skill 文档展开/收起",
                     "Shift+Tab 或点击底栏思考标记：循环 low/high/max（关闭时先启用 low）",
                     "F6 文档回看：Up/Down 选择 · Enter 展开/分页 · Esc 返回"
                     "（PageUp/PageDown/Home/End 翻看）",
@@ -1168,7 +1152,6 @@ def build(
         "on_submit": view.on_submit,
         "on_escape": view.handle_escape,
         "on_ctrl_c": view.handle_ctrl_c,
-        "on_ctrl_t": view.handle_ctrl_t,  # 票据 01: 思考展开切换 (原键不变)
         "on_exit": view.handle_exit,
         "editor": view.editor,
         "view": view,
