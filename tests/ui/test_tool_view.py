@@ -4,7 +4,7 @@
 经 AgentEventReceived 包装 — 与 application.ApplicationSession._on_core_event
 的投递形态一致 (application.py:315)。会话组合场景用真实 ApplicationSession
 + FakeModel + 真实 glob 工具, 构造口径与 tests/test_application.py 相同;
-不接真实模型、不启动 Ollama、不执行检查模式。
+不接真实模型、不启动本地模型服务、不执行检查模式。
 """
 
 from __future__ import annotations

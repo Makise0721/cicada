@@ -1,4 +1,4 @@
-"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --ollama-url <url> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>"
+"""非交互入口: uv run python -m cicada --workspace <dir> [--script <script.json> | --model <name> --think --num-ctx N] [--instructions-file <path>] [--check-command <PowerShell> ...] [--check-timeout <s>] "<prompt>"
 交互入口: uv run python -m cicada --tui --workspace <dir> [同上模型/检查旗标] [首问]
 持久会话 (05): --tui 默认自动保存新会话; --resume <ID> 恢复, --resume 不带 ID
 在 --tui 下启动会话选择器 (只读列表, Esc 取消退出码 0); --list-sessions 列出
@@ -7,8 +7,8 @@
 
 模型来源二选一:
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
-- 缺省: 真实模型默认 DeepSeek Flash thinking; 显式 --provider ollama 保留本地 preflight。
---script 与真实模型旗标 (--model/--ollama-url/--think/--num-ctx) 互斥, 混用退出码 2.
+- 缺省: 真实模型默认 DeepSeek Flash thinking; 可用 --model 选择 API 模型。
+--script 与真实模型旗标 (--model/--think/--num-ctx) 互斥, 混用退出码 2.
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
 
@@ -26,7 +26,7 @@
 
 P4 检查模式: 给出 --check-command (可重复, 最多 8 条) 即进入. 该模式要求 workspace
 是 Git 工作树根; 启动时 initialize 建立基线快照, 失败退出码 2; 最多 25 轮; 真实模型
-Ollama profile 固定 num_ctx>=32768、num_predict=2048、请求体上限 65536 bytes;
+窗口至少 32768;
 DeepSeek 普通/检查使用同一 max_tokens 与本地预留，摘要独立关闭 thinking。 运行结束后
 程序独立扫描终结事实、刷新检查视图、生成变更证据并判定交付 (不读模型文字):
 - 0: 模型 stop 且全部指定检查的最近回执 passed/current 且证据完整;
@@ -49,8 +49,6 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
-
-import httpx
 
 from cicada.application import (
     AgentEventReceived,
@@ -87,7 +85,6 @@ from cicada.plugins.coding.verification_contracts import (
     VerificationPlan,
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.plugins.ollama import OllamaConfig, ollama_plugin
 from cicada.plugins.deepseek import DeepSeekConfig, deepseek_plugin
 from cicada.plugins.deepseek.protocol import BASE_URL as DEEPSEEK_BASE_URL, REQUEST_LIMIT
 from cicada.plugins.session_store import list_sessions, read_session_identity
@@ -114,9 +111,6 @@ from cicada.skills import (
     find_skill,
 )
 
-DEFAULT_CONFIG = OllamaConfig()
-DEFAULT_NUM_CTX = 32768  # CLI 请求级默认值; 消除服务端默认 4K 依赖. 仅是请求值, 非实际分配保证
-
 # P4 §5/§8 检查模式的固定 profile 与输入边界
 MAX_CHECK_COMMANDS = 8
 CHECK_COMMAND_MAX_BYTES = 4096
@@ -124,13 +118,8 @@ CHECK_TIMEOUT_DEFAULT_S = 120.0
 CHECK_TIMEOUT_MIN_S = 0.0
 CHECK_TIMEOUT_MAX_S = 300.0
 CHECK_MODE_MIN_NUM_CTX = 32768
-CHECK_MODE_NUM_PREDICT = 2048
 CHECK_MODE_MAX_TURNS = 25
-CHECK_MODE_MAX_REQUEST_BYTES = 65536
 NORMAL_MODE_MAX_TURNS = 50
-
-# 04: 存档 options 的已知键 (ollama 透传); 继承前拒绝未知键与非法值
-KNOWN_OLLAMA_OPTION_KEYS = ("num_ctx", "num_predict")
 
 # 05: --tui --resume 不带 ID = 启动选择器 (哨兵; 单次模式明确拒绝)
 _RESUME_PICK = object()
@@ -160,23 +149,6 @@ async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdenti
         )
         return None
     return identity
-
-
-def _validate_saved_options(options: dict[str, object]) -> str | None:
-    """存档 options 键/值校验; 返回错误消息或 None (契约 §6: 未知配置键不执行)."""
-    unknown = sorted(str(key) for key in options if key not in KNOWN_OLLAMA_OPTION_KEYS)
-    if unknown:
-        return (
-            f"存档配置包含未知配置键: {', '.join(unknown)} "
-            f"(当前程序仅支持: {', '.join(KNOWN_OLLAMA_OPTION_KEYS)})"
-        )
-    for key in KNOWN_OLLAMA_OPTION_KEYS:
-        value = options.get(key)
-        if value is None:
-            continue
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            return f"存档配置 {key} 必须是正整数, 存档记录 {value!r}"
-    return None
 
 
 _LIST_TITLE_MAX_CHARS = 30
@@ -352,16 +324,6 @@ def _print_prompt_info(info: PromptInfo) -> None:
     print(line)
 
 
-async def _ollama_reachable(base_url: str) -> bool:
-    """preflight: GET /api/version (2s 超时); 连接失败或非 2xx 均视为不可达."""
-    try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            response = await client.get(f"{base_url.rstrip('/')}/api/version")
-    except httpx.HTTPError:
-        return False
-    return response.is_success
-
-
 async def _launch_session_selector(workspace: Path) -> str | None:
     """--tui 无 ID 恢复的选择器入口; 返回选中的 session_id (取消为 None)。
 
@@ -464,7 +426,6 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             return 2
     if args.script is not None and (
         args.model is not None
-        or args.ollama_url is not None
         or args.think is not None
         or args.num_ctx is not None
         or args.provider is not None
@@ -603,8 +564,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 file=sys.stderr,
             )
             return 2
-        if saved_stored.launch.provider not in ("ollama", "deepseek", "fake"):
-            print("--resume: 存档 provider 不受支持", file=sys.stderr)
+        if saved_stored.launch.provider not in ("deepseek", "fake"):
+            print("--resume: 存档 provider 已不受支持; 使用 --resume-with-current-config 显式采用当前配置", file=sys.stderr)
             return 2
         if saved_stored.launch.provider == "deepseek":
             saved_launch = saved_stored.launch
@@ -621,13 +582,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             except ValueError as exc:
                 print(f"--resume: {exc}", file=sys.stderr)
                 return 2
-        elif saved_stored.launch.provider == "ollama":
-            saved_launch = saved_stored.launch
-            option_error = _validate_saved_options(dict(saved_launch.options))
-            if option_error is not None:
-                print(f"--resume: {option_error}", file=sys.stderr)
-                return 2
-    # 01: 预算配置只由 ollama 路径实填; fake 默认 None = 预算层不安装 (D9)
+    # API 路径启用预算; fake 默认不安装预算层。
     budget_config: BudgetConfig | None = None
     defaults_saved = False
     if args.script is not None:
@@ -656,206 +611,111 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         if saved_launch is not None and provider != saved_launch.provider:
             print("--resume: provider 与存档不匹配; 使用 --resume-with-current-config 显式采用当前配置", file=sys.stderr)
             return 2
-        if provider == "deepseek":
-            if args.ollama_url is not None:
-                print("--ollama-url 只对 --provider ollama 合法", file=sys.stderr)
+        saved_options = saved_launch.options if saved_launch is not None else {}
+        explicit = {name: getattr(args, name) for name in (
+            'provider', 'model', 'think', 'reasoning_effort', 'num_ctx', 'max_output_tokens')}
+        archive = (UserDefaults(model=saved_launch.model, think=saved_launch.think,
+            num_ctx=saved_options['num_ctx'], max_output_tokens=saved_options['max_tokens'],
+            reasoning_effort=saved_options['reasoning_effort']) if saved_launch else None)
+        if saved_launch is not None:
+            # 与应用打开时的完整核对并存；在读取凭据及02向导前拒绝显式冲突。
+            provisional = resolve_launch_config(
+                UserConfigSnapshot(UserDefaults(), frozenset(), None, 'missing', ''),
+                explicit=explicit, archive=archive).defaults
+            proposed = replace(saved_launch, model=provisional.model, think=provisional.think,
+                options={'num_ctx': provisional.num_ctx, 'max_tokens': provisional.max_output_tokens,
+                         'reasoning_effort': provisional.reasoning_effort}, max_turns=max_turns,
+                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+                instructions_sha256=prompt_info.instructions_sha256,
+                checks_signature=verification_checks_signature(plan.checks) if plan else None)
+            conflicts = conflicting_launch_fields(saved_launch, proposed)
+            if conflicts:
+                print('--resume: config conflicts: ' + ', '.join(conflicts), file=sys.stderr)
                 return 2
-            saved_options = saved_launch.options if saved_launch is not None else {}
-            explicit = {name: getattr(args, name) for name in (
-                'provider', 'model', 'think', 'reasoning_effort', 'num_ctx', 'max_output_tokens')}
-            archive = (UserDefaults(model=saved_launch.model, think=saved_launch.think,
-                num_ctx=saved_options['num_ctx'], max_output_tokens=saved_options['max_tokens'],
-                reasoning_effort=saved_options['reasoning_effort']) if saved_launch else None)
-            if saved_launch is not None:
-                # 与应用打开时的完整核对并存；在读取凭据及02向导前拒绝显式冲突。
-                provisional = resolve_launch_config(
-                    UserConfigSnapshot(UserDefaults(), frozenset(), None, 'missing', ''),
-                    explicit=explicit, archive=archive).defaults
-                proposed = replace(saved_launch, model=provisional.model, think=provisional.think,
-                    options={'num_ctx': provisional.num_ctx, 'max_tokens': provisional.max_output_tokens,
-                             'reasoning_effort': provisional.reasoning_effort}, max_turns=max_turns,
-                    prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
-                    instructions_sha256=prompt_info.instructions_sha256,
-                    checks_signature=verification_checks_signature(plan.checks) if plan else None)
-                conflicts = conflicting_launch_fields(saved_launch, proposed)
-                if conflicts:
-                    print('--resume: config conflicts: ' + ', '.join(conflicts), file=sys.stderr)
+        try:
+            store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
+            snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
+            resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
+            defaults = resolved.defaults
+            sources = dict(resolved.sources)
+            # 会话options沿用既有max_tokens命名；用户文件采用max_output_tokens。
+            sources['max_tokens'] = sources.pop('max_output_tokens')
+            config = DeepSeekConfig(
+                model=defaults.model, think=defaults.think, num_ctx=defaults.num_ctx,
+                max_tokens=defaults.max_output_tokens, reasoning_effort=defaults.reasoning_effort,
+                max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT,
+            )
+        except UserConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid DeepSeek config: {exc}", file=sys.stderr)
+            return 2
+        if checks and config.num_ctx < CHECK_MODE_MIN_NUM_CTX:
+            print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
+            return 2
+        if resolved.credential is None:
+            if not args.tui:
+                print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
+                      '交互入口为 --tui', file=sys.stderr)
+                return 2
+            if checks:
+                # 沿生产只读 inventory 核对 Git 根，不创建 Workspace 输出目录。
+                from cicada.core.cancel import CancelToken
+                from cicada.plugins.coding.inventory import GitInventory, InventoryError
+                from cicada.plugins.coding.workspace import Workspace
+
+                root = Path(os.path.realpath(workspace.expanduser()))
+                try:
+                    await GitInventory(Workspace(root, root / '.cicada' / 'outputs')).list_files(CancelToken())
+                except InventoryError:
+                    print('检查模式工作区 Git 预检失败', file=sys.stderr)
                     return 2
             try:
-                store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
+                result = await _launch_first_run(store, snapshot, defaults,
+                    explicit=explicit, credentials_only=archive is not None)
+                if result is None:
+                    return 0
+                defaults_saved = result.defaults_saved
+                if not defaults_saved or result.error_code is not None:
+                    print(('用户默认值已保存；' if defaults_saved else '') +
+                          'login failed: ' + (result.error_code or 'save-failed'), file=sys.stderr)
+                    return 2
                 snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
                 resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
                 defaults = resolved.defaults
+                config = DeepSeekConfig(model=defaults.model, think=defaults.think,
+                    reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
+                    max_tokens=defaults.max_output_tokens,
+                    max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT)
                 sources = dict(resolved.sources)
-                # 会话options沿用既有max_tokens命名；用户文件采用max_output_tokens。
                 sources['max_tokens'] = sources.pop('max_output_tokens')
-                config = DeepSeekConfig(
-                    model=defaults.model, think=defaults.think, num_ctx=defaults.num_ctx,
-                    max_tokens=defaults.max_output_tokens, reasoning_effort=defaults.reasoning_effort,
-                    max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT,
-                )
+                if resolved.credential is None:
+                    raise UserConfigError('credential', 'missing-credential')
             except UserConfigError as exc:
-                print(str(exc), file=sys.stderr)
+                print(('用户默认值已保存；' if defaults_saved else '') + str(exc), file=sys.stderr)
                 return 2
-            except ValueError as exc:
-                print(f"invalid DeepSeek config: {exc}", file=sys.stderr)
+            except Exception:
+                print(('用户默认值已保存；' if defaults_saved else '') +
+                      'login startup failed', file=sys.stderr)
                 return 2
-            if checks and config.num_ctx < CHECK_MODE_MIN_NUM_CTX:
-                print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
-                return 2
-            if resolved.credential is None:
-                if not args.tui:
-                    print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
-                          '交互入口为 --tui', file=sys.stderr)
-                    return 2
-                if checks:
-                    # 沿生产只读 inventory 核对 Git 根，不创建 Workspace 输出目录。
-                    from cicada.core.cancel import CancelToken
-                    from cicada.plugins.coding.inventory import GitInventory, InventoryError
-                    from cicada.plugins.coding.workspace import Workspace
-
-                    root = Path(os.path.realpath(workspace.expanduser()))
-                    try:
-                        await GitInventory(Workspace(root, root / '.cicada' / 'outputs')).list_files(CancelToken())
-                    except InventoryError:
-                        print('检查模式工作区 Git 预检失败', file=sys.stderr)
-                        return 2
-                try:
-                    result = await _launch_first_run(store, snapshot, defaults,
-                        explicit=explicit, credentials_only=archive is not None)
-                    if result is None:
-                        return 0
-                    defaults_saved = result.defaults_saved
-                    if not defaults_saved or result.error_code is not None:
-                        print(('用户默认值已保存；' if defaults_saved else '') +
-                              'login failed: ' + (result.error_code or 'save-failed'), file=sys.stderr)
-                        return 2
-                    snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
-                    resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
-                    defaults = resolved.defaults
-                    config = DeepSeekConfig(model=defaults.model, think=defaults.think,
-                        reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
-                        max_tokens=defaults.max_output_tokens,
-                        max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT)
-                    sources = dict(resolved.sources)
-                    sources['max_tokens'] = sources.pop('max_output_tokens')
-                    if resolved.credential is None:
-                        raise UserConfigError('credential', 'missing-credential')
-                except UserConfigError as exc:
-                    print(('用户默认值已保存；' if defaults_saved else '') + str(exc), file=sys.stderr)
-                    return 2
-                except Exception:
-                    print(('用户默认值已保存；' if defaults_saved else '') +
-                          'login startup failed', file=sys.stderr)
-                    return 2
-            safe = config.identity
-            identity = LaunchIdentity(
-                provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
-                options=dict(safe.options), max_request_bytes=safe.max_request_bytes, max_turns=max_turns,
-                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
-                instructions_sha256=prompt_info.instructions_sha256,
-                checks_signature=verification_checks_signature(plan.checks) if plan is not None else None,
-                sources=sources,
-            )
-            budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
-            model_plugin = deepseek_plugin(config, api_key=resolved.credential.reveal())
-            model_label = config.model
-            preflight = None
-            if not args.tui:
-                print(f"[config provider=deepseek model={config.model} context_requested={config.num_ctx} "
-                      f"source={sources['num_ctx']} think={str(config.think).lower()} "
-                      f"max_tokens={config.max_tokens} reasoning_effort={config.reasoning_effort}]")
-        else:
-            if args.max_output_tokens is not None or args.reasoning_effort is not None:
-                print("--max-output-tokens/--reasoning-effort 只对 DeepSeek 合法", file=sys.stderr)
-                return 2
-            # 04: 省略的模型/服务地址/think/窗口继承存档 (来源记 archive); 显式值保持
-            # 原语义, 与存档的差异由恢复准入点名拒绝
-            sources: dict[str, str] = {}
-            eff_model = args.model or DEFAULT_CONFIG.model
-            eff_base_url = args.ollama_url or DEFAULT_CONFIG.base_url
-            eff_think: bool | None = bool(args.think)
-            num_ctx_source = "cli" if args.num_ctx is not None else "default"
-            if args.num_ctx is not None:
-                num_ctx = args.num_ctx
-            elif saved_launch is not None and saved_launch.options.get("num_ctx") is not None:
-                num_ctx = saved_launch.options["num_ctx"]
-                num_ctx_source = "archive"
-            else:
-                num_ctx = DEFAULT_NUM_CTX
-            if saved_launch is not None:
-                if args.model is None:
-                    eff_model = saved_launch.model
-                    sources["model"] = "archive"
-                if args.ollama_url is None and saved_launch.base_url is not None:
-                    eff_base_url = saved_launch.base_url
-                    sources["base_url"] = "archive"
-                if args.think is None:
-                    eff_think = saved_launch.think
-                    sources["think"] = "archive"
-            sources["num_ctx"] = num_ctx_source
-            options: dict[str, object] = {"num_ctx": num_ctx}
-            request_limit: int | None = None
-            if checks:
-                options["num_predict"] = CHECK_MODE_NUM_PREDICT
-                request_limit = CHECK_MODE_MAX_REQUEST_BYTES
-            # 01: 预算由有效 num_ctx 实填 (D9, 含 archive 继承来源); 输出预留取配置的
-            # num_predict (检查模式 2048), 否则用 BudgetConfig 缺省。fake 路径保持 None
-            num_predict = options.get("num_predict")
-            budget_config = BudgetConfig(
-                num_ctx=num_ctx,
-                num_predict=(
-                    num_predict
-                    if isinstance(num_predict, int) and not isinstance(num_predict, bool) and num_predict > 0
-                    else None
-                ),
-            )
-            config = OllamaConfig(
-                base_url=eff_base_url,
-                model=eff_model,
-                think=eff_think,
-                options=options,
-                max_request_bytes=request_limit,
-            )
-            if not args.tui:
-                policy_line = (
-                    f" num_predict={CHECK_MODE_NUM_PREDICT} request_bytes_limit={CHECK_MODE_MAX_REQUEST_BYTES}"
-                    if checks else ""
-                )
-                print(
-                    f"[config model={config.model} context_requested={num_ctx} source={num_ctx_source} "
-                    f"think={str(config.think).lower()}{policy_line} workspace={prompt_info.workspace}]"
-                )
-            identity = LaunchIdentity(
-                provider="ollama", model=config.model, base_url=config.base_url, think=config.think,
-                options=dict(config.options), max_request_bytes=config.max_request_bytes,
-                max_turns=max_turns,
-                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
-                instructions_sha256=prompt_info.instructions_sha256,
-                checks_signature=(
-                    verification_checks_signature(plan.checks) if plan is not None else None
-                ),
-                sources=sources,
-            )
-            if args.save_session or args.resume is not None or args.tui:
-                # 持久路径 (TUI 默认持久): 可达性探测在存档格式/配置预检之后执行 (契约 §1 次序)
-                async def preflight() -> None:
-                    if not await _ollama_reachable(config.base_url):
-                        raise ApplicationOpenError(
-                            f"Ollama 不可达: {config.base_url} "
-                            "(请先启动 Ollama, 或用 --script 走 fake model)"
-                        )
-            else:
-                preflight = None
-                if not await _ollama_reachable(config.base_url):
-                    print(
-                        f"Ollama 不可达: {config.base_url} (请先启动 Ollama, 或用 --script 走 fake model)",
-                        file=sys.stderr,
-                    )
-                    return 2
-            model_plugin = ollama_plugin(config)
-            model_label = config.model
-
+        safe = config.identity
+        identity = LaunchIdentity(
+            provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
+            options=dict(safe.options), max_request_bytes=safe.max_request_bytes, max_turns=max_turns,
+            prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+            instructions_sha256=prompt_info.instructions_sha256,
+            checks_signature=verification_checks_signature(plan.checks) if plan is not None else None,
+            sources=sources,
+        )
+        budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
+        model_plugin = deepseek_plugin(config, api_key=resolved.credential.reveal())
+        model_label = config.model
+        preflight = None
+        if not args.tui:
+            print(f"[config provider=deepseek model={config.model} context_requested={config.num_ctx} "
+                  f"source={sources['num_ctx']} think={str(config.think).lower()} "
+                  f"max_tokens={config.max_tokens} reasoning_effort={config.reasoning_effort}]")
     resume_id = args.resume if isinstance(args.resume, str) else None
     if args.tui or args.save_session or args.resume is not None:
         persistence_config = PersistenceConfig(
@@ -1001,7 +861,7 @@ def main(*, user_config_store: UserConfigStore | None = None,
         epilog='''DeepSeek 用户默认配置：读取当前用户 ~/.cicada/config.toml，不会读取工作区配置。
 新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
 普通 --resume 继承存档模型配置；凭据每次启动按有效 DEEPSEEK_API_KEY > 文件引用。
-help、list、fake 与显式 Ollama 不读取这些文件。文件存在但无效时明确失败。
+help、list 与 fake 不读取这些文件。文件存在但无效时明确失败。
 
 config.toml 示例（普通字段均可省略；不接受 API key 或 max_request_bytes）：
 version = 1
@@ -1031,15 +891,14 @@ credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
     )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
-    parser.add_argument("--provider", choices=("deepseek", "ollama"), help="真实 provider (新会话默认 deepseek; 恢复继承存档)")
-    parser.add_argument("--model", help="DeepSeek: deepseek-flash (默认)/deepseek-v4-pro; Ollama: 本地模型名")
-    parser.add_argument("--ollama-url", help=f"Ollama 服务地址 (默认 {DEFAULT_CONFIG.base_url})")
+    parser.add_argument("--provider", choices=("deepseek",), help="真实 provider (新会话默认 deepseek; 恢复继承存档)")
+    parser.add_argument("--model", help="deepseek-flash (默认)/deepseek-v4-pro")
     parser.add_argument("--think", action=argparse.BooleanOptionalAction, default=None,
-                        help="开启/关闭思考 (DeepSeek 默认开启; Ollama 默认关闭; 思考不展示)")
+                        help="开启/关闭思考 (默认开启; 思考可在 TUI 展开查看)")
     parser.add_argument("--reasoning-effort", choices=("low", "high", "max"), help="DeepSeek 思考强度 (默认 high)")
     parser.add_argument("--max-output-tokens", type=int, help="DeepSeek 思考+答案总输出上限 (默认 32768)")
     parser.add_argument(
-        "--num-ctx", type=int, help="本地窗口上限 (DeepSeek 默认 131072; Ollama 默认 32768)"
+        "--num-ctx", type=int, help="本地窗口上限 (默认 131072)"
     )
     parser.add_argument(
         "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"

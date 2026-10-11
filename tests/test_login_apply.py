@@ -68,7 +68,7 @@ def test_prepare_configuration_is_local_shares_client_and_keeps_old_binding():
     assert kept.model._api_key == 'old-sentinel'
     with pytest.raises(ValueError):
         old.prepare_configuration(ConfigurationRequest(
-            replace(before.identity, provider='ollama'), 'keep'))
+            replace(before.identity, provider='unsupported-provider'), 'keep'))
     with pytest.raises(ValueError):
         old.prepare_configuration(ConfigurationRequest(
             replace(before.identity, options=(('num_ctx', 100), ('max_tokens', 4096),

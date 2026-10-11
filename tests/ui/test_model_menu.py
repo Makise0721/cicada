@@ -508,7 +508,7 @@ async def test_same_option_is_noop_without_barrier_or_task(tmp_path):
 
 
 async def test_model_command_unavailable_without_selection_capability(tmp_path):
-    """fake/Ollama 会话无选择能力: /model 给有界说明, 不开菜单 (C7)."""
+    """fake 会话无选择能力: /model 给有界说明, 不开菜单 (C7)."""
     session = await open_application(fake_config(_repo(tmp_path), _script({"text": "答", "stop": True})))
     h = ViewHarness(session)
     try:

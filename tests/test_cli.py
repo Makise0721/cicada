@@ -1,17 +1,14 @@
 """CLI 配置与接线聚焦测试: num_ctx 解析/互斥/校验时序、启动显示、摘要输出.
 
-经子进程核对 `_run` 接线 (P3 §9: 不能只测 helper). preflight 失败路径用死端口,
-确定性零网络依赖; 指令文件错误必须先于 preflight。
+经子进程核对 `_run` 接线 (P3 §9: 不能只测 helper). API 路径用 MockTransport，参数与存档错误必须先于模型请求。
 """
 
 from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -36,64 +33,39 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
     )
 
 
-class _OllamaStub:
-    """最小本地 Ollama 替身 (A11 真实模型组合的确定性证据):
+class _ApiMock:
+    """通过 MockTransport 运行实际 API 插件，不启动服务。"""
 
-    GET /api/version -> 200 (preflight); POST /api/chat -> 单条 NDJSON stop 终结流.
-    requests 记录收到的请求行, 用于「参数来源/冲突字段/零意外调用」断言。
-    """
+    def __init__(self, monkeypatch):
+        import httpx
+        from cicada import __main__ as cli
+        from cicada.plugins.deepseek import deepseek_plugin
+        from test_deepseek_application import response
 
-    def __init__(self) -> None:
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.monkeypatch = monkeypatch
+        self.requests = []
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "cli-mock-key")
 
-        outer = self
-        self.requests: list[str] = []
+        def handle(request):
+            body = json.loads(request.content)
+            self.requests.append(body)
+            reasoning = "思考" if body["thinking"]["type"] == "enabled" else None
+            return httpx.Response(200, content=response(reasoning, "stub answer"))
 
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
+        monkeypatch.setattr(cli, "deepseek_plugin", lambda config, *, api_key: deepseek_plugin(
+            config, api_key=api_key, transport=httpx.MockTransport(handle)))
 
-            def log_message(self, *args) -> None:
-                pass
+    def run(self, *args):
+        from cicada import __main__ as cli
+        from cicada.plugins.user_config import FileUserConfigStore
 
-            def _reply(self, body: bytes, content_type: str) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def do_GET(self) -> None:
-                outer.requests.append(f"GET {self.path}")
-                self._reply(b'{"version": "stub"}', "application/json")
-
-            def do_POST(self) -> None:
-                length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
-                outer.requests.append(f"POST {self.path}")
-                self._reply(
-                    b'{"message": {"role": "assistant", "content": "stub answer"},'
-                    b' "done": true, "done_reason": "stop"}\n',
-                    "application/x-ndjson",
-                )
-
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        self._thread.start()
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
-
-    def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
-
-
-def _dead_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+        out, err = _CaptureStream(), _CaptureStream()
+        self.monkeypatch.setattr(cli.sys, "argv", ["cicada", *args])
+        self.monkeypatch.setattr(cli.sys, "stdout", out)
+        self.monkeypatch.setattr(cli.sys, "stderr", err)
+        workspace = Path(args[args.index("--workspace") + 1])
+        code = cli.main(user_config_store=FileUserConfigStore(workspace / "test-user"))
+        return subprocess.CompletedProcess(args, code, out.value, err.value)
 
 
 def _script(tmp_path: Path) -> Path:
@@ -108,13 +80,10 @@ def test_num_ctx_non_integer_rejected(tmp_path):
 
 
 def test_num_ctx_non_positive_rejected_before_preflight(tmp_path):
-    # 死端口: 若先 preflight 会报 Ollama 不可达; 先报 num_ctx 证明校验时序
-    dead = f"http://127.0.0.1:{_dead_port()}"
     for value in ("0", "-5"):
-        proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "--num-ctx", value, "任务")
+        proc = run_cli("--workspace", str(tmp_path), "--provider", "deepseek", "--num-ctx", value, "任务")
         assert proc.returncode == 2, value
         assert "--num-ctx 必须是正整数" in proc.stderr
-        assert "Ollama 不可达" not in proc.stderr
 
 
 def test_script_and_num_ctx_are_mutually_exclusive(tmp_path):
@@ -125,43 +94,35 @@ def test_script_and_num_ctx_are_mutually_exclusive(tmp_path):
     assert "互斥" in proc.stderr
 
 
-def test_real_mode_displays_default_and_cli_num_ctx(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "任务")
-    assert proc.returncode == 2
-    assert "context_requested=32768 source=default" in proc.stdout
-    assert "Ollama 不可达" in proc.stderr
-
-    proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "--num-ctx", "8192", "任务"
-    )
-    assert proc.returncode == 2
-    assert "context_requested=8192 source=cli" in proc.stdout
+def test_real_mode_displays_default_and_cli_num_ctx(tmp_path, monkeypatch):
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(tmp_path), "任务")
+    assert proc.returncode == 0, proc.stderr
+    assert "context_requested=131072 source=default" in proc.stdout
+    proc = mock.run("--workspace", str(tmp_path), "--num-ctx", "65536", "任务")
+    assert proc.returncode == 0, proc.stderr
+    assert "context_requested=65536 source=cli" in proc.stdout
 
 
 def test_instructions_file_error_precedes_preflight(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "deepseek",
         "--instructions-file", "missing.md", "任务",
     )
     assert proc.returncode == 2
     assert "invalid instructions file" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr
 
 
-def test_instructions_file_in_real_mode_displayed(tmp_path):
+def test_instructions_file_in_real_mode_displayed(tmp_path, monkeypatch):
     (tmp_path / "RULES.md").write_text("先跑测试再汇报。", encoding="utf-8")
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
-        "--instructions-file", "RULES.md", "任务",
-    )
-    assert proc.returncode == 2  # preflight 失败
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(tmp_path), "--instructions-file", "RULES.md", "任务")
+    assert proc.returncode == 0, proc.stderr
     assert "[prompt version=builtin:p4-v1" in proc.stdout
     assert "instructions=" in proc.stdout and "RULES.md" in proc.stdout
     assert "instructions_sha256=" in proc.stdout and "prompt_sha256=" in proc.stdout
-    assert "先跑测试再汇报" not in proc.stdout  # 不打印提示全文
+    assert "先跑测试再汇报" not in proc.stdout
+    assert "先跑测试再汇报" in mock.requests[0]["messages"][0]["content"]
 
 
 def test_script_mode_uses_builtin_prompt_and_prints_summary(tmp_path):
@@ -229,34 +190,30 @@ def test_check_timeout_range_rejected(tmp_path):
 
 
 def test_check_mode_small_num_ctx_rejected_before_preflight(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "deepseek",
         "--check-command", "exit 0", "--num-ctx", "8192", "任务",
     )
     assert proc.returncode == 2
     assert "检查模式要求 --num-ctx >= 32768" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr  # 输入校验先于 preflight
 
 
-def test_check_mode_real_model_profile_displayed(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
-        "--check-command", "exit 0", "任务",
-    )
-    assert proc.returncode == 2  # preflight 失败, 但先显示检查模式 profile
-    assert "num_predict=2048" in proc.stdout
-    assert "request_bytes_limit=65536" in proc.stdout
+def test_check_mode_real_model_profile_displayed(tmp_path, monkeypatch):
+    work = _git_worktree(tmp_path)
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(work), "--check-command", "exit 0", "任务")
+    assert proc.returncode == 3, proc.stderr
     assert "[check_mode checks=1 ids=check-1" in proc.stdout
     assert "max_turns=25" in proc.stdout
+    assert mock.requests[0]["max_tokens"] == 32768
 
 
-def test_normal_mode_has_no_request_limit(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead, "任务")
-    assert proc.returncode == 2
-    assert "request_bytes_limit" not in proc.stdout  # 普通模式保持原语义
+def test_normal_mode_uses_api_request_profile(tmp_path, monkeypatch):
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(tmp_path), "任务")
+    assert proc.returncode == 0, proc.stderr
+    assert "[check_mode" not in proc.stdout
+    assert mock.requests[0]["max_tokens"] == 32768
 
 
 # --- T14: --tui 接线 (非 TTY / 缺 UI 依赖 / prompt 语义 / 零 UI 导入) ---------------------------
@@ -404,13 +361,11 @@ def test_save_and_resume_roundtrip_via_separate_processes(tmp_path):
 
 
 def test_resume_unknown_id_reports_not_found_before_preflight(tmp_path):
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
+    proc = run_cli("--workspace", str(tmp_path), "--provider", "deepseek",
                    "--resume", "123e4567-e89b-42d3-a456-426614174000", "任务")
     assert proc.returncode == 2
     assert "session store open failed" in proc.stderr
     assert "no session archive" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr, "可达性探测不得先于存档预检"
 
 
 def test_resume_malformed_id_rejected(tmp_path):
@@ -561,7 +516,7 @@ def test_resume_config_conflict_names_field(tmp_path):
     """同配置恢复之外的变化在副作用前拒绝, 且不先做模型可达性探测。
 
     存档由 fake 会话写入 (provider=fake); 恢复时改用真实模型旗标 ->
-    provider/base_url 冲突先于 Ollama preflight 报出。
+    provider 冲突先于 API 凭据与网络操作报出。
     """
     work = tmp_path / "ws2"
     work.mkdir()
@@ -571,13 +526,11 @@ def test_resume_config_conflict_names_field(tmp_path):
                     "--save-session", "问")
     assert first.returncode == 0, first.stderr
     session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-    dead = f"http://127.0.0.1:{_dead_port()}"
-    proc = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", dead,
+    proc = run_cli("--workspace", str(work), "--provider", "deepseek",
                    "--resume", session_id, "任务")
     assert proc.returncode == 2
     assert "config conflicts" in proc.stderr
     assert "provider" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr
 
 
 def test_resume_after_workspace_move_rejected(tmp_path):
@@ -745,90 +698,43 @@ def test_resume_with_pending_intent_prints_interrupted_and_continues(tmp_path):
     assert "[session saved request_id=" in proc.stdout
 
 
-# --- 04: 默认恢复的配置继承 (A11; 真实模型组合 + 本地 ollama 替身) ------------------------------
+# --- 04: 默认恢复的配置继承 (A11; API 配置组合 + MockTransport) ------------------------------
 
 
-def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path):
-    """省略参数继承存档 (来源 archive), 显式相同可用, 显式不同点名冲突且零模型探测."""
-    stub = _OllamaStub()
-    try:
-        work = tmp_path / "ws"
-        work.mkdir()
-        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                        "--model", "stub-model", "--think", "--num-ctx", "8192",
-                        "--save-session", "第一问")
-        assert first.returncode == 0, (first.stdout, first.stderr)
-        assert "model=stub-model context_requested=8192 source=cli think=true" in first.stdout
-        assert stub.requests == ["GET /api/version", "POST /api/chat"]
-        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-        stub.requests.clear()
-
-        inherited = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                            "--resume", session_id, "第二问")
-        assert inherited.returncode == 0, (inherited.stdout, inherited.stderr)
-        # 省略 model/think/num-ctx 全部继承存档, 来源标记 archive
-        assert "model=stub-model context_requested=8192 source=archive think=true" in inherited.stdout
-        assert stub.requests == ["GET /api/version", "POST /api/chat"], "恰一次探测与一次调用"
-        stub.requests.clear()
-
-        same = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                       "--resume", session_id,
-                       "--model", "stub-model", "--think", "--num-ctx", "8192", "第三问")
-        assert same.returncode == 0, (same.stdout, same.stderr)
-        assert "model=stub-model context_requested=8192 source=cli think=true" in same.stdout
-        stub.requests.clear()
-
-        inherited_url = run_cli("--workspace", str(work), "--resume", session_id, "第四问")
-        assert inherited_url.returncode == 0, (inherited_url.stdout, inherited_url.stderr)
-        # 省略 --ollama-url: 服务地址继承存档 (仍指向本替身)
-        assert stub.requests == ["GET /api/version", "POST /api/chat"], "base_url 继承存档"
-        stub.requests.clear()
-
-        conflict = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                           "--resume", session_id, "--num-ctx", "4096", "第五问")
-        assert conflict.returncode == 2
-        assert "config conflicts" in conflict.stderr
-        assert "options" in conflict.stderr
-        assert stub.requests == [], "配置冲突先于可达性探测 (零模型请求)"
-    finally:
-        stub.stop()
+def test_real_mode_resume_inherits_omitted_config_and_names_conflicts(tmp_path, monkeypatch):
+    mock = _ApiMock(monkeypatch)
+    first = mock.run("--workspace", str(tmp_path), "--model", "deepseek-v4-pro", "--think",
+                     "--num-ctx", "65536", "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    for flags, source in (([], "archive"), (["--model", "deepseek-v4-pro", "--think", "--num-ctx", "65536"], "cli")):
+        proc = mock.run("--workspace", str(tmp_path), "--resume", session_id, *flags, "续问")
+        assert proc.returncode == 0, proc.stderr
+        assert f"model=deepseek-v4-pro context_requested=65536 source={source} think=true" in proc.stdout
+        assert mock.requests[-1]["model"] == "deepseek-v4-pro"
+    count = len(mock.requests)
+    proc = mock.run("--workspace", str(tmp_path), "--resume", session_id, "--num-ctx", "98304", "冲突")
+    assert proc.returncode == 2 and "config conflicts" in proc.stderr and "options" in proc.stderr
+    assert len(mock.requests) == count
 
 
-def test_resume_unknown_saved_option_key_rejected(tmp_path):
-    """契约 §6: 未知配置键不执行——继承前明确拒绝且零模型探测."""
+def test_resume_unknown_saved_option_key_rejected(tmp_path, monkeypatch):
     import sqlite3
 
-    stub = _OllamaStub()
-    try:
-        work = tmp_path / "ws"
-        work.mkdir()
-        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                        "--num-ctx", "8192", "--save-session", "问")
-        assert first.returncode == 0, first.stderr
-        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-        db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
-        connection = sqlite3.connect(str(db))
-        try:
-            row = connection.execute(
-                "SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1"
-            ).fetchone()
-            payload = json.loads(row[0])
-            payload["options"]["bogus_threads"] = 4
-            connection.execute(
-                "UPDATE epoch SET identity_json = ? WHERE identity_json = ?",
-                (json.dumps(payload), row[0]),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-        stub.requests.clear()
-        proc = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                       "--resume", session_id, "问")
-        assert proc.returncode == 2
-        assert "未知配置键" in proc.stderr and "bogus_threads" in proc.stderr
-        assert stub.requests == []
-    finally:
-        stub.stop()
+    mock = _ApiMock(monkeypatch)
+    first = mock.run("--workspace", str(tmp_path), "--save-session", "问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    db = tmp_path / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    with sqlite3.connect(db) as connection:
+        row = connection.execute("SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1").fetchone()
+        payload = json.loads(row[0])
+        payload["options"]["bogus_threads"] = 4
+        connection.execute("UPDATE epoch SET identity_json = ? WHERE identity_json = ?", (json.dumps(payload), row[0]))
+    count = len(mock.requests)
+    proc = mock.run("--workspace", str(tmp_path), "--resume", session_id, "问")
+    assert proc.returncode == 2 and "options" in proc.stderr
+    assert len(mock.requests) == count
 
 
 def test_resume_omitted_checks_on_check_mode_archive_rejected(tmp_path):
@@ -846,31 +752,35 @@ def test_resume_omitted_checks_on_check_mode_archive_rejected(tmp_path):
     assert "--resume-with-current-config" in proc.stderr
 
 
-def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path):
-    """A11: 旗标下省略参数取当前默认 (而非存档), 差异记入新 epoch."""
-    stub = _OllamaStub()
-    try:
-        work = tmp_path / "ws"
-        work.mkdir()
-        first = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                        "--num-ctx", "8192", "--save-session", "第一问")
-        assert first.returncode == 0, first.stderr
-        session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-        stub.requests.clear()
+def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path, monkeypatch):
+    """旧 provider 只读身份保留，显式采用当前 API 配置写入新 epoch。"""
+    import sqlite3
 
-        adopted = run_cli("--workspace", str(work), "--provider", "ollama", "--ollama-url", stub.url,
-                          "--resume", session_id, "--resume-with-current-config", "第二问")
-        assert adopted.returncode == 0, (adopted.stdout, adopted.stderr)
-        # 省略 --num-ctx 取当前默认 32768 (非存档 8192), 来源 default
-        assert "context_requested=32768 source=default" in adopted.stdout
-        assert "[session saved request_id=" in adopted.stdout
-
-        stored = _latest_epoch_launch(work, session_id)
-        assert stored.launch.options.get("num_ctx") == 32768
-        assert stored.launch.sources.get("resume_config") == "current"
-        assert "options" in stored.launch.sources.get("changed_fields", "")
-    finally:
-        stub.stop()
+    mock = _ApiMock(monkeypatch)
+    first = mock.run("--workspace", str(tmp_path), "--num-ctx", "65536", "--save-session", "第一问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+    db = tmp_path / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    with sqlite3.connect(db) as connection:
+        row = connection.execute("SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1").fetchone()
+        payload = json.loads(row[0])
+        payload["provider"] = "unsupported-provider"
+        connection.execute("UPDATE epoch SET identity_json = ? WHERE identity_json = ?", (json.dumps(payload), row[0]))
+    count = len(mock.requests)
+    rejected = mock.run("--workspace", str(tmp_path), "--resume", session_id, "第二问")
+    assert rejected.returncode == 2 and "--resume-with-current-config" in rejected.stderr
+    assert len(mock.requests) == count
+    adopted = mock.run("--workspace", str(tmp_path), "--resume", session_id, "--resume-with-current-config", "第二问")
+    assert adopted.returncode == 0, adopted.stderr
+    assert "context_requested=131072 source=default" in adopted.stdout
+    stored = _latest_epoch_launch(tmp_path, session_id)
+    assert stored.launch.provider == "deepseek"
+    assert stored.launch.options["num_ctx"] == 131072
+    assert stored.launch.sources["resume_config"] == "current"
+    assert "provider" in stored.launch.sources["changed_fields"]
+    with sqlite3.connect(db) as connection:
+        identities = [json.loads(row[0]) for row in connection.execute("SELECT identity_json FROM epoch")]
+    assert any(identity["provider"] == "unsupported-provider" for identity in identities)
 
 
 def test_fake_resume_records_new_script_source_per_epoch(tmp_path):
@@ -1153,14 +1063,9 @@ def test_tui_resume_with_initial_prompt_executes_once(tmp_path, monkeypatch):
 
 def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
     """审查 05-F10: 列表入口零模型探测 (A12) 且零 UI 依赖导入."""
-    stub = _OllamaStub()
-    try:
-        (tmp_path / ".cicada" / "sessions").mkdir(parents=True)
-        proc = run_cli("--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", stub.url, "--list-sessions")
-        assert proc.returncode == 0, proc.stderr
-        assert stub.requests == [], "列表入口零模型探测"
-    finally:
-        stub.stop()
+    (tmp_path / ".cicada" / "sessions").mkdir(parents=True)
+    proc = run_cli("--workspace", str(tmp_path), "--list-sessions")
+    assert proc.returncode == 0, proc.stderr
 
     code = (
         "import sys; "
@@ -1204,55 +1109,34 @@ def test_list_cursor_without_list_sessions_rejected(tmp_path):
     assert "--list-cursor 只能与 --list-sessions" in proc.stderr
 
 
-# --- 01: 预算启用条件的 CLI 叉 (D9/C-F1): ollama 路径实填预算, fake 默认不装 ---
+# --- 01: 预算启用条件的 CLI 叉 (D9/C-F1): API 路径实填预算, fake 默认不装 ---
 
 
-def test_budget_rejects_oversized_prompt_with_zero_model_post(tmp_path):
-    """--num-ctx 实填预算: 请求前预估拒绝 -> exit 1, 只有 preflight GET 无 POST."""
-    stub = _OllamaStub()
-    try:
-        proc = run_cli(
-            "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", stub.url,
-            "--num-ctx", "64", "任务" * 300,
-        )
-        assert proc.returncode == 1, (proc.stdout, proc.stderr)
-        assert "context budget exceeded" in proc.stderr
-        assert stub.requests == ["GET /api/version"], "预算拒绝零模型 POST"
-    finally:
-        stub.stop()
+def test_budget_rejects_oversized_prompt_with_zero_model_post(tmp_path, monkeypatch):
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(tmp_path), "--num-ctx", "4096", "--max-output-tokens", "1024", "任务" * 5000)
+    assert proc.returncode == 1, (proc.stdout, proc.stderr)
+    assert "context budget exceeded" in proc.stderr
+    assert mock.requests == []
 
 
 def test_cli_fills_budget_from_archive_num_ctx(tmp_path, monkeypatch):
-    """resume 不带 --num-ctx: 预算由存档继承的 num_ctx 实填 (来源 archive, D9)."""
+    """预算使用存档有效上下文和输出预留。"""
     import cicada.__main__ as m
-
     from cicada.application import ApplicationOpenError
 
-    stub = _OllamaStub()
-    try:
-        saved = run_cli(
-            "--workspace", str(tmp_path), "--save-session", "--provider", "ollama", "--ollama-url", stub.url,
-            "--num-ctx", "100000", "保存一轮",
-        )
-        assert saved.returncode == 0, (saved.stdout, saved.stderr)
-        assert "POST /api/chat" in stub.requests
-        session_id = saved.stdout.split("[session id=")[1].split(" ")[0]
-    finally:
-        stub.stop()
-
+    mock = _ApiMock(monkeypatch)
+    saved = mock.run("--workspace", str(tmp_path), "--save-session", "--num-ctx", "100000", "保存一轮")
+    assert saved.returncode == 0, saved.stderr
+    session_id = saved.stdout.split("[session id=")[1].split(" ")[0]
     captured = {}
-
     async def spy_open(config, *, preflight=None):
         captured["budget"] = config.budget
         raise ApplicationOpenError("captured")
-
     monkeypatch.setattr(m, "open_application", spy_open)
-    code, err = _run_main(
-        monkeypatch,
-        ["--workspace", str(tmp_path), "--resume", session_id, "恢复一问"],
-    )
-    assert code == 2, err.value  # spy 拒开: 只为捕获配置
+    proc = mock.run("--workspace", str(tmp_path), "--resume", session_id, "恢复一问")
+    assert proc.returncode == 2, proc.stderr
     budget = captured["budget"]
-    assert budget is not None, "ollama 恢复路径必须实填预算"
-    assert budget.num_ctx == 100000, "继承存档 num_ctx (source=archive)"
-    assert budget.num_predict is None
+    assert budget is not None
+    assert budget.num_ctx == 100000
+    assert budget.num_predict == 32768

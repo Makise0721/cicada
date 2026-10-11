@@ -110,7 +110,7 @@ def test_deep_yaml_is_classified_and_cli_exits_two(tmp_path):
         load(root)
     assert error.value.kind == "yaml"
     proc = run_cli("--workspace", str(tmp_path), "--skills-dir", str(root),
-                   "--provider", "ollama", "--ollama-url", "http://127.0.0.1:1", "task")
+                   "--provider", "deepseek", "task")
     assert proc.returncode == 2
     assert "invalid skills directory" in proc.stderr and "Traceback" not in proc.stderr
 
@@ -125,7 +125,7 @@ def test_yaml_surrogate_metadata_rejects_before_manifest_and_provider(tmp_path, 
     with pytest.raises(SkillCatalogError):
         load(root)
     proc = run_cli("--workspace", str(tmp_path), "--skills-dir", str(root),
-                   "--provider", "ollama", "--ollama-url", "http://127.0.0.1:1", "task")
+                   "--provider", "deepseek", "task")
     assert proc.returncode == 2
     assert "invalid skills directory" in proc.stderr and "Traceback" not in proc.stderr
 
@@ -442,12 +442,12 @@ def _script_file(tmp_path: Path, name: str = "script.json") -> Path:
 def test_cli_skills_dir_rejects_bad_directory_before_model(tmp_path):
     dead = "http://127.0.0.1:1"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "deepseek",
         "--skills-dir", str(tmp_path / "nope"), "任务",
     )
     assert proc.returncode == 2
     assert "invalid skills directory" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr
+    assert "DEEPSEEK_API_KEY" not in proc.stderr
 
 
 def test_cli_skills_dir_with_script_runs_and_announces(tmp_path):
@@ -734,12 +734,12 @@ def test_cli_skill_unknown_rejected_before_provider_probe(tmp_path):
     write_skill(root, "alpha")
     dead = "http://127.0.0.1:1"
     proc = run_cli(
-        "--workspace", str(tmp_path), "--provider", "ollama", "--ollama-url", dead,
+        "--workspace", str(tmp_path), "--provider", "deepseek",
         "--skills-dir", str(root), "--skill", "nope",
     )
     assert proc.returncode == 2
     assert "invalid --skill" in proc.stderr and "unknown skill" in proc.stderr
-    assert "Ollama 不可达" not in proc.stderr
+    assert "DEEPSEEK_API_KEY" not in proc.stderr
 
 
 def test_cli_skill_rejected_with_list_sessions(tmp_path):

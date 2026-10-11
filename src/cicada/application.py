@@ -96,7 +96,6 @@ from cicada.run_policy import (
     verification_policy,
 )
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
-from cicada.plugins.ollama import OllamaModel, classify_context_overflow
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.change_review import (
     CHANGE_REVIEW_CAPABILITY, REVIEW_TIMEOUT_S, ChangeReview, change_review_plugin,
@@ -1451,7 +1450,7 @@ class ApplicationSession:
         try:
             self._refuse_overbudget_request(prompt)
         except RuntimeError:
-            if self._budget_policy is None or not await self._auto_compact_for_request("admission"):
+            if self._budget_policy is None or not await self._auto_compact_for_request():
                 if self._cancel_token is not None and self._cancel_token.cancelled:
                     raise asyncio.CancelledError() from None
                 raise
@@ -1910,14 +1909,14 @@ class ApplicationSession:
             raise asyncio.CancelledError()
         return compacted
 
-    async def _auto_compact_for_request(self, quota: str) -> bool:
-        """自动压缩回调 (D7, 03): 准入自动尝试与 overflow 重试共用的应用侧实现.
+    async def _auto_compact_for_request(self) -> bool:
+        """自动压缩回调 (D7, 03): 发送前准入自动压缩的应用侧实现.
 
         属于已有 execute, 不重复获取会自锁的互斥 (execute 已排除并发
         compact/clear; 本方法置位同一屏障供 close 监督与封口)。全部准入条件
-        (锁存/互斥/可压缩区间) 通过后才消费对应额度, 失败不返还; 成功返回
+        (锁存/互斥/可压缩区间) 通过后才消费本次请求额度, 失败不返还; 成功返回
         True (投影已切换, 调用方对有效投影重估), 其余返回 False, 压缩失败不
-        中断请求 (按原准入/重试路径收尾)。不发 OperationBusy: 自动属于请求
+        中断请求 (按原准入路径收尾)。不发 OperationBusy: 自动属于请求
         生命周期, UI 反馈随请求事件。
         """
         if self._store is None:
@@ -1939,14 +1938,8 @@ class ApplicationSession:
             plan = self._compaction_plan()
         except RuntimeError:
             return False
-        if quota == "admission":
-            if not policy.try_consume_admission_auto_attempt():
-                return False
-        elif quota == "overflow":
-            if not policy.try_consume_overflow_retry():
-                return False
-        else:
-            raise ValueError(f"unknown auto-compaction quota: {quota!r}")
+        if not policy.try_consume_admission_auto_attempt():
+            return False
         token = self._cancel_token
         assert token is not None, "auto compaction belongs to an execute attempt"
         self._compacting = True
@@ -2692,11 +2685,6 @@ async def open_application(
             summary_budget=binding.summary_budget if binding is not None else None,
             summary_identity=binding.summary_identity if binding is not None else None,
             validate_request=binding.validate_request if binding is not None else None,
-            # 03/D7: overflow 分类器只接 ollama 形态的适配器——分类按上游
-            # 版本化错误文本形态匹配, 其他适配器接线属误配 (不匹配即不重试)
-            classify_overflow=(
-                classify_context_overflow if isinstance(model, OllamaModel) else None
-            ),
             projection=context_projection,
         )
         policy_state["budget_policy"] = budget

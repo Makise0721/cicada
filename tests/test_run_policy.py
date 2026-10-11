@@ -38,8 +38,7 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.plugins.coding.workspace import Workspace
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.fake_tools import EchoTool, fake_tools_plugin
-from cicada.plugins.ollama.model import OllamaModel
-from cicada.plugins.ollama.protocol import OllamaConfig
+from cicada.plugins.deepseek import DeepSeekModel, DeepSeekConfig
 from cicada.run_policy import (
     CONTROL_SECTION_MAX_BYTES,
     HistoricalPrefixProof,
@@ -192,20 +191,20 @@ def check_messages(request: ModelRequest) -> list[ToolResultMessage]:
     return [m for m in request.messages if isinstance(m, ToolResultMessage)]
 
 
-class Qwen:
-    """跑一遍完整策略 + 真实 OllamaModel 适配路径, 返回 wire 请求体 (未发送则 None)."""
+class ApiWire:
+    """跑一遍完整策略 + 真实 DeepSeekModel 适配路径, 返回 wire 请求体 (未发送则 None)."""
 
     def __init__(self, service: FakeVerificationService, limit: int | None = None) -> None:
         self.service = service
-        config = OllamaConfig(base_url="http://ollama.test", max_request_bytes=limit)
+        config = DeepSeekConfig(think=False, max_request_bytes=limit or 2 * 1024 * 1024)
         self.seen: list[httpx.Request] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
             self.seen.append(request)
-            body = b'{"message":{"role":"assistant","content":"ok"},"done":true,"done_reason":"stop"}\n'
-            return httpx.Response(200, content=body, headers={"content-type": "application/x-ndjson"})
+            body = b'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+            return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
 
-        self.model = OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), config)
+        self.model = DeepSeekModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), config, "offline-key")
         self.policy = RunPolicy(self.model, service)
 
     async def run(self, messages, tools=(), system_prompt=""):
@@ -824,22 +823,22 @@ def test_policy_rejects_non_model_and_non_service():
 async def test_wire_request_carries_control_section_and_freshness_markers():
     fresh = make_receipt("r-1")
     view = make_view(states=(CheckState("check-1", receipt=fresh, freshness="current"),), receipts=(fresh,))
-    qwen = Qwen(FakeVerificationService(view))
+    api_wire = ApiWire(FakeVerificationService(view))
     messages = (
         UserMessage(text="任务"),
+        AssistantMessage("", tool_calls=(ToolCall("c1", "check", "{}"),), stop_reason="tool_use"),
         check_result("c1", "PASS", receipt_id="r-1"),
     )
-    events = await qwen.run(messages, (ToolSpec("check", "run a check", {"type": "object"}),), system_prompt="rules")
+    events = await api_wire.run(messages, (ToolSpec("check", "run a check", {"type": "object"}),), system_prompt="rules")
 
-    payload = qwen.wire
+    payload = api_wire.wire
     assert payload["messages"][0]["role"] == "system"
     assert "<cicada-verification-state>" in payload["messages"][0]["content"]
     assert f"snapshot_ref: {REF}" in payload["messages"][0]["content"]
     assert payload["messages"][1] == {"role": "user", "content": "任务"}
-    tool_message = payload["messages"][2]
+    tool_message = payload["messages"][3]
     assert tool_message["role"] == "tool"
     assert tool_message["tool_call_id"] == "c1"
-    assert tool_message["name"] == "check"
     assert tool_message["content"] == "PASS\nCicada freshness: stale=false freshness=current tool=check"
     assert [e.stop_reason for e in events if isinstance(e, StreamDone)] == ["stop"]
 
@@ -849,30 +848,30 @@ async def test_wire_request_cap_counts_projection_and_refuses_one_byte_over():
     view = make_view(states=(CheckState("check-1", receipt=fresh, freshness="current"),), receipts=(fresh,))
     messages = (
         UserMessage(text="开始"),
+        AssistantMessage("", tool_calls=(ToolCall("c1", "check", "{}"),), stop_reason="tool_use"),
         check_result("c1", "PASS" + "中" * 200, receipt_id="r-1"),
     )
     tools = (ToolSpec("check", "run a check", {"type": "object"}),)
     service = FakeVerificationService(view)
 
     # 先量出同一投影的真实 wire 字节, 再按差值把上限设成 恰好 / 恰好-1
-    reference = Qwen(service)
+    reference = ApiWire(service)
     await reference.run(messages, tools, system_prompt="rules")
     size = len(reference.seen[0].content)
 
-    qwen_ok = Qwen(service, limit=size)
-    events_ok = await qwen_ok.run(messages, tools, system_prompt="rules")
-    assert len(qwen_ok.seen) == 1
-    assert len(qwen_ok.seen[0].content) == size
+    api_wire_ok = ApiWire(service, limit=size)
+    events_ok = await api_wire_ok.run(messages, tools, system_prompt="rules")
+    assert len(api_wire_ok.seen) == 1
+    assert len(api_wire_ok.seen[0].content) == size
     assert [e.stop_reason for e in events_ok if isinstance(e, StreamDone)] == ["stop"]
-    assert "<cicada-verification-state>" in qwen_ok.wire["messages"][0]["content"]
+    assert "<cicada-verification-state>" in api_wire_ok.wire["messages"][0]["content"]
 
-    qwen_over = Qwen(service, limit=size - 1)
-    events_over = await qwen_over.run(messages, tools, system_prompt="rules")
-    assert qwen_over.seen == []  # 超限不发 POST
+    api_wire_over = ApiWire(service, limit=size - 1)
+    events_over = await api_wire_over.run(messages, tools, system_prompt="rules")
+    assert api_wire_over.seen == []  # 超限不发 POST
     dones = [e for e in events_over if isinstance(e, StreamDone)]
     assert dones[0].stop_reason == "error"
-    assert f"{size} bytes" in dones[0].error
-    assert f"{size - 1} bytes" in dones[0].error
+    assert "request exceeds byte limit; not sent" in dones[0].error
 
 
 # --- bootstrap 公开组装入口 ----------------------------------------------------

@@ -32,9 +32,6 @@ def mock_provider(monkeypatch):
         return httpx.Response(200, content=response("思考", "离线答复"))
     monkeypatch.setattr(cli, "deepseek_plugin", lambda config, *, api_key: deepseek_plugin(
         config, api_key=api_key, transport=httpx.MockTransport(handle)))
-    async def forbidden(*args):
-        pytest.fail("DeepSeek must not probe Ollama")
-    monkeypatch.setattr(cli, "_ollama_reachable", forbidden)
     return bodies
 
 
@@ -64,15 +61,21 @@ def test_default_flash_and_pro_explicit_limits_persist_and_restore(monkeypatch, 
 
 
 @pytest.mark.parametrize("args", [
-    ["--ollama-url", "http://localhost:1"], ["--model", "deepseek-chat"],
+    ["--model", "deepseek-chat"],
     ["--max-output-tokens", "0"], ["--max-output-tokens", "393217"],
     ["--num-ctx", "1048577"], ["--num-ctx", "4096"],
-    ["--provider", "ollama", "--reasoning-effort", "low"],
+    ["--provider", "unsupported-provider", "--reasoning-effort", "low"],
 ])
 def test_bad_provider_flags_zero_network(monkeypatch, tmp_path, args):
     bodies = mock_provider(monkeypatch)
-    code, _, _ = invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
-    assert code == 2 and bodies == []
+    if args[0] == "--provider":
+        with pytest.raises(SystemExit) as exc:
+            invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
+        assert exc.value.code == 2
+    else:
+        code, _, _ = invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
+        assert code == 2
+    assert bodies == []
 
 
 def test_list_and_fake_do_not_read_credentials_or_use_provider_network(monkeypatch, tmp_path):

@@ -193,7 +193,7 @@ def _identity_config(root: Path, script: list, *, provider: str, think, options:
         ("deepseek", True, {"reasoning_effort": "max"}, "max"),
         ("deepseek", True, {}, "不可得"),
         ("deepseek", True, {"reasoning_effort": "medium"}, "不可得"),
-        ("ollama", True, None, "开启"),
+        ("fake", True, None, "开启"),
     ],
 )
 async def test_thinking_decision_table(tmp_path, provider, think, options, expected):

@@ -103,12 +103,12 @@ def test_format_tokens_compact(count, expected):
 
 
 def test_footer_two_lines_workspace_and_right_aligned_model():
-    footer = FooterComponent(r"C:\repo\demo", "qwen3.5:9b", lambda: (1500, False, 300, False))
+    footer = FooterComponent(r"C:\repo\demo", "deepseek-flash", lambda: (1500, False, 300, False))
     lines = footer.render(40, 24)
     assert len(lines) == 2
     first = strip_terminal_sequences(lines[0])
     # 行 1: 工作区左 + 模型右 (同一行水平对齐)
-    assert "demo" in first and first.endswith("qwen3.5:9b")
+    assert "demo" in first and first.endswith("deepseek-flash")
     # 行 2: 计量左 (规格 §E: · 分隔)
     assert "累计 ↑1.5k · ↓300" in strip_terminal_sequences(lines[1])
     assert "\x1b[38;2;128;128;128m" in lines[0]  # dim 提亮 #808080 (规格 §E)

@@ -229,14 +229,11 @@ def test_constructor_rejects_bad_inner_and_config():
 
 
 def test_constructor_accepts_injected_seams_but_stays_inert():
-    classify = lambda text: True  # noqa: E731
     summarize = lambda *args, **kwargs: None  # noqa: E731
     policy = BudgetPolicy(
-        FakeModel([]), _config(), summarize=summarize, classify_overflow=classify
+        FakeModel([]), _config(), summarize=summarize
     )
     assert policy.inner is not None
-    with pytest.raises(TypeError, match="classify_overflow"):
-        BudgetPolicy(FakeModel([]), _config(), classify_overflow="not callable")
     with pytest.raises(TypeError, match="summarize"):
         BudgetPolicy(FakeModel([]), _config(), summarize="not callable")
 

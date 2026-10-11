@@ -192,14 +192,14 @@ def test_tui_uses_same_defaults_and_key_for_initial_prompt(monkeypatch, tmp_path
     b'version = 1\n[defaults]\napi_key = "secret-sentinel"',
     b'version = 1\n[defaults]\nthink = 1', b'version = 1\n[defaults]\nnum_ctx = true',
     b'version = 1\n[defaults]\nmax_output_tokens = 1.5',
-    b'version = 1\n[defaults]\nprovider = "ollama"',
+    b'version = 1\n[defaults]\nprovider = "unsupported-provider"',
     b'version = 1\n[defaults]\nmodel = "secret-sentinel"',
     b'version = 1\n[defaults]\nreasoning_effort = "medium"',
     b'version = 1\n[defaults]\nnum_ctx = 1048577',
     b'version = 1\n[defaults]\nmax_output_tokens = 393217',
     b'version = 1\n[defaults]\nnum_ctx = 2048\nmax_output_tokens = 4096',
     b'version = 1\n[credentials.deepseek]\nref = "secret-sentinel"',
-    b'version = 1\n[credentials.ollama]\nref = "secret-sentinel"',
+    b'version = 1\n[credentials.unsupported-provider]\nref = "secret-sentinel"',
 ], ids=[f'config-{i}' for i in range(18)])
 def test_bad_config_fails_without_echo_even_with_cli_and_environment(monkeypatch, tmp_path, requests, raw):
     root = tmp_path / 'user'
@@ -233,7 +233,7 @@ def test_bad_selected_credentials_fail_safely(monkeypatch, tmp_path, requests, c
         if change == 'unknown': data['secret-sentinel'] = 'x'
         if change == 'missing-ref': data['entries'] = {}
         if change == 'bad-ref': data['entries'] = {'secret-sentinel': data['entries'][ref]}
-        if change == 'provider': data['entries'][ref]['provider'] = 'ollama'
+        if change == 'provider': data['entries'][ref]['provider'] = 'unsupported-provider'
         if change == 'unknown-entry': data['entries'][ref]['secret-sentinel'] = 'x'
         if change == 'bad-key': data['entries'][ref]['api_key'] = 'secret sentinel'
         if change == 'missing-key': del data['entries'][ref]['api_key']
@@ -286,13 +286,13 @@ def test_concurrent_publishing_retries_stale_ref_at_most_three_times(monkeypatch
     assert 'file-sentinel' not in out + err
 
 
-def test_help_list_fake_ollama_and_selector_cancel_skip_user_config_and_key(monkeypatch, tmp_path):
+def test_help_list_fake_and_selector_cancel_skip_user_config_and_key(monkeypatch, tmp_path):
     import cicada.ui
 
     from cicada.plugins.user_config import FileUserConfigStore
 
     def forbidden_load(*args, **kwargs):
-        pytest.fail('offline or Ollama entry read user configuration')
+        pytest.fail('offline entry read user configuration')
 
     monkeypatch.setattr(FileUserConfigStore, 'load', forbidden_load)
     original_get = cli.os.environ.get
@@ -309,15 +309,7 @@ def test_help_list_fake_ollama_and_selector_cancel_skip_user_config_and_key(monk
         invoke(monkeypatch, ['--help'], root)
     assert exc.value.code == 0
 
-    async def send(client, req, *args, **kwargs):
-        assert req.url.path in ('/api/version', '/api/chat')
-        content = (b'{"version":"mock"}' if req.url.path == '/api/version' else
-                   b'{"message":{"role":"assistant","content":"answer"},"done":true,"done_reason":"stop"}\n')
-        return httpx.Response(200, content=content, request=req)
-
-    monkeypatch.setattr(httpx.AsyncClient, 'send', send)
-    code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--provider', 'ollama', '任务'], root)
-    assert code == 0, err
+    monkeypatch.setattr(httpx.AsyncClient, 'send', lambda *args, **kwargs: pytest.fail('offline network'))
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
 

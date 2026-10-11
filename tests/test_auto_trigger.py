@@ -1,16 +1,4 @@
-"""自动触发与有界 overflow 重试测试 (03, A09/A10 + D7/PA06).
-
-§1 BudgetPolicy 策略级: 两项独立额度 (接缝重置, begin 不重置, 失败不返还)、
-零输出判定 (任何 TextDelta 含空片段/ToolCallEvent 禁止透明重发)、分类终结
-错误策略内暂存且只向上游发布一次终结、取消收尾为 aborted 不按 error。
-
-§2 持久会话组合: begin 前预估自动压缩、跨请求/跨预估额度反例、begin 前/
-后取消、close 组合与完整请求生产者屏障、A11 终结扫描复核。
-
-自动压缩回调由测试桩充当 (与 open_application 接线语义一致: 条件判定与
-额度消费在应用侧回调内, 成功=投影已切换); 真实提交协议由 §2 的真实 store
-组合覆盖。
-"""
+"""发送前自动压缩、错误零重试与持久会话取消/投影验收。"""
 
 from __future__ import annotations
 
@@ -62,12 +50,12 @@ def _budget(num_ctx: int = 1_000_000) -> BudgetConfig:
     return BudgetConfig(num_ctx=num_ctx, num_predict=2048)
 
 
-# 适配器归一后的上下文超限错误文本 (上游出处见 tests/plugins/ollama/test_context_overflow.py)
+# 服务端错误原样发布，发送后不自动压缩或重试。
 OVERFLOW_ERROR = (
-    "ollama protocol error: request (302 tokens) exceeds the available context size "
+    "provider protocol error: request (302 tokens) exceeds the available context size "
     "(256 tokens), try increasing it"
 )
-OTHER_ERROR = "ollama http 500: backend failed"
+OTHER_ERROR = "provider http 500: backend failed"
 
 
 class _CountingModel:
@@ -102,18 +90,12 @@ class _AutoCompactStub:
         self.calls: list[str] = []
         self.cancel_token: CancelToken | None = None  # 取消场景由测试注入
 
-    async def __call__(self, quota: str) -> bool:
-        self.calls.append(quota)
+    async def __call__(self) -> bool:
+        self.calls.append("admission")
         if self.cancel_token is not None:
             self.cancel_token.cancel()
-        if quota == "admission":
-            if not self.policy.try_consume_admission_auto_attempt():
-                return False
-        elif quota == "overflow":
-            if not self.policy.try_consume_overflow_retry():
-                return False
-        else:
-            raise ValueError(quota)
+        if not self.policy.try_consume_admission_auto_attempt():
+            return False
         if not self.outcome:
             return False
         block = SummaryBlock(
@@ -144,10 +126,10 @@ def _window_request() -> tuple[ModelRequest, BudgetConfig]:
     return ModelRequest(messages=(big, prompt), tools=(), system_prompt="sys"), config
 
 
-def _server_overflow_request() -> tuple[ModelRequest, BudgetConfig]:
+def _admitted_request() -> tuple[ModelRequest, BudgetConfig]:
     """预估可过但服务端仍报超限的请求 (现实场景: 启发式低估).
 
-    返回 (请求, 宽裕配置): 准入通过, 由分类终结错误触发 overflow 重试路径。
+    返回 (请求, 宽裕配置): 准入通过，服务端终结错误保持原样。
     """
     request = ModelRequest(
         messages=(UserMessage(text="x" * 4000), UserMessage(text="please")),
@@ -171,20 +153,17 @@ def _done(events) -> StreamDone:
 # --- §1 额度语义 ---------------------------------------------------------------------------
 
 
-def test_quotas_reset_per_seam_and_fail_closed():
-    """两项额度独立; 接缝重置; 未接缝的 begin 语义不重置; 消费至多一次."""
+def test_admission_quota_resets_per_seam_and_fails_closed():
+    """准入额度; 接缝重置; 未接缝的 begin 语义不重置; 消费至多一次."""
     model = _CountingModel([])
     policy = BudgetPolicy(model, _budget())
     policy.note_request_start(0)
     assert policy.try_consume_admission_auto_attempt()
     assert not policy.try_consume_admission_auto_attempt()
-    assert policy.try_consume_overflow_retry()
-    assert not policy.try_consume_overflow_retry()
     # begin 不调用接缝: 额度不重置
     assert not policy.try_consume_admission_auto_attempt()
     policy.note_request_start(4)
     assert policy.try_consume_admission_auto_attempt(), "下一次 execute 重新建立额度"
-    assert policy.try_consume_overflow_retry()
 
 
 async def test_admission_auto_attempt_success_continues_to_send():
@@ -251,77 +230,7 @@ async def test_admission_cancel_during_compaction_ends_aborted():
     assert model.requests == [], "取消后零主模型发送"
 
 
-# --- §1 overflow 重试 (PA06/A10) -------------------------------------------------------------
-
-
-async def test_overflow_retry_after_classified_error_with_zero_output():
-    """零输出 + 分类超限 + 额度可用: 暂存原错误, 压缩后重发一次, 只发布一次终结."""
-    request, config = _server_overflow_request()
-    model = _CountingModel([
-        [StreamDone("error", OVERFLOW_ERROR)],
-        [StreamDone("stop", metrics=None)],
-    ])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    stub = _AutoCompactStub(policy)
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    events, _token = await _collect(policy, request)
-    assert stub.calls == ["overflow"], "重试额度独立, 准入额度不动"
-    assert len(model.requests) == 2, "原发送 + 重发一次"
-    dones = [event for event in events if isinstance(event, StreamDone)]
-    assert len(dones) == 1, "首次分类错误被暂存, 只向上游发布一次终结"
-    assert dones[0].stop_reason == "stop"
-    # 重发请求 = 压缩后的投影, 不是原样重发
-    assert model.requests[1].messages[0].text.startswith("[程序生成的对话摘要]")
-    assert policy.try_consume_overflow_retry() is False
-    assert policy.try_consume_admission_auto_attempt() is True, "准入额度仍可用"
-
-
-async def test_overflow_second_failure_publishes_single_terminal_no_more_retry():
-    """重发再次失败: 发布该终结且不再重试 (发送次数恰为 2)."""
-    request, config = _server_overflow_request()
-    model = _CountingModel([
-        [StreamDone("error", OVERFLOW_ERROR)],
-        [StreamDone("error", OTHER_ERROR)],
-    ])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    stub = _AutoCompactStub(policy)
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    events, _token = await _collect(policy, request)
-    assert len(model.requests) == 2
-    dones = [event for event in events if isinstance(event, StreamDone)]
-    assert len(dones) == 1 and dones[0].stop_reason == "error"
-    assert OTHER_ERROR in dones[0].error
-
-
-async def test_overflow_retry_still_over_budget_refuses_after_compaction():
-    """压缩后二次准入仍超限: 按每轮权威口径拒绝, 不重发 (D7/D8)."""
-    prompt = UserMessage(text="please")
-    config = BudgetConfig(num_ctx=4000, num_predict=2048)
-    request = ModelRequest(
-        messages=(UserMessage(text="x" * 4000), prompt), tools=(), system_prompt="sys"
-    )
-    assert admission_total("sys", request.messages, config) <= config.num_ctx, "准入通过"
-    model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    stub = _AutoCompactStub(policy, block_text="y" * 9000)  # 摘要块自身就把投影撑爆
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    events, _token = await _collect(policy, request)
-    assert stub.calls == ["overflow"]
-    assert len(model.requests) == 1, "仍超限零重发"
-    done = _done(events)
-    assert done.stop_reason == "error" and "context budget exceeded" in done.error
+# --- §1 服务端错误零重试 -------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -334,11 +243,10 @@ async def test_overflow_retry_still_over_budget_refuses_after_compaction():
 )
 async def test_transparent_resend_banned_after_any_output(prefix_events):
     """透明重发禁令: 该发送点出现任何 TextDelta/ToolCallEvent 后的上下文错误不重试."""
-    request, config = _server_overflow_request()
+    request, config = _admitted_request()
     model = _CountingModel([[*prefix_events, StreamDone("error", OVERFLOW_ERROR)]])
     policy = BudgetPolicy(
         model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
     )
     stub = _AutoCompactStub(policy)
     policy.set_auto_compact(stub)
@@ -350,37 +258,12 @@ async def test_transparent_resend_banned_after_any_output(prefix_events):
     assert done.stop_reason == "error" and OVERFLOW_ERROR in done.error, "保留原错误"
 
 
-async def test_prior_turn_output_does_not_block_retry():
-    """判定范围固定在该发送点: 先前轮次的可见输出不影响本轮零输出重试资格 (A10)."""
-    request, config = _server_overflow_request()
-    model = _CountingModel([
-        [TextDelta("轮 0 的可见输出"), StreamDone("stop")],
-        [StreamDone("error", OVERFLOW_ERROR)],
-        [StreamDone("stop")],
-    ])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    stub = _AutoCompactStub(policy)
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    first, _token = await _collect(policy, request)
-    assert _done(first).stop_reason == "stop"
-    second, _token = await _collect(policy, request)
-    assert stub.calls == ["overflow"], "先前轮次输出不泄漏进本轮判定"
-    dones = [event for event in second if isinstance(event, StreamDone)]
-    assert len(dones) == 1 and dones[0].stop_reason == "stop"
-    assert len(model.requests) == 3
-
-
-async def test_overflow_not_classified_passthrough_without_retry():
+async def test_provider_failure_passes_through_once():
     """取消/网络/其他服务端错误形态: 原样发布, 不消费额度."""
-    request, config = _server_overflow_request()
+    request, config = _admitted_request()
     model = _CountingModel([[StreamDone("error", OTHER_ERROR)]])
     policy = BudgetPolicy(
         model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
     )
     stub = _AutoCompactStub(policy)
     policy.set_auto_compact(stub)
@@ -391,49 +274,11 @@ async def test_overflow_not_classified_passthrough_without_retry():
     assert _done(events).error == OTHER_ERROR
 
 
-async def test_overflow_retry_without_quota_keeps_original_error():
-    """重试额度已消费: 分类超限也不重试, 保留原错误."""
-    request, config = _server_overflow_request()
+async def test_context_error_is_not_retried():
+    """服务端上下文超限原样发布，不调用自动压缩或重试。"""
+    request, config = _admitted_request()
     model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    stub = _AutoCompactStub(policy)
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    assert policy.try_consume_overflow_retry()
-    events, _token = await _collect(policy, request)
-    assert stub.calls == []
-    assert len(model.requests) == 1
-    done = _done(events)
-    assert done.stop_reason == "error" and OVERFLOW_ERROR in done.error
-
-
-async def test_overflow_cancel_during_retry_compaction_ends_aborted():
-    """重试压缩期间取消: 该轮以 aborted 收尾, 不发布暂存错误."""
-    request, config = _server_overflow_request()
-    model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-    token = CancelToken()
-    stub = _AutoCompactStub(policy, outcome=False)
-    stub.cancel_token = token
-    policy.set_auto_compact(stub)
-    policy.note_request_start(2)
-    events, _ = await _collect(policy, request, token)
-    assert stub.calls == ["overflow"]
-    assert len(model.requests) == 1
-    assert _done(events).stop_reason == "aborted"
-
-
-async def test_overflow_without_classifier_keeps_original_error():
-    """未接分类器 (非 ollama 适配器): 分类形态的超限错误也原样发布, 不重试."""
-    request, config = _server_overflow_request()
-    model = _CountingModel([[StreamDone("error", OVERFLOW_ERROR)]])
-    policy = BudgetPolicy(model, config)  # classify_overflow=None
+    policy = BudgetPolicy(model, config)
     stub = _AutoCompactStub(policy)
     policy.set_auto_compact(stub)
     policy.note_request_start(2)
@@ -442,60 +287,9 @@ async def test_overflow_without_classifier_keeps_original_error():
     assert len(model.requests) == 1
     done = _done(events)
     assert done.stop_reason == "error" and OVERFLOW_ERROR in done.error
-
-
-async def test_retry_success_considers_anchor_on_retried_request():
-    """重发成功的实测计量在重发请求上立锚 (D3: 基准=策略实际所见的投影后请求).
-
-    原请求 3 条消息、投影后 2 条 (块覆盖前 2 条): 锚 message_count==2 只在
-    「锚基准=重发请求」时成立 (锚到原请求会是 3); 后继与重发请求逐位相同的
-    请求按 measured 估计, 行为面复核锚命中。
-    """
-    big = UserMessage(text="x" * 4000)
-    mid = UserMessage(text="y" * 100)
-    prompt = UserMessage(text="please")
-    request = ModelRequest(messages=(big, mid, prompt), tools=(), system_prompt="sys")
-    config = _budget()
-    model = _CountingModel([
-        [StreamDone("error", OVERFLOW_ERROR)],
-        [StreamDone("stop", metrics=ModelMetrics(input_tokens=77, output_tokens=1))],
-    ])
-    policy = BudgetPolicy(
-        model, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
-    )
-
-    async def auto_compact(quota: str) -> bool:
-        assert quota == "overflow"
-        assert policy.try_consume_overflow_retry()
-        block = SummaryBlock(
-            message=summary_block_message(
-                first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
-            ),
-            end_message_index=2,
-            first_request_seq=1, last_request_seq=1, message_count=2,
-            prefix_sha256=canonical_prefix_sha256((big, mid)),
-        )
-        policy.projection.apply_summary(block, canonical_length=3)
-        return True
-
-    policy.set_auto_compact(auto_compact)
-    policy.note_request_start(3)
-    events, _token = await _collect(policy, request)
-    assert _done(events).stop_reason == "stop"
-    assert len(model.requests) == 2
-    anchor = policy.anchor
-    assert anchor is not None and anchor.measured_input_tokens == 77
-    assert anchor.message_count == 2, "锚基准 = 投影后重发请求 (块 + 当前请求); 原请求为 3 条"
-    # 后继请求 = 原始 3 条消息形态: 经投影替换后与重发请求逐位相同 → 命中重发锚
-    await _collect(policy, request)
-    assert policy.last_report is not None and policy.last_report.source == "measured", (
-        "与重发请求逐位相同的后继请求命中重发锚 (measured)"
-    )
 
 
 # --- §2 持久会话组合 (A09/A11 + PA03/PA05 复验) ----------------------------------------------
-
 
 
 from tests.support.summary import GatedSummary, ScriptedSummary as _ScriptedSummary
@@ -607,7 +401,7 @@ async def _seed_committed_requests(session: ApplicationSession, store, req1: tup
 
 
 async def _auto_session(
-    tmp_path, *, script, channel, num_ctx: int, classifier=None, model=None,
+    tmp_path, *, script, channel, num_ctx: int, model=None,
 ):
     """持久会话 + 手动组装 (open_application 无法注入独立通道, 02 同型);
     与 open_application 一致地绑定自动压缩回调."""
@@ -628,7 +422,7 @@ async def _auto_session(
     context_projection = ContextProjection()
     policy = BudgetPolicy(
         main_model, config.budget,
-        summarize=channel, classify_overflow=classifier, projection=context_projection,
+        summarize=channel, projection=context_projection,
     )
     app = await bootstrap(
         [fake_model_plugin(main_model)], tool_capabilities=(),
@@ -641,8 +435,6 @@ async def _auto_session(
     )
     session._budget_policy.set_auto_compact(session._auto_compact_for_request)
     return session, main_model, channel, store, policy
-
-
 
 
 async def test_pre_estimate_auto_compaction_switches_projection_and_proceeds(tmp_path):
@@ -678,9 +470,8 @@ async def test_pre_estimate_auto_compaction_switches_projection_and_proceeds(tmp
         # 完整请求生产者屏障: 摘要完成不替代请求完成——commit_request 已落库
         assert session.persistence.saved_request_count == 1
         assert len(session._committed_spans) == 3, "压缩切点簿记随新请求推进"
-        # 额度: 本次 execute 的准入额度已消费, 溢出重试额度未动
+        # 本次 execute 的准入额度已消费
         assert policy.try_consume_admission_auto_attempt() is False
-        assert policy.try_consume_overflow_retry() is True
     finally:
         await session.aclose()
         await store.aclose()
@@ -996,16 +787,16 @@ async def test_latched_states_yield_zero_summary_calls_in_auto_callback(tmp_path
     await _seed_committed_requests(session, store, req1, req2)
     try:
         session._view_only_reason = "restored session has unproven activity (probe)"
-        assert await session._auto_compact_for_request("admission") is False
+        assert await session._auto_compact_for_request() is False
         assert channel.requests == []
         session._view_only_reason = None
         session.latch_storage_failure("store closed")
-        assert await session._auto_compact_for_request("admission") is False
+        assert await session._auto_compact_for_request() is False
         assert channel.requests == []
         session._storage_failed = None
         # 直接探针不在 execute 内: 补一个请求 token 满足屏障归属断言
         session._cancel_token = CancelToken()
-        assert await session._auto_compact_for_request("admission") is True
+        assert await session._auto_compact_for_request() is True
         assert len(channel.requests) == 1
         assert len(session._context_projection.blocks) == 1
     finally:
@@ -1013,8 +804,8 @@ async def test_latched_states_yield_zero_summary_calls_in_auto_callback(tmp_path
         await store.aclose()
 
 
-async def test_a11_terminal_scan_covers_canonical_history_through_auto_retry(tmp_path):
-    """A11 复核: 压缩 + 自动重试组合下, 上游 RunPolicy 的终结扫描仍针对完整
+async def test_a11_terminal_scan_covers_canonical_history_through_compacted_projection(tmp_path):
+    """A11 复核: 压缩投影组合下, 上游 RunPolicy 的终结扫描仍针对完整
     规范历史——被摘要覆盖的未证终结事实仍锁存; 摘要块不携带验证权威。"""
     canonical = (
         UserMessage(text="第一问"),
@@ -1041,37 +832,27 @@ async def test_a11_terminal_scan_covers_canonical_history_through_auto_retry(tmp
 
     service = _RecordingService(view)
     inner = _CountingModel([
-        [StreamDone("error", OVERFLOW_ERROR)],
         [StreamDone("stop")],
     ])
     config = _budget()
     policy = BudgetPolicy(
         inner, config,
-        classify_overflow=lambda text: "exceeds the available context size" in text,
     )
 
-    async def auto_compact(quota: str) -> bool:
-        assert quota == "overflow"
-        assert policy.try_consume_overflow_retry()
-        block = SummaryBlock(
-            message=summary_block_message(
-                first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
-            ),
-            end_message_index=2,
-            first_request_seq=1, last_request_seq=1, message_count=2,
-            prefix_sha256=canonical_prefix_sha256(canonical[:2]),
-        )
-        policy.projection.apply_summary(block, canonical_length=len(canonical))
-        return True
-
-    policy.set_auto_compact(auto_compact)
+    block = SummaryBlock(
+        message=summary_block_message(
+            first_request_seq=1, last_request_seq=1, message_count=2, text="摘要",
+        ),
+        end_message_index=2, first_request_seq=1, last_request_seq=1, message_count=2,
+        prefix_sha256=canonical_prefix_sha256(canonical[:2]),
+    )
+    policy.projection.apply_summary(block, canonical_length=len(canonical))
     wrapped = verification_policy(policy, service)
     request = ModelRequest(messages=canonical, tools=(), system_prompt="sys")
     events = [event async for event in wrapped.stream(request, CancelToken())]
     dones = [event for event in events if isinstance(event, StreamDone)]
     assert len(dones) == 1 and dones[0].stop_reason == "stop"
     assert service.reasons, "被摘要覆盖的未证终结事实仍被扫描锁存 (A11)"
-    assert len(inner.requests) == 2
-    assert inner.requests[0].messages[0] == canonical[0], "首次发送是投影前请求"
-    assert inner.requests[1].messages[0].text.startswith("[程序生成的对话摘要]")
-    assert "验证权威" in inner.requests[1].messages[0].text, "摘要块不携带验证权威"
+    assert len(inner.requests) == 1
+    assert inner.requests[0].messages[0].text.startswith("[程序生成的对话摘要]")
+    assert "验证权威" in inner.requests[0].messages[0].text, "摘要块不携带验证权威"

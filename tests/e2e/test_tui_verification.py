@@ -6,7 +6,7 @@
 - T12 用 httpx.MockTransport 记录 POST 次数, 核对 65536 bytes 请求守卫零 POST;
 - 显示断言合并滚动历史与屏幕 (stage.flat()), 长路径/hash 允许跨行拼接;
 - 规范事实与会话历史保持原始内容, 显示副本经清理 (T13)。
-全部确定性: fake 剧本或 MockTransport, 不启动 Ollama, 无真实模型调用。
+全部确定性: fake 剧本或 MockTransport, 不启动模型服务, 无真实模型调用。
 """
 
 from __future__ import annotations
@@ -288,16 +288,10 @@ async def test_t10_artifact_tamper_or_missing_shows_failure(tmp_path, mode):
 # --- T12: 实际 HTTP 请求 65536 bytes 守卫 (MockTransport, 零 POST) ------------------------------
 
 
-def _ndjson(text: str, prompt_eval: int = 3) -> bytes:
-    chunk = json.dumps(
-        {"message": {"role": "assistant", "content": text}, "done": False},
-        ensure_ascii=False,
-    )
-    done = json.dumps({
-        "message": {"role": "assistant", "content": ""}, "done": True,
-        "done_reason": "stop", "prompt_eval_count": prompt_eval, "eval_count": 2,
-    })
-    return f"{chunk}\n{done}\n".encode("utf-8")
+def _sse(text: str, prompt_eval: int = 3) -> bytes:
+    payload = {"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": prompt_eval, "completion_tokens": 2}}
+    return ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\ndata: [DONE]\n\n").encode("utf-8")
 
 
 class _CountingTransport(httpx.MockTransport):
@@ -311,36 +305,48 @@ class _CountingTransport(httpx.MockTransport):
     def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             self.posts.append(request)
-        body = self._responses.pop(0) if self._responses else _ndjson("ok")
-        return httpx.Response(200, headers={"content-type": "application/x-ndjson"}, content=body)
+        body = self._responses.pop(0) if self._responses else _sse("ok")
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body)
 
 
-def _mock_ollama_plugin(transport: _CountingTransport) -> PluginDefinition:
-    from cicada.plugins.ollama.model import OllamaModel
-    from cicada.plugins.ollama.protocol import OllamaConfig
+def _mock_deepseek_plugin(transport: _CountingTransport) -> PluginDefinition:
+    from cicada.plugins.deepseek.model import DeepSeekModel
+    from cicada.plugins.deepseek.protocol import DeepSeekConfig
 
     def setup(ctx) -> None:
         client = httpx.AsyncClient(transport=transport)
         ctx.defer(client.aclose)
-        ctx.provide("model", OllamaModel(
+        ctx.provide("model", DeepSeekModel(
             client,
-            OllamaConfig(
-                base_url="http://mock.local", model="fake-model",
+            DeepSeekConfig(
+                think=False,
                 max_request_bytes=65536,
-            ),
+            ), "offline-key",
         ))
 
-    return PluginDefinition(name="mock-ollama", setup=setup, provides=frozenset({"model"}))
+    return PluginDefinition(name="mock-deepseek", setup=setup, provides=frozenset({"model"}))
 
 
-async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_path):
+async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_path, monkeypatch):
     from cicada.application import ApplicationConfig
     from cicada.prompting import PromptInfo
+
+    from cicada.ui.admission import is_enter_barrier
+
+    views = []
+    view_type = ui.ConversationView
+
+    def capture_view(*args, **kwargs):
+        view = view_type(*args, **kwargs)
+        views.append(view)
+        return view
+
+    monkeypatch.setattr(ui, "ConversationView", capture_view)
 
     workspace = tmp_path / "ws"
     workspace.mkdir()
     big_text = "汉" * 20000  # 60000 UTF-8 bytes -> 进入历史后下一请求超限
-    transport = _CountingTransport([_ndjson(big_text, prompt_eval=100), _ndjson("小回复")])
+    transport = _CountingTransport([_sse(big_text, prompt_eval=100), _sse("小回复")])
     config = ApplicationConfig(
         workspace=workspace,
         system_prompt="S" * 2000,
@@ -348,7 +354,7 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
             version="test", workspace=workspace, instructions_path=None,
             instructions_sha256=None, prompt_sha256="0" * 64,
         ),
-        model_plugin=_mock_ollama_plugin(transport),
+        model_plugin=_mock_deepseek_plugin(transport),
         plan=None,
         max_turns=6,
         model_label="fake-model",
@@ -358,7 +364,7 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
     try:
         task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
         assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
-        # mock ollama 无 ChunkedFakeModel: 以 transport POST 计数与 idle 等待
+        # mock DeepSeek 无 ChunkedFakeModel: 以 transport POST 计数与 idle 等待
         stage.emit(text_keys("第一问"))
         stage.emit([ENTER])
         assert await wait_until(
@@ -374,7 +380,7 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
         # 带历史 (60KB 助手文本) + 系统提示 + 工具 -> 超 65536 bytes -> 零 POST
         stage.emit(text_keys("第二问"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("request too large")), "守卫错误如实成条"
+        assert await wait_until(lambda: stage.contains("request exceeds byte limit")), "守卫错误如实成条"
         assert len(transport.posts) == 1, "超限请求不得发出 POST"
         assert await wait_until(lambda: session.state == "idle")
 
@@ -388,6 +394,8 @@ async def test_t12_oversized_history_request_sends_zero_post_and_recovers(tmp_pa
             lambda: len(transport.posts) == 2 and session.state == "idle"
         )
         assert len(transport.posts) == 2, "清空历史后恢复 POST"
+        # idle 先于拥有任务收尾，真实准入屏障释放后才提交退出。
+        assert await wait_until(lambda: not is_enter_barrier(session, views[0]._gate))
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)

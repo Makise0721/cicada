@@ -36,8 +36,7 @@ from cicada.persistence.contracts import StorageUnavailableError, StoredIdentity
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.plugins.ollama.model import OllamaModel
-from cicada.plugins.ollama.protocol import OllamaConfig
+from cicada.plugins.deepseek import DeepSeekModel, DeepSeekConfig
 from cicada.plugins.session_store import open_session_store
 
 from test_application import _prompt_info, _repo
@@ -398,8 +397,8 @@ def test_budget_rejection_distinct_from_wire_byte_guard():
     text = budget_exceeded_text(report)
     assert text.startswith("context budget exceeded")
     assert "num_ctx" in text
-    # wire 守卫是 adapter 级另一条信息 (ollama request too large ...), 不在预算文本中
-    assert "ollama request too large" not in text
+    # wire 守卫是 adapter 级另一条信息 (request exceeds byte limit ...), 不在预算文本中
+    assert "request exceeds byte limit" not in text
 
 
 # --- 审查处置 (01 独立审查 2026-10-06) --------------------------------------------------
@@ -504,12 +503,12 @@ async def test_restored_session_starts_without_anchor(tmp_path):
         await session2.aclose()
 
 
-def _wire_model(limit: int | None) -> OllamaModel:
+def _wire_model(limit: int | None) -> DeepSeekModel:
     async def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("transport must not be reached: guards fire before send")
 
-    config = OllamaConfig(base_url="http://test", model="m", max_request_bytes=limit)
-    return OllamaModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), config)
+    config = DeepSeekConfig(think=False, max_request_bytes=limit or 2 * 1024 * 1024)
+    return DeepSeekModel(httpx.AsyncClient(transport=httpx.MockTransport(handler)), config, "offline-key")
 
 
 async def test_budget_and_wire_guards_coexist_and_stay_distinct():
@@ -523,12 +522,12 @@ async def test_budget_and_wire_guards_coexist_and_stay_distinct():
     events = [event async for event in tight.stream(request, token)]
     assert events[-1].stop_reason == "error"
     assert events[-1].error is not None and "context budget exceeded" in events[-1].error
-    assert "ollama request too large" not in events[-1].error
+    assert "request exceeds byte limit" not in events[-1].error
 
     loose = BudgetPolicy(_wire_model(10), BudgetConfig(num_ctx=1_000_000, num_predict=1))
     events = [event async for event in loose.stream(request, token)]
     assert events[-1].stop_reason == "error"
-    assert events[-1].error is not None and events[-1].error.startswith("ollama request too large")
+    assert events[-1].error is not None and "request exceeds byte limit" in events[-1].error
     assert "context budget" not in events[-1].error
 
 

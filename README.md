@@ -1,10 +1,10 @@
 # Cicada
 
-Cicada 是一个面向 Windows 的 Python coding agent：通过模型循环调用工具，读写文件、执行 PowerShell 命令并把结果交回模型继续任务。三层设计——简洁 Agent 内核、负责依赖与资源清理的插件运行时、可替换的模型与 Coding 工具插件（设计借鉴 Pi / Cordis / Chord）。当前为可运行 MVP，默认使用 DeepSeek Flash thinking，支持 Pro、显式 Ollama、离线剧本与持久会话。
+Cicada 是一个面向 Windows 的 Python coding agent：通过模型循环调用工具，读写文件、执行 PowerShell 命令并把结果交回模型继续任务。三层设计——简洁 Agent 内核、负责依赖与资源清理的插件运行时、可替换的模型与 Coding 工具插件（设计借鉴 Pi / Cordis / Chord）。当前为可运行 MVP，默认使用 DeepSeek Flash thinking，支持 Pro、离线 fake 剧本与持久会话。
 
 ## 环境要求
 
-Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据优先来自 `DEEPSEEK_API_KEY`，也可使用用户文件引用的凭据；Ollama 需本地服务（剧本模式不需要）；交互界面需要 `tui` 可选依赖组。
+Windows 11（验证基线）、Python 3.12、`uv`、PowerShell 7。DeepSeek 凭据优先来自 `DEEPSEEK_API_KEY`，也可使用用户文件引用的凭据（fake 剧本无需凭据）；交互界面需要 `tui` 可选依赖组。
 
 ## 快速开始
 
@@ -38,7 +38,7 @@ uv run --frozen python -m cicada --workspace .\sandbox --script .\demo-script.js
 
 ## 带指定检查的编码任务
 
-`--check-command`（可重复，最多 8 条）固定"必须通过什么检查"：模型只能用 `check` 工具运行启动者声明的命令，不能替换命令或超时。程序独立维护验证事实——基线快照、检查回执（最近一次尝试取代旧 PASS，任何文件变化使旧回执过时）、独立变更证据——并给出交付判定：全部条件满足退出码 `0`；模型正常 stop 但条件不满足为 `3`，不依赖模型自然语言汇报。超时/取消/输出未 EOF 永久锁存 `process_uncertain`，后续新 PASS 不能清除。检查模式要求 `--workspace` 是 Git 工作树根目录、`--num-ctx` ≥ 32768，最多 25 轮；DeepSeek 输出默认上限 32768、请求体上限 2 MiB；显式 Ollama 检查模式输出预留 2048、请求体上限 65536 字节。
+`--check-command`（可重复，最多 8 条）固定"必须通过什么检查"：模型只能用 `check` 工具运行启动者声明的命令，不能替换命令或超时。程序独立维护验证事实——基线快照、检查回执（最近一次尝试取代旧 PASS，任何文件变化使旧回执过时）、独立变更证据——并给出交付判定：全部条件满足退出码 `0`；模型正常 stop 但条件不满足为 `3`，不依赖模型自然语言汇报。超时/取消/输出未 EOF 永久锁存 `process_uncertain`，后续新 PASS 不能清除。检查模式要求 `--workspace` 是 Git 工作树根目录、`--num-ctx` ≥ 32768，最多 25 轮；DeepSeek 输出默认上限 32768、请求体上限 2 MiB。
 
 ```powershell
 uv run --frozen python -m cicada --workspace .\repo --check-command 'python check.py' '修复失败的测试并通过检查'
@@ -56,21 +56,21 @@ cicada
 持久会话覆盖单次 CLI 与 TUI：
 
 - `--tui` 默认自动保存；`--save-session` 供单次模式落盘。存档位于 `<workspace>/.cicada/sessions/<id>.sqlite3`。
-- `--resume <id>` 恢复：完整历史恢复、旧工具不重放、追加保存。省略的 provider、模型、模式和限额继承存档（旧 Ollama 会话仍用 Ollama），显式参数与存档冲突点名拒绝（先于模型探测）；检查模式存档恢复需显式给出相同 `--check-command`。`--tui` 下省略 ID 启动会话选择器（Esc 取消，退出码 0）。
-- `--resume-with-current-config` 显式采用当前配置恢复（差异不拒绝，记入新启动代次）。
+- `--resume <id>` 恢复：完整历史恢复、旧工具不重放、追加保存。省略的 provider、模型、模式和限额继承存档，显式参数与存档冲突点名拒绝；检查模式存档恢复需显式给出相同 `--check-command`；不再支持的 provider 明确拒绝普通恢复。`--tui` 下省略 ID 启动会话选择器（Esc 取消，退出码 0）。
+- `--resume-with-current-config` 显式采用当前 API 配置恢复（差异不拒绝，记入新启动代次）；旧历史及模型归属保留，恢复阻断仍有效。
 - `--list-sessions` 只读分页列表，无需模型探测；标注占用/恢复阻断/坏档。
 - 恢复的会话存在未证终结进程活动时为 view-only：新请求零执行，TUI 无新请求关闭后退出码 3。两个进程不能同时续写同一会话（Windows 文件锁独占）。
 
 ## 发送预算与上下文压缩
 
-真实模型发送前做预算准入：完整输入按启发式估计（非精确 token），加上输出预留与安全余量后的总估计超过有效 `--num-ctx`（请求值）即拒绝发送并说明原因；请求体字节上限是独立的请求体字节守卫，不充当 token 预算。TUI 底栏常驻最近预算评估及输入来源，完整分解见 `/status`。持久会话可用 `/compact` 手动压缩较早请求（原始记录保留）；请求超限时先自动压缩至多一次再重估，Ollama 服务端确认上下文超限且该次无可见输出时压缩后重发至多一次；DeepSeek 不自动 HTTP 重试。非持久会话只有预算准入，无压缩。
+真实模型发送前做预算准入：完整输入按启发式估计（非精确 token），加上输出预留与安全余量后的总估计超过有效 `--num-ctx`（请求值）即拒绝发送并说明原因；请求体字节上限是独立的请求体字节守卫，不充当 token 预算。TUI 底栏常驻最近预算评估及输入来源，完整分解见 `/status`。持久会话可用 `/compact` 手动压缩较早请求（原始记录保留）；请求超限时先自动压缩至多一次再重估；DeepSeek 不自动 HTTP 重试。非持久会话只有预算准入，无压缩。
 
 ## 常用参数
 
 | 参数 | 说明 |
 |---|---|
 | `--workspace` | 工作区根目录，默认当前目录 |
-| `--provider` / `--model` / `--think` / `--no-think` / `--num-ctx` | 默认 DeepSeek Flash thinking，窗口 131072；`--provider ollama` 默认 qwen3.5:9b、关闭思考、窗口 32768（可用 `--ollama-url`） |
+| `--provider` / `--model` / `--think` / `--no-think` / `--num-ctx` | 默认 DeepSeek Flash thinking，窗口 131072；支持 Flash/Pro |
 | `--reasoning-effort` / `--max-output-tokens` | DeepSeek 强度 low/high/max（默认 high）、思考+答案总输出上限（默认 32768） |
 | `--instructions-file` | 追加到系统提示的项目指令文件（≤16 KiB UTF-8） |
 | `--skills-dir` | 启用本地 Skills 的目录（相对 workspace；每个直接子目录一份 `SKILL.md`，Markdown + YAML frontmatter 基本格式）。启动只把目录元数据加入系统提示，模型经 `load_skill` 工具按名称取冻结正文；恢复不从存档继承，须重传同一目录 |
@@ -85,9 +85,7 @@ cicada
 ## 测试
 
 ```powershell
-uv run --frozen python -m pytest -q -m 'not live'   # 无真实模型调用
-uv run --frozen python -m pytest -q -m live          # 真实 Ollama 用例 (不可达则 skip)
-uv run --frozen python -m pytest -q                  # 完整套件
+uv run --frozen python -m pytest -q   # fake / MockTransport 离线检查
 ```
 
 须用 `python -m pytest` 而非直接 `pytest`：跨目录的 `tests.` 导入依赖项目根在 sys.path。测试临时目录固定为项目内 `.pytest-tmp`。

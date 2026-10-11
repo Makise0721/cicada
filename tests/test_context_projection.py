@@ -134,7 +134,7 @@ def test_summary_prompt_is_versioned_and_stable():
 
 def test_summary_input_messages_appends_fixed_user_turn():
     """摘要请求整形 (05 收口修正): 对话切片以 assistant 结尾时模型立即终结
-    (实测 qwen3.5/ollama 0.20.7: stop + content 空 + eval_count=1)——固定 user
+    (模型 stop + content 空 + output_tokens=1)——固定 user
     结尾保证摘要请求有生成起点; 追加消息不属规范历史 (调用方不计覆盖范围)."""
     from cicada.context_policy import SUMMARY_TURN_TEXT, summary_input_messages
 

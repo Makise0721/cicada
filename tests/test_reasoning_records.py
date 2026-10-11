@@ -207,13 +207,13 @@ def test_budget_counts_raw_reasoning_bytes():
 
 
 @pytest.mark.parametrize("text", ["", "output"])
-async def test_reasoning_even_empty_prohibits_overflow_retry(text):
+async def test_reasoning_server_error_sends_once(text):
     attempts = []
-    async def compact(quota):
-        attempts.append(quota)
+    async def compact():
+        attempts.append("admission")
         return True
     model = FakeModel([[ReasoningDelta(text), StreamDone("error", "overflow")], [StreamDone("stop")]])
-    policy = BudgetPolicy(model, BudgetConfig(num_ctx=100_000), classify_overflow=lambda _: True,
+    policy = BudgetPolicy(model, BudgetConfig(num_ctx=100_000),
                           auto_compact=compact)
     events = [e async for e in policy.stream(ModelRequest((UserMessage("q"),), ()), CancelToken())]
     assert events[-1].stop_reason == "error"

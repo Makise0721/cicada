@@ -836,7 +836,7 @@ class ConversationView:
         """/model (DeepSeek 04, 契约 C7/D8): 打开模型目录的本地操作.
 
         不是 UserMessage/模型请求/工具调用; 目录只读来自 session.model_options。
-        当前会话无选择能力 (Ollama/fake) 时给有界说明, 不触碰历史/存储。
+        当前会话无选择能力 (fake) 时给有界说明, 不触碰历史/存储。
         view-only/storage_failed/process_uncertain 下仍可查看目录; 选择能否
         提交由应用 select_model 双向核对 (失败有界成条, 不解除编码阻断)。
         """
