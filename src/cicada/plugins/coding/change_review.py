@@ -58,6 +58,17 @@ def _records(data: bytes) -> list[bytes]:
     return data.split(b"\0")[:-1]
 
 
+def _artifact_reason(exc: BaseException) -> str:
+    kind = getattr(exc, "kind", None)
+    if kind == "file_limit":
+        return "over_limit"
+    if kind == "stale":
+        return "changed"
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    return "unreadable"
+
+
 @dataclass(frozen=True)
 class _FileObservation:
     data: bytes
@@ -310,6 +321,43 @@ class ChangeReview:
             return ReviewPreview(snapshot.review_id, item_id, item.relative_path, _COMPARISONS[item.group],
                                  "stale" if reason == "stale" else "unavailable", notice=reason,
                                  observed_at=_now())
+
+    async def read_artifact(self, path: Path, expected_sha256: str,
+                            cancel: CancelToken) -> ReviewPreview:
+        """既有输出工件的有界读取与全量 hash 核验：一次操作共用预算。
+
+        notice 是短原因 token（missing/mismatch/over_limit/changed/unreadable/
+        timeout/binary），由调用方组装显示文本；integrity 只在完整读取且与期望
+        hash 相符时为 verified，正文预览截断可与核验成功并存。路径只接受应用
+        持有的真实工件事实，正文整体读取，不解析内容为文件清单。
+        """
+        observation = _Observation(self.workspace.root, cancel)
+        try:
+            async with asyncio.timeout(REVIEW_TIMEOUT_S):
+                data = await observation.file(Path(path))
+        except asyncio.CancelledError:
+            raise
+        except (GitIOError, OSError, TimeoutError) as exc:
+            return ReviewPreview("", "", "输出工件", "", "unavailable",
+                                 notice=_artifact_reason(exc), observed_at=None,
+                                 integrity="unknown")
+        if data is None:
+            return ReviewPreview("", "", "输出工件", "", "unavailable", notice="missing",
+                                 observed_at=None, integrity="unknown")
+        verified = data.sha256 == expected_sha256
+        notice = None if verified else "mismatch"
+        source = data.data[:MAX_PREVIEW_BYTES]
+        truncated = len(source) < len(data.data)
+        if b"\0" in source:
+            return ReviewPreview("", "", "输出工件", "", "complete", "",
+                                 notice if notice else "binary", None,
+                                 "verified" if verified else "unknown")
+        try:
+            text = source.decode("utf-8", "ignore" if truncated or not verified else "strict")
+        except UnicodeDecodeError:
+            text = source.decode("utf-8", "ignore")
+        return ReviewPreview("", "", "输出工件", "", "truncated" if truncated else "complete",
+                             text, notice, None, "verified" if verified else "unknown")
 
     async def _read(self, snapshot: ReviewSnapshot, item: ReviewItem,
                     observation: _Observation) -> ReviewPreview:

@@ -99,9 +99,11 @@ from cicada.plugins.session_store import SQLiteSessionStore, open_session_store,
 from cicada.plugins.ollama import OllamaModel, classify_context_overflow
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.change_review import (
-    CHANGE_REVIEW_CAPABILITY, ChangeReview, change_review_plugin,
+    CHANGE_REVIEW_CAPABILITY, REVIEW_TIMEOUT_S, ChangeReview, change_review_plugin,
 )
-from cicada.review import ReviewError, ReviewPreview, ReviewSnapshot
+from cicada.review import (
+    ReviewCheckDetails, ReviewCheckRow, ReviewError, ReviewPreview, ReviewSnapshot,
+)
 from cicada.plugins.coding.process import process_plugin
 from cicada.plugins.coding.tool_check import check_plugin
 from cicada.plugins.coding.tool_edit import edit_plugin
@@ -456,6 +458,37 @@ def _outcome_exit_code(
     return 0 if decision.can_deliver else 3
 
 
+# 审阅工件读取短原因 -> 显示文本; 未知 token 原样显示 (有界)
+_ARTIFACT_NOTICES = {
+    "missing": "工件缺失或不可读",
+    "mismatch": "工件与记录 hash 不符",
+    "over_limit": "工件超过全量核验限额",
+    "changed": "工件在核验期间变化",
+    "unreadable": "工件不可读",
+    "timeout": "工件核验超出时间预算",
+    "binary": "二进制工件不显示正文",
+}
+
+
+@dataclass(frozen=True)
+class _ReviewTarget:
+    """审阅页登记的检查/工件目标; 只由应用从真实事实构造, 不接受 UI 输入."""
+
+    kind: str  # "checks" | "artifact"
+    path: Path | None = None
+    expected_sha256: str | None = None
+    evidence: ChangeEvidence | None = None
+
+
+def _evidence_label(evidence: ChangeEvidence | None) -> str | None:
+    """complete/failure 事实的有界显示; 不掩盖不完整工件, 无证据为 None."""
+    if evidence is None:
+        return None
+    if evidence.complete:
+        return "累计变更工件（生成时完整）"
+    return f"累计变更工件（生成时不完整 · {evidence.failure_kind or 'unknown'}）"
+
+
 class ApplicationSession:
     """单一执行 seam: 持有一个 App、一个 Agent, 检查模式下还有一套验证服务."""
 
@@ -500,6 +533,10 @@ class ApplicationSession:
         self._review_snapshot: ReviewSnapshot | None = None
         self._review_token: CancelToken | None = None
         self._review_task: asyncio.Task | None = None
+        # 02 (C8): 最近本进程 outcome 的隔离只读引用与登记目标; 恢复不建立,
+        # clear 不清除。页面不持久化, 旧工件不因此获得当前交付权威。
+        self._last_outcome: RequestOutcome | None = None
+        self._review_targets: dict[str, _ReviewTarget] = {}
         # 04 (C6): 最新接受的配置准备源; 发布时按结构能力更新, 不从启动缓存准备
         self._model_configuration: ModelConfigurationPort | None = None
         if model_route is not None and isinstance(model_route.binding.model, ModelConfigurationPort):
@@ -600,6 +637,7 @@ class ApplicationSession:
         """同步准入、占住页面 lease 后派发一个受拥有读取；刷新不排队。"""
         self._check_review_admission()
         self._review_active = True
+        self._review_targets = {}
         review_id = uuid.uuid4().hex
         self._review_id = review_id
         self._review_snapshot = None
@@ -608,26 +646,141 @@ class ApplicationSession:
             snapshot = await self._review_io(self._review_reader.capture(review_id, token), token)
             if self._review_id != review_id or self._closing:
                 raise ReviewError("inactive", "审阅已关闭。")
-            snapshot = replace(snapshot, checks_state="not_enabled" if self._config.plan is None else "not_recorded")
+            snapshot = self._apply_check_state(snapshot)
             self._review_snapshot = snapshot
             return snapshot
         except BaseException:
             self.cancel_review()
             raise
 
-    async def read_review(self, review_id: str, target_id: str) -> ReviewPreview:
+    def _apply_check_state(self, snapshot: ReviewSnapshot) -> ReviewSnapshot:
+        """C8 三状态: 无 plan 未启用; 有 plan 无本进程 outcome 尚无记录; 有记录
+        登记 checks/工件目标。恢复的旧回执不进入, 也不获得当前权威。"""
+        if self._config.plan is None or self._service is None:
+            return replace(snapshot, checks_state="not_enabled")
+        if self._last_outcome is None:
+            return replace(snapshot, checks_state="not_recorded")
+        checks_target_id = uuid.uuid4().hex
+        self._review_targets[checks_target_id] = _ReviewTarget(kind="checks")
+        artifact_target_id = None
+        evidence = self._last_outcome.evidence
+        if (evidence is not None and evidence.artifact_path is not None
+                and evidence.artifact_sha256 is not None):
+            artifact_target_id = uuid.uuid4().hex
+            self._review_targets[artifact_target_id] = _ReviewTarget(
+                kind="artifact", path=evidence.artifact_path,
+                expected_sha256=evidence.artifact_sha256, evidence=evidence)
+        return replace(snapshot, checks_state="available", checks_target_id=checks_target_id)
+
+    async def read_review(self, review_id: str, target_id: str) -> ReviewPreview | ReviewCheckDetails:
         snapshot = self._review_snapshot
         if not self._review_active or self._review_id != review_id or snapshot is None:
             raise ReviewError("inactive", "审阅观察已失效，请刷新。")
-        if not any(item.item_id == target_id for item in snapshot.items):
+        target = self._review_targets.get(target_id)
+        if target is None and not any(item.item_id == target_id for item in snapshot.items):
             raise ReviewError("invalid_target", "未知审阅目标。")
         if self._review_task is not None and not self._review_task.done():
             raise ReviewError("busy", "上一项读取尚未结束。")
         token = CancelToken()
-        result = await self._review_io(self._review_reader.read_file(snapshot, target_id, token), token)
+        if target is None:
+            operation = self._review_reader.read_file(snapshot, target_id, token)
+        elif target.kind == "checks":
+            operation = self._read_check_details(snapshot, target_id, token)
+        else:
+            operation = self._read_artifact_preview(snapshot, target_id, target, token)
+        result = await self._review_io(operation, token)
         if self._review_id != review_id or self._review_snapshot is not snapshot or self._closing:
             raise ReviewError("inactive", "审阅已关闭或刷新。")
         return result
+
+    async def _read_check_details(self, snapshot: ReviewSnapshot, target_id: str,
+                                  token: CancelToken) -> ReviewCheckDetails:
+        """检查详情只投影验证事实: refresh 重算 freshness, 最近工件有界核验。
+
+        不调用 check/finalize/decide_delivery; refresh 沿既有 snapshotter 更新
+        单调观察账本, 是原应用验证语义。整体读取共用 10s 预算, 超限如实报错。
+        """
+        assert self._service is not None and self._review_reader is not None
+        assert self._config.plan is not None
+        try:
+            async with asyncio.timeout(REVIEW_TIMEOUT_S):
+                view = await self._service.refresh(token)
+                rows = tuple([await self._check_row(state, token) for state in view.checks])
+        except TimeoutError:
+            raise ReviewError("unavailable", "检查详情读取超出预算，请重试。") from None
+        evidence = self._last_outcome.evidence if self._last_outcome is not None else None
+        artifact_target_id = next((tid for tid, registered in self._review_targets.items()
+                                   if registered.kind == "artifact"), None)
+        return ReviewCheckDetails(
+            review_id=snapshot.review_id, target_id=target_id,
+            verification_run_id=view.verification_run_id,
+            snapshot_ref=view.snapshot_ref, scope_id=view.scope_id,
+            rows=rows, process_uncertain=view.process_uncertain,
+            blocking_reasons=view.blocking_reasons,
+            artifact_target_id=artifact_target_id,
+            artifact_label=_evidence_label(evidence),
+        )
+
+    async def _check_row(self, state, token: CancelToken) -> ReviewCheckRow:
+        """单检查行: 无回执即尚未运行, 不伪造 execution/verification 状态。"""
+        definition = next(
+            (c for c in self._config.plan.checks if c.check_id == state.check_id), None)
+        command = definition.command if definition is not None else state.check_id
+        receipt = state.receipt
+        if receipt is None:
+            return ReviewCheckRow(state.check_id, None, command, None, None,
+                                  state.freshness, "not_recorded", None)
+        integrity, reason = "not_recorded", None
+        if receipt.output_artifact_path is not None:
+            if receipt.artifact_error is not None:
+                integrity, reason = "unknown", receipt.artifact_error[:256]
+            elif receipt.output_artifact_sha256 is None:
+                integrity, reason = "unknown", "输出工件未记录 hash，无法核验"
+            else:
+                integrity, reason = await self._verify_check_artifact(receipt, token)
+        return ReviewCheckRow(state.check_id, receipt.receipt_id, command,
+                              receipt.execution_status, receipt.verification_status,
+                              state.freshness, integrity, reason)
+
+    async def _verify_check_artifact(self, receipt, token: CancelToken) -> tuple[str, str | None]:
+        """复用 verify_receipt_artifacts 的规则口径, 经 reader 有界核验不阻塞 loop。"""
+        assert self._review_reader is not None
+        preview = await self._review_reader.read_artifact(
+            receipt.output_artifact_path, receipt.output_artifact_sha256, token)
+        if preview.integrity == "verified":
+            return "verified", None
+        notice = preview.notice or "unknown"
+        if notice == "missing":
+            return "missing", "输出工件缺失或不可读"
+        if notice == "mismatch":
+            return "mismatch", "输出工件与写入时记录的 hash 不符"
+        if notice == "over_limit":
+            return "unknown", "输出工件超过全量核验限额"
+        if notice == "changed":
+            return "unknown", "输出工件在核验期间发生变化"
+        return "unknown", f"输出工件核验未完成（{notice}）"
+
+    async def _read_artifact_preview(self, snapshot: ReviewSnapshot, target_id: str,
+                                     target: _ReviewTarget, token: CancelToken) -> ReviewPreview:
+        """累计变更工件: 完整 hash 核验与有界正文同一次有界读取; 只显示历史身份。
+
+        启动基线→生成时 snapshot/scope 进标题, 无观察完成时间不显示;
+        正文整体呈现, 不解析为当前文件清单, 也不获得当前交付权威。
+        """
+        assert self._review_reader is not None
+        assert target.path is not None and target.expected_sha256 is not None
+        read = await self._review_reader.read_artifact(target.path, target.expected_sha256, token)
+        evidence = target.evidence
+        assert evidence is not None
+        comparison = (f"启动基线 {evidence.baseline_snapshot_ref or '未知'} → 生成时快照 "
+                      f"{evidence.snapshot_ref or '未知'} · scope {evidence.scope_id or '未知'}")
+        notes = ["累计历史工件，不随当前修改刷新",
+                 "生成时完整" if evidence.complete
+                 else f"生成时不完整 · {evidence.failure_kind or 'unknown'}"]
+        if read.notice:
+            notes.append(_ARTIFACT_NOTICES.get(read.notice, read.notice))
+        return ReviewPreview(snapshot.review_id, target_id, "累计变更工件", comparison,
+                             read.state, read.text, " · ".join(notes), None, read.integrity)
 
     async def _review_io(self, operation, token: CancelToken):
         task = asyncio.create_task(operation)
@@ -652,6 +805,7 @@ class ApplicationSession:
     def cancel_review(self) -> None:
         self._review_id = None
         self._review_snapshot = None
+        self._review_targets = {}
         if self._review_token is not None:
             self._review_token.cancel()
         if self._review_task is None or self._review_task.done():
@@ -1213,6 +1367,9 @@ class ApplicationSession:
         else:
             self._state = "idle"
             self._notify(RequestPhaseChanged(result.run_id, "idle"))
+        # C8: 在既有发布位置保存最近本进程 outcome 的隔离只读引用 (02);
+        # 不从 CheckProjection/_last_completed 反取权威, 也不从 restored_requests 恢复
+        self._last_outcome = _isolate_outcome(outcome)
         self._notify(RequestCompleted(outcome))
         return outcome
 
