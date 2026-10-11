@@ -239,22 +239,35 @@ class ReviewView:
                 if action in self._visible_actions:
                     self.execute(action)
         elif key.key in (Keys.PageUp, Keys.PageDown):
-            self._viewport.page(-1 if key.key is Keys.PageUp else 1)
+            direction = -1 if key.key is Keys.PageUp else 1
+            if self.preview is None and self.snapshot is not None:
+                self._scroll_list(direction * self._list_height)
+            else:
+                self._viewport.page(direction)
         elif key.key is Keys.Home:
-            self._viewport.go_home()
+            if self.preview is None:
+                self._scroll_list(-self._list_top)
+            else:
+                self._viewport.go_home()
         elif key.key is Keys.End:
-            self._viewport.go_end()
+            if self.preview is None and self.snapshot is not None:
+                self._scroll_list(len(self.snapshot.items))
+            else:
+                self._viewport.go_end()
         self._changed()
 
     def wheel(self, notches: int) -> None:
         if not self.closing:
             if self.preview is None and self.snapshot is not None:
-                count = sum(i.group == self.group for i in self.snapshot.items)
-                self._list_top = max(0, min(self._list_top - notches * 3, count - self._list_height))
-                self._list_scroll_dirty = True
+                self._scroll_list(-notches * 3)
             else:
                 self._viewport.wheel_scroll(notches)
             self._changed()
+
+    def _scroll_list(self, delta: int) -> None:
+        count = sum(i.group == self.group for i in self.snapshot.items) if self.snapshot else 0
+        self._list_top = max(0, min(self._list_top + delta, count - self._list_height))
+        self._list_scroll_dirty = True
 
     def layout(self, width: int, rows: int) -> DocumentLayout:
         width, rows = max(1, width), max(1, rows)
