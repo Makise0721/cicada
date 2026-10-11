@@ -82,7 +82,8 @@ def test_restored_metrics_none_stays_unknown():
         ),),
     )
     project_restored_history(transcript, tools, requests=(request,), interrupted=())
-    assert "不可得" in transcript.metrics_summary(), "None 计量不当作 0"
+    assert "历史计量: 不可得" in "\n".join(transcript.render(60)), "历史 None 计量不当作 0"
+    assert transcript.metrics_fact() == (None, False, None, False)
 
 
 def test_tool_cards_namespaced_and_check_attribution():
