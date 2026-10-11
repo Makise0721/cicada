@@ -70,10 +70,24 @@ async def test_diff_page_consumes_input_and_returns_without_model_history(tmp_pa
         ])
         await view.review_view._task
         assert "+VALUE = 2" in view.review_view.preview.text
+        entered = asyncio.Event()
+        original_read = session._review_reader.read_file
+
+        async def slow_read(snapshot, target, token):
+            entered.set()
+            await token.wait()
+            return await original_read(snapshot, target, token)
+
+        session._review_reader.read_file = slow_read
+        view.review_view.execute(span.action)
+        await entered.wait()
         frontend._on_input_batch([KeyPress(Keys.Escape, "\x1b"), KeyPress("y", "y"), enter])
+        await asyncio.gather(view.review_view._task, return_exceptions=True)
+        await asyncio.sleep(0)
         assert not view.review_view.active and not session.review_active
         assert view.editor.is_empty() and session.history == ()
         assert not any(isinstance(entry, UserEntry) for entry in view.transcript.entries())
+        assert not any(isinstance(entry, ErrorEntry) for entry in view.transcript.entries())
     finally:
         frontend._stopped = True
         await session.aclose()

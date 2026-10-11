@@ -412,6 +412,7 @@ class MainScreenFrontend:
 
     def _dispatch_key(self, key) -> None:
         if self._review_active():
+            self._sync_viewport_layout()
             self._disarm_escape_prefix()
             self._review.handle(key)
             return

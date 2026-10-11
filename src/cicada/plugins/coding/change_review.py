@@ -10,6 +10,7 @@ import stat
 import time
 import uuid
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from cicada.core.cancel import CancelToken
@@ -32,6 +33,7 @@ _KINDS = {"A": "added", "M": "modified", "D": "deleted", "T": "type_changed",
           "U": "conflict"}
 _COMPARISONS = {"unstaged": "index → 工作区", "staged": "HEAD → index",
                 "untracked": "未跟踪新增（原始文件）"}
+_ATTRIBUTES = ("filter", "diff", "text", "eol", "working-tree-encoding")
 
 
 def _now() -> str:
@@ -54,6 +56,13 @@ def _records(data: bytes) -> list[bytes]:
     if data and not data.endswith(b"\0"):
         raise GitIOError("invalid_metadata", "Git metadata lacks a terminating NUL")
     return data.split(b"\0")[:-1]
+
+
+@dataclass(frozen=True)
+class _FileObservation:
+    data: bytes
+    sha256: str
+    stamp: tuple[int, ...]
 
 
 class _Observation:
@@ -84,7 +93,7 @@ class _Observation:
         self.checkpoint()
         return result
 
-    async def file(self, path: Path) -> bytes | None:
+    async def file(self, path: Path) -> _FileObservation | None:
         """worker 受当前 reader task 拥有，外层取消也先等实际读取终结。"""
         task = asyncio.create_task(asyncio.to_thread(self._read_file, path))
         try:
@@ -102,7 +111,7 @@ class _Observation:
                 task.exception()
             raise
 
-    def _read_file(self, path: Path) -> bytes | None:
+    def _read_file(self, path: Path) -> _FileObservation | None:
         self.checkpoint()
         try:
             before = path.lstat()
@@ -114,6 +123,7 @@ class _Observation:
         if before.st_size > MAX_FILE_BYTES:
             raise GitIOError("file_limit", "complete file exceeds 16 MiB")
         result = bytearray()
+        digest = hashlib.sha256()
         with path.open("rb") as handle:
             opened = os.fstat(handle.fileno())
             if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
@@ -124,6 +134,7 @@ class _Observation:
                 if not chunk:
                     break
                 result.extend(chunk)
+                digest.update(chunk)
                 if len(result) > MAX_FILE_BYTES:
                     raise GitIOError("file_limit", "complete file exceeds 16 MiB")
         after = path.lstat()
@@ -133,7 +144,7 @@ class _Observation:
         if fields(before) != fields(after) or len(result) != after.st_size:
             raise GitIOError("stale", "file changed while reading")
         self.checkpoint()
-        return bytes(result)
+        return _FileObservation(bytes(result), digest.hexdigest(), fields(after))
 
 
 class ChangeReview:
@@ -158,15 +169,16 @@ class ChangeReview:
         index = Path(index_path.decode("utf-8").rstrip("\r\n"))
         content = await observation.file(index)
         return (head.decode("utf-8").strip(), str(index),
-                "missing" if content is None else hashlib.sha256(content).hexdigest())
+                "missing" if content is None else content.sha256)
 
     async def _filters(self, observation: _Observation, paths: tuple[str, ...]) -> tuple[str, bool]:
         # 先核对全部有效 filter 命令及候选属性，再允许任何工作区 diff。
         config, _, _ = await observation.git("config", "--null", "--get-regexp",
-                                             r"^filter\..*\.(clean|process)$", allowed_codes=(0, 1))
+                                             r"^(filter\..*\.(clean|process)|core\.(autocrlf|eol|safecrlf|attributesfile)|diff\..*)$",
+                                             allowed_codes=(0, 1))
         attrs = b""
         if paths:
-            attrs, _, _ = await observation.git("check-attr", "-z", "--stdin", "filter",
+            attrs, _, _ = await observation.git("check-attr", "-z", "--stdin", *_ATTRIBUTES,
                                                input_data=b"".join(p.encode("utf-8") + b"\0" for p in paths))
         commands = {}
         for record in _records(config):
@@ -175,10 +187,12 @@ class ChangeReview:
                 raise GitIOError("filter_unknown", "filter configuration cannot be checked")
             commands[key] = value
         fields = _records(attrs)
-        if len(fields) != len(paths) * 3:
+        if len(fields) != len(paths) * len(_ATTRIBUTES) * 3:
             raise GitIOError("filter_unknown", "filter attributes cannot be checked")
         active = False
         for offset in range(0, len(fields), 3):
+            if fields[offset + 1] != b"filter":
+                continue
             value = fields[offset + 2]
             if value not in (b"unspecified", b"unset", b"set"):
                 active |= any(commands.get(b"filter." + value + b"." + suffix)
@@ -213,12 +227,20 @@ class ChangeReview:
                                            for record in _records(tracked)))
         # Git 的工作区比较会读取文件。已观察到 reparse 祖先时整组拒绝，
         # 保留 staged 对象比较与 untracked 原始读取，避免跟随链接目标。
-        special_paths = any(self._inventory._inspect_path(path.split("/"))[1] for path in tracked_paths)
+        special_paths = False
+        filter_paths = []
+        for index, path in enumerate(tracked_paths):
+            if index % 128 == 0:
+                await asyncio.sleep(0)
+                observation.checkpoint()
+            if self._inventory._inspect_path(path.split("/"))[1]:
+                special_paths = True
+            else:
+                filter_paths.append(path)
+        filter_paths = tuple(filter_paths)
         filter_basis = "unknown"
         filter_reason = None
         try:
-            filter_paths = tuple(path for path in tracked_paths
-                                 if not self._inventory._inspect_path(path.split("/"))[1])
             filter_basis, active = await self._filters(observation, filter_paths)
             if active:
                 filter_reason = "external_filter"
@@ -325,7 +347,7 @@ class ChangeReview:
                 object_id = _records(head_info)[0].partition(b"\t")[0].split()[2]
                 blob, _, _ = await observation.git("cat-file", "blob", object_id.decode("ascii"), content=True)
                 blobs.append(blob)
-        compared = blobs + ([work_before] if item.group != "staged" and work_before is not None else [])
+        compared = blobs + ([work_before.data] if item.group != "staged" and work_before is not None else [])
         textual = True
         notice = None
         for content in compared:
@@ -344,7 +366,11 @@ class ChangeReview:
                 raise GitIOError("stale", "entry is no longer untracked; refresh")
             patch = b""
             if textual:
-                pieces = difflib.unified_diff([], work_before.decode("utf-8").splitlines(keepends=True),
+                # 全量文件已在 worker 核对；只为有界前缀建立逻辑行，
+                # 避免大量短行把 16 MiB 文件膨胀成数百万 Python 字符串。
+                source = work_before.data[:MAX_PREVIEW_BYTES]
+                truncated = len(source) < len(work_before.data)
+                pieces = difflib.unified_diff([], source.decode("utf-8", "ignore").splitlines(keepends=True),
                                               fromfile="/dev/null", tofile=path)
                 output = bytearray()
                 for line in pieces:
@@ -377,9 +403,9 @@ class ChangeReview:
         if textual:
             facts = []
             if work_before is not None:
-                if work_before.startswith(b"\xef\xbb\xbf"):
+                if work_before.data.startswith(b"\xef\xbb\xbf"):
                     facts.append("工作区 UTF-8 BOM")
-                facts.append("工作区 CRLF" if b"\r\n" in work_before else "工作区 LF/无换行")
+                facts.append("工作区 CRLF" if b"\r\n" in work_before.data else "工作区 LF/无换行")
             facts.append("Git 原生 EOL 比较" if item.group != "untracked" else "原始读取")
             if not patch:
                 facts.append("空文本差异；仍有新增/模式等元数据变化")

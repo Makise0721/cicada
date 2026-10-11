@@ -42,9 +42,13 @@ class ReviewView:
         self._started = False
         self._selected = 0
         self._actions: tuple[DisplayAction, ...] = ()
+        self._visible_actions: tuple[DisplayAction, ...] = ()
         self._body_mode = False
         self._body_lines: tuple[str, ...] = ()
-        self._body_cache: tuple[int, tuple[str, ...], DocumentLayout] | None = None
+        self._body_layout: DocumentLayout | None = None
+        self._list_top = 0
+        self._list_height = 1
+        self._list_scroll_dirty = False
         self._viewport = DocumentViewport()
         self._viewport.follow = False
 
@@ -62,6 +66,7 @@ class ReviewView:
         self.snapshot = None
         self.preview = None
         self._body_lines = ()
+        self._body_layout = None
         self.message = "读取文件清单…"
         self._selected = 0
         self._body_mode = False
@@ -82,8 +87,6 @@ class ReviewView:
             if not self._session.review_active:
                 self.active = False
                 self.generation += 1
-                if self._on_error:
-                    self._on_error(self.message)
         self._changed()
 
     async def _open(self, generation: int, *, consume_command: bool = False) -> None:
@@ -102,11 +105,15 @@ class ReviewView:
             if consume_command:
                 self._editor.clear()
         except ReviewError as exc:
+            if self.closing:
+                return
             if consume_command:
                 # 准入失败不消费命令，短错误由页退回后显示到原草稿旁。
                 self.message = str(exc)
                 self.active = False
                 self.generation += 1
+                if self._on_error:
+                    self._on_error(self.message)
             else:
                 self.message = str(exc)
         except asyncio.CancelledError:
@@ -114,6 +121,8 @@ class ReviewView:
             raise
         except Exception:
             self.message = "审阅读取失败"
+            if self._on_error and not self.closing:
+                self._on_error(self.message)
             self._session.cancel_review()
             self.closing = True
         finally:
@@ -142,7 +151,7 @@ class ReviewView:
                 self.preview = preview
                 # 一次净化，逻辑行只在可见窗口按宽度截断，不每帧全量 wrap。
                 self._body_lines = tuple(sanitize_display(preview.text).splitlines())
-                self._body_cache = None
+                self._body_layout = DocumentLayout(self._body_lines, (), (None,) * len(self._body_lines))
                 self._viewport = DocumentViewport()
                 self._viewport.follow = False
                 self.message = ""
@@ -178,6 +187,7 @@ class ReviewView:
             self.message = "刷新文件清单…"
             self.preview = None
             self._body_lines = ()
+            self._body_layout = None
             self._body_mode = False
             self._start(self._open(self.generation))
         elif operation == "group" and target in _LABELS:
@@ -185,6 +195,7 @@ class ReviewView:
             self.target = None
             self.preview = None
             self._body_lines = ()
+            self._body_layout = None
             self._body_mode = False
             self.message = "选择文件查看差异"
             self._selected = 0
@@ -196,6 +207,7 @@ class ReviewView:
             self.target = target
             self.preview = None
             self._body_lines = ()
+            self._body_layout = None
             self.message = "读取文件…"
             self._body_mode = True
             self._start(self._read(self.generation, self.snapshot, target))
@@ -214,6 +226,7 @@ class ReviewView:
         if data in ("r", "R"):
             self.execute(self._action("refresh"))
         elif key.key in (Keys.Up, Keys.Down):
+            self._list_scroll_dirty = False
             if self._actions:
                 self._selected = (self._selected + (-1 if key.key is Keys.Up else 1)) % len(self._actions)
         elif key.key in (Keys.Left, Keys.Right):
@@ -222,7 +235,9 @@ class ReviewView:
             self.execute(self._action("group", groups[(index + (-1 if key.key is Keys.Left else 1)) % 3]))
         elif key.key is Keys.ControlM or data == "\r":
             if self._actions:
-                self.execute(self._actions[min(self._selected, len(self._actions)-1)])
+                action = self._actions[min(self._selected, len(self._actions)-1)]
+                if action in self._visible_actions:
+                    self.execute(action)
         elif key.key in (Keys.PageUp, Keys.PageDown):
             self._viewport.page(-1 if key.key is Keys.PageUp else 1)
         elif key.key is Keys.Home:
@@ -233,7 +248,12 @@ class ReviewView:
 
     def wheel(self, notches: int) -> None:
         if not self.closing:
-            self._viewport.wheel_scroll(notches)
+            if self.preview is None and self.snapshot is not None:
+                count = sum(i.group == self.group for i in self.snapshot.items)
+                self._list_top = max(0, min(self._list_top - notches * 3, count - self._list_height))
+                self._list_scroll_dirty = True
+            else:
+                self._viewport.wheel_scroll(notches)
             self._changed()
 
     def layout(self, width: int, rows: int) -> DocumentLayout:
@@ -261,6 +281,8 @@ class ReviewView:
                 return
             text = truncate_to_width(sanitize_display(text).replace("\t", "    ").replace("\n", " "), width)
             if action is not None:
+                if selected == action and current_style().plain:
+                    text = truncate_to_width("> " + text, width)
                 if selected == action:
                     text = theme.bg_open(theme.MENU_SEL_BG) + text + current_style().sgr("0")
                 hits.append(HitSpan(len(lines), 0, visible_width(text), action))
@@ -281,6 +303,7 @@ class ReviewView:
         lines.append(truncate_to_width(top.rstrip(), width))
         if self.closing or self.snapshot is None:
             add(self.message)
+            self._visible_actions = tuple(h.action for h in hits)
             return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
         if rows >= 12:
             add("审阅 · " + self.snapshot.workspace_label)
@@ -299,7 +322,12 @@ class ReviewView:
             list_height = max(1, min(6, (rows - len(lines)) // 3))
             selected_file = next((n for n, item in enumerate(files)
                                   if selected == self._action("file", item.item_id)), 0)
-            start = max(0, min(selected_file - list_height//2, len(files) - list_height))
+            self._list_height = list_height
+            if self._list_scroll_dirty:
+                start = max(0, min(self._list_top, len(files) - list_height))
+            else:
+                start = max(0, min(selected_file - list_height//2, len(files) - list_height))
+            self._list_top = start
             for item in files[start:start+list_height]:
                 add(f"{_STATUS[item.kind]} {item.relative_path}", self._action("file", item.item_id))
             if not files:
@@ -317,17 +345,15 @@ class ReviewView:
             if rows - len(lines) > 2:
                 add("正文观察 " + (preview.observed_at or "未知") + " · 长行按窗口截断")
             height = rows - len(lines)
-            cache = self._body_cache
-            if cache is None or cache[:2] != (width, self._body_lines):
-                body = tuple(truncate_to_width(line.replace("\t", "    "), width) for line in self._body_lines)
-                self._body_cache = (width, self._body_lines, DocumentLayout(body, (), (None,) * len(body)))
-            body_frame = self._viewport.frame(self._body_cache[2], height)
+            body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
             for line in body_frame:
+                line = truncate_to_width(line.replace("\t", "    "), width)
                 color = (theme.DIFF_ADDED if line.startswith("+") else
                          theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
                 lines.append(theme.fg(color, line))
         else:
             add(self.message)
+        self._visible_actions = tuple(h.action for h in hits)
         return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
 
     def _changed(self) -> None:

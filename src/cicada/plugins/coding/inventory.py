@@ -187,7 +187,8 @@ class GitInventory:
 
     async def _git(self, arguments: tuple[str, ...], cancel: CancelToken, budget: int) -> bytes:
         try:
-            output, _, _ = await read_git(self.workspace.root, arguments, cancel, budget)
+            output, _, _ = await read_git(self.workspace.root, arguments, cancel, budget,
+                                          cleanup_timeout_s=1, include_error_detail=True)
             return output
         except GitIOError as exc:
             message = (f"Git stdout exceeds {self.max_output_bytes} bytes"

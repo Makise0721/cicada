@@ -18,7 +18,8 @@ class GitIOError(RuntimeError):
 async def read_git(
     root: Path, arguments: tuple[str, ...], cancel: CancelToken, budget: int,
     *, input_data: bytes | None = None, allowed_codes: tuple[int, ...] = (0,),
-    preview_bytes: int | None = None,
+    preview_bytes: int | None = None, cleanup_timeout_s: float | None = None,
+    include_error_detail: bool = False,
 ) -> tuple[bytes, int, bool]:
     """累计 stdout 有硬上限；预览可截断但继续有界排空，取消等实际回收。"""
     cancel.throw_if_cancelled()
@@ -38,7 +39,8 @@ async def read_git(
     except FileNotFoundError as exc:
         raise GitIOError("git_unavailable", "Git executable is unavailable") from exc
     except OSError as exc:
-        raise GitIOError("git_launch_failed", "cannot launch Git") from exc
+        message = f"cannot launch Git: {exc}" if include_error_detail else "cannot launch Git"
+        raise GitIOError("git_launch_failed", message) from exc
 
     async def read_stdout() -> tuple[bytes, bool]:
         output = bytearray()
@@ -77,19 +79,38 @@ async def read_git(
             cancel.throw_if_cancelled()
         (output, truncated), stderr, returncode, _ = await operation
         if returncode not in allowed_codes:
-            # stderr 可含仓库配置中的凭据/命令，不暴露给显示 DTO。
-            raise GitIOError("git_failed", f"Git failed ({returncode})")
+            message = f"Git failed ({returncode})"
+            if include_error_detail:
+                message += ": " + stderr.decode("utf-8", "replace")
+            raise GitIOError("git_failed", message)
         return output, returncode, truncated
     finally:
-        cancellation.cancel()
-        if process.returncode is None:
+        async def cleanup() -> None:
+            cancellation.cancel()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            operation.cancel()
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(operation, cancellation, *readers, return_exceptions=True)
+            if cleanup_timeout_s is None:
+                await process.wait()
+            else:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=cleanup_timeout_s)
+                except TimeoutError:
+                    pass  # inventory 原有监督策略；review 保持实际回收所有权。
+
+        cleanup_task = asyncio.create_task(cleanup())
+        cancelled = False
+        while not cleanup_task.done():
             try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-        operation.cancel()
-        for reader in readers:
-            reader.cancel()
-        await asyncio.gather(operation, cancellation, *readers, return_exceptions=True)
-        # 强引用保持到回收。调用方的监督可以隔离此任务，不能把超时当作 released。
-        await process.wait()
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
