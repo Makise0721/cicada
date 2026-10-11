@@ -1021,7 +1021,10 @@ class ConversationView:
         fields = [row for _, rows in clipped_sections for row in rows]
         if len(fields) > STATUS_MAX_LINES or len("\n".join(fields).encode("utf-8")) > STATUS_MAX_BYTES:
             clipped_sections = [
-                (heading, [row for row in rows if not row.startswith(("缓存（", "已提交摘要缓存:"))])
+                (heading, [row for row in rows if not (
+                    (heading == "计量" and row.startswith("缓存（"))
+                    or (heading == "摘要" and row.startswith("已提交摘要缓存:"))
+                )])
                 for heading, rows in clipped_sections
             ]
             cache_omitted = True
