@@ -54,6 +54,11 @@ def test_text_estimation_is_bytes_over_three():
     assert estimate_text_tokens("a" * 300) == 100
 
 
+def test_estimator_version_tracks_request_context_change():
+    """版本字面值钉住算法面变化 (04 校准基线): 缓存 02 尾部组件进入估计面."""
+    assert BUDGET_ESTIMATOR_VERSION == "3"
+
+
 def test_message_estimation_adds_template_overhead():
     config = _config(message_template_overhead=8)
     bare = estimate_text_tokens("abcd")
@@ -98,6 +103,24 @@ def test_tool_schema_estimation_is_deterministic_and_content_sensitive():
     assert estimate_tool_spec_tokens(_specs("t")[0]) == first
     big = ToolSpec("t", "d" * 300, {"type": "object"})
     assert estimate_tool_spec_tokens(big) > first
+
+
+def test_request_context_estimated_as_separate_component_with_template_overhead():
+    """缓存 02 (契约 C4): 非空尾部单独组成 = ⌈字节/3⌉ + 模板开销; 空串无组件."""
+    config = _config(message_template_overhead=8)
+    context = "x" * 30
+    total, components = estimate_input_components(
+        "sys", (), (UserMessage(text="q"),), config, request_context=context
+    )
+    labels = [component.label for component in components]
+    assert labels[-1] == "request_context"
+    assert components[-1].tokens == 10 + 8
+    assert components[-1].source == "estimated"
+    assert sum(c.tokens for c in components) == total
+
+    plain_total, plain_components = estimate_input_components("sys", (), (UserMessage(text="q"),), config)
+    assert "request_context" not in [c.label for c in plain_components]
+    assert plain_total == total - 18
 
 
 # --- 报告完整性 (A01) --------------------------------------------------------------

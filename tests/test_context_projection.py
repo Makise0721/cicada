@@ -260,6 +260,31 @@ async def test_policy_forwards_projected_request_when_blocks_exist():
     assert forwarded.messages[1:] == canonical[2:]
 
 
+async def test_policy_projection_preserves_request_context():
+    """投影替换规范消息时 request_context 原样保留; 尾部不是摘要覆盖范围 (契约 C4)."""
+    inner = _Recording()
+    policy = BudgetPolicy(inner, _config())
+    canonical = (UserMessage(text="x" * 3000), AssistantMessage(text="done"), UserMessage(text="tail"))
+    block = summary_block_message(
+        first_request_seq=1, last_request_seq=1, message_count=2, text="较早请求的摘要"
+    )
+    policy.projection.apply_summary(
+        SummaryBlock(
+            message=block, end_message_index=2, first_request_seq=1,
+            last_request_seq=1, message_count=2,
+            prefix_sha256=canonical_prefix_sha256(canonical[:2]),
+        ),
+        canonical_length=len(canonical),
+    )
+    request = ModelRequest(messages=canonical, tools=(), system_prompt="sys", request_context="<ctx-v1/>")
+    events = [event async for event in policy.stream(request, CancelToken())]
+    assert events[-1].stop_reason == "stop"
+    forwarded = inner.requests[0]
+    assert forwarded.request_context == "<ctx-v1/>"
+    assert forwarded.messages[0].text == block.text
+    assert forwarded.messages[1:] == canonical[2:]
+
+
 async def test_policy_estimate_covers_summary_block():
     """投影后计量包含摘要块: 块+长尾超限时拒绝, 适配器零发送 (01-F10 下游面)."""
     inner = _Recording()

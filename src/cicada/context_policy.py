@@ -7,15 +7,17 @@ Agent → RunPolicy → BudgetPolicy → 适配器; 内核零改动, 规范历�
 全量进行。
 
 - 每轮 stream 先按投影容器把请求消息替换为 [摘要块] + 保留后缀 (无块时原样
-  透传), 再按 BudgetConfig 估计完整输入 (system prompt 已含 RunPolicy 控制
-  段、消息已含 freshness 标记: 计量覆盖验证段最终形态)。总需求 > num_ctx 时
-  产出 StreamDone("error") 且适配器零发送, 错误文本带估计值、上限与主要占用。
-- 实测锚 (spec D3): 指纹基准是本策略实际所见 (投影后) 的完整请求。前次实测
-  input_tokens 非 None/非 0 且流级终结非 error/aborted 时立锚; 后继请求为该锚
-  的严格前缀延长时按 anchored 估计 = 实测 + 后缀增量; 与锚完全相同则整体
-  measured。clear (committed_count == 0)、恢复 (新策略实例)、压缩 (投影版本
-  变化) 与配置/工具/提示/验证视图变化经前缀失配自然失效; 后者是预期的保守
-  回退, 不是缺陷。
+  透传), 再按 BudgetConfig 估计完整输入 (system prompt 已含 RunPolicy 固定验证
+  规则、非空 request_context 按尾部单列: 计量覆盖验证段最终形态)。总需求 >
+  num_ctx 时产出 StreamDone("error") 且适配器零发送, 错误文本带估计值、上限与
+  主要占用。
+- 实测锚 (spec D3/缓存 02 C4): 指纹基准是本策略实际所见 (投影后) 的完整请求。
+  前次实测 input_tokens 非 None/非 0 且流级终结非 error/aborted 时立锚; 无尾部
+  请求为该锚的严格前缀延长时按 anchored 估计 = 实测 + 后缀增量; 与锚完全相同则
+  整体 measured。带尾部的请求即使规范历史延长也不是完整 wire 前缀延长, 仅
+  system/tools/messages/context 全部等值可 measured, 不标 anchored。clear
+  (committed_count == 0)、恢复 (新策略实例)、压缩 (投影版本变化) 与配置/工具/
+  提示/尾部变化经前缀失配自然失效; 后者是预期的保守回退, 不是缺陷。
 - 请求边界接缝 (spec D1/PA02): note_request_start(committed_count) 由应用在
   每次 execute 准入通过后、首次预算预估之前调用一次, 参数为该时刻规范历史
   消息数; 它建立本次 execute 尝试的预算状态范围, begin 不再调用或清零。
@@ -214,12 +216,26 @@ class _UsageAnchor:
     system_prompt: str
     tools: tuple
     messages: tuple[Message, ...]
+    request_context: str
     input_tokens: int
     estimated_input_tokens: int | None
 
 
 def _is_prefix_extension(anchor: _UsageAnchor, request: ModelRequest) -> bool:
-    """本次请求是否为锚请求的 (弱) 前缀延长: 投影后逐位相同的前缀 (spec D3)."""
+    """本次请求是否可复用锚的实测输入 (spec D3/缓存 02 C4).
+
+    无尾部 (锚与新请求 context 都空) 沿现行严格前缀延长条件; 任一侧带尾部时
+    完整 wire 前缀不再随规范历史延长——仅 system/tools/messages/context 全部
+    等值可按 measured 复用, 增加消息或改变尾部都重新估计, 不标 anchored。
+    """
+    if request.request_context or anchor.request_context:
+        return (
+            request.system_prompt == anchor.system_prompt
+            and request.tools == anchor.tools
+            and request.request_context == anchor.request_context
+            and len(request.messages) == len(anchor.messages)
+            and request.messages == anchor.messages
+        )
     return (
         request.system_prompt == anchor.system_prompt
         and request.tools == anchor.tools
@@ -377,12 +393,16 @@ class BudgetPolicy:
             yield event
 
     def _project(self, request: ModelRequest) -> ModelRequest:
-        """按投影容器替换请求消息; 无块时返回原请求对象 (02 语义不变)."""
+        """按投影容器替换请求消息; 无块时返回原请求对象 (02 语义不变).
+
+        request_context 原样保留: 投影替换只针对规范消息, 尾部不是摘要覆盖范围。
+        """
         if self._projection.blocks:
             return ModelRequest(
                 messages=self._projection.project(request.messages),
                 tools=request.tools,
                 system_prompt=request.system_prompt,
+                request_context=request.request_context,
             )
         return request
 
@@ -425,7 +445,8 @@ class BudgetPolicy:
                 self.config, input_estimate=input_total, input_components=tuple(components), source=source
             )
         input_estimate, components = estimate_input_components(
-            request.system_prompt, request.tools, request.messages, self.config
+            request.system_prompt, request.tools, request.messages, self.config,
+            request_context=request.request_context,
         )
         return assemble_report(
             self.config,
@@ -450,6 +471,7 @@ class BudgetPolicy:
             system_prompt=request.system_prompt,
             tools=request.tools,
             messages=request.messages,
+            request_context=request.request_context,
             input_tokens=tokens,
             estimated_input_tokens=report.input_estimate,
         )

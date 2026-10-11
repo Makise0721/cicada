@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 from dataclasses import replace as dc_replace
@@ -55,7 +56,7 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.fake_tools import fake_tools_plugin
 from cicada.plugins.session_store import open_session_store, session_store_plugin
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
-from cicada.run_policy import RunPolicy
+from cicada.run_policy import CONTEXT_CLOSE_TAG, CONTEXT_OPEN_TAG, RunPolicy
 from cicada.runtime.plugin import PluginDefinition
 
 from test_application import _repo, _script  # 复用既有工作区/剧本构造
@@ -987,9 +988,15 @@ async def test_check_mode_save_resume_old_pass_is_historical_new_ledger_independ
     sent = inner.requests[0]
     tool_messages = [m for m in sent.messages if isinstance(m, ToolResultMessage)]
     assert tool_messages, "实际 ModelRequest 携带恢复前缀"
-    assert "historical result from a previous verification run" in tool_messages[0].result.content
-    assert "not applicable to the current verification run" in tool_messages[0].result.content
-    assert "verification_run_id" in sent.system_prompt, "控制段是当前运行的"
+    # 缓存 02: 恢复的旧文字不清洗不标注, 执行时正文原样透传 (历史叙述由固定规则说明)
+    assert "Cicada freshness" not in tool_messages[0].result.content
+    assert "historical result" not in tool_messages[0].result.content
+    assert "<cicada-verification-rules>" in sent.system_prompt, "固定规则在 system"
+    tail_text = sent.request_context
+    assert tail_text.startswith(CONTEXT_OPEN_TAG)
+    tail = json.loads(tail_text[len(CONTEXT_OPEN_TAG) + 1:len(tail_text) - len(CONTEXT_CLOSE_TAG) - 1])
+    assert tail["verification_run_id"] != old_run_id, "尾部是当前运行的"
+    assert tail["checks"][0]["status"] == "not_run", "旧 PASS 不进当前尾部"
     # 原始记录不改: 规范历史无投影标记, details/call 身份保持
     canonical_tool = [m for m in resumed.history if isinstance(m, ToolResultMessage)][0]
     assert "historical result" not in canonical_tool.result.content

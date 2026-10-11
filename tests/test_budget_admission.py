@@ -303,7 +303,7 @@ async def test_budget_only_boot_has_no_run_policy(tmp_path):
 
 
 async def test_check_mode_budget_covers_control_section(tmp_path):
-    """检查+预算: BudgetPolicy 所见请求含控制段, 计量覆盖动态验证段最终形态 (A01/D1)."""
+    """检查+预算: BudgetPolicy 所见请求含固定规则与程序尾部, 计量覆盖验证段最终形态 (缓存 02 C4)."""
     root = _repo(tmp_path)
     model = FakeModel([list(STOP_WITH_METRICS)])
     session = await open_application(
@@ -314,14 +314,18 @@ async def test_check_mode_budget_covers_control_section(tmp_path):
         # 检查模式交付判定: 模型 stop 但检查未运行 -> can_deliver=False -> exit 3 (既有语义)
         assert outcome.exit_code == 3
         sent = model.requests[0]
-        assert "<cicada-verification-state>" in sent.system_prompt
+        assert "<cicada-verification-rules>" in sent.system_prompt, "固定信任规则在 system"
+        assert sent.request_context.startswith('<cicada-verification-context version="1">'), (
+            "当前验证观察在独立尾部"
+        )
         report = session.budget.report
         assert report is not None
         tools = tuple(tool.spec for tool in session._app.agent._tools.values())
         raw, _components = estimate_input_components(
             "test system prompt", tools, (UserMessage(text="hello"),), session.config.budget
         )
-        assert report.input_estimate > raw, "预算计量包含控制段增量"
+        assert report.input_estimate > raw, "预算计量包含固定规则与尾部增量"
+        assert any(c.label == "request_context" for c in report.components), "尾部单独组成"
         assert report.source == "estimated"
     finally:
         await session.aclose()
@@ -443,17 +447,20 @@ async def test_check_mode_per_turn_rejection_model_stopped_false(tmp_path):
     root = _repo(tmp_path)
     (root / "big.txt").write_text("x" * 20_000, encoding="utf-8")
     plan = _plan(root)
-    # 开一次 (不执行请求) 取实际工具声明, 据此精确算出请求前预估门槛
+    # 开一次 (不执行请求) 取实际工具声明与同源预估面, 据此精确算出请求前预估门槛
     warm = await open_application(_config(root, FakeModel([]), budget=_generous(), plan=plan))
     try:
         tools = tuple(tool.spec for tool in warm._app.agent._tools.values())
+        assert warm._policy is not None
+        system_for_estimate = warm._policy.preflight_system_prompt("test system prompt")
+        tail_cap = warm._policy.request_context_max_bytes
     finally:
         await warm.aclose()
     shape = BudgetConfig(num_ctx=1, num_predict=2048)
     raw, _components = estimate_input_components(
-        "test system prompt", tools, (UserMessage(text="q"),), shape
+        system_for_estimate, tools, (UserMessage(text="q"),), shape
     )
-    input_pre = raw + math.ceil(4096 / 3)  # verification_control_allowance
+    input_pre = raw + math.ceil(tail_cap / 3) + shape.message_template_overhead  # verification_context_allowance
     threshold = input_pre + 2048 + max(256, math.ceil(0.10 * input_pre))
     # num_ctx 恰在预估门槛之上: 预估与首轮都放行; 首轮 read 20KB 结果使次轮必超
     model = FakeModel([

@@ -253,11 +253,13 @@ async def test_launch_failure_returns_a_blocked_receipt_through_the_public_tool(
 
 
 async def test_launch_failure_projection_names_launch_failed_without_latching(repo, monkeypatch):
-    """跨层: 已知未启动经 05 真实账本核对后不锁存, 同轮控制视图报 launch_failed."""
+    """跨层: 已知未启动经 05 真实账本核对后不锁存, 同轮尾部报 blocked/current."""
+    import json
+
     from cicada.core.ports import ModelRequest
     from cicada.plugins.coding import process as process_module
     from cicada.plugins.fake_model import FakeModel
-    from cicada.run_policy import RunPolicy
+    from cicada.run_policy import CONTEXT_CLOSE_TAG, CONTEXT_OPEN_TAG, RunPolicy
 
     workspace = Workspace.create(repo)
     snapshotter = Snapshotter(workspace, GitInventory(workspace))
@@ -277,12 +279,13 @@ async def test_launch_failure_projection_names_launch_failed_without_latching(re
         ModelRequest(messages=(ToolResultMessage(result=result),), tools=()), CancelToken()
     ):
         pass
-    section = inner.requests[0].system_prompt
     assert verifier.process_uncertain is False
-    assert "process_uncertain: true" not in section
-    assert "check check-1: status=blocked freshness=current" in section
-    assert "failure_kind: launch_failed" in section
-    assert "<cicada-verification-state>" in section
+    assert "process_uncertain: true" not in inner.requests[0].request_context
+    assert "<cicada-verification-rules>" in inner.requests[0].system_prompt
+    text = inner.requests[0].request_context
+    tail = json.loads(text[len(CONTEXT_OPEN_TAG) + 1:len(text) - len(CONTEXT_CLOSE_TAG) - 1])
+    assert tail["checks"][0]["status"] == "blocked"
+    assert tail["checks"][0]["freshness"] == "current"
 
 
 async def test_receipt_id_survives_the_kernel_tool_result_message(repo):
@@ -297,9 +300,15 @@ async def test_receipt_id_survives_the_kernel_tool_result_message(repo):
 
 async def test_k_projection_marks_the_receipt_current_and_stale_by_program_ledger(repo):
     """跨层: K 的 RunPolicy 用 receipt_id 在程序账本里查 freshness, 不解析输出文字."""
+    import json
+
     from cicada.core.ports import ModelRequest
     from cicada.plugins.fake_model import FakeModel
-    from cicada.run_policy import RunPolicy
+    from cicada.run_policy import CONTEXT_CLOSE_TAG, CONTEXT_OPEN_TAG, RunPolicy
+
+    def tail_of(request):
+        text = request.request_context
+        return json.loads(text[len(CONTEXT_OPEN_TAG) + 1:len(text) - len(CONTEXT_CLOSE_TAG) - 1])
 
     workspace = Workspace.create(repo)
     snapshotter = Snapshotter(workspace, GitInventory(workspace))
@@ -315,24 +324,28 @@ async def test_k_projection_marks_the_receipt_current_and_stale_by_program_ledge
     for _ in range(2):
         async for _event in policy.stream(request, CancelToken()):
             pass
-    assert "freshness=current" in inner.requests[0].messages[0].result.content
-    assert "stale=false" in inner.requests[0].messages[0].result.content
-    assert "<cicada-verification-state>" in inner.requests[0].system_prompt
-    assert "check check-1: status=passed freshness=current" in inner.requests[0].system_prompt
+    first_tail = tail_of(inner.requests[0])
+    assert first_tail["checks"][0]["status"] == "passed"
+    assert first_tail["checks"][0]["freshness"] == "current"
+    assert first_tail["checks"][0]["latest_receipt_id"] == result.details["receipt_id"]
+    # 正文原样透传, 不再追加 freshness 标记
+    assert inner.requests[0].messages[0].result.content == result.content
 
     (repo / "sample.py").write_text("VALUE = 11\n", encoding="utf-8")
     async for _event in policy.stream(request, CancelToken()):
         pass
-    stale_projection = inner.requests[2].messages[0].result.content
-    assert "freshness=stale" in stale_projection and "stale=true" in stale_projection
-    assert "freshness=stale" in inner.requests[2].system_prompt
+    stale_tail = tail_of(inner.requests[2])
+    assert stale_tail["checks"][0]["freshness"] == "stale"
+    assert stale_tail["checks"][0]["status"] == "passed"
 
 
 async def test_k_projection_marks_a_recheck_current_after_the_range_grows(repo):
-    """跨层 (V 修复 + 05 发布后): 新增范围让投影转 stale, 在新范围重检通过又转回 current."""
+    """跨层 (V 修复 + 05 发布后): 新增范围让尾部转 stale, 在新范围重检通过又转回 current."""
+    import json
+
     from cicada.core.ports import ModelRequest
     from cicada.plugins.fake_model import FakeModel
-    from cicada.run_policy import RunPolicy
+    from cicada.run_policy import CONTEXT_CLOSE_TAG, CONTEXT_OPEN_TAG, RunPolicy
 
     workspace = Workspace.create(repo)
     snapshotter = Snapshotter(workspace, GitInventory(workspace))
@@ -347,18 +360,19 @@ async def test_k_projection_marks_a_recheck_current_after_the_range_grows(repo):
         request = ModelRequest(messages=(ToolResultMessage(result=result),), tools=())
         async for _event in policy.stream(request, CancelToken()):
             pass
-        return inner.requests[-1].messages[0].result.content
+        text = inner.requests[-1].request_context
+        return json.loads(text[len(CONTEXT_OPEN_TAG) + 1:len(text) - len(CONTEXT_CLOSE_TAG) - 1])
 
     first = await call(tool, {"action": "run", "check_id": "check-1"})
-    assert "freshness=current" in await projected(first)
+    assert (await projected(first))["checks"][0]["freshness"] == "current"
 
     (repo / "added.txt").write_text("new\n", encoding="utf-8")
-    assert "freshness=stale" in await projected(first)
+    assert (await projected(first))["checks"][0]["freshness"] == "stale"
 
     second = await call(tool, {"action": "run", "check_id": "check-1"})
     assert second.details["freshness"] == "current"
     # 投影按程序账本重新形成 freshness: 同一当前范围重检通过能恢复 current。
-    assert "freshness=current" in await projected(second)
+    assert (await projected(second))["checks"][0]["freshness"] == "current"
     assert second.details["snapshot_ref"] != first.details["snapshot_ref"]
     assert second.details["snapshot_ref"] == second.details["snapshot_after"]
 

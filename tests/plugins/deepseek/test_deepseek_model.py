@@ -228,6 +228,26 @@ async def test_nonthinking_rejects_unexpected_reasoning():
     assert events[-1].stop_reason == "error"
 
 
+async def test_request_context_maps_to_trailing_user_and_requires_tools():
+    """缓存 02 (契约 C3): 非空 context 恰好追加最后一条 user; 无工具本地拒绝; 空值不加消息."""
+    context = '<cicada-verification-context version="1">\n{"blocked":false}\n</cicada-verification-context>'
+    with_context = replace(REQUEST, request_context=context)
+    events, requests = await collect(frame(finish="stop") + DONE, request=with_context)
+    body = json.loads(requests[0].content)
+    assert body["messages"] == [
+        {"role": "user", "content": "任务"},
+        {"role": "user", "content": context},
+    ], "尾部是最后一条, 恰好追加一条 user"
+    assert events[-1].stop_reason == "stop"
+
+    events, requests = await collect(b"", request=replace(with_context, tools=()))
+    assert events[-1].stop_reason == "error" and requests == [], "无工具且非空本地拒绝"
+
+    events, requests = await collect(frame(finish="stop") + DONE, request=REQUEST)
+    body = json.loads(requests[0].content)
+    assert body["messages"] == [{"role": "user", "content": "任务"}], "空 context 不追加消息"
+
+
 @pytest.mark.parametrize("phase", ["send", "read", "task"])
 async def test_cancellation_interrupts_blocked_io_and_closes_response(phase):
     entered = asyncio.Event()

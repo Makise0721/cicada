@@ -31,24 +31,13 @@ def _assert_manifest_shape(manifest: dict, script: str) -> None:
 
 
 def _assert_no_skills_baseline(model) -> None:
-    """无 Skills 基线: 固定配置提示前缀 (RunPolicy 其后追加有界验证状态段) + 既有完整工具名单."""
+    """无 Skills 基线: 固定配置提示前缀 (RunPolicy 其后追加固定验证规则段) + 既有完整工具名单."""
     assert model.requests[0].system_prompt.startswith(fx.SYSTEM_PROMPT)
     assert fx.declared_tools(model) == fx.EXPECTED_NO_SKILLS_TOOLS
 
 
 def _comparable(message) -> str:
-    """请求投影可比形: RunPolicy 会在发送时对历史 check/powershell 结果重写
-    freshness 标记行 (恢复后为 historical/unknown), 比较前剥离该行."""
-    from dataclasses import replace
-
-    from cicada.core.messages import ToolResultMessage
-
-    if isinstance(message, ToolResultMessage):
-        content = "\n".join(
-            line for line in message.result.content.splitlines()
-            if not line.startswith("Cicada freshness:")
-        )
-        return encode_messages((ToolResultMessage(result=replace(message.result, content=content)),))
+    """请求投影可比形: 缓存 02 起规范历史逐字透传, 按规范编码直接比较."""
     return encode_messages((message,))
 
 
@@ -213,8 +202,7 @@ async def test_scenario_c_compaction_resume_continuation(tmp_path):
     sent = resumed_model.requests[0]
     # 恢复进程同样收到固定配置提示与一致的工具声明
     _assert_no_skills_baseline(resumed_model)
-    # 历史工具不重放: 实际请求 = [摘要块] + 请求二规范消息 + 新 UserMessage;
-    # 除 RunPolicy 请求时追加的 freshness 标记行外逐位一致
+    # 历史工具不重放: 实际请求 = [摘要块] + 请求二规范消息 + 新 UserMessage, 逐位一致
     assert [_comparable(m) for m in sent.messages] == [
         _comparable(expected_block),
         *[_comparable(m) for m in req2_messages],

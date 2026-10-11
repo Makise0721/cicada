@@ -2,8 +2,9 @@
 
 只依赖 core (消息/端口类型); 不导入 persistence/runtime/plugins/boot (导入边界
 测试钉住)。预算口径 (spec D2): 上限 = 有效 num_ctx; 完整输入 = system prompt
-(含 RunPolicy 控制段) + 实际工具 schema + 有效消息; 总需求另加输出预留
-(配置 num_predict, 缺省固定值) 与安全余量 max(下限, ⌈比例 × 估计输入⌉)。
+(含 RunPolicy 固定验证规则) + 实际工具 schema + 有效消息 + 非空 request_context
+(程序验证上下文尾部); 总需求另加输出预留 (配置 num_predict, 缺省固定值) 与安全
+余量 max(下限, ⌈比例 × 估计输入⌉)。
 
 来源等级如实标注 (spec D3): measured (同身份实测) / anchored (实测锚+增量) /
 estimated (启发式) / unknown。启发式: 文本 token ≈ ⌈UTF-8 字节 / 3⌉ (英文保守
@@ -30,7 +31,7 @@ from cicada.core.messages import (
 from cicada.core.ports import ToolSpec
 
 BUDGET_ESTIMATOR_NAME = "utf8-bytes-over-3-plus-template-overhead"
-BUDGET_ESTIMATOR_VERSION = "2"
+BUDGET_ESTIMATOR_VERSION = "3"
 
 OUTPUT_RESERVE_DEFAULT_TOKENS = 4096
 SAFETY_MARGIN_MIN_TOKENS = 256
@@ -217,8 +218,14 @@ def estimate_input_components(
     tools: Sequence[ToolSpec],
     messages: Sequence[Message],
     config: BudgetConfig,
+    *,
+    request_context: str = "",
 ) -> tuple[int, tuple[ComponentEstimate, ...]]:
-    """纯启发式输入分解: system prompt / 工具 schema / 逐条消息, 来源全为 estimated."""
+    """纯启发式输入分解: system prompt / 工具 schema / 逐条消息 / 请求上下文, 来源全为 estimated.
+
+    非空 `request_context` 是本轮程序验证观察 (不是规范 Message), 单独组成计:
+    ⌈UTF-8 字节 / 3⌉ + 一条消息模板开销; 空串不产生组件。
+    """
     components: list[ComponentEstimate] = [
         ComponentEstimate("system_prompt", estimate_text_tokens(system_prompt), "estimated")
     ]
@@ -235,6 +242,10 @@ def estimate_input_components(
                 f"message:{index}:{message_kind(message)}", tokens, "estimated"
             )
         )
+        total += tokens
+    if request_context:
+        tokens = math.ceil(len(request_context.encode("utf-8")) / 3) + config.message_template_overhead
+        components.append(ComponentEstimate("request_context", tokens, "estimated"))
         total += tokens
     return total, tuple(components)
 

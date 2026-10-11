@@ -1,9 +1,13 @@
-"""P4 05 应用层投影策略测试: 共享 VerificationService fake + 真实 ModelPort/MockTransport."""
+"""缓存 02 应用层投影策略测试: 固定信任规则 + 独立程序验证上下文尾部.
+
+共享 VerificationService fake + 真实 ModelPort/MockTransport。历史逐字透传,
+不再追加 freshness 标记; 当前验证观察经 request_context 尾部发送, 核心身份
+超限拒绝本轮 (零 inner/provider)。
+"""
 
 import hashlib
 import json
 import subprocess
-import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,7 +44,9 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.fake_tools import EchoTool, fake_tools_plugin
 from cicada.plugins.deepseek import DeepSeekModel, DeepSeekConfig
 from cicada.run_policy import (
-    CONTROL_SECTION_MAX_BYTES,
+    CONTEXT_CLOSE_TAG,
+    CONTEXT_OPEN_TAG,
+    REQUEST_CONTEXT_MAX_BYTES,
     HistoricalPrefixProof,
     HistoricalProjection,
     PrefixEntry,
@@ -191,6 +197,15 @@ def check_messages(request: ModelRequest) -> list[ToolResultMessage]:
     return [m for m in request.messages if isinstance(m, ToolResultMessage)]
 
 
+def parse_tail(request: ModelRequest) -> dict:
+    """尾部文本必须是固定标签包住的完整可解析 JSON."""
+    text = request.request_context
+    assert text.startswith(CONTEXT_OPEN_TAG + "\n"), text[:80]
+    assert text.endswith("\n" + CONTEXT_CLOSE_TAG)
+    body = text[len(CONTEXT_OPEN_TAG) + 1:len(text) - len(CONTEXT_CLOSE_TAG) - 1]
+    return json.loads(body)
+
+
 class ApiWire:
     """跑一遍完整策略 + 真实 DeepSeekModel 适配路径, 返回 wire 请求体 (未发送则 None)."""
 
@@ -219,10 +234,10 @@ class ApiWire:
         return json.loads(self.seen[0].content)
 
 
-# --- 系统状态段: current / stale / unknown -------------------------------------
+# --- 程序验证上下文尾部: current / stale / unknown --------------------------------
 
 
-async def test_system_section_reports_snapshot_and_check_state_within_budget():
+async def test_tail_reports_full_identities_and_fixed_rules():
     receipt = make_receipt("r-1")
     view = make_view(
         states=(
@@ -243,77 +258,143 @@ async def test_system_section_reports_snapshot_and_check_state_within_budget():
     ]
     request = model.requests[0]
 
-    assert CONTROL_SECTION_MAX_BYTES == 4096  # spec §6 控制段上限
-    section = request.system_prompt
-    assert section.startswith("rules\n<cicada-verification-state>")
-    assert f"snapshot_ref: {REF}" in section
-    assert f"scope_id: {SCOPE}" in section
-    assert "check check-1: status=passed freshness=current" in section
-    assert "check check-2: status=failed freshness=stale" in section
-    assert "check check-3: status=not_run freshness=unknown" in section
-    assert "blocking_reasons:" in section
-    assert "- check-2 latest attempt failed" in section
-    assert len(section.encode("utf-8")) <= CONTROL_SECTION_MAX_BYTES
+    assert REQUEST_CONTEXT_MAX_BYTES == 8192  # 契约 C2 尾部上限
+    # 固定信任规则在 system; 当前状态不在 system
+    assert request.system_prompt.startswith("rules\n<cicada-verification-rules>")
+    assert "cicada-verification-context" not in request.system_prompt
+    assert "cicada-verification-rules" not in request.request_context
+
+    payload = parse_tail(request)
+    assert payload["verification_run_id"] == RUN_ID
+    assert payload["snapshot_ref"] == REF
+    assert payload["scope_id"] == SCOPE
+    assert payload["process_uncertain"] is False
+    assert payload["blocked"] is True, "stale/not_run/失败原因任一即 blocked"
+    assert payload["explanations_omitted"] is False
+    assert payload["blocking_reasons"] == ["check-2 latest attempt failed"]
+    assert payload["checks"] == [
+        {
+            "check_id": "check-1",
+            "latest_receipt_id": "r-1",
+            "receipt_run_id": RUN_ID,
+            "receipt_snapshot_after": REF,
+            "status": "passed",
+            "freshness": "current",
+        },
+        {
+            "check_id": "check-2",
+            "latest_receipt_id": "r-2",
+            "receipt_run_id": RUN_ID,
+            "receipt_snapshot_after": REF,
+            "status": "failed",
+            "freshness": "stale",
+        },
+        {
+            "check_id": "check-3",
+            "latest_receipt_id": None,
+            "receipt_run_id": None,
+            "receipt_snapshot_after": None,
+            "status": "not_run",
+            "freshness": "unknown",
+        },
+    ]
+    assert len(request.request_context.encode("utf-8")) <= REQUEST_CONTEXT_MAX_BYTES
     assert events[-1] == StreamDone("stop")
 
-    # 空原始 prompt: 控制段单独构成 system_prompt, 恰好追加一次
+    # 空原始 prompt: 固定规则单独构成 system_prompt, 恰好追加一次
     request2, _ = await projected_request(FakeVerificationService(make_view()), (UserMessage(text="go"),))
-    assert request2.system_prompt.startswith("<cicada-verification-state>")
-    assert request2.system_prompt.count("<cicada-verification-state>") == 1
+    assert request2.system_prompt.startswith("<cicada-verification-rules>")
+    assert request2.system_prompt.count("<cicada-verification-rules>") == 1
 
 
-async def test_system_section_is_bounded_for_oversized_identifiers_and_reasons():
-    # 默认界下靠字段膨胀超过 4096 需要极端输入; 这里用同一路径的收紧界证明截断与关键字段优先
-    config = RunPolicyConfig(control_section_max_bytes=512, identifier_max_bytes=32, reason_max_bytes=24)
+async def test_tail_carries_full_latest_receipt_so_new_failure_overrides_old_success():
+    """同一检查旧 PASS 之后新失败: 尾部列最新 receipt 身份与失败状态, 不回退旧成功."""
+    old_pass = make_receipt("r-old", "check-1", "passed")
+    new_fail = make_receipt("r-new", "check-1", "failed", "nonzero_exit")
+    view = make_view(
+        states=(CheckState("check-1", receipt=new_fail, freshness="current"),),
+        receipts=(old_pass, new_fail),
+    )
+    messages = (
+        check_result("c1", "PASS: old run", receipt_id="r-old"),
+        check_result("c2", "FAIL: new run", receipt_id="r-new", is_error=True),
+    )
+    request, _ = await projected_request(FakeVerificationService(view), messages)
+    payload = parse_tail(request)
+    assert payload["checks"] == [{
+        "check_id": "check-1",
+        "latest_receipt_id": "r-new",
+        "receipt_run_id": RUN_ID,
+        "receipt_snapshot_after": REF,
+        "status": "failed",
+        "freshness": "current",
+    }]
+    assert payload["blocked"] is True
+    # 历史两轮正文原样保留, 旧 PASS 文字不被清洗或标注
+    assert [m.result.content for m in check_messages(request)] == ["PASS: old run", "FAIL: new run"]
+
+
+async def test_full_identities_are_never_truncated_and_explanations_are_omitted_with_flag():
+    """核心身份不截断不规整; 可缩短的解释按剩余空间容纳, 超出显式 explanations_omitted."""
     receipt = make_receipt("r-" + "x" * 4000, "check-" + "y" * 2000)
     view = make_view(
         states=(CheckState("check-" + "y" * 2000, receipt=receipt, freshness="current"),),
         receipts=(receipt,),
         blocking_reasons=tuple("reason " + "z" * 900 for _ in range(20)),
     )
+    request, _ = await projected_request(FakeVerificationService(view), (UserMessage(text="go"),))
+    payload = parse_tail(request)
+    # 核心身份完整原样 (默认 8192 上限内), 无截断/hash/空白规整
+    assert payload["checks"][0]["check_id"] == "check-" + "y" * 2000
+    assert payload["checks"][0]["latest_receipt_id"] == "r-" + "x" * 4000
+    assert len(request.request_context.encode("utf-8")) <= REQUEST_CONTEXT_MAX_BYTES
+    # 解释被截短 (reason_max_bytes) 且部分装不下: 显式标记, blocked 不受影响
+    assert payload["explanations_omitted"] is True
+    assert 1 <= len(payload["blocking_reasons"]) < 20
+    assert all(len(reason.encode("utf-8")) <= 512 + 3 for reason in payload["blocking_reasons"])
+    assert payload["blocked"] is True, "存在 blocking reasons 即 blocked, 与解释缩短无关"
+
+
+async def test_core_overflow_refuses_round_with_zero_inner_calls_and_keeps_locks():
+    """核心加标签超限: 本轮一次 StreamDone(error), 零 inner 调用, 已发生锁存保留."""
+    receipt = make_receipt("r-" + "x" * 4000, "check-" + "y" * 2000)
+    view = make_view(
+        states=(CheckState("check-" + "y" * 2000, receipt=receipt, freshness="current"),),
+        receipts=(receipt,),
+    )
+    ghost = ToolResultMessage(
+        result=ToolResult("c1", "check", "check output", is_error=True, details={"receipt_id": "ghost"})
+    )
+    service = FakeVerificationService(view)
     model = RecordingModel()
-    policy = RunPolicy(model, FakeVerificationService(view), config)
-    async for _ in policy.stream(ModelRequest((UserMessage(text="go"),), ()), CancelToken()):
-        pass
-    section = model.requests[0].system_prompt
-
-    assert len(section.encode("utf-8")) <= 512
-    assert "truncated at byte limit" in section
-    assert section.startswith("<cicada-verification-state>")
-    # 关键字段 (snapshot 身份与 check 状态) 在截断前仍可见
-    assert f"snapshot_ref: {REF}" in section
-    assert "status=passed freshness=current" in section
-
-
-async def test_tiny_control_budget_still_stays_within_it():
-    receipt = make_receipt("r-1")
-    view = make_view(states=(CheckState("check-1", receipt=receipt, freshness="current"),), receipts=(receipt,))
-    model = RecordingModel()
-    policy = RunPolicy(model, FakeVerificationService(view), RunPolicyConfig(control_section_max_bytes=16))
-    async for _ in policy.stream(ModelRequest((UserMessage(text="go"),), ()), CancelToken()):
-        pass
-    assert len(model.requests[0].system_prompt.encode("utf-8")) <= 16
+    policy = RunPolicy(model, service, RunPolicyConfig(control_section_max_bytes=512))
+    events = [event async for event in policy.stream(ModelRequest((ghost,), ()), CancelToken())]
+    assert len(events) == 1
+    done = events[0]
+    assert isinstance(done, StreamDone)
+    assert done.stop_reason == "error"
+    assert "byte limit" in done.error and "512" in done.error
+    # 错误只说明 context size/limit, 不泄露身份/正文
+    assert REF not in done.error and "ghost" not in done.error
+    assert model.requests == [], "零 inner/provider 调用"
+    assert service.uncertain_reasons, "已发生的锁存保留"
+    assert "not in the verification ledger" in service.uncertain_reasons[0]
 
 
-async def test_multibyte_fields_never_break_the_byte_budget_or_utf8():
-    receipt = make_receipt("r-1", "check-" + "中" * 200, "failed", "非零退出" * 40)
+async def test_multibyte_tail_stays_within_budget_and_valid_utf8():
+    """多字节身份原样进 JSON; 超限拒绝不产生半个字符, 默认上限内完整可解析."""
+    receipt = make_receipt("r-1", "check-" + "中" * 200, "failed", "非零退出")
     view = make_view(
         states=(CheckState("check-" + "中" * 200, receipt=receipt, freshness="stale"),),
         receipts=(receipt,),
         blocking_reasons=tuple("原因" * 300 for _ in range(4)),
     )
-    for budget in (64, 129, 512, 4096):
-        model = RecordingModel()
-        policy = RunPolicy(
-            model,
-            FakeVerificationService(view),
-            RunPolicyConfig(control_section_max_bytes=budget),
-        )
-        async for _ in policy.stream(ModelRequest((UserMessage(text="go"),), ()), CancelToken()):
-            pass
-        section = model.requests[0].system_prompt
-        assert len(section.encode("utf-8")) <= budget
-        section.encode("utf-8").decode("utf-8")  # 不产生半个字符
+    request, _ = await projected_request(FakeVerificationService(view), (UserMessage(text="go"),))
+    assert len(request.request_context.encode("utf-8")) <= REQUEST_CONTEXT_MAX_BYTES
+    payload = parse_tail(request)  # 完整可解析即无半个字符
+    assert payload["checks"][0]["check_id"] == "check-" + "中" * 200
+    assert payload["checks"][0]["status"] == "failed"
+    assert payload["explanations_omitted"] is True, "解释按 reason 上限截短须显式标记"
 
 
 @pytest.mark.parametrize("value", [0, -1, True, 1.5, "4096"])
@@ -322,18 +403,31 @@ def test_config_rejects_non_positive_budgets(value):
         RunPolicyConfig(control_section_max_bytes=value)
 
 
-async def test_unavailable_snapshot_reports_unknown_instead_of_claiming_current():
+async def test_unavailable_snapshot_reports_null_and_blocks():
     view = make_view(snapshot_ref=None)
     request, _ = await projected_request(FakeVerificationService(view), (UserMessage(text="go"),))
-    assert "snapshot: unavailable" in request.system_prompt
-    assert "freshness: unknown" in request.system_prompt
-    assert REF not in request.system_prompt
+    payload = parse_tail(request)
+    assert payload["snapshot_ref"] is None
+    assert payload["scope_id"] is None
+    assert payload["blocked"] is True, "snapshot/scope 不可得即 blocked"
+    assert REF not in request.request_context
 
 
-# --- 历史投影: receipt_id 账本关联 ---------------------------------------------
+def test_preflight_system_prompt_is_pure_sync_and_stable():
+    policy = RunPolicy(RecordingModel(), FakeVerificationService(make_view()))
+    assert policy.request_context_max_bytes == REQUEST_CONTEXT_MAX_BYTES
+    once = policy.preflight_system_prompt("base")
+    assert once.startswith("base\n<cicada-verification-rules>")
+    assert once == policy.preflight_system_prompt("base"), "同 base 同字节"
+    assert once.count("base") == 1
+    assert policy.preflight_system_prompt("") == policy.preflight_system_prompt("").strip()
+    assert "<cicada-verification-rules>" in policy.preflight_system_prompt("")
 
 
-async def test_history_check_text_is_annotated_and_original_bytes_kept():
+# --- 历史逐字透传: 不再追加任何 freshness 标记 ------------------------------------
+
+
+async def test_history_bodies_are_passed_through_without_annotations():
     fresh = make_receipt("r-current")
     old = make_receipt("r-old")
     view = make_view(
@@ -343,11 +437,10 @@ async def test_history_check_text_is_annotated_and_original_bytes_kept():
         ),
         receipts=(fresh, old, make_receipt("r-2", "check-2")),
     )
-    original = "PASS: all checks succeeded"
     messages = (
         UserMessage(text="task"),
         AssistantMessage(text="", tool_calls=(ToolCall("c1", "check", '{"action":"run"}'),)),
-        check_result("c1", original, receipt_id="r-current"),
+        check_result("c1", "PASS: all checks succeeded", receipt_id="r-current"),
         AssistantMessage(text="", tool_calls=(ToolCall("c2", "check", '{"action":"run"}'),)),
         check_result("c2", "PASS: old run", receipt_id="r-old"),
         check_result("c3", "PASS: wrong check", receipt_id="r-ghost"),
@@ -356,46 +449,23 @@ async def test_history_check_text_is_annotated_and_original_bytes_kept():
     request, _ = await projected_request(FakeVerificationService(view), messages)
 
     bodies = [m.result for m in check_messages(request)]
+    # 原文一字不改; 旧标记/历史说明都不再追加
+    assert [r.content for r in bodies] == [
+        "PASS: all checks succeeded",
+        "PASS: old run",
+        "PASS: wrong check",
+        "PASS: no receipt",
+    ]
     assert [r.call_id for r in bodies] == ["c1", "c2", "c3", "c4"]
-    assert [r.name for r in bodies] == ["check"] * 4
-    assert bodies[0].content == original + "\nCicada freshness: stale=false freshness=current tool=check"
-    assert bodies[1].content.startswith("PASS: old run\nCicada freshness: stale=true freshness=stale tool=check")
-    assert bodies[1].details["receipt_id"] == "r-old"
-    assert "superseded" in bodies[1].content
-    assert "freshness=unknown" in bodies[2].content
-    assert "not in the verification ledger" in bodies[2].content
-    assert "freshness=unknown" in bodies[3].content
-    assert "no receipt_id" in bodies[3].content
-    # 每个历史 PASS 都紧邻 freshness 标记, 不依赖模型回忆
-    assert all("Cicada freshness" in r.content for r in bodies)
-    # 只有 check/powershell 结果被标注
+    assert all("Cicada freshness" not in r.content for r in bodies)
+    assert "Cicada freshness" not in request.system_prompt
+    assert "Cicada freshness" not in request.request_context
+    # 只有结构化扫描需要 check/powershell 结果; 非检查结果不受影响
     assert [m.result.name for m in request.messages if isinstance(m, ToolResultMessage)] == ["check"] * 4
 
 
-async def test_duplicate_model_call_ids_do_not_confuse_ledger_and_do_not_leak_receipt_of_other_attempt():
-    first = make_receipt("r-1")
-    second = make_receipt("r-2")
-    view = make_view(
-        states=(CheckState("check-1", receipt=second, freshness="current"),),
-        receipts=(first, second),
-    )
-    same_id = "call_dup"
-    messages = (
-        check_result(same_id, "old attempt output", receipt_id="r-1"),
-        check_result(same_id, "new attempt output", receipt_id="r-2"),
-    )
-    request, _ = await projected_request(FakeVerificationService(view), messages)
-
-    bodies = [m.result for m in check_messages(request)]
-    assert [r.call_id for r in bodies] == [same_id, same_id]
-    assert "stale=true freshness=stale" in bodies[0].content
-    assert "freshness=current stale=false" not in bodies[0].content
-    assert "freshness=current" in bodies[1].content
-    assert "stale=true" not in bodies[1].content
-
-
-async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
-    """锁存路径同样不得改写原消息: id/name/顺序/正文一字不改, 只追加投影 marker."""
+async def test_projection_keeps_ids_names_order_and_original_bodies_when_latching():
+    """锁存路径同样不得改写原消息: id/name/顺序/正文一字不改."""
     view = make_view()  # 空账本: 所有 check 回执都是 unknown
     messages = (
         UserMessage(text="task"),
@@ -419,17 +489,11 @@ async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
     assert len(service.uncertain_reasons) == 2  # 两条都保守锁存
 
     projected = model.requests[0]
+    assert projected.messages == messages, "规范历史逐字逐对象透传"
     bodies = [m.result for m in projected.messages if isinstance(m, ToolResultMessage)]
     assert [r.call_id for r in bodies] == ["c1", "c2"]
     assert [r.name for r in bodies] == ["powershell", "check"]
-    assert bodies[0].content.startswith(
-        "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]"
-        "\nCicada freshness: stale=true freshness=unknown tool=powershell"
-    )
-    assert bodies[1].content.startswith(
-        "check body\nCicada freshness: stale=true freshness=unknown tool=check"
-    )
-    assert bodies[1].details == {"receipt_id": "ghost"}
+    assert "Cicada freshness" not in projected.messages[2].result.content
     # 原消息对象与传入请求都不被重写
     assert messages[2].result.content == "out\n[exit_code=0 timed_out=False cancelled=False output_complete=False]"
     assert messages[2].result.details == {
@@ -440,7 +504,10 @@ async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
     }
     assert messages[3].result.content == "check body"
     assert request.messages[2].result.content == messages[2].result.content
-    assert request.system_prompt == "rules"
+    # 同一轮锁存经尾部可见
+    payload = parse_tail(projected)
+    assert payload["process_uncertain"] is True
+    assert len(payload["blocking_reasons"]) == 2
 
     # 非锁存路径 (已知回执) 同样不改写原消息对象与传入请求
     resolved = make_receipt("r-1")
@@ -458,18 +525,19 @@ async def test_latching_projection_keeps_ids_names_order_and_original_bodies():
     assert known_request.system_prompt == "sys"
 
 
-async def test_missing_structured_receipt_is_unknown_and_latched_conservatively():
-    view = make_view()
+async def test_structured_receipt_absence_latches_but_leaves_body_untouched():
+    service = FakeVerificationService(make_view())
     detail_less = ToolResultMessage(
         result=ToolResult("c1", "check", "check failed", is_error=True, details=None)
     )
-    request, _ = await projected_request(FakeVerificationService(view), (detail_less,))
-    body = check_messages(request)[0].result
-    assert "freshness=unknown" in body.content
-    assert "no structured receipt" in body.content
+    request, _ = await projected_request(service, (detail_less,))
+    assert check_messages(request)[0].result.content == "check failed", "正文不再追加标记"
+    assert service.uncertain_reasons == [
+        "check result has no structured details; termination unproven"
+    ]
 
 
-async def test_powershell_history_is_annotated_as_unknown_and_non_check_results_untouched():
+async def test_powershell_results_pass_through_and_non_check_results_untouched():
     other = ToolResultMessage(result=ToolResult("c9", "read", "file body"))
     shell = ToolResultMessage(
         result=ToolResult("c8", "powershell", "out", details={"exit_code": 0, "output_complete": True})
@@ -477,8 +545,7 @@ async def test_powershell_history_is_annotated_as_unknown_and_non_check_results_
     request, _ = await projected_request(FakeVerificationService(make_view()), (other, shell))
     results = [m.result for m in request.messages if isinstance(m, ToolResultMessage)]
     assert results[0].content == "file body"
-    assert "freshness=unknown" in results[1].content
-    assert results[1].content.startswith("out\nCicada freshness:")
+    assert results[1].content == "out", "check/powershell 正文同样逐字透传"
 
 
 async def test_projection_is_idempotent_for_repeated_view():
@@ -489,6 +556,7 @@ async def test_projection_is_idempotent_for_repeated_view():
     once, _ = await projected_request(service, (message,))
     twice, _ = await projected_request(service, tuple(once.messages))
     assert check_messages(twice)[0].result.content == check_messages(once)[0].result.content
+    assert twice.request_context == once.request_context
 
 
 # --- 终结点事实与保守锁存 -------------------------------------------------------
@@ -518,9 +586,10 @@ async def test_timeout_and_cancel_results_latch_process_uncertain():
     assert len(service.uncertain_reasons) == 2
     assert "timed out" in service.uncertain_reasons[0]
     assert "cancelled" in service.uncertain_reasons[1]
-    # 锁存经 view 出现在系统状态段
-    assert "process_uncertain: true" in request.system_prompt
-    assert "timed out before EOF" in request.system_prompt
+    # 锁存经尾部可见
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is True
+    assert any("timed out before EOF" in reason for reason in payload["blocking_reasons"])
 
 
 async def test_non_eof_and_missing_details_errors_latch_but_plain_errors_do_not():
@@ -563,9 +632,9 @@ async def test_reliable_non_eof_latches_even_with_exit_code_zero():
     assert service.uncertain_reasons == [
         "powershell ended without reaching EOF; termination unproven"
     ]
-    # 锁存发生在 refresh 之前, 同一轮系统状态段已含 process_uncertain;
+    # 锁存发生在 refresh 之前, 同一轮尾部已含 process_uncertain;
     # 每轮一次 refresh, 扫描先于 refresh
-    assert "process_uncertain: true" in request.system_prompt
+    assert parse_tail(request)["process_uncertain"] is True
     assert len(service.refresh_calls) == 1
 
 
@@ -584,10 +653,10 @@ async def test_unknown_receipt_id_never_skips_ledger_check():
     request, _ = await projected_request(service, (ghost,))
     reason = "check result receipt_id is not in the verification ledger; termination unproven"
     assert service.uncertain_reasons == [reason]
-    # 账本核对结果必须在**同一轮**发给模型的请求里可见, 不能只保证下一轮
-    assert "process_uncertain: true" in request.system_prompt
-    assert f"- {reason}" in request.system_prompt
-    assert "none reported by the verification view" not in request.system_prompt
+    # 账本核对结果必须在**同一轮**发给模型的尾部里可见, 不能只保证下一轮
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is True
+    assert reason in payload["blocking_reasons"]
     # 不为此重复整仓快照: 每轮仍只有一次 refresh
     assert len(service.refresh_calls) == 1
 
@@ -618,7 +687,7 @@ async def test_structured_generic_error_without_terminal_fields_latches_conserva
         "powershell error carries no trustworthy terminal fact",
         "check result receipt_id is not in the verification ledger; termination unproven",
     ]
-    assert "process_uncertain: true" in request.system_prompt
+    assert parse_tail(request)["process_uncertain"] is True
 
 
 async def test_trustworthy_terminal_facts_stay_clean():
@@ -644,7 +713,7 @@ async def test_trustworthy_terminal_facts_stay_clean():
     )
     request, _ = await projected_request(service, messages)
     assert service.uncertain_reasons == []
-    assert "process_uncertain: true" not in request.system_prompt
+    assert parse_tail(request)["process_uncertain"] is False
 
 
 async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
@@ -655,9 +724,9 @@ async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
     check_known = check_result("c1", "PASS", receipt_id="r-1")
     request, _ = await projected_request(service, (check_known,))
     assert service.uncertain_reasons == []
-    assert "process_uncertain: true" not in request.system_prompt
-    assert "- none reported by the verification view" in request.system_prompt
-    assert "freshness=current" in check_messages(request)[0].result.content
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is False
+    assert payload["checks"][0]["status"] == "passed" and payload["checks"][0]["freshness"] == "current"
 
     service2 = FakeVerificationService(view)
     known = ToolResultMessage(
@@ -665,8 +734,7 @@ async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
     )
     request2, _ = await projected_request(service2, (known,))
     assert service2.uncertain_reasons == []
-    assert "process_uncertain: true" not in request2.system_prompt
-    assert check_messages(request2)[0].result.content.startswith("out\nCicada freshness: stale=false freshness=current")
+    assert parse_tail(request2)["process_uncertain"] is False
 
     ghost = ToolResultMessage(
         result=ToolResult("c3", "powershell", "out", details={"receipt_id": "ghost"})
@@ -675,10 +743,10 @@ async def test_powershell_result_with_ledger_receipt_is_resolved_not_latched():
     ghost_request, _ = await projected_request(service_ghost, (ghost,))
     assert len(service_ghost.uncertain_reasons) == 1
     assert "not in the verification ledger" in service_ghost.uncertain_reasons[0]
-    assert "freshness=unknown" in check_messages(ghost_request)[0].result.content
-    # 同一轮的 system/control 段也必须是锁存后的状态
-    assert "process_uncertain: true" in ghost_request.system_prompt
-    assert f"- {service_ghost.uncertain_reasons[0]}" in ghost_request.system_prompt
+    # 同一轮的尾部也必须是锁存后的状态
+    ghost_payload = parse_tail(ghost_request)
+    assert ghost_payload["process_uncertain"] is True
+    assert service_ghost.uncertain_reasons[0] in ghost_payload["blocking_reasons"]
 
 
 async def test_receipt_in_ledger_without_terminal_fact_still_latches():
@@ -696,10 +764,11 @@ async def test_receipt_in_ledger_without_terminal_fact_still_latches():
     assert len(service.uncertain_reasons) == 1
     assert "trustworthy terminal fact" in service.uncertain_reasons[0]
     # 同轮可见, 不推迟到下一轮
-    assert "process_uncertain: true" in request.system_prompt
-    assert f"- {service.uncertain_reasons[0]}" in request.system_prompt
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is True
+    assert service.uncertain_reasons[0] in payload["blocking_reasons"]
     assert len(service.refresh_calls) == 1
-    # 原始工具结果不被改写 (投影只加 freshness marker)
+    # 原始工具结果不被改写
     assert result.result.details == {"receipt_id": "r-1"}
     assert check_messages(request)[0].result.call_id == "c1"
 
@@ -718,7 +787,9 @@ async def test_launch_failed_receipt_is_a_known_failure_not_unknown_termination(
     result = check_result("c1", "check blocked", receipt_id="r-1", is_error=True)
     request, _ = await projected_request(service, (result,))
     assert service.uncertain_reasons == []
-    assert "process_uncertain: true" not in request.system_prompt
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is False
+    assert payload["blocked"] is True, "status=blocked 是观察的保守摘要"
 
 
 async def test_model_stream_failed_closure_is_pre_execution_sentinel_not_latch():
@@ -748,11 +819,11 @@ async def test_model_stream_failed_closure_is_pre_execution_sentinel_not_latch()
     )
     request, _ = await projected_request(service, messages)
     assert service.uncertain_reasons == []
-    assert "process_uncertain: true" not in request.system_prompt
+    assert parse_tail(request)["process_uncertain"] is False
 
 
-async def test_static_service_view_still_yields_same_round_latched_control_section():
-    """即使 refresh 的 view 未反映本轮锁存, 交给 inner 的控制段也必须带上已核对的锁存事实."""
+async def test_static_service_view_still_yields_same_round_latched_tail():
+    """即使 refresh 的 view 未反映本轮锁存, 交给 inner 的尾部也必须带上已核对的锁存事实."""
 
     class StaticViewService(FakeVerificationService):
         def mark_process_uncertain(self, reason: str) -> None:
@@ -766,9 +837,9 @@ async def test_static_service_view_still_yields_same_round_latched_control_secti
     request, _ = await projected_request(service, (ghost,))
     reason = "check result receipt_id is not in the verification ledger; termination unproven"
     assert service.uncertain_reasons == [reason]
-    assert "process_uncertain: true" in request.system_prompt
-    assert f"- {reason}" in request.system_prompt
-    assert "none reported by the verification view" not in request.system_prompt
+    payload = parse_tail(request)
+    assert payload["process_uncertain"] is True
+    assert reason in payload["blocking_reasons"]
     assert len(service.refresh_calls) == 1
 
 
@@ -783,7 +854,7 @@ async def test_success_text_does_not_clear_latched_uncertainty_and_successes_are
     service.mark_process_uncertain("earlier cancelled process")
     request, _ = await projected_request(service, (good,))
     assert service.uncertain_reasons == ["earlier cancelled process"]  # 单调: 不被 PASS 清除
-    assert "process_uncertain: true" in request.system_prompt
+    assert parse_tail(request)["process_uncertain"] is True
 
 
 async def test_already_cancelled_stream_sends_nothing_and_skips_refresh():
@@ -820,7 +891,7 @@ def test_policy_rejects_non_model_and_non_service():
 # --- wire 边界与真实适配路径 ----------------------------------------------------
 
 
-async def test_wire_request_carries_control_section_and_freshness_markers():
+async def test_wire_request_maps_context_to_trailing_user_message():
     fresh = make_receipt("r-1")
     view = make_view(states=(CheckState("check-1", receipt=fresh, freshness="current"),), receipts=(fresh,))
     api_wire = ApiWire(FakeVerificationService(view))
@@ -832,18 +903,28 @@ async def test_wire_request_carries_control_section_and_freshness_markers():
     events = await api_wire.run(messages, (ToolSpec("check", "run a check", {"type": "object"}),), system_prompt="rules")
 
     payload = api_wire.wire
+    # system 只含基础提示与固定规则, 不含当前状态
     assert payload["messages"][0]["role"] == "system"
-    assert "<cicada-verification-state>" in payload["messages"][0]["content"]
-    assert f"snapshot_ref: {REF}" in payload["messages"][0]["content"]
+    assert "<cicada-verification-rules>" in payload["messages"][0]["content"]
+    assert "cicada-verification-context" not in payload["messages"][0]["content"]
     assert payload["messages"][1] == {"role": "user", "content": "任务"}
     tool_message = payload["messages"][3]
     assert tool_message["role"] == "tool"
     assert tool_message["tool_call_id"] == "c1"
-    assert tool_message["content"] == "PASS\nCicada freshness: stale=false freshness=current tool=check"
+    assert tool_message["content"] == "PASS", "工具正文原样映射"
+    # 尾部恰好一条 user 消息, 内容为固定标签包住的完整 JSON
+    assert len(payload["messages"]) == 5
+    tail = payload["messages"][-1]
+    assert tail["role"] == "user"
+    assert tail["content"].startswith(CONTEXT_OPEN_TAG)
+    tail_payload = json.loads(
+        tail["content"][len(CONTEXT_OPEN_TAG) + 1:len(tail["content"]) - len(CONTEXT_CLOSE_TAG) - 1]
+    )
+    assert tail_payload["checks"][0]["latest_receipt_id"] == "r-1"
     assert [e.stop_reason for e in events if isinstance(e, StreamDone)] == ["stop"]
 
 
-async def test_wire_request_cap_counts_projection_and_refuses_one_byte_over():
+async def test_wire_request_cap_counts_context_and_refuses_one_byte_over():
     fresh = make_receipt("r-1")
     view = make_view(states=(CheckState("check-1", receipt=fresh, freshness="current"),), receipts=(fresh,))
     messages = (
@@ -864,7 +945,7 @@ async def test_wire_request_cap_counts_projection_and_refuses_one_byte_over():
     assert len(api_wire_ok.seen) == 1
     assert len(api_wire_ok.seen[0].content) == size
     assert [e.stop_reason for e in events_ok if isinstance(e, StreamDone)] == ["stop"]
-    assert "<cicada-verification-state>" in api_wire_ok.wire["messages"][0]["content"]
+    assert api_wire_ok.wire["messages"][-1]["content"].startswith(CONTEXT_OPEN_TAG)
 
     api_wire_over = ApiWire(service, limit=size - 1)
     events_over = await api_wire_over.run(messages, tools, system_prompt="rules")
@@ -912,16 +993,16 @@ async def test_bootstrap_policy_wires_service_into_model_port():
     assert result.stop_reason == "stop"
     assert seen == [service]
     sent = model.requests[0]
-    assert sent.system_prompt.startswith("rules\n<cicada-verification-state>")
-    assert f"snapshot_ref: {REF}" in sent.system_prompt
+    assert sent.system_prompt.startswith("rules\n<cicada-verification-rules>")
+    assert parse_tail(sent)["checks"][0]["latest_receipt_id"] == "r-1"
     assert sent.tools[0].name == "echo"
     assert len(service.refresh_calls) == 1
     # 内核会话与 RunResult 保留原始 system prompt; 投影只存在于发给模型的请求
     assert [m.text for m in result.messages if isinstance(m, UserMessage)] == ["任务"]
     assert not any(
-        getattr(m, "text", "").startswith("rules\n<cicada-verification-state>") for m in result.messages
+        getattr(m, "text", "").startswith("rules\n<cicada-verification-rules>") for m in result.messages
     )
-    assert "cicada-verification-state" not in repr(result.messages)
+    assert "cicada-verification-rules" not in repr(result.messages)
     await app.aclose()
 
 
@@ -991,13 +1072,13 @@ async def _real_check_result(workspace: Workspace, verifier: Verifier, check_id:
     )
 
 
-async def _stream_with(policy: RunPolicy, model: RecordingModel, messages) -> tuple[str, list]:
+async def _stream_tail(policy: RunPolicy, model: RecordingModel, messages) -> tuple[dict, list]:
     events = [event async for event in policy.stream(ModelRequest(messages, ()), CancelToken())]
-    return model.requests[0].system_prompt, events
+    return parse_tail(model.requests[0]), events
 
 
 async def test_real_service_receipt_survives_projection_without_latching(tmp_path):
-    """真实服务回执 id 经公开 ModelPort 投影: 账本核对通过, 不锁存且 marker 为 current."""
+    """真实服务回执 id 经公开 ModelPort 投影: 账本核对通过, 不锁存且尾部为 current."""
     workspace = _real_repo(tmp_path)
     verifier = _real_verifier(workspace, CheckDefinition("check-1", "exit 0"))
     result = await _real_check_result(workspace, verifier, "check-1")
@@ -1006,16 +1087,15 @@ async def test_real_service_receipt_survives_projection_without_latching(tmp_pat
     assert verifier.receipts[-1].verification_status == "passed"
 
     model = RecordingModel()
-    section, _ = await _stream_with(
-        RunPolicy(model, verifier), model, (ToolResultMessage(result=result),)
-    )
+    payload, _ = await _stream_tail(RunPolicy(model, verifier), model, (ToolResultMessage(result=result),))
     assert verifier.process_uncertain is False
-    assert "process_uncertain: true" not in section
-    assert f"verification_run_id: {verifier.plan.verification_run_id}" in section
-    assert f"check check-1: status=passed freshness=current" in section
-    projected = model.requests[0].messages[0].result
-    assert result.details["receipt_id"] in projected.content
-    assert "freshness=current" in projected.content
+    assert payload["process_uncertain"] is False
+    assert payload["verification_run_id"] == verifier.plan.verification_run_id
+    assert payload["checks"][0]["status"] == "passed"
+    assert payload["checks"][0]["freshness"] == "current"
+    assert payload["checks"][0]["latest_receipt_id"] == result.details["receipt_id"]
+    # 原始工具结果正文逐字透传
+    assert model.requests[0].messages[0].result.content == result.content
 
 
 async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path):
@@ -1032,7 +1112,7 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
     assert verifier.process_uncertain is True
 
     first_model = RecordingModel()
-    first_section, _ = await _stream_with(
+    first_payload, _ = await _stream_tail(
         RunPolicy(first_model, verifier), first_model, (ToolResultMessage(result=result),)
     )
     # 投影按账本核对回执: 回执自身 output_complete=False, 因此保守锁存 (与服务的锁存并存)
@@ -1041,17 +1121,16 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
         for reason in verifier._uncertain_reasons
         if "does not record a trustworthy terminal fact" in reason
     )
-    assert first_section.count("process_uncertain: true") == 1
+    assert first_payload["process_uncertain"] is True
     # 账本核对产生的新锁存必须在同一轮可见, 不能只保证下一轮
-    assert f"- {ledger_reason}" in first_section
-    assert "none reported by the verification view" not in first_section
+    assert ledger_reason in first_payload["blocking_reasons"]
 
     # 下一轮同一历史: 锁存仍在, 不会因为已记录过而消失
     second_model = RecordingModel()
-    second_section, _ = await _stream_with(
+    second_payload, _ = await _stream_tail(
         RunPolicy(second_model, verifier), second_model, (ToolResultMessage(result=result),)
     )
-    assert "process_uncertain: true" in second_section
+    assert second_payload["process_uncertain"] is True
     assert sum(
         "does not record a trustworthy terminal fact" in reason for reason in verifier._uncertain_reasons
     ) == 1
@@ -1060,10 +1139,10 @@ async def test_real_service_non_eof_check_negates_exit_zero_and_latches(tmp_path
         result=ToolResult("c9", "check", "PASS", details={"receipt_id": "chk-ghost"})
     )
     third_model = RecordingModel()
-    third_section, _ = await _stream_with(RunPolicy(third_model, verifier), third_model, (ghost,))
+    third_payload, _ = await _stream_tail(RunPolicy(third_model, verifier), third_model, (ghost,))
     assert any("not in the verification ledger" in reason for reason in verifier._uncertain_reasons)
-    assert "process_uncertain: true" in third_section
-    assert "- check result receipt_id is not in the verification ledger; termination unproven" in third_section
+    assert third_payload["process_uncertain"] is True
+    assert "check result receipt_id is not in the verification ledger; termination unproven" in third_payload["blocking_reasons"]
 
 
 async def test_real_service_launch_failure_projects_blocked_without_new_latch(tmp_path, monkeypatch):
@@ -1082,14 +1161,12 @@ async def test_real_service_launch_failure_projects_blocked_without_new_latch(tm
     assert verifier.process_uncertain is False  # 已知未启动不是"进程终结未知"
 
     model = RecordingModel()
-    section, _ = await _stream_with(
-        RunPolicy(model, verifier), model, (ToolResultMessage(result=result),)
-    )
+    payload, _ = await _stream_tail(RunPolicy(model, verifier), model, (ToolResultMessage(result=result),))
     assert verifier.process_uncertain is False
-    assert "process_uncertain: true" not in section
-    assert "check check-1: status=blocked" in section
-    assert "not in the verification ledger" not in section
-    assert "trustworthy terminal fact" not in section
+    assert payload["process_uncertain"] is False
+    assert payload["checks"][0]["status"] == "blocked"
+    assert not any("not in the verification ledger" in reason for reason in payload["blocking_reasons"])
+    assert not any("trustworthy terminal fact" in reason for reason in payload["blocking_reasons"])
 
 
 async def test_real_service_execution_cancel_propagates_and_projection_latches(tmp_path):
@@ -1111,8 +1188,8 @@ async def test_real_service_execution_cancel_propagates_and_projection_latches(t
         result=ToolResult("c1", "powershell", "cancelled during execution", is_error=True, details=None)
     )
     model = RecordingModel()
-    section, _ = await _stream_with(RunPolicy(model, verifier), model, (normalized,))
-    assert "process_uncertain: true" in section
+    payload, _ = await _stream_tail(RunPolicy(model, verifier), model, (normalized,))
+    assert payload["process_uncertain"] is True
     assert any("termination failure" in reason for reason in verifier._uncertain_reasons)
 
 
@@ -1171,7 +1248,7 @@ def test_proof_validate_rejects_missing_reorder_and_modification():
 
 
 async def test_prefix_walks_historical_path_without_current_ledger_latch():
-    """A09: 前缀内旧回执不走当前账本核对 (不 ghost 锁存), 投影追加历史说明."""
+    """A09: 前缀内旧回执不走当前账本核对 (不 ghost 锁存), 正文一字不改."""
     prefix = (UserMessage(text="旧问"), check_result("c1", "旧检查通过", receipt_id="r-old"))
     proof_entries = (
         _prefix_entry(prefix[0]),
@@ -1193,10 +1270,9 @@ async def test_prefix_walks_historical_path_without_current_ledger_latch():
     assert service.uncertain_reasons == [], "前缀不按当前账本锁存"
     sent = model.requests[0]
     projected_prefix = [m for m in sent.messages if isinstance(m, ToolResultMessage)][0]
-    assert "historical result from a previous verification run" in projected_prefix.result.content
-    assert "not applicable to the current verification run" in projected_prefix.result.content
+    assert projected_prefix.result.content == "旧检查通过", "恢复旧文字不清洗不标注"
     # 原消息不改: 投影只发生在发给模型的副本上
-    assert "historical result" not in prefix[1].result.content
+    assert "旧检查通过" in prefix[1].result.content
 
 
 async def test_suffix_copying_old_receipt_field_by_field_still_ghost_latches():

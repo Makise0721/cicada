@@ -34,6 +34,8 @@ class ModelRequest:
     messages: tuple[Message, ...]
     tools: tuple[ToolSpec, ...]
     system_prompt: str = ""
+    # 本轮程序验证观察 (RunPolicy 唯一非空写入者); 不是规范消息, 空串即无上下文.
+    request_context: str = ""
 
 
 @dataclass(frozen=True)

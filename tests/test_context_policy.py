@@ -8,6 +8,7 @@ clear (committed_count=0)/投影或提示或工具变化经前缀失配失效。
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -200,6 +201,56 @@ async def test_new_anchor_replaces_previous():
     async for _ in policy.stream(request, CancelToken()):
         pass
     assert policy.anchor.measured_input_tokens == 150
+
+
+# --- 带尾部请求的锚条件 (缓存 02, 契约 C4) ---------------------------------------------
+
+
+async def _tail_anchored_policy(context: str = "tail-v1"):
+    """一轮带尾部流结束后返回 (policy, 基准请求); 锚以实测 100 tokens 建立."""
+    inner = FakeModel([[_stop(_measured(100))]])
+    policy = BudgetPolicy(inner, _config())
+    request = replace(_request("q1", tools=_specs("read")), request_context=context)
+    async for _ in policy.stream(request, CancelToken()):
+        pass
+    return policy, request
+
+
+async def test_tail_request_is_measured_only_on_full_equality():
+    policy, request = await _tail_anchored_policy()
+    async for _ in policy.stream(request, CancelToken()):
+        pass
+    report = policy.last_report
+    assert report.source == "measured"
+    assert report.input_estimate == 100
+
+
+async def test_tail_request_history_extension_is_estimated_not_anchored():
+    """带尾部的请求即使规范历史延长也不是完整 wire 前缀延长: 重新估计, 不标 anchored."""
+    policy, request = await _tail_anchored_policy()
+    extended = replace(request, messages=request.messages + (UserMessage(text="q2"),))
+    async for _ in policy.stream(extended, CancelToken()):
+        pass
+    report = policy.last_report
+    assert report.source == "estimated"
+    assert "request_context" in [component.label for component in report.components]
+
+
+async def test_tail_change_reestimates_even_with_identical_history():
+    policy, request = await _tail_anchored_policy()
+    drifted = replace(request, request_context="tail-v2")
+    async for _ in policy.stream(drifted, CancelToken()):
+        pass
+    assert policy.last_report.source == "estimated"
+
+
+async def test_anchor_from_no_tail_request_never_serves_tail_request():
+    """无尾锚与新尾部请求 context 不等: 不沿现行前缀条件复用实测."""
+    policy, request = await _anchored_policy()
+    with_tail = replace(request, request_context="tail-v1")
+    async for _ in policy.stream(with_tail, CancelToken()):
+        pass
+    assert policy.last_report.source == "estimated"
 
 
 # --- 快照出口与构造校验 -----------------------------------------------------------------

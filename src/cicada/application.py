@@ -86,9 +86,6 @@ from cicada.persistence.contracts import (
 )
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
 from cicada.run_policy import (
-    CONTROL_SECTION_MAX_BYTES,
-    FRESHNESS_MARKER_MAX_BYTES,
-    FRESHNESS_TOOLS,
     HistoricalPrefixProof,
     HistoricalProjection,
     PrefixEntry,
@@ -1386,8 +1383,9 @@ class ApplicationSession:
         零 begin、零模型调用; 预算拒绝不是存储故障, 不锁存 storage_failed。
         持久模式预估拒绝不落库 (无 intent; 01 裁决, 完成回执钉住"无 intent"断言);
         每轮权威准入 (BudgetPolicy) 发生在 begin 之后, 按既有错误路径收尾并落
-        finalized 错误记录。预估不含锚 (锚状态在 BudgetPolicy), 检查模式另加
-        RunPolicy 控制段字节上限的允许量, 保持保守方向。
+        finalized 错误记录。预估不含锚 (锚状态在 BudgetPolicy), 检查模式 system
+        面用 RunPolicy.preflight_system_prompt 同源生成, 并按同源 cap 加最大尾部
+        允许量 (缓存 02, 契约 C4); 不再逐旧结果添加 freshness allowance。
         """
         policy = self._budget_policy
         config = self._config.budget
@@ -1395,43 +1393,40 @@ class ApplicationSession:
             return
         # 01-F10/PA02: 预估计量面 = 当前 ContextProjection 的有效消息
         # ([摘要块] + 保留后缀) + 本次 prompt; 旧规范历史不再参与 (压缩后重估
-        # 必须能回到限内)。控制段/freshness 允许量仍覆盖最终发送形态 (01 裁决)。
+        # 必须能回到限内)。
         messages = (
             *self._context_projection.project(self._history),
             UserMessage(text=prompt),
         )
-        input_estimate, components = estimate_input_components(
-            self._config.system_prompt, self._request_tool_specs(), messages, config
-        )
+        tail_allowance = 0
         if self._config.plan is not None:
-            allowance = math.ceil(CONTROL_SECTION_MAX_BYTES / 3)
+            # plan 存在而策略实例缺失的人工组合明确拒绝, 不回退常量漏算 (契约 C1)
+            run_policy = self._policy
+            if run_policy is None:
+                raise RuntimeError(
+                    "check mode is configured without a RunPolicy instance; "
+                    "the preflight budget estimate cannot be sourced"
+                )
+            system_prompt = run_policy.preflight_system_prompt(self._config.system_prompt)
+            tail_allowance = (
+                math.ceil(run_policy.request_context_max_bytes / 3)
+                + config.message_template_overhead
+            )
+        else:
+            system_prompt = self._config.system_prompt
+        input_estimate, components = estimate_input_components(
+            system_prompt, self._request_tool_specs(), messages, config
+        )
+        if tail_allowance:
             components = components + (
                 ComponentEstimate(
-                    "verification_control_allowance",
-                    allowance,
+                    "verification_context_allowance",
+                    tail_allowance,
                     "estimated",
-                    note="upper bound of the RunPolicy control section appended before send",
+                    note="upper bound of the RunPolicy verification context tail appended before send",
                 ),
             )
-            input_estimate += allowance
-            # RunPolicy 还对每条 check/powershell 工具结果在投影中追加 freshness
-            # 标记 (单条上限 FRESHNESS_MARKER_MAX_BYTES 字节); 规范历史不含标记,
-            # 逐条按上限补足, 使预估成为投影后请求的保守上界 (审查 01-F9/F13)
-            fresh_count = sum(
-                1 for m in messages
-                if isinstance(m, ToolResultMessage) and m.result.name in FRESHNESS_TOOLS
-            )
-            if fresh_count:
-                fresh_allowance = fresh_count * math.ceil(FRESHNESS_MARKER_MAX_BYTES / 3)
-                components = components + (
-                    ComponentEstimate(
-                        "verification_freshness_allowance",
-                        fresh_allowance,
-                        "estimated",
-                        note="upper bound of per-result freshness markers appended before send",
-                    ),
-                )
-                input_estimate += fresh_allowance
+            input_estimate += tail_allowance
         report = assemble_report(
             config, input_estimate=input_estimate, input_components=components, source="estimated"
         )

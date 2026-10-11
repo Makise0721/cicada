@@ -44,6 +44,12 @@ class DeepSeekConfig:
 
     def validate_request(self, request: ModelRequest) -> None:
         validate_history_structure(request.messages)
+        # 缓存 02 (契约 C3): 非空 request_context 说明程序状态, 需要工具调用形态
+        # 才能映射尾部 user 消息; 无工具且非空本地拒绝, fake 继续支持中立请求捕获。
+        if request.request_context and not request.tools:
+            raise ValueError(
+                "DeepSeek requires tools to carry a nonempty request context"
+            )
         if not self.think or not request.tools:
             return
         for message in request.messages:
@@ -77,6 +83,10 @@ def build_request(request: ModelRequest, config: DeepSeekConfig) -> dict:
                     "function": {"name": c.name, "arguments": c.arguments_json}}
                     for c in message.tool_calls]
         messages.append(mapped)
+    # 缓存 02 (契约 C3): 非空 context 在所有规范消息之后追加恰好一条带固定
+    # 内容的 user 消息 (工具响应配对完成后才追加); 空值不增加消息, 不发送空 user。
+    if request.request_context:
+        messages.append({"role": "user", "content": request.request_context})
     body = {"model": config.model, "messages": messages, "stream": True,
             "stream_options": {"include_usage": True}, "max_tokens": config.max_tokens,
             "thinking": {"type": "enabled" if config.think else "disabled"}}

@@ -201,7 +201,7 @@ def test_reasoning_dto_strict_types(text, complete):
 
 def test_budget_counts_raw_reasoning_bytes():
     config = BudgetConfig(num_ctx=1000)
-    assert BUDGET_ESTIMATOR_VERSION == "2"
+    assert BUDGET_ESTIMATOR_VERSION == "3"  # 缓存 02: 尾部组件进入估计面
     plain = estimate_message_tokens(AssistantMessage(""), config)
     assert estimate_message_tokens(AssistantMessage("", reasoning=ReasoningContent("思考", True)), config) == plain + 2
 
