@@ -95,6 +95,54 @@ async def test_old_usage_only_and_unknown_metrics(usage):
     assert events[-1].metrics is None if usage is None else events[-1].metrics.input_tokens == 7
 
 
+async def test_cache_usage_snapshots_and_protocol_errors():
+    """同帧成对、不跨帧拼接；无效后帧保留前一次有效 usage，EOF 不冒充成功。"""
+    paired = {"prompt_tokens": 10, "prompt_cache_hit_tokens": 7, "prompt_cache_miss_tokens": 3}
+    for usage in (paired, {"prompt_cache_hit_tokens": 0}, {"prompt_tokens_details": {"cached_tokens": 100}},
+                  {"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}):
+        data = frame(finish="stop", usage=paired)
+        data += ("data: " + json.dumps({"choices": [], "usage": usage}) + "\n\n").encode() + DONE
+        events, _ = await collect(data)
+        metrics = events[-1].metrics
+        assert events[-1].stop_reason == "stop"
+        assert (metrics.cache_hit_input_tokens, metrics.cache_miss_input_tokens) == (
+            usage.get("prompt_cache_hit_tokens"), usage.get("prompt_cache_miss_tokens"),
+        )
+        assert metrics.input_tokens == usage.get("prompt_tokens")
+    for bad in (True, -1, 1.5, "7"):
+        invalid = dict(paired, prompt_cache_hit_tokens=bad)
+        events, _ = await collect(frame(usage=paired) + frame(finish="stop", usage=invalid) + DONE)
+        assert events[-1].stop_reason == "error"
+        assert events[-1].metrics.cache_hit_input_tokens == 7
+    events, _ = await collect(frame(finish="stop", usage=dict(paired, prompt_cache_miss_tokens=4)) + DONE)
+    assert events[-1].stop_reason == "error" and events[-1].metrics is None
+    events, _ = await collect(frame(usage=paired))
+    assert events[-1].stop_reason == "error" and events[-1].metrics.cache_miss_input_tokens == 3
+
+
+async def test_cache_usage_survives_cancellation_once():
+    token = CancelToken()
+    class CancelAfterUsage(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield frame(usage={"prompt_tokens": 10, "prompt_cache_hit_tokens": 7,
+                               "prompt_cache_miss_tokens": 3})
+            token.cancel()
+            await token.wait()
+        async def aclose(self):
+            pass
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, stream=CancelAfterUsage())
+    )) as client:
+        agent = Agent(model=DeepSeekModel(client, DeepSeekConfig(), KEY), tools={})
+        from cicada.core.events import ModelCallCompleted
+        events = []
+        agent.subscribe(events.append)
+        await agent.run("任务", cancel=token)
+    calls = [event for event in events if isinstance(event, ModelCallCompleted)]
+    assert len(calls) == 1 and calls[0].stop_reason == "aborted"
+    assert calls[0].metrics.cache_hit_input_tokens == 7
+
+
 @pytest.mark.parametrize("tail", [
     frame(finish="stop"), DONE, b"data: broken\n\n",
     frame({"tool_calls": [tool(arguments="[]")]}, "tool_calls") + DONE,

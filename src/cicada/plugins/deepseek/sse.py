@@ -105,12 +105,17 @@ class Completion:
             if not isinstance(usage, dict):
                 raise ProtocolError("invalid usage")
             values = []
-            for name in ("prompt_tokens", "completion_tokens"):
+            for name in ("prompt_tokens", "completion_tokens",
+                         "prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
                 value = usage.get(name)
                 if value is not None and (type(value) is not int or value < 0):
                     raise ProtocolError("invalid usage count")
                 values.append(value)
-            self.metrics = ModelMetrics(*values)
+            input_tokens, output_tokens, hit, miss = values
+            if input_tokens is not None and hit is not None and miss is not None and hit + miss != input_tokens:
+                raise ProtocolError("inconsistent cache usage counts")
+            self.metrics = ModelMetrics(input_tokens, output_tokens,
+                                        cache_hit_input_tokens=hit, cache_miss_input_tokens=miss)
         choices = payload.get("choices")
         if not isinstance(choices, list):
             raise ProtocolError("invalid choices")

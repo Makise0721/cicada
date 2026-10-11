@@ -125,7 +125,7 @@ from cicada.ui.document_layout import (
     DocumentLayout,
 )
 from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
-from cicada.ui.transcript import Transcript
+from cicada.ui.transcript import CacheMetricsTotal, Transcript
 from cicada.ui.welcome import build_welcome_entry
 from cicada.ui.display_style import DisplayStyle
 
@@ -416,7 +416,7 @@ class ConversationView:
                 self._model_stage = None
                 self._active_run_id = None
         elif isinstance(event, ModelCallCompleted):
-            self.transcript.add_metrics(event.metrics)
+            self.transcript.add_metrics(event.metrics, call_key=(event.run_id, event.turn_index))
         # 工具组与检查回执收集: 全部内核事件过一遍 (各自过滤)
         self._checks.observe_event(event)
         # 紧凑交互 01 (C1): 组只在创建时挂载一个显示条目, 子项更新原位重排
@@ -1008,7 +1008,7 @@ class ConversationView:
         sections = [
             ("会话", session_lines),
             *self._budget_sections(),
-            ("计量", [self.transcript.metrics_summary()]),
+            ("计量", [self.transcript.metrics_summary(), self.transcript.cache_summary()]),
             ("检查", self._checks.status_lines()),
             ("配置", [*diagnostics, *self._session.login_status]),
         ]
@@ -1016,9 +1016,20 @@ class ConversationView:
         clipped_sections = [
             (heading, [clip_status_field(row) for row in rows]) for heading, rows in sections
         ]
+        # 新缓存行不挤掉原有检查/阻断事实。超限先省略缓存行，再沿用原裁剪。
+        cache_omitted = False
+        fields = [row for _, rows in clipped_sections for row in rows]
+        if len(fields) > STATUS_MAX_LINES or len("\n".join(fields).encode("utf-8")) > STATUS_MAX_BYTES:
+            clipped_sections = [
+                (heading, [row for row in rows if not row.startswith(("缓存（", "已提交摘要缓存:"))])
+                for heading, rows in clipped_sections
+            ]
+            cache_omitted = True
         fields = [row for _, rows in clipped_sections for row in rows]
         total = "\n".join(fields)
         if len(fields) <= STATUS_MAX_LINES and len(total.encode("utf-8")) <= STATUS_MAX_BYTES:
+            if cache_omitted:
+                clipped_sections.append(("", ["…[缓存计量因状态页限额省略]"]))
             return clipped_sections
         kept, original_lines, original_bytes, truncated = clip_lines(
             total, STATUS_MAX_LINES, STATUS_MAX_BYTES,
@@ -1034,7 +1045,8 @@ class ConversationView:
             offset += count
         notes = truncation_note(kept, original_lines, original_bytes, truncated)
         if notes:
-            result.append(("", list(notes)))
+            suffix = "（缓存计量因状态页限额省略）" if cache_omitted else ""
+            result.append(("", [note + suffix for note in notes]))
         return result
 
     # --- 预算与摘要段 (04, A12) ------------------------------------------------------
@@ -1130,6 +1142,7 @@ class ConversationView:
             lines.append("压缩: 0 次 · 摘要边界: 无（未压缩）")
         if not records:
             lines.append("摘要计量: 不可得（本代次尚无已提交摘要）")
+            lines.append("已提交摘要缓存: 尚无调用")
             return lines
         inputs = [r.metrics.input_tokens for r in records if r.metrics is not None and r.metrics.input_tokens is not None]
         outputs = [r.metrics.output_tokens for r in records if r.metrics is not None and r.metrics.output_tokens is not None]
@@ -1148,6 +1161,10 @@ class ConversationView:
             f"摘要计量: {len(records)} 次 · 累计输入 {fmt(inputs, partial_in)}"
             f" · 累计输出 {fmt(outputs, partial_out)} · 累计时长 {fmt(durations, partial_dur, 's')}"
         )
+        cache = CacheMetricsTotal()
+        for record in records:
+            cache.add(record.metrics)
+        lines.append(cache.summary("已提交摘要缓存"))
         return lines
 
 

@@ -195,6 +195,18 @@ def test_metrics_accumulate_and_none_is_not_zero():
     assert other.metrics_summary() == "计量: 不可得"
 
 
+def test_cache_zero_denominator_stays_unknown():
+    from cicada.ui.transcript import CacheMetricsTotal
+    cache = CacheMetricsTotal()
+    cache.add(ModelMetrics(cache_hit_input_tokens=0, cache_miss_input_tokens=0))
+    assert "份额 不可得 · 覆盖 1/1 次" in cache.summary("缓存")
+    cache.add(ModelMetrics(cache_hit_input_tokens=0, cache_miss_input_tokens=10))
+    assert "份额 0.0%" in cache.summary("缓存")
+    cache = CacheMetricsTotal()
+    cache.add(ModelMetrics(cache_hit_input_tokens=10, cache_miss_input_tokens=0))
+    assert "份额 100.0%" in cache.summary("缓存")
+
+
 @pytest.mark.usefixtures("color_env")
 def test_user_entry_keeps_lines_and_prefixes_each_row():
     """04 主题化: 用户消息为 Pi 背景盒 (上下 1 行、左右 1 列), 原文换行保留。"""

@@ -4,8 +4,8 @@
 直接重建显示文档条目: 不调用 execute、不重新发布 ToolStarted/ToolCompleted、
 不改应用规范历史。每条请求一个来源头 (epoch/request/seq), 助手条目与工具卡
 的键命名空间化为 restored:<request_id>, 与本进程新 run_id (run-1)、跨组同
-call_id 不碰撞 (A13); 历史计量经 transcript.add_metrics 一次重建, None 保持
-不可得; 历史失败只成显示条目, 不冒充本进程最后请求 (退出码仍由本进程
+call_id 不碰撞 (A13); 历史计量仅成来源明确的显示条目, None 保持
+不可得, 不进入本进程累计; 历史失败只成显示条目, 不冒充本进程最后请求 (退出码仍由本进程
 RequestCompleted 决定)。
 
 04 (A12): 压缩边界插入程序条目——当前代次摘要记录覆盖的请求序列末尾处,
@@ -119,8 +119,11 @@ def _project_request(
         transcript.append_cancelled()
     elif outcome.stop_reason == "error":
         transcript.append_error(outcome.error or "历史请求以错误结束，但未记录错误信息。")
-    for model_call in outcome.model_calls:
-        transcript.add_metrics(model_call.metrics)
+    if outcome.model_calls:
+        historical = Transcript()
+        for model_call in outcome.model_calls:
+            historical.add_metrics(model_call.metrics)
+        transcript.append_system("历史" + historical.metrics_summary())
 
 
 def _add_tool_card(

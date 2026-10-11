@@ -7,6 +7,7 @@ stop/error/计量缺失), 但完整请求级恢复由应用与 store 测试证�
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -230,3 +231,45 @@ def test_dumps_strict_rejects_unserializable_objects():
 
     with pytest.raises(CodecError, match="serializable"):
         dumps_strict({"command": object()})
+
+
+def test_cache_metrics_old_bytes_and_both_codecs_strictness():
+    from cicada.persistence.codec import decode_summary_record, encode_summary_record
+    from cicada.persistence.contracts import SummaryRecord
+    from cicada.models import SafeModelIdentity
+    metrics = ModelMetrics(10, 2, 0.5)
+    call = ModelCallCompleted("run-1", 0, "stop", metrics, 0.5)
+    record = SummaryRecord(
+        summary_id="s-1", epoch_id="e-1", context_generation=0,
+        first_request_seq=1, last_request_seq=2, message_count=4, end_message_index=4,
+        prefix_sha256="b" * 64, text="正文", provider="fake", model="m",
+        prompt_version="1", prompt_sha256="c" * 64, metrics=metrics,
+        reason="manual", created_at=1.0, previous_projection_identity=None,
+        call_identity=SafeModelIdentity("fake", "m", None, None),
+    )
+    for encode, decode in (
+        (lambda m: encode_model_calls((replace(call, metrics=m),)),
+         lambda raw: decode_model_calls(raw)[0].metrics),
+        (lambda m: encode_summary_record(replace(record, metrics=m)),
+         lambda raw: decode_summary_record(strict_load(raw)).metrics),
+    ):
+        old = encode(metrics)
+        assert "cache_" not in old
+        assert encode(decode(old)) == old
+        for cache in (ModelMetrics(10, 2, 0.5, 7, 3), ModelMetrics(cache_hit_input_tokens=0)):
+            assert decode(encode(cache)) == cache
+        payload = strict_load(old)
+        raw_metrics = payload[0]["metrics"] if isinstance(payload, list) else payload["metrics"]
+        for key, bad in (("cache_hit_input_tokens", True), ("cache_miss_input_tokens", -1),
+                         ("cache_hit_input_tokens", 1.5), ("unexpected", 3)):
+            raw_metrics[key] = bad
+            with pytest.raises(CodecError):
+                decode(json.dumps(payload))
+            del raw_metrics[key]
+        raw_metrics.update(cache_hit_input_tokens=7, cache_miss_input_tokens=4)
+        with pytest.raises(CodecError, match="inconsistent"):
+            decode(json.dumps(payload))
+        with pytest.raises(CodecError):
+            encode(ModelMetrics(10, 2, 0.5, True, 3))
+        raw_metrics.update(cache_hit_input_tokens=None, cache_miss_input_tokens=None)
+        assert encode(decode(json.dumps(payload))) == old

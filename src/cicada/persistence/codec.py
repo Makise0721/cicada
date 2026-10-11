@@ -271,17 +271,57 @@ def _decode_message(item: Any, where: str) -> Message:
 # --- 计量事实 ---------------------------------------------------------------------------
 
 
+_METRICS_REQUIRED_KEYS = frozenset({"input_tokens", "output_tokens", "provider_duration_s"})
+_CACHE_METRICS_KEYS = frozenset({"cache_hit_input_tokens", "cache_miss_input_tokens"})
+
+
+def _decode_metrics(payload: Any, where: str) -> ModelMetrics | None:
+    if payload is None:
+        return None
+    _exact_keys(payload, _METRICS_REQUIRED_KEYS | _CACHE_METRICS_KEYS, where)
+    if not _METRICS_REQUIRED_KEYS <= set(payload):
+        raise CodecError(f"{where} is missing fields")
+    cache = {}
+    for key in _CACHE_METRICS_KEYS:
+        value = payload.get(key)
+        if value is not None and (type(value) is not int or value < 0):
+            raise CodecError(f"{where}.{key} must be a nonnegative integer or null")
+        cache[key] = value
+    input_tokens = _take_opt_int(payload, "input_tokens", where)
+    hit, miss = cache["cache_hit_input_tokens"], cache["cache_miss_input_tokens"]
+    if input_tokens is not None and hit is not None and miss is not None and hit + miss != input_tokens:
+        raise CodecError(f"{where} has inconsistent cache counts")
+    return ModelMetrics(
+        input_tokens=input_tokens,
+        output_tokens=_take_opt_int(payload, "output_tokens", where),
+        provider_duration_s=_take_opt_float(payload, "provider_duration_s", where),
+        **cache,
+    )
+
+
+def _encode_metrics(metrics: ModelMetrics | None) -> dict[str, Any] | None:
+    if metrics is None:
+        return None
+    payload = {
+        "input_tokens": metrics.input_tokens,
+        "output_tokens": metrics.output_tokens,
+        "provider_duration_s": metrics.provider_duration_s,
+    }
+    for key in sorted(_CACHE_METRICS_KEYS):
+        value = getattr(metrics, key)
+        if value is not None:
+            payload[key] = value
+    _decode_metrics(payload, "metrics")
+    return payload
+
+
 def encode_model_calls(calls: tuple[ModelCallCompleted, ...]) -> str:
     payload = [
         {
             "run_id": call.run_id,
             "turn_index": call.turn_index,
             "stop_reason": call.stop_reason,
-            "metrics": None if call.metrics is None else {
-                "input_tokens": call.metrics.input_tokens,
-                "output_tokens": call.metrics.output_tokens,
-                "provider_duration_s": call.metrics.provider_duration_s,
-            },
+            "metrics": _encode_metrics(call.metrics),
             "elapsed_s": call.elapsed_s,
         }
         for call in calls
@@ -297,20 +337,7 @@ def decode_model_calls(raw: str) -> tuple[ModelCallCompleted, ...]:
     for index, item in enumerate(parsed):
         where = f"model_calls[{index}]"
         _exact_keys(item, frozenset({"run_id", "turn_index", "stop_reason", "metrics", "elapsed_s"}), where)
-        metrics_raw = item["metrics"]
-        metrics: ModelMetrics | None = None
-        if metrics_raw is not None:
-            metrics_where = f"{where}.metrics"
-            _exact_keys(
-                metrics_raw,
-                frozenset({"input_tokens", "output_tokens", "provider_duration_s"}),
-                metrics_where,
-            )
-            metrics = ModelMetrics(
-                input_tokens=_take_opt_int(metrics_raw, "input_tokens", metrics_where),
-                output_tokens=_take_opt_int(metrics_raw, "output_tokens", metrics_where),
-                provider_duration_s=_take_opt_float(metrics_raw, "provider_duration_s", metrics_where),
-            )
+        metrics = _decode_metrics(item["metrics"], f"{where}.metrics")
         calls.append(ModelCallCompleted(
             run_id=_take_str(item, "run_id", where),
             turn_index=_take_int(item, "turn_index", where),
@@ -510,11 +537,7 @@ def encode_summary_record(record: SummaryRecord) -> str:
         "model": record.model,
         "prompt_version": record.prompt_version,
         "prompt_sha256": record.prompt_sha256,
-        "metrics": None if record.metrics is None else {
-            "input_tokens": record.metrics.input_tokens,
-            "output_tokens": record.metrics.output_tokens,
-            "provider_duration_s": record.metrics.provider_duration_s,
-        },
+        "metrics": _encode_metrics(record.metrics),
         "reason": record.reason,
         "created_at": record.created_at,
         "previous_projection_identity": record.previous_projection_identity,
@@ -549,20 +572,7 @@ def decode_summary_record(payload: Any) -> SummaryRecord:
             )
         except ValueError as exc:
             raise CodecError(f"invalid summary call_identity: {exc}") from exc
-    metrics_raw = payload["metrics"]
-    metrics = None
-    if metrics_raw is not None:
-        metrics_where = f"{where}.metrics"
-        _exact_keys(
-            metrics_raw,
-            frozenset({"input_tokens", "output_tokens", "provider_duration_s"}),
-            metrics_where,
-        )
-        metrics = ModelMetrics(
-            input_tokens=_take_opt_int(metrics_raw, "input_tokens", metrics_where),
-            output_tokens=_take_opt_int(metrics_raw, "output_tokens", metrics_where),
-            provider_duration_s=_take_opt_float(metrics_raw, "provider_duration_s", metrics_where),
-        )
+    metrics = _decode_metrics(payload["metrics"], f"{where}.metrics")
     try:
         return SummaryRecord(
             summary_id=_take_str(payload, "summary_id", where),

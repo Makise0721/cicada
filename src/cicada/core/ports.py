@@ -25,6 +25,8 @@ class ModelMetrics:
     input_tokens: int | None = None
     output_tokens: int | None = None
     provider_duration_s: float | None = None
+    cache_hit_input_tokens: int | None = None
+    cache_miss_input_tokens: int | None = None
 
 
 @dataclass(frozen=True)

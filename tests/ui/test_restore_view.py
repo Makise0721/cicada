@@ -67,8 +67,9 @@ def test_restored_request_projects_user_assistant_and_metrics():
     assert "已恢复历史：1 条请求" in rendered
     assert "历史请求 #1 · epoch" in rendered
     assert "恢复后的回答" in rendered
-    assert "累计输入 10" in transcript.metrics_summary(), "历史计量一次重建"
-    assert "不可得" not in transcript.metrics_summary()
+    assert "历史计量: 累计输入 10 · 累计输出 5" in rendered, "历史计量仅供回看"
+    assert transcript.metrics_fact() == (None, False, None, False)
+    assert transcript.cache_summary().endswith("尚无调用")
 
 
 def test_restored_metrics_none_stays_unknown():

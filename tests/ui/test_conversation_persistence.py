@@ -189,6 +189,9 @@ async def test_compacted_session_restore_shows_boundary_and_rebuilds_summary_fac
         {"text": "答二", "stop": True},
         {"text": "较早请求的摘要正文", "stop": True},  # 摘要通道复用同一 fake 适配器
     )
+    from cicada.core.ports import ModelMetrics
+    for entry in script:
+        entry[-1] = dc_replace(entry[-1], metrics=ModelMetrics(10, 2, cache_hit_input_tokens=7, cache_miss_input_tokens=3))
     session = await open_application(dc_replace(
         _persistence_config(root, script, session_id=None),
         budget=BudgetConfig(num_ctx=1_000_000, num_predict=2048),
@@ -229,7 +232,11 @@ async def test_compacted_session_restore_shows_boundary_and_rebuilds_summary_fac
         assert resumed.submit("/status")
         status = strip_terminal_sequences(chr(10).join(resumed.lines(90)))
         assert "压缩: 1 次 · 最近原因 manual" in status
-        assert "摘要计量: 1 次 · 累计输入 不可得" in status, "记录 None 计量如实不可得"
+        assert "摘要计量: 1 次 · 累计输入 10" in status
+        assert records[0].metrics.cache_hit_input_tokens == 7
+        assert "已提交摘要缓存: 已知命中 7 · 已知未命中 3 · 成对样本份额 70.0% · 覆盖 1/1 次" in status
+        assert resumed.view.transcript.cache_summary().endswith("尚无调用"), "恢复普通计量不导入本进程"
+        assert resumed_session.budget.anchor is None, "恢复计量不恢复锚"
     finally:
         await resumed_session.aclose()
         resumed.close()

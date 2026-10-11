@@ -51,6 +51,7 @@ class _TimedSummary:
         yield TextDelta("较早请求的摘要正文")
         yield StreamDone("stop", metrics=ModelMetrics(
             input_tokens=9, output_tokens=2, provider_duration_s=1.5,
+            cache_hit_input_tokens=7, cache_miss_input_tokens=2,
         ))
 
 
@@ -165,10 +166,51 @@ async def test_status_summary_metrics_single_listed_after_manual_compact(tmp_pat
         assert len(records) == 1 and records[0].reason == "manual"
         assert records[0].metrics is not None
         assert records[0].metrics.provider_duration_s == 1.5
+        cache = "已提交摘要缓存: 已知命中 7 · 已知未命中 2 · 成对样本份额 77.8% · 覆盖 1/1 次"
+        assert cache in " ".join(_status_rows(harness))
+        assert harness.view.transcript.cache_summary().endswith("份额 不可得 · 覆盖 0/2 次（部分不可得）")
     finally:
         await session.aclose()
         if store is not None:
             await store.aclose()
+
+
+async def test_status_cache_pairs_clear_and_event_replay(tmp_path):
+    from cicada.core.events import ModelCallCompleted
+    from cicada.ui.display_style import DisplayStyle
+    metrics = (
+        ModelMetrics(100, 2, cache_hit_input_tokens=1, cache_miss_input_tokens=99),
+        ModelMetrics(1000, 2, cache_hit_input_tokens=900, cache_miss_input_tokens=100),
+        ModelMetrics(cache_hit_input_tokens=7), ModelMetrics(cache_miss_input_tokens=8), None,
+    )
+    session, _m, _c, _s = await _manual_session(
+        tmp_path, script=[[StreamDone("stop", metrics=value)] for value in metrics], store=False,
+    )
+    harness = Harness(session)
+    try:
+        assert harness.view.transcript.cache_summary().endswith("尚无调用")
+        observed = []
+        session._app.agent.subscribe(lambda event: observed.append(event) if isinstance(event, ModelCallCompleted) else None)
+        for index in range(len(metrics)):
+            assert harness.submit(f"问题 {index}")
+            await harness.wait_request_done()
+        expected = harness.view.transcript.cache_summary()
+        assert "已知命中 908 · 已知未命中 207 · 成对样本份额 81.9% · 覆盖 2/5 次" in expected
+        harness.view._project_agent_event(observed[0])
+        assert harness.view.transcript.cache_summary() == expected
+        assert harness.view.transcript.metrics_fact() == (1100, True, 4, True)
+        assert harness.submit("/clear")
+        assert harness.view.transcript.cache_summary() == expected
+        assert harness.submit("/status")
+        entry = next(e for e in reversed(harness.entries()) if isinstance(e, InformationEntry))
+        assert expected in " ".join(_status_rows(harness))
+        for plain in (True, False):
+            with DisplayStyle(plain=plain).use():
+                for width in (24, 90):
+                    assert all(visible_width(line) <= width for line in entry.render(width))
+    finally:
+        await session.aclose()
+        harness.close()
 
 
 @pytest.mark.parametrize("persistent", [False, True], ids=["sync", "persistent"])

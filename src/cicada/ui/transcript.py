@@ -57,6 +57,44 @@ LENGTH_NOTE = "（回答因达到输出长度上限被截断）"
 STREAM_PLACEHOLDER = "…"
 
 
+class CacheMetricsTotal:
+    """调用快照的只读展示累计；单边值不参与成对份额。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.paired_calls = 0
+        self.hit: int | None = None
+        self.miss: int | None = None
+        self.paired_hit = 0
+        self.paired_tokens = 0
+
+    def add(self, metrics: ModelMetrics | None) -> None:
+        self.calls += 1
+        if metrics is None:
+            return
+        hit, miss = metrics.cache_hit_input_tokens, metrics.cache_miss_input_tokens
+        if hit is not None:
+            self.hit = (self.hit or 0) + hit
+        if miss is not None:
+            self.miss = (self.miss or 0) + miss
+        if hit is not None and miss is not None:
+            self.paired_calls += 1
+            self.paired_hit += hit
+            self.paired_tokens += hit + miss
+
+    def summary(self, label: str) -> str:
+        if not self.calls:
+            return f"{label}: 尚无调用"
+        hit = "不可得" if self.hit is None else str(self.hit)
+        miss = "不可得" if self.miss is None else str(self.miss)
+        share = f"{self.paired_hit / self.paired_tokens:.1%}" if self.paired_tokens else "不可得"
+        partial = "（部分不可得）" if self.paired_calls < self.calls else ""
+        return (
+            f"{label}: 已知命中 {hit} · 已知未命中 {miss}"
+            f" · 成对样本份额 {share} · 覆盖 {self.paired_calls}/{self.calls} 次{partial}"
+        )
+
+
 class TranscriptEntry(Protocol):
     """显示文档条目协议 (票据 03 的工具条目同样实现)。"""
 
@@ -323,6 +361,8 @@ class Transcript:
         self._output_total: int | None = None
         self._input_unknown = False
         self._output_unknown = False
+        self._cache_total = CacheMetricsTotal()
+        self._metric_calls: set[tuple[str, int]] = set()
 
     # --- 条目管理 ----------------------------------------------------------------
 
@@ -480,8 +520,13 @@ class Transcript:
         elif stop_reason == "error":
             self.append_error(error or "模型请求以错误结束，但未提供错误信息。")
 
-    def add_metrics(self, metrics: ModelMetrics | None) -> None:
+    def add_metrics(self, metrics: ModelMetrics | None, *, call_key: tuple[str, int] | None = None) -> None:
         """累计一次模型调用的计量; None 字段记不可得, 不当作 0。"""
+        if call_key is not None:
+            if call_key in self._metric_calls:
+                return
+            self._metric_calls.add(call_key)
+        self._cache_total.add(metrics)
         if metrics is None:
             self._input_unknown = True
             self._output_unknown = True
@@ -515,6 +560,10 @@ class Transcript:
     def metrics_fact(self) -> tuple[int | None, bool, int | None, bool]:
         """底栏用计量事实: (输入累计, 输入含缺失, 输出累计, 输出含缺失)。"""
         return (self._input_total, self._input_unknown, self._output_total, self._output_unknown)
+
+    def cache_summary(self) -> str:
+        """仅本进程普通调用，跨模型累计；不导入恢复历史或摘要计量。"""
+        return self._cache_total.summary("缓存（本进程普通调用，跨模型累计）")
 
     # --- 渲染 ----------------------------------------------------------------------
 
