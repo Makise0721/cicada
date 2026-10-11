@@ -45,6 +45,8 @@ MD_CODE = "#8abeb7"
 MD_CODE_BLOCK = "#b5bd68"
 DIFF_ADDED = "#b5bd68"
 DIFF_REMOVED = "#cc6666"
+DIFF_ADDED_BG = "#1f2419"  # 与成功工具卡一致
+DIFF_REMOVED_BG = "#2b1c1c"  # 与失败工具卡一致
 
 # --- 工具卡 v2 (tui-aesthetics 规格 §B, 2026-10-07 起为本项目自有外观, 不再回引 dark.json) -----
 

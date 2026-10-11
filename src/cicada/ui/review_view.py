@@ -417,17 +417,33 @@ class ReviewView:
         self._selected = min(self._selected, max(0, len(nav)-1))
         selected = nav[self._selected] if nav else None
 
-        def add(text: str, action: DisplayAction | None = None) -> None:
+        pad = "  " if width >= 20 else ""
+        content_width = max(1, width - len(pad) * 2)
+
+        def add(text: str, action: DisplayAction | None = None, *,
+                color: str = theme.ASSISTANT_TEXT, bold: bool = False,
+                active: bool = False) -> None:
             if len(lines) >= rows:
                 return
-            text = truncate_to_width(sanitize_display(text).replace("\t", "    ").replace("\n", " "), width)
-            if action is not None:
-                if selected == action and current_style().plain:
-                    text = truncate_to_width("> " + text, width)
-                if selected == action:
-                    text = theme.bg_open(theme.MENU_SEL_BG) + text + current_style().sgr("0")
-                hits.append(HitSpan(len(lines), 0, visible_width(text), action))
-            lines.append(text)
+            text = sanitize_display(text).replace("\t", "    ").replace("\n", " ")
+            focused = action is not None and selected == action
+            highlighted = focused or active
+            text = truncate_to_width(("→ " if focused else "› " if active else "") + text, content_width)
+            used = len(pad) + visible_width(text)
+            if action is not None and text:
+                hits.append(HitSpan(len(lines), len(pad), width if highlighted else used, action))
+            # 背景行内只开样式，行尾一次复位；选中态与斜线菜单一致。
+            styled = theme.fg_open(theme.EDITOR_BORDER if focused else color)
+            if bold:
+                styled += current_style().sgr("1")
+            if highlighted:
+                styled = theme.bg_open(theme.MENU_SEL_BG) + styled
+            lines.append(styled + pad + text + (" " * (width - used) if highlighted else "")
+                         + current_style().sgr("0"))
+
+        def section(title: str) -> None:
+            add(title + " " + "─" * max(0, content_width - visible_width(title) - 1),
+                color=theme.EDITOR_BORDER, bold=True)
 
         # 顶部操作一行、极窄时缩短；刷新同时保留 R 键入口。
         labels = ("返回", "刷新") if width >= 12 else ("返", "刷")
@@ -435,20 +451,25 @@ class ReviewView:
         for operation, label in zip(("back", "refresh"), labels):
             start = visible_width(top)
             action = self._action(operation)
-            label = (">" if action == selected else " ") + label
+            label = ("→ " if action == selected else "  ") + label
             fragment = truncate_to_width(label, max(0, width-start))
             if fragment:
                 hits.append(HitSpan(0, start, start + visible_width(fragment), action))
-                top += fragment
+                if action == selected:
+                    top += (theme.bg_open(theme.MENU_SEL_BG) + theme.fg_open(theme.EDITOR_BORDER)
+                            + fragment + current_style().sgr("0"))
+                else:
+                    top += theme.fg(theme.MD_LINK, fragment)
             top += " "
         lines.append(truncate_to_width(top.rstrip(), width))
         if self.closing or snapshot is None:
-            add(self.message)
+            add(self.message, color=theme.MUTED_GRAY)
             self._visible_actions = tuple(h.action for h in hits)
             return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
         if pane in ("list", "file"):
-            if rows >= 12:
-                add("审阅 · " + snapshot.workspace_label)
+            if rows >= 12 and not (pane == "file" and compact):
+                section("改动审阅")
+                add(snapshot.workspace_label, color=theme.MUTED_GRAY)
             if pane == "file" and compact:
                 add("返回列表", self._action("list"))
             else:
@@ -458,9 +479,13 @@ class ReviewView:
                         continue
                     count = sum(i.group == group.group for i in snapshot.items)
                     state = str(count) if group.state == "complete" else group.reason or group.state
-                    marker = "> " if self.group == group.group else "  "
+                    marker = "› " if self.group == group.group else "  "
                     hint = " ←/→" if compact else ""
-                    add(marker + _LABELS[group.group] + "  " + state + hint, self._action("group", group.group))
+                    add(marker + _LABELS[group.group] + "  " + state + hint,
+                        self._action("group", group.group),
+                        color=theme.EDITOR_BORDER if self.group == group.group else theme.MUTED_GRAY)
+                if not compact:
+                    add("")
                 list_height = max(1, min(6, (rows - len(lines)) // 3))
                 selected_file = next((n for n, item in enumerate(files)
                                       if selected == self._action("file", item.item_id)), 0)
@@ -471,23 +496,28 @@ class ReviewView:
                     start = max(0, min(selected_file - list_height//2, len(files) - list_height))
                 self._list_top = start
                 for item in files[start:start+list_height]:
-                    add(f"{_STATUS[item.kind]} {item.relative_path}", self._action("file", item.item_id))
+                    color = (theme.DIFF_ADDED if item.kind == "added" else
+                             theme.DIFF_REMOVED if item.kind in ("deleted", "conflict") else theme.MD_LINK)
+                    add(f"{_STATUS[item.kind]}  {item.relative_path}",
+                        self._action("file", item.item_id), color=color, active=self.target == item.item_id)
                 if not files:
                     state = next(g for g in snapshot.groups if g.group == self.group)
                     add("该组无改动" if state.state == "complete" else "该组不可用，请查看原因")
-            if rows - len(lines) > 4:
-                add(snapshot.scope)
+            if rows - len(lines) > 4 and not (pane == "file" and compact):
+                add(snapshot.scope, color=theme.TOOL_HINT_FG)
                 # 三状态准确：未启用/本进程尚无记录只显示事实，有记录才可点击 (C8)。
                 if snapshot.checks_state == "not_enabled":
-                    add("检查：未启用")
+                    add("检查：未启用", color=theme.MUTED_GRAY)
                 elif snapshot.checks_state == "available" and snapshot.checks_target_id:
-                    add("检查记录 · 点击查看", self._action("checks", snapshot.checks_target_id))
+                    add("检查记录 · 点击查看", self._action("checks", snapshot.checks_target_id), color=theme.MD_LINK)
                 else:
-                    add("检查记录：本进程尚无检查记录")
+                    add("检查记录：本进程尚无检查记录", color=theme.MUTED_GRAY)
             if self.preview:
+                if rows - len(lines) > 6:
+                    add("")
                 self._layout_preview(add, width, rows, lines)
             else:
-                add(self.message)
+                add(self.message, color=theme.MUTED_GRAY)
         elif pane == "checks":
             self._layout_checks(add, width, rows, lines)
         elif pane == "artifact":
@@ -498,53 +528,72 @@ class ReviewView:
     def _layout_preview(self, add, width: int, rows: int, lines: list[str]) -> None:
         preview = self.preview
         if rows >= 5:
-            add(preview.title + " · " + preview.comparison)
+            add(preview.title + " · " + preview.comparison, color=theme.MD_LINK, bold=True)
         if rows >= 8:
-            add(preview.state + " · " + (preview.notice or ""))
+            add(preview.state + " · " + (preview.notice or ""), color=theme.MUTED_GRAY)
         if rows - len(lines) > 2:
-            add("正文观察 " + (preview.observed_at or "未知") + " · 长行按窗口截断")
+            add("正文观察 " + (preview.observed_at or "未知") + " · 长行按窗口截断", color=theme.TOOL_HINT_FG)
         height = rows - len(lines)
         body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
         for line in body_frame:
-            line = truncate_to_width(line.replace("\t", "    "), width)
-            color = (theme.DIFF_ADDED if line.startswith("+") else
-                     theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
-            lines.append(theme.fg(color, line))
+            lines.append(self._diff_line(line, width))
 
     def _layout_checks(self, add, width: int, rows: int, lines: list[str]) -> None:
         details = self.checks
-        add("检查记录")
+        add("检查记录 " + "─" * max(0, width - (4 if width >= 20 else 0) - 9),
+            color=theme.EDITOR_BORDER, bold=True)
         if details is None:
-            add(self.message)
+            add(self.message, color=theme.MUTED_GRAY)
             return
-        add("返回列表", self._action("list"))
+        add("返回列表", self._action("list"), color=theme.MD_LINK)
         if details.artifact_target_id:
             add("查看" + (details.artifact_label or "累计变更工件"),
-                self._action("artifact", details.artifact_target_id))
+                self._action("artifact", details.artifact_target_id), color=theme.MD_LINK)
+        if rows - len(lines) > 8:
+            add("")
         height = rows - len(lines)
         body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
         for line in body_frame:
-            lines.append(truncate_to_width(line.replace("\t", "    "), width))
+            add(line, color=theme.TOOL_OUTPUT_FG)
 
     def _layout_artifact(self, add, width: int, rows: int, lines: list[str]) -> None:
         preview = self.preview
         if preview is None:
-            add(self.message)
+            add(self.message, color=theme.MUTED_GRAY)
             return
         if rows >= 5:
-            add(preview.title + " · " + preview.comparison)
+            add(preview.title + " · " + preview.comparison, color=theme.MD_LINK, bold=True)
         if rows >= 8:
             add(preview.state + " · " + _INTEGRITY.get(preview.integrity, preview.integrity)
-                + " · " + (preview.notice or ""))
+                + " · " + (preview.notice or ""), color=theme.MUTED_GRAY)
         if rows - len(lines) > 2:
-            add("返回检查详情", self._action("back_checks"))
+            add("返回检查详情", self._action("back_checks"), color=theme.MD_LINK)
         height = rows - len(lines)
         body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
         for line in body_frame:
-            line = truncate_to_width(line.replace("\t", "    "), width)
-            color = (theme.DIFF_ADDED if line.startswith("+") else
-                     theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
-            lines.append(theme.fg(color, line))
+            lines.append(self._diff_line(line, width))
+
+    @staticmethod
+    def _diff_line(line: str, width: int) -> str:
+        """单栏差异：复用工具卡增删底色、菜单分块与主屏文本亮度。"""
+        pad = "  " if width >= 20 else ""
+        text = truncate_to_width(line.replace("\t", "    "), max(1, width - len(pad) * 2))
+        color, background = theme.ASSISTANT_TEXT, None
+        if line.startswith(("+++", "---")):
+            color = theme.MD_LINK
+        elif line.startswith("+"):
+            color, background = theme.DIFF_ADDED, theme.DIFF_ADDED_BG
+        elif line.startswith("-"):
+            color, background = theme.DIFF_REMOVED, theme.DIFF_REMOVED_BG
+        elif line.startswith("@@"):
+            color, background = theme.MD_LINK, theme.MENU_SEL_BG
+        elif line.startswith(("diff ", "index ", "\\")):
+            color = theme.MUTED_GRAY
+        styled = theme.fg_open(color)
+        if background:
+            styled = theme.bg_open(background) + styled
+        used = len(pad) + visible_width(text)
+        return styled + pad + text + (" " * (width - used) if background else "") + current_style().sgr("0")
 
     def _changed(self) -> None:
         if self._on_update:
