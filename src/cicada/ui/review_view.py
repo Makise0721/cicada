@@ -1,4 +1,8 @@
-"""独立审阅页：拥有串行读取与显示状态，由现有 frontend 唯一写屏。"""
+"""独立审阅页：拥有串行读取与显示状态，由现有 frontend 唯一写屏。
+
+窗格 list/file 沿 01；checks（检查记录详情）与 artifact（累计变更工件正文）
+沿同一 lease/target/有界读取路径（02, C8），不建立第二 renderer。
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from typing import Callable
 from prompt_toolkit.keys import Keys
 
 from cicada.application import ApplicationSession
-from cicada.review import ReviewError, ReviewPreview, ReviewSnapshot
+from cicada.review import ReviewCheckDetails, ReviewError, ReviewPreview, ReviewSnapshot
 from cicada.ui import theme
 from cicada.ui.document_layout import DisplayAction, DocumentLayout, DocumentViewport, HitSpan
 from cicada.ui.editor import Editor
@@ -20,6 +24,8 @@ ACTION_REVIEW = "review"
 _LABELS = {"unstaged": "未暂存", "staged": "已暂存", "untracked": "未跟踪"}
 _STATUS = {"added": "+", "modified": "M", "deleted": "-", "type_changed": "T",
            "conflict": "!", "metadata": "?"}
+_INTEGRITY = {"verified": "核验相符", "missing": "缺失", "mismatch": "与记录不符",
+              "unknown": "未能核验", "not_recorded": "未记录"}
 
 
 class ReviewView:
@@ -35,6 +41,7 @@ class ReviewView:
         self.closing = False
         self.snapshot: ReviewSnapshot | None = None
         self.preview: ReviewPreview | None = None
+        self.checks: ReviewCheckDetails | None = None
         self.group = "unstaged"
         self.target: str | None = None
         self.message = ""
@@ -43,7 +50,7 @@ class ReviewView:
         self._selected = 0
         self._actions: tuple[DisplayAction, ...] = ()
         self._visible_actions: tuple[DisplayAction, ...] = ()
-        self._body_mode = False
+        self._pane = "list"
         self._body_lines: tuple[str, ...] = ()
         self._body_layout: DocumentLayout | None = None
         self._list_top = 0
@@ -65,11 +72,12 @@ class ReviewView:
         self.generation += 1
         self.snapshot = None
         self.preview = None
+        self.checks = None
+        self._pane = "list"
         self._body_lines = ()
         self._body_layout = None
         self.message = "读取文件清单…"
         self._selected = 0
-        self._body_mode = False
         self._start(self._open(self.generation, consume_command=True))
         return True
 
@@ -101,6 +109,10 @@ class ReviewView:
                                and any(i.group == g.group for i in snapshot.items)), "unstaged")
             self.target = None
             self.preview = None
+            self.checks = None
+            self._pane = "list"
+            self._body_lines = ()
+            self._body_layout = None
             self.message = "选择文件查看差异"
             if consume_command:
                 self._editor.clear()
@@ -142,18 +154,25 @@ class ReviewView:
             self.active = False
         self._changed()
 
+    def _accept(self, generation: int, snapshot: ReviewSnapshot, target: str) -> bool:
+        """读取返回验收：页面 generation/目标身份与旧异步结果纪律沿 01 (C4)。"""
+        return (self.active and not self.closing and generation == self.generation
+                and self.snapshot is snapshot and self.target == target)
+
+    def _set_body(self, lines: list[str]) -> None:
+        self._body_lines = tuple(sanitize_display(line) for line in lines)
+        self._body_layout = DocumentLayout(self._body_lines, (), (None,) * len(self._body_lines))
+        self._viewport = DocumentViewport()
+        self._viewport.follow = False
+
     async def _read(self, generation: int, snapshot: ReviewSnapshot, target: str) -> None:
         self._started = True
         try:
             preview = await self._session.read_review(snapshot.review_id, target)
-            if (self.active and not self.closing and generation == self.generation
-                    and self.snapshot is snapshot and self.target == target):
+            if self._accept(generation, snapshot, target):
                 self.preview = preview
                 # 一次净化，逻辑行只在可见窗口按宽度截断，不每帧全量 wrap。
-                self._body_lines = tuple(sanitize_display(preview.text).splitlines())
-                self._body_layout = DocumentLayout(self._body_lines, (), (None,) * len(self._body_lines))
-                self._viewport = DocumentViewport()
-                self._viewport.follow = False
+                self._set_body(preview.text.splitlines())
                 self.message = ""
         except ReviewError as exc:
             if not self.closing:
@@ -166,6 +185,74 @@ class ReviewView:
                 self.message = "文件读取失败，请刷新"
         finally:
             self._changed()
+
+    async def _read_checks(self, generation: int, snapshot: ReviewSnapshot, target: str) -> None:
+        self._started = True
+        try:
+            details = await self._session.read_review(snapshot.review_id, target)
+            if self._accept(generation, snapshot, target):
+                self.checks = details
+                self._set_body(self._checks_lines(details))
+                self.message = ""
+        except ReviewError as exc:
+            if not self.closing:
+                self.message = str(exc)
+        except asyncio.CancelledError:
+            self._session.cancel_review()
+            raise
+        except Exception:
+            if not self.closing:
+                self.message = "检查详情读取失败，请重试"
+        finally:
+            self._changed()
+
+    async def _read_artifact(self, generation: int, snapshot: ReviewSnapshot, target: str) -> None:
+        self._started = True
+        try:
+            preview = await self._session.read_review(snapshot.review_id, target)
+            if self._accept(generation, snapshot, target):
+                self.preview = preview
+                self._set_body(preview.text.splitlines())
+                self.message = ""
+        except ReviewError as exc:
+            if not self.closing:
+                self.message = str(exc)
+        except asyncio.CancelledError:
+            self._session.cancel_review()
+            raise
+        except Exception:
+            if not self.closing:
+                self.message = "工件读取失败，请重试"
+        finally:
+            self._changed()
+
+    def _checks_lines(self, details: ReviewCheckDetails) -> list[str]:
+        """详情行：历史执行、freshness、工件完整性与阻断原因分别呈现。"""
+        lines = [
+            f"验证 run {details.verification_run_id}",
+            "当前快照 " + (details.snapshot_ref or "不可用 · freshness 只能是 unknown")
+            + " · scope " + (details.scope_id or "未知"),
+            "process_uncertain：" + ("是（锁存未解除）" if details.process_uncertain else "否"),
+        ]
+        for row in details.rows:
+            execution = row.execution_status or "尚未运行"
+            verdict = row.verification_status or "尚未运行"
+            lines.append(
+                f"{row.check_id} · 执行 {execution} · 判定 {verdict} · freshness {row.freshness}"
+                f" · 工件 {_INTEGRITY.get(row.artifact_integrity, row.artifact_integrity)}")
+            lines.append("  命令 " + row.command)
+            if row.receipt_id:
+                lines.append("  回执 " + row.receipt_id)
+            if row.reason:
+                lines.append("  " + row.reason)
+        if not details.rows:
+            lines.append("计划内没有检查定义")
+        if details.blocking_reasons:
+            lines.append("阻断原因：")
+            lines.extend("  " + reason for reason in details.blocking_reasons)
+        lines.append("检查范围与上方 Git 审阅范围（排除/忽略）可能不同")
+        lines.append("详情为进入页面时读取；返回清单重新进入可刷新")
+        return lines
 
     def _action(self, operation: str, target: str = "") -> DisplayAction:
         identity = self.snapshot.review_id if self.snapshot is not None else str(self.generation)
@@ -186,30 +273,56 @@ class ReviewView:
         if operation == "refresh":
             self.message = "刷新文件清单…"
             self.preview = None
+            self.checks = None
+            self._pane = "list"
             self._body_lines = ()
             self._body_layout = None
-            self._body_mode = False
             self._start(self._open(self.generation))
         elif operation == "group" and target in _LABELS:
             self.group = target
             self.target = None
             self.preview = None
+            self._pane = "list"
             self._body_lines = ()
             self._body_layout = None
-            self._body_mode = False
             self.message = "选择文件查看差异"
             self._selected = 0
         elif operation == "list":
-            self._body_mode = False
+            if self._pane in ("checks", "artifact"):
+                self.preview = None  # 离开检查/工件窗格不携带旧正文
+            self._pane = "list"
+        elif operation == "back_checks" and self.checks is not None:
+            self._pane = "checks"
+        elif operation == "checks" and self.snapshot is not None:
+            if target != self.snapshot.checks_target_id:
+                return False
+            self.target = target
+            self.preview = None
+            self.checks = None
+            self._pane = "checks"
+            self._body_lines = ()
+            self._body_layout = None
+            self.message = "读取检查记录…"
+            self._start(self._read_checks(self.generation, self.snapshot, target))
+        elif operation == "artifact" and self.snapshot is not None and self.checks is not None:
+            if target != self.checks.artifact_target_id:
+                return False
+            self.target = target
+            self.preview = None
+            self._pane = "artifact"
+            self._body_lines = ()
+            self._body_layout = None
+            self.message = "读取累计变更工件…"
+            self._start(self._read_artifact(self.generation, self.snapshot, target))
         elif operation == "file" and self.snapshot is not None:
             if not any(i.item_id == target and i.group == self.group for i in self.snapshot.items):
                 return False
             self.target = target
             self.preview = None
+            self._pane = "file"
             self._body_lines = ()
             self._body_layout = None
             self.message = "读取文件…"
-            self._body_mode = True
             self._start(self._read(self.generation, self.snapshot, target))
         else:
             return False
@@ -240,17 +353,17 @@ class ReviewView:
                     self.execute(action)
         elif key.key in (Keys.PageUp, Keys.PageDown):
             direction = -1 if key.key is Keys.PageUp else 1
-            if self.preview is None and self.snapshot is not None:
+            if self._pane == "list" and self.snapshot is not None:
                 self._scroll_list(direction * self._list_height)
             else:
                 self._viewport.page(direction)
         elif key.key is Keys.Home:
-            if self.preview is None:
+            if self._pane == "list":
                 self._scroll_list(-self._list_top)
             else:
                 self._viewport.go_home()
         elif key.key is Keys.End:
-            if self.preview is None and self.snapshot is not None:
+            if self._pane == "list" and self.snapshot is not None:
                 self._scroll_list(len(self.snapshot.items))
             else:
                 self._viewport.go_end()
@@ -258,7 +371,7 @@ class ReviewView:
 
     def wheel(self, notches: int) -> None:
         if not self.closing:
-            if self.preview is None and self.snapshot is not None:
+            if self._pane == "list" and self.snapshot is not None:
                 self._scroll_list(-notches * 3)
             else:
                 self._viewport.wheel_scroll(notches)
@@ -273,16 +386,29 @@ class ReviewView:
         width, rows = max(1, width), max(1, rows)
         lines: list[str] = []
         hits: list[HitSpan] = []
-        files = tuple(i for i in self.snapshot.items if i.group == self.group) if self.snapshot else ()
-        compact_body = self._body_mode and (width < 60 or rows < 14)
-        compact_list = width < 60 or rows < 14
+        snapshot = self.snapshot
+        files = tuple(i for i in snapshot.items if i.group == self.group) if snapshot else ()
+        compact = width < 60 or rows < 14
+        pane = self._pane
         previous = (self._actions[min(self._selected, len(self._actions)-1)] if self._actions else None)
         nav = [self._action("back"), self._action("refresh")]
-        if compact_body:
+        if pane in ("list", "file") and snapshot is not None:
+            if pane == "file" and compact:
+                nav.append(self._action("list"))
+            else:
+                if snapshot.checks_state == "available" and snapshot.checks_target_id:
+                    nav.append(self._action("checks", snapshot.checks_target_id))
+                if compact:
+                    nav.append(self._action("group", self.group))
+                else:
+                    nav.extend(self._action("group", group) for group in _LABELS)
+                nav.extend(self._action("file", item.item_id) for item in files)
+        elif pane == "checks" and self.checks is not None:
             nav.append(self._action("list"))
-        elif self.snapshot:
-            nav.extend(self._action("group", group) for group in (_LABELS if not compact_list else (self.group,)))
-            nav.extend(self._action("file", item.item_id) for item in files)
+            if self.checks.artifact_target_id:
+                nav.append(self._action("artifact", self.checks.artifact_target_id))
+        elif pane == "artifact" and self.preview is not None:
+            nav.append(self._action("back_checks"))
         if previous in nav:
             self._selected = nav.index(previous)
         self._actions = tuple(nav)
@@ -314,60 +440,109 @@ class ReviewView:
                 top += fragment
             top += " "
         lines.append(truncate_to_width(top.rstrip(), width))
-        if self.closing or self.snapshot is None:
+        if self.closing or snapshot is None:
             add(self.message)
             self._visible_actions = tuple(h.action for h in hits)
             return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
-        if rows >= 12:
-            add("审阅 · " + self.snapshot.workspace_label)
-        if compact_body:
-            add("返回列表", self._action("list"))
-        else:
-            # 每组有独立状态；未知不填零，不用一组空值推断整个工作区无改动。
-            for group in self.snapshot.groups:
-                if compact_list and group.group != self.group:
-                    continue
-                count = sum(i.group == group.group for i in self.snapshot.items)
-                state = str(count) if group.state == "complete" else group.reason or group.state
-                marker = "> " if self.group == group.group else "  "
-                hint = " ←/→" if compact_list else ""
-                add(marker + _LABELS[group.group] + "  " + state + hint, self._action("group", group.group))
-            list_height = max(1, min(6, (rows - len(lines)) // 3))
-            selected_file = next((n for n, item in enumerate(files)
-                                  if selected == self._action("file", item.item_id)), 0)
-            self._list_height = list_height
-            if self._list_scroll_dirty:
-                start = max(0, min(self._list_top, len(files) - list_height))
+        if pane in ("list", "file"):
+            if rows >= 12:
+                add("审阅 · " + snapshot.workspace_label)
+            if pane == "file" and compact:
+                add("返回列表", self._action("list"))
             else:
-                start = max(0, min(selected_file - list_height//2, len(files) - list_height))
-            self._list_top = start
-            for item in files[start:start+list_height]:
-                add(f"{_STATUS[item.kind]} {item.relative_path}", self._action("file", item.item_id))
-            if not files:
-                state = next(g for g in self.snapshot.groups if g.group == self.group)
-                add("该组无改动" if state.state == "complete" else "该组不可用，请查看原因")
-        if rows - len(lines) > 4:
-            add(self.snapshot.scope)
-            add("检查：未启用" if self.snapshot.checks_state == "not_enabled" else "检查记录：尚未提供详情")
-        if self.preview:
-            preview = self.preview
-            if rows >= 5:
-                add(preview.title + " · " + preview.comparison)
-            if rows >= 8:
-                add(preview.state + " · " + (preview.notice or ""))
-            if rows - len(lines) > 2:
-                add("正文观察 " + (preview.observed_at or "未知") + " · 长行按窗口截断")
-            height = rows - len(lines)
-            body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
-            for line in body_frame:
-                line = truncate_to_width(line.replace("\t", "    "), width)
-                color = (theme.DIFF_ADDED if line.startswith("+") else
-                         theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
-                lines.append(theme.fg(color, line))
-        else:
-            add(self.message)
+                # 每组有独立状态；未知不填零，不用一组空值推断整个工作区无改动。
+                for group in snapshot.groups:
+                    if compact and group.group != self.group:
+                        continue
+                    count = sum(i.group == group.group for i in snapshot.items)
+                    state = str(count) if group.state == "complete" else group.reason or group.state
+                    marker = "> " if self.group == group.group else "  "
+                    hint = " ←/→" if compact else ""
+                    add(marker + _LABELS[group.group] + "  " + state + hint, self._action("group", group.group))
+                list_height = max(1, min(6, (rows - len(lines)) // 3))
+                selected_file = next((n for n, item in enumerate(files)
+                                      if selected == self._action("file", item.item_id)), 0)
+                self._list_height = list_height
+                if self._list_scroll_dirty:
+                    start = max(0, min(self._list_top, len(files) - list_height))
+                else:
+                    start = max(0, min(selected_file - list_height//2, len(files) - list_height))
+                self._list_top = start
+                for item in files[start:start+list_height]:
+                    add(f"{_STATUS[item.kind]} {item.relative_path}", self._action("file", item.item_id))
+                if not files:
+                    state = next(g for g in snapshot.groups if g.group == self.group)
+                    add("该组无改动" if state.state == "complete" else "该组不可用，请查看原因")
+            if rows - len(lines) > 4:
+                add(snapshot.scope)
+                # 三状态准确：未启用/本进程尚无记录只显示事实，有记录才可点击 (C8)。
+                if snapshot.checks_state == "not_enabled":
+                    add("检查：未启用")
+                elif snapshot.checks_state == "available" and snapshot.checks_target_id:
+                    add("检查记录 · 点击查看", self._action("checks", snapshot.checks_target_id))
+                else:
+                    add("检查记录：本进程尚无检查记录")
+            if self.preview:
+                self._layout_preview(add, width, rows, lines)
+            else:
+                add(self.message)
+        elif pane == "checks":
+            self._layout_checks(add, width, rows, lines)
+        elif pane == "artifact":
+            self._layout_artifact(add, width, rows, lines)
         self._visible_actions = tuple(h.action for h in hits)
         return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
+
+    def _layout_preview(self, add, width: int, rows: int, lines: list[str]) -> None:
+        preview = self.preview
+        if rows >= 5:
+            add(preview.title + " · " + preview.comparison)
+        if rows >= 8:
+            add(preview.state + " · " + (preview.notice or ""))
+        if rows - len(lines) > 2:
+            add("正文观察 " + (preview.observed_at or "未知") + " · 长行按窗口截断")
+        height = rows - len(lines)
+        body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
+        for line in body_frame:
+            line = truncate_to_width(line.replace("\t", "    "), width)
+            color = (theme.DIFF_ADDED if line.startswith("+") else
+                     theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
+            lines.append(theme.fg(color, line))
+
+    def _layout_checks(self, add, width: int, rows: int, lines: list[str]) -> None:
+        details = self.checks
+        add("检查记录")
+        if details is None:
+            add(self.message)
+            return
+        add("返回列表", self._action("list"))
+        if details.artifact_target_id:
+            add("查看" + (details.artifact_label or "累计变更工件"),
+                self._action("artifact", details.artifact_target_id))
+        height = rows - len(lines)
+        body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
+        for line in body_frame:
+            lines.append(truncate_to_width(line.replace("\t", "    "), width))
+
+    def _layout_artifact(self, add, width: int, rows: int, lines: list[str]) -> None:
+        preview = self.preview
+        if preview is None:
+            add(self.message)
+            return
+        if rows >= 5:
+            add(preview.title + " · " + preview.comparison)
+        if rows >= 8:
+            add(preview.state + " · " + _INTEGRITY.get(preview.integrity, preview.integrity)
+                + " · " + (preview.notice or ""))
+        if rows - len(lines) > 2:
+            add("返回检查详情", self._action("back_checks"))
+        height = rows - len(lines)
+        body_frame = self._viewport.frame(self._body_layout or DocumentLayout((), (), ()), height)
+        for line in body_frame:
+            line = truncate_to_width(line.replace("\t", "    "), width)
+            color = (theme.DIFF_ADDED if line.startswith("+") else
+                     theme.DIFF_REMOVED if line.startswith("-") else theme.MUTED_GRAY)
+            lines.append(theme.fg(color, line))
 
     def _changed(self) -> None:
         if self._on_update:
