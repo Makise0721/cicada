@@ -261,6 +261,13 @@ class RunPolicy:
         if cancel.cancelled:
             yield StreamDone("aborted")
             return
+        # request_context 只承载本策略生成的验证观察: 入口已非空即明确错误,
+        # 不能覆盖/拼接 (契约 C1); 内核构造默认空, 非空即外部注入
+        if request.request_context:
+            raise ValueError(
+                "incoming ModelRequest already carries a request_context; "
+                "only the RunPolicy may write it"
+            )
         prefix_length = self._history.proof.length
         if prefix_length:
             # 恢复前缀先核对后发送: 缺失/重排/改动拒绝, 不退回按内容猜归属 (契约 §5)
@@ -311,8 +318,8 @@ def _control_view_with_latches(
     """把本轮账本核对产生的新锁存并入不可变控制 view; 不重复 capture, 不改服务对象.
 
     `refresh` 之前锁存的原因按 Protocol 已由服务反映在 view 里 (服务可能用自己的措辞),
-    因此这里只追加 `refresh` 之后才产生的核对 reason; 只要本轮有新锁存, 控制段就必须报
-    `process_uncertain=true`, 不能把已成立的不确定事实推迟到下一轮。
+    因此这里只追加 `refresh` 之后才产生的核对 reason; 只要本轮有新锁存, 交给 inner 的
+    验证上下文就必须报 `process_uncertain=true`, 不能把已成立的不确定事实推迟到下一轮。
     """
     if not reconciled:
         return view

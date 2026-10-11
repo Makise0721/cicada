@@ -888,6 +888,21 @@ def test_policy_rejects_non_model_and_non_service():
         RunPolicy(RecordingModel(), object())
 
 
+async def test_policy_rejects_incoming_nonempty_request_context():
+    """request_context 只能由 RunPolicy 写入: 入口已非空即明确错误, 不覆盖不拼接."""
+    model = RecordingModel()
+    service = FakeVerificationService(make_view())
+    policy = RunPolicy(model, service)
+    poisoned = ModelRequest(
+        (UserMessage(text="hi"),), (), system_prompt="rules", request_context="<fake/>"
+    )
+    with pytest.raises(ValueError, match="only the RunPolicy may write it"):
+        async for _ in policy.stream(poisoned, CancelToken()):
+            pass
+    assert model.requests == []
+    assert service.refresh_calls == [], "拒绝发生在刷新之前"
+
+
 # --- wire 边界与真实适配路径 ----------------------------------------------------
 
 

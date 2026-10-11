@@ -2671,7 +2671,7 @@ async def open_application(
 
     def _make_budget_policy(model, binding=None):
         # D1 次序: BudgetPolicy 在 RunPolicy 下游、适配器上游;
-        # 计量因此覆盖验证投影 (控制段/freshness 标记) 的最终形态
+        # 计量因此覆盖验证投影 (固定规则 system 与 request_context 尾部) 的最终形态
         budget = BudgetPolicy(
             model,
             budget_config,
