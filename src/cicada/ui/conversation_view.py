@@ -50,8 +50,8 @@
 - tui-compact-interaction 票据 03 (契约 C5/C6): Shift+Tab 与点击底栏徽标
   共用 handle_shift_tab 同步准入入口——屏障内静默, 阻断态短路, 目标只由
   UI 计算 (关闭→第一档/循环/同值 no-op), 受理同步置 model 屏障后建任务;
-  ReasoningEffortChanged 只清 pending (04 用户裁决: 切换不发确认条目, 底栏
-  徽标即生效值), 失败有界成条; 底栏徽标事实经
+  ReasoningEffortChanged 只清 pending (04 用户裁决: 切换不发确认条目、
+  期间无状态行, 底栏徽标即生效值), 失败有界成条; 底栏徽标事实经
   FooterComponent effort 回调读取 session.reasoning_effort, 事务目标只作
   pending 展示, 不伪造已生效。
 """
@@ -499,7 +499,7 @@ class ConversationView:
         if self._gate.compacting:
             return "正在压缩…"
         if self._effort_pending is not None and self._gate.model_selecting:
-            return "正在切换思考强度…"  # 票据 03: 真实忙碌状态, 不提前宣称新值已生效
+            return None  # 04 用户裁决: 切换期间不显示状态行 (出现/消失引起版面跳动), 反馈由底栏徽标承担
         if self._gate.model_selecting:
             return "正在切换模型…"
         if self._session.state == "cancelling":
