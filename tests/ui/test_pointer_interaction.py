@@ -181,6 +181,43 @@ async def test_move_drag_and_cancel_clear_pending():
 
 
 @pytest.mark.asyncio
+async def test_wheel_clears_pending_click_pairing():
+    """按下与释放之间滚轮清除配对并失效命中行: 释放不执行动作 (C4)."""
+    h = PointerHarness()
+    try:
+        await h.start()
+        geo = h.geo()
+        h.terminal.emit([
+            PointerEvent("down", 1, 0, geo, button="left"),
+            PointerEvent("wheel", 1, 1, geo, wheel_delta=120),
+            PointerEvent("up", 1, 0, geo),
+        ])
+        await h.settle()
+        assert h.executed == []
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+async def test_new_frame_revalidates_pending_click_target():
+    """流式帧更新后释放: 目标身份已变时不执行旧动作 (C4 同区域同身份才配对)."""
+    h = PointerHarness()
+    try:
+        await h.start()
+        geo = h.geo()
+        h.terminal.emit([PointerEvent("down", 1, 0, geo, button="left")])
+        # 帧更新: 第 0 行从组标题变为另一工具标题 (同坐标不同身份)
+        h.lines = (TITLE_B, BODY, TITLE_A)
+        h.frontend.request_render_now()
+        await h.settle()
+        h.terminal.emit([PointerEvent("up", 1, 0, geo)])
+        await h.settle()
+        assert h.executed == []
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
 async def test_double_click_second_press_and_modifiers_consumed():
     """原生双击第二按不误触展开后的另一行; 修饰符点击归宿主选择 (C4)。"""
     h = PointerHarness()
@@ -286,14 +323,14 @@ async def test_resize_keeps_reading_position_and_rearms_hits():
     h = PointerHarness(long_doc=True)
     try:
         await h.start()
-        h.wheel(-120)
+        h.wheel(120)
         await h.settle()
         assert "历史第28行" in h.vt.line_text(0)
         h.set_size(60, 14)
         await h.settle()
         assert "历史第28行" in h.vt.line_text(0)  # 阅读位置保持
         assert h.frontend._frame_hits is not None  # 新帧命中图已重新提升
-        h.wheel(-120)
+        h.wheel(120)
         await h.settle()
         assert "历史第25行" in h.vt.line_text(0)  # 滚动继续可用
     finally:
@@ -307,7 +344,7 @@ async def test_wheel_review_anchor_and_latest_indicator():
     try:
         await h.start()
         assert h.vt.find_row("历史第40行") is not None  # 默认跟随尾部
-        h.wheel(-120)  # 上滚一个 notch = 3 行 (窗口 10 行: 顶部第31行 -> 第28行)
+        h.wheel(120)  # 滚轮向前 (上滚) 一个 notch = 3 行 (窗口 10 行: 顶部第31行 -> 第28行)
         await h.settle()
         anchor_text = h.vt.line_text(0)
         assert "历史第28行" in anchor_text
@@ -323,7 +360,7 @@ async def test_wheel_review_anchor_and_latest_indicator():
         screen = "\n".join(h.vt.screen_text())
         assert "历史第42行" in screen
         assert h.vt.find_row("有更新 · 最新") is None  # 跟随后指示行消失
-        h.wheel(120)  # 到底后下滚: clamp 且恢复跟随
+        h.wheel(-120)  # 到底后下滚: clamp 且恢复跟随
         await h.settle()
         assert "历史第42行" in "\n".join(h.vt.screen_text())
     finally:
@@ -336,12 +373,12 @@ async def test_wheel_accumulates_small_deltas():
     h = PointerHarness(long_doc=True)
     try:
         await h.start()
-        h.wheel(-30)
-        h.wheel(-30)
+        h.wheel(30)
+        h.wheel(30)
         await h.settle()
         assert "历史第40行" in "\n".join(h.vt.screen_text())  # 60 尚不足一格
-        h.wheel(-30)
-        h.wheel(-30)
+        h.wheel(30)
+        h.wheel(30)
         await h.settle()
         anchor_text = h.vt.line_text(0)
         assert "历史第28行" in anchor_text  # 累积满 120 → 恰好一格

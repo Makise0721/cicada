@@ -218,9 +218,11 @@ class MainScreenFrontend:
         lines.extend(menu)
         footer_base = len(lines)
         lines.extend(footer)
-        if footer and self._footer_badge_spans is not None:
+        if footer and self._viewport is not None and self._footer_badge_spans is not None:
             # 票据 03 (C6): 本次成功呈现的底栏徽标列区间并入同一帧命中图;
-            # FooterComponent 已按"右段完整保留"过滤, 被裁掉的徽标无 span
+            # FooterComponent 已按"右段完整保留"过滤, 被裁掉的徽标无 span。
+            # 无自有视口的旧回放路径不注册: 帧可超 rows 且无 viewport_top
+            # 补偿, 行号会错位 (02 回执: 旧回放路径 pointer 安全消费)
             badge_action = DisplayAction(ACTION_EFFORT_CYCLE, (TARGET_EFFORT,))
             hits = list(self._pending_frame_hits or ())
             hits.extend(

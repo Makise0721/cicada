@@ -635,7 +635,8 @@ class ConversationView:
                 self._effort_task = asyncio.get_running_loop().create_task(
                     self._run_effort_cycle(target)
                 )
-            elif not state.enabled:
+            elif not state.enabled or target is None:
+                # 关闭或 enabled 但 levels 为空 (第三方 provider 边界): 一次短提示, 原值不动
                 self.transcript.append_system("当前模型不支持思考强度切换。")
         if self._on_update is not None:
             self._on_update()
@@ -707,6 +708,7 @@ class ConversationView:
                 ]),
                 ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
                 ("快捷键", [
+                    "点击工具/思考/Skill 标题逐层展开；滚轮回看，点「最新」返回",
                     "Ctrl+T 思考展开/收起 · Ctrl+O 工具/Skill 文档展开/收起",
                     "Shift+Tab 或点击底栏思考标记：循环 low/high/max（关闭时先启用 low）",
                     "F6 文档回看：Up/Down 选择 · Enter 展开/分页 · Esc 返回"

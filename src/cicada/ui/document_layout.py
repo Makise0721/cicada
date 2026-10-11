@@ -265,9 +265,11 @@ class DocumentViewport:
         """滚轮 (02, C3): 每 notch 移动 WHEEL_LINES_PER_NOTCH 物理行。
 
         notches 正 = 向文档头回看, 负 = 向尾部; 到达底部自动恢复跟随。
+        scroll_top 随文档行号增长, 回看 = 向头部减小偏移 (Win32 滚轮向前
+        为正 delta, 与 PointerEvent「正 = 向上」契约一致)。
         """
         if notches:
-            self._scroll_by(notches * WHEEL_LINES_PER_NOTCH)
+            self._scroll_by(-notches * WHEEL_LINES_PER_NOTCH)
 
     def frame_hits(self, width: int) -> tuple[HitSpan, ...]:
         """最近一次 frame() 呈现窗口的帧行命中 (02, D5 同源)。

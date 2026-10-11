@@ -144,10 +144,6 @@ if sys.platform == "win32":
     _RIGHT_CTRL_PRESSED = 0x0004
     _LEFT_ALT_PRESSED = 0x0002
     _RIGHT_ALT_PRESSED = 0x0001
-    _MODIFIER_MASK = (
-        _SHIFT_PRESSED | _LEFT_CTRL_PRESSED | _RIGHT_CTRL_PRESSED
-        | _LEFT_ALT_PRESSED | _RIGHT_ALT_PRESSED
-    )
 
     # ButtonState 按钮 位 (非滚轮记录)
     _BUTTON_LEFT = 0x0001
