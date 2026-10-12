@@ -133,6 +133,9 @@ from cicada.ui.display_style import DisplayStyle
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 SPINNER_INTERVAL_S = 0.1
 
+# 03 (契约 C7): 分词观察行的固定前缀; 状态页超限时按此后置优先级省略整行。
+TOKEN_OBSERVATION_PREFIXES = ("本地计数:", "同请求偏差:")
+
 
 class ConversationView:
     """ApplicationSession 与显示文档/输入回调之间的唯一组合层。"""
@@ -1012,6 +1015,7 @@ class ConversationView:
                 self.transcript.metrics_summary(),
                 self.transcript.cache_summary(),
                 self._observation_line(),
+                *self._token_observation_lines(),
             ]),
             ("检查", self._checks.status_lines()),
             ("配置", [*diagnostics, *self._session.login_status]),
@@ -1020,30 +1024,45 @@ class ConversationView:
         clipped_sections = [
             (heading, [clip_status_field(row) for row in rows]) for heading, rows in sections
         ]
-        # 新缓存/发送诊断行不挤掉原有检查/阻断事实。超限先省略这些行，再沿用原裁剪。
+        # 新缓存/发送诊断/分词观察行不挤掉原有检查/阻断事实。超限先省略缓存与发送诊断行,
+        # 仍超限再省略分词观察行, 最后沿用原裁剪。
         cache_omitted = False
         observation_omitted = False
-        fields = [row for _, rows in clipped_sections for row in rows]
-        if len(fields) > STATUS_MAX_LINES or len("\n".join(fields).encode("utf-8")) > STATUS_MAX_BYTES:
-            limited: list[tuple[str, list[str]]] = []
-            for heading, rows in clipped_sections:
-                kept: list[str] = []
-                for row in rows:
-                    if heading == "计量" and row.startswith("缓存（"):
-                        cache_omitted = True
-                    elif heading == "计量" and row.startswith("发送诊断:"):
-                        observation_omitted = True
-                    elif heading == "摘要" and row.startswith("已提交摘要缓存:"):
-                        cache_omitted = True
-                    else:
-                        kept.append(row)
-                limited.append((heading, kept))
-            clipped_sections = limited
+        token_omitted = False
+
+        def over_limit(sections: list[tuple[str, list[str]]]) -> bool:
+            fields = [row for _, rows in sections for row in rows]
+            return (
+                len(fields) > STATUS_MAX_LINES
+                or len("\n".join(fields).encode("utf-8")) > STATUS_MAX_BYTES
+            )
+
+        def without(sections: list[tuple[str, list[str]]], predicate) -> list[tuple[str, list[str]]]:
+            return [
+                (heading, [row for row in rows if not predicate(heading, row)])
+                for heading, rows in sections
+            ]
+
+        def present(sections: list[tuple[str, list[str]]], predicate) -> bool:
+            return any(predicate(heading, row) for heading, rows in sections for row in rows)
+
+        if over_limit(clipped_sections):
+            cache_omitted = present(clipped_sections, self._is_cache_row)
+            observation_omitted = present(clipped_sections, self._is_observation_row)
+            clipped_sections = without(
+                clipped_sections,
+                lambda heading, row: self._is_cache_row(heading, row)
+                or self._is_observation_row(heading, row),
+            )
+            if over_limit(clipped_sections):
+                token_omitted = present(clipped_sections, self._is_token_row)
+                clipped_sections = without(clipped_sections, self._is_token_row)
         fields = [row for _, rows in clipped_sections for row in rows]
         total = "\n".join(fields)
         omitted = "/".join(
             name for flag, name in (
                 (cache_omitted, "缓存计量"), (observation_omitted, "发送诊断"),
+                (token_omitted, "分词观察"),
             ) if flag
         )
         if len(fields) <= STATUS_MAX_LINES and len(total.encode("utf-8")) <= STATUS_MAX_BYTES:
@@ -1091,6 +1110,59 @@ class ConversationView:
         if observation.preserved_messages is not None:
             parts.append(f"保留前导消息 {observation.preserved_messages} 条")
         return f"发送诊断: {' · '.join(parts)}（本地对比，非服务端命中）"
+
+    def _token_observation_lines(self) -> list[str]:
+        """03 (契约 C7): 最近正式普通调用的本地计数与同请求偏差观察 (至多两条)。
+
+        只读 session.budget 已发布快照, 不加载资源、不重复计数: 无预算/无报告/未
+        配置本地计数时不出行; 本地不可用时只报安全原因; profile 为固定公开参考,
+        线上一致性未验证, 短显示身份可回溯完整 manifest。
+        """
+        snapshot = self._session.budget
+        if snapshot is None or snapshot.report is None:
+            return []
+        local = snapshot.report.local_count
+        if local is None:
+            return []
+        if local.tokens is None:
+            return [f"本地计数: 不可用（{local.reason}）"]
+        lines = [
+            f"本地计数: {local.tokens} tokens · {self._short_profile(local.profile)}"
+            "（固定公开参考，线上一致性未验证）"
+        ]
+        comparison = snapshot.comparison
+        if comparison is None:
+            return lines
+        actual = comparison.input_tokens
+        if actual is None:
+            lines.append("同请求偏差: 实际输入不可得（本地计数偏高与否未知）")
+        else:
+            deviation = comparison.local_count.tokens - actual
+            lines.append(
+                f"同请求偏差: 实际输入 {actual} · 本地 − 实际 = {deviation:+d}（正=本地偏高）"
+            )
+        return lines
+
+    @staticmethod
+    def _short_profile(profile: str) -> str:
+        """短显示身份 (03): profile 名 + manifest hash 前 8 位, 可回溯完整 manifest。"""
+        name, separator, digest = profile.partition(":manifest-sha256:")
+        return f"{name} · manifest {digest[:8]}…" if separator else profile
+
+    @staticmethod
+    def _is_cache_row(heading: str, row: str) -> bool:
+        """可先省略的缓存观察行: 计量段缓存行与摘要段已提交摘要缓存行。"""
+        return (heading == "计量" and row.startswith("缓存（")) or (
+            heading == "摘要" and row.startswith("已提交摘要缓存:")
+        )
+
+    @staticmethod
+    def _is_observation_row(heading: str, row: str) -> bool:
+        return heading == "计量" and row.startswith("发送诊断:")
+
+    @staticmethod
+    def _is_token_row(heading: str, row: str) -> bool:
+        return heading == "计量" and row.startswith(TOKEN_OBSERVATION_PREFIXES)
 
     # --- 预算与摘要段 (04, A12) ------------------------------------------------------
 
@@ -1161,7 +1233,7 @@ class ConversationView:
             deviation = anchor.estimated_input_tokens - anchor.measured_input_tokens
             lines.append(
                 f"校准偏差: 估计 {anchor.estimated_input_tokens} − "
-                f"实测 {anchor.measured_input_tokens} = {deviation:+d}（正=启发式偏高）"
+                f"实测 {anchor.measured_input_tokens} = {deviation:+d}（正=估计偏高）"
             )
         return lines
 

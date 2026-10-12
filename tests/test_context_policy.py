@@ -340,6 +340,114 @@ async def test_snapshot_before_any_stream_has_no_report():
     snapshot = policy.snapshot()
     assert snapshot.report is None
     assert snapshot.anchor is None
+    assert snapshot.comparison is None
+
+
+# --- 同请求计数对照 (票据 03, 契约 C7) --------------------------------------------------
+
+
+class _LocalCounter:
+    """可改写的本地计数替身: 每次调用返回最新结果。"""
+
+    def __init__(self, result):
+        self.result = result
+
+    def count_request(self, request):
+        return self.result
+
+
+async def test_comparison_pairs_local_count_with_same_dispatch_usage():
+    from cicada.budget import LocalTokenCount, TokenCountComparison
+
+    counter = _LocalCounter(LocalTokenCount(20, "test-profile"))
+    inner = FakeModel([
+        [_stop(_measured(100))],                                  # 同请求 usage 可得
+        [_stop()],                                                # usage 缺失
+        [_stop(ModelMetrics(input_tokens=0, output_tokens=1))],   # 已报告的 0 保留
+        [_stop(_measured(100))],                                  # 本地不可用那一轮
+    ])
+    policy = BudgetPolicy(inner, _config(), token_counter=counter)
+
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison == TokenCountComparison(
+        LocalTokenCount(20, "test-profile"), 100
+    )
+
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison.input_tokens is None, "缺 usage 保持不可得而非 0"
+
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison.input_tokens == 0, "0 与 None 区分"
+
+    counter.result = LocalTokenCount(None, "test-profile", "asset-missing")
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    snapshot = policy.snapshot()
+    assert snapshot.comparison is None, "本地不可用时比较不可得"
+    assert snapshot.report.local_count.reason == "asset-missing", "安全原因随报告可得"
+
+
+async def test_comparison_cleared_by_invalidation_error_and_cancel():
+    from cicada.budget import LocalTokenCount, TokenCountComparison
+
+    counter = _LocalCounter(LocalTokenCount(20, "test-profile"))
+    inner = FakeModel([[_stop(_measured(100))], [_stop(_measured(100))], [_stop(_measured(100))]])
+    policy = BudgetPolicy(inner, _config(), token_counter=counter)
+    expected = TokenCountComparison(LocalTokenCount(20, "test-profile"), 100)
+
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison == expected
+    policy.invalidate()  # clear/压缩/配置变化/恢复的公共失效面
+    assert policy.snapshot().comparison is None
+
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison == expected
+    policy.config = _config(num_ctx=1)
+    async for _ in policy.stream(_request("x" * 300), CancelToken()):
+        pass
+    assert policy.snapshot().comparison is None, "准入拒绝不留下旧偏差"
+
+    policy.config = _config()
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    assert policy.snapshot().comparison == expected
+    token = CancelToken()
+    token.cancel()
+    async for _ in policy.stream(_request("q1"), token):
+        pass
+    assert policy.snapshot().comparison is None, "取消不冒充新调用"
+
+
+async def test_comparison_cleared_at_request_boundary_seam():
+    """03: 请求边界接缝清旧对照 (本次尝试可能在进入预算评估前就终结: 取消/
+    RunPolicy 拒绝/本地准入拒绝, 不进入 BudgetPolicy.stream)。"""
+    from cicada.budget import LocalTokenCount, TokenCountComparison
+
+    counter = _LocalCounter(LocalTokenCount(20, "test-profile"))
+    policy = BudgetPolicy(FakeModel([[_stop(_measured(100))]]), _config(), token_counter=counter)
+    async for _ in policy.stream(_request("q1"), CancelToken()):
+        pass
+    expected = TokenCountComparison(LocalTokenCount(20, "test-profile"), 100)
+    assert policy.snapshot().comparison == expected
+
+    policy.note_request_start(3)  # 应用在准入通过后、首次预估前调用一次
+    assert policy.snapshot().comparison is None, "新尝试开始即丢弃旧偏差"
+
+
+async def test_comparison_refuses_non_local_count_payload():
+    from cicada.budget import LocalTokenCount, TokenCountComparison
+
+    with pytest.raises(TypeError, match="local_count"):
+        TokenCountComparison(local_count=20, input_tokens=1)
+    with pytest.raises(TypeError, match="input_tokens"):
+        TokenCountComparison(local_count=LocalTokenCount(1, "p"), input_tokens=True)
+    with pytest.raises(ValueError, match="available count"):
+        TokenCountComparison(local_count=LocalTokenCount(None, "p", "asset-missing"), input_tokens=1)
 
 
 def test_constructor_rejects_bad_inner_and_config():

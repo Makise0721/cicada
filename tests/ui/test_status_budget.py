@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from test_compact_command import _ScriptedSummary, _manual_session
-from test_conversation_view import Harness, _wait_until
+from test_conversation_view import Harness, _wait_until, session_idle
 
 from cicada.application import open_application
 from cicada.core.ports import ModelMetrics, StreamDone, TextDelta
@@ -117,7 +117,7 @@ async def test_status_budget_anchor_and_deviation_after_requests(tmp_path):
         assert "锚: 已立锚 · 实测输入 500 · 锚定请求含 1 条消息" in rendered
         # 首请求报告先于锚确立: 如实显示启发式, 不虚构"前缀失配"
         assert "最近估计未使用锚" in rendered
-        assert "校准偏差: 估计 17 − 实测 500 = -483（正=启发式偏高）" in rendered
+        assert "校准偏差: 估计 17 − 实测 500 = -483（正=估计偏高）" in rendered
         assert "累计输入 500" in rendered, "计量段保持跨调用累计, 与占用分开"
 
         assert harness.submit("第二问")
@@ -389,6 +389,101 @@ async def test_status_omits_cache_and_observation_rows_first_over_limit(tmp_path
         assert "状态: idle" in lines and "计量: 不可得" in lines, "既有会话/计量事实保留"
     finally:
         view.close()
+        await session.aclose()
+
+
+class _FixedLocalCount:
+    """固定本地计数替身: 只回放给定结果, 不加载任何资源; 记录次数验证重绘不重复计数。"""
+
+    def __init__(self, result) -> None:
+        self.result = result
+        self.calls = 0
+
+    def count_request(self, request):
+        self.calls += 1
+        return self.result
+
+
+# 锁定版本的 Flash 公开身份 (与 tokenizer 资产 manifest 同源); 显示只取前 8 位摘要
+_FLASH_PROFILE = (
+    "deepseek-flash-v4.1:manifest-sha256:"
+    "75bc6e53c9f8666f36c541fb57bd9a2d94b53355b8e0fe008e2b7782edbba132"
+)
+
+
+async def test_status_local_count_and_comparison_rows(tmp_path):
+    """票据 03 验收4: 状态页两条观察行 (本地 count/profile + 同请求有符号差值);
+    本地不可用时只留原因行, 旧对照立即失效 (验收2)。"""
+    from cicada.budget import LocalTokenCount
+
+    script = [
+        [StreamDone("stop", metrics=ModelMetrics(input_tokens=1200, output_tokens=5))],
+        [StreamDone("stop", metrics=ModelMetrics(input_tokens=1180, output_tokens=5))],
+    ]
+    session, _m, _c, _s = await _manual_session(tmp_path, script=script, store=False)
+    harness = Harness(session)
+    try:
+        counter = _FixedLocalCount(LocalTokenCount(1250, _FLASH_PROFILE))
+        session._budget_policy.token_counter = counter
+        assert harness.submit("第一问")
+        await harness.wait_request_done()
+        counted = counter.calls
+        assert harness.submit("/status")
+        rows = " ".join(_status_rows(harness))
+        assert ("本地计数: 1250 tokens · deepseek-flash-v4.1 · manifest 75bc6e53…"
+                "（固定公开参考，线上一致性未验证）") in rows
+        assert "同请求偏差: 实际输入 1200 · 本地 − 实际 = +50（正=本地偏高）" in rows
+        snapshot = session.budget
+        assert snapshot is not None and snapshot.comparison is not None
+        assert snapshot.comparison.local_count.tokens == 1250
+        assert snapshot.comparison.input_tokens == 1200
+        assert harness.submit("/status"), "重绘仍然受理"
+        assert counter.calls == counted, "状态页重绘只读快照, 不重复计数"
+
+        # 本地拒绝: 显示不可用原因, 不拿旧对照冒充新调用
+        session._budget_policy.token_counter = _FixedLocalCount(
+            LocalTokenCount(None, _FLASH_PROFILE, "asset-missing")
+        )
+        assert harness.submit("第二问")
+        await harness.wait_request_done()
+        assert harness.submit("/status")
+        rows = " ".join(_status_rows(harness))
+        assert "本地计数: 不可用（asset-missing）" in rows
+        assert "同请求偏差" not in rows and "本地计数: 1250" not in rows
+        assert session.budget is not None and session.budget.comparison is None
+    finally:
+        await session.aclose()
+        harness.close()
+
+
+async def test_status_omits_token_observation_rows_after_cache_rows(tmp_path):
+    """票据 03 验收5: 仍超限才省略分词观察两条行并明确标注, 既有事实保持。"""
+    from cicada.budget import LocalTokenCount
+    from cicada.ui.conversation_view import build
+
+    session, _m, _c, _s = await _manual_session(
+        tmp_path,
+        script=[[StreamDone("stop", metrics=ModelMetrics(input_tokens=1200, output_tokens=5))]],
+        store=False,
+    )
+    session._budget_policy.token_counter = _FixedLocalCount(LocalTokenCount(1250, _FLASH_PROFILE))
+    bundle = build(session, diagnostics=lambda: [f"诊断{i}: 原始值" for i in range(20)])
+    try:
+        assert bundle["on_submit"]("第一问") is True
+        assert await _wait_until(
+            lambda: session_idle(session)
+            and bundle["view"]._gate.busy() is False
+            and session.budget is not None
+            and session.budget.comparison is not None
+        )
+        assert bundle["on_submit"]("/status") is True
+        lines = [strip_terminal_sequences(line).strip() for line in bundle["document_lines"](100)]
+        assert not any(line.startswith("本地计数:") for line in lines), "分词观察行后于缓存/诊断省略"
+        assert not any(line.startswith("缓存（") for line in lines)
+        assert any("缓存计量/发送诊断/分词观察因状态页限额省略" in line for line in lines), "省略有显式标注"
+        assert "状态: idle" in lines and "计量: " in "\n".join(lines), "既有事实保留"
+    finally:
+        bundle["view"].close()
         await session.aclose()
 
 

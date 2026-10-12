@@ -45,6 +45,7 @@ from cicada.budget import (
     ComponentEstimate,
     LocalTokenCount,
     RequestTokenCounter,
+    TokenCountComparison,
     assemble_report,
     budget_exceeded_text,
     estimate_input_components,
@@ -324,6 +325,7 @@ class BudgetPolicy:
         self._projection = projection if projection is not None else ContextProjection()
         self._anchor: _UsageAnchor | None = None
         self._last_report: BudgetReport | None = None
+        self._comparison: TokenCountComparison | None = None  # 03: 最近同请求计数对照
         self._last_committed_count: int | None = None  # PA02 范围事实
         # 本次 execute 的准入自动压缩额度: 接缝重置, begin 不重置, 失败不返还
         self._admission_auto_used = False
@@ -335,9 +337,14 @@ class BudgetPolicy:
         self._auto_compact = auto_compact
 
     def invalidate(self) -> None:
-        """配置、模式或投影改变后显式丢弃旧计量权威."""
+        """配置、模式或投影改变后显式丢弃旧计量权威.
+
+        clear/压缩/配置变化/恢复都经此入口: 最近同请求计数对照 (03) 一并失效,
+        不把旧调用的偏差冒充当前事实。
+        """
         self._anchor = None
         self._last_report = None
+        self._comparison = None
 
     def try_consume_admission_auto_attempt(self) -> bool:
         """消费本次 execute 的准入自动压缩额度 (至多一次, 失败不返还)."""
@@ -353,6 +360,9 @@ class BudgetPolicy:
         参数为该时刻规范历史消息数; 它建立本次 execute 尝试的预算状态范围。
         committed_count == 0 视为代次重置 (clear) 丢弃锚; 同时重置自动压缩额度,
         跨请求/跨预估不残留 (A09)。
+
+        03: 同时丢弃上一轮的同请求计数对照——本次尝试也可能在进入预算评估前就
+        终结 (取消/RunPolicy 拒绝/本地准入拒绝), 不留旧偏差冒充本次调用。
         """
         if isinstance(committed_count, bool) or not isinstance(committed_count, int):
             raise ValueError("committed_count must be an int")
@@ -360,6 +370,7 @@ class BudgetPolicy:
             raise ValueError("committed_count must be nonnegative")
         self._last_committed_count = committed_count
         self._admission_auto_used = False
+        self._comparison = None
         if committed_count == 0:
             # 代次重置 (clear): 锚随历史一起失效; 恢复/压缩等其余失效面经前缀失配
             self._anchor = None
@@ -400,10 +411,13 @@ class BudgetPolicy:
             limit=self.config.num_ctx,
             report=self._last_report,
             anchor=self.anchor,
+            comparison=self._comparison,
         )
 
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
         self._last_report = None
+        # 03: 新一次正式评估开始即丢弃旧对照, error/aborted/拒绝不留下旧偏差
+        self._comparison = None
         if cancel.cancelled:
             yield StreamDone("aborted")
             return
@@ -446,6 +460,7 @@ class BudgetPolicy:
         async for event in self.inner.stream(projected, cancel):
             if isinstance(event, StreamDone):
                 self._consider_anchor(projected, report, event)
+                self._consider_comparison(report, event)
                 yield event
                 return
             yield event
@@ -538,6 +553,23 @@ class BudgetPolicy:
             input_tokens=tokens,
             estimated_input_tokens=report.input_estimate,
         )
+
+    def _consider_comparison(self, report: BudgetReport, done: StreamDone) -> None:
+        """同请求计数组对 (03, 契约 C7): 只接受本次正式普通调用的 local 与 usage.
+
+        error/aborted 不配对; 本地不可用 (含未配置/资格拒绝/底层失败) 比较不可得;
+        usage 缺失保留 input_tokens=None, 已报告的 0 保留 0。
+        """
+        if done.stop_reason in ("error", "aborted"):
+            return
+        local = report.local_count
+        if local is None or local.tokens is None:
+            return
+        metrics = done.metrics
+        tokens = None if metrics is None else metrics.input_tokens
+        if isinstance(tokens, bool) or not isinstance(tokens, int):
+            tokens = None
+        self._comparison = TokenCountComparison(local_count=local, input_tokens=tokens)
 
 
 # --- 摘要生成协议 (D5, 02) ----------------------------------------------------------------

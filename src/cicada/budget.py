@@ -113,6 +113,29 @@ class BudgetConfig:
 
 
 @dataclass(frozen=True)
+class TokenCountComparison:
+    """同一次正式普通调用的本地计数与实测输入对照 (03 观察, 契约 C7).
+
+    只由该调用的完整本地 count 与其终结事件的 usage.input_tokens 配对; 本地不可用
+    时比较不可得 (不构造), 缺 usage 时 input_tokens=None, 已报告的 0 保留 0。
+    """
+
+    local_count: LocalTokenCount
+    input_tokens: int | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.local_count, LocalTokenCount):
+            raise TypeError("local_count must be a LocalTokenCount")
+        if self.local_count.tokens is None:
+            # 本地不可用时比较不可得 (不构造): 空能力不得充当 0 或偏差样本
+            raise ValueError("local_count must carry an available count")
+        if self.input_tokens is not None and (
+            isinstance(self.input_tokens, bool) or not isinstance(self.input_tokens, int)
+        ):
+            raise TypeError("input_tokens must be an int or None")
+
+
+@dataclass(frozen=True)
 class ComponentEstimate:
     """一个开销组成部分的估计; tokens=None 表示不可得 (来源 unknown)."""
 
@@ -162,11 +185,12 @@ class AnchorInfo:
 
 @dataclass(frozen=True)
 class BudgetSnapshot:
-    """应用只读预算出口: 最新一次每轮报告与当前锚状态 (04 显示消费)."""
+    """应用只读预算出口: 最新一次每轮报告、当前锚状态与最近同请求计数对照 (04 显示消费)."""
 
     limit: int
     report: BudgetReport | None
     anchor: AnchorInfo | None
+    comparison: TokenCountComparison | None = None
 
 
 def estimate_text_tokens(text: str) -> int:
