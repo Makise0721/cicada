@@ -71,17 +71,25 @@ class GitInventory:
     """
 
     def __init__(self, workspace: Workspace, *, max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
-                 max_paths: int = MAX_PATHS, timeout_s: float = QUERY_TIMEOUT_S) -> None:
+                 max_paths: int = MAX_PATHS, timeout_s: float = QUERY_TIMEOUT_S,
+                 cleanup_timeout_s: float | None = 1.0) -> None:
         for name, value, ceiling in (("max_output_bytes", max_output_bytes, MAX_GIT_OUTPUT_BYTES),
                                      ("max_paths", max_paths, MAX_PATHS)):
             if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= ceiling:
                 raise ValueError(f"{name} must be an integer in [1, {ceiling}]")
         if isinstance(timeout_s, bool) or not 0 < timeout_s <= QUERY_TIMEOUT_S:
             raise ValueError(f"timeout_s must be in (0, {QUERY_TIMEOUT_S}]")
+        if cleanup_timeout_s is not None and (
+            isinstance(cleanup_timeout_s, bool) or not cleanup_timeout_s > 0
+        ):
+            raise ValueError("cleanup_timeout_s must be a positive float or None")
         self.workspace = workspace
         self.max_output_bytes = max_output_bytes
         self.max_paths = max_paths
         self.timeout_s = timeout_s
+        # 1.0 是既有监督上限 (不能据此宣称进程已回收); None 让共享 read_git 走
+        # 实际等待回收分支，归需要真实所有权的需求 (如文件补全) 使用。
+        self.cleanup_timeout_s = cleanup_timeout_s
 
     async def list_files(self, cancel: CancelToken) -> FileInventory:
         cancel.throw_if_cancelled()
@@ -188,7 +196,8 @@ class GitInventory:
     async def _git(self, arguments: tuple[str, ...], cancel: CancelToken, budget: int) -> bytes:
         try:
             output, _, _ = await read_git(self.workspace.root, arguments, cancel, budget,
-                                          cleanup_timeout_s=1, include_error_detail=True)
+                                          cleanup_timeout_s=self.cleanup_timeout_s,
+                                          include_error_detail=True)
             return output
         except GitIOError as exc:
             message = (f"Git stdout exceeds {self.max_output_bytes} bytes"

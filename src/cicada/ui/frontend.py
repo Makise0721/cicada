@@ -55,6 +55,7 @@ from cicada.ui.document_layout import (
     HitSpan,
 )
 from cicada.ui.editor import Editor
+from cicada.ui.file_menu import FileCompletionMenu
 from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
@@ -107,6 +108,7 @@ class MainScreenFrontend:
         on_shift_tab: Callable[[], None] | None = None,
         footer_badge_spans: Callable[[], tuple[tuple[int, int, int], ...]] | None = None,
         review: ReviewView | None = None,
+        file_menu: FileCompletionMenu | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
@@ -132,6 +134,7 @@ class MainScreenFrontend:
         self._on_model_confirm = on_model_confirm
         self._modal = modal
         self._review = review
+        self._file_menu = file_menu
         self.sensitive_input_used = False
         self.ui_failures: list[str] = []
         self.terminal_failed = False
@@ -186,6 +189,9 @@ class MainScreenFrontend:
             if self._model_menu_active():
                 # 模型菜单 (DeepSeek 04) 与斜线菜单共用编辑器下方槽位; 两者不会同时打开
                 menu = self._model_menu.render(width, menu_budget)
+            elif self._file_menu is not None and self._file_menu.visible:
+                # 文件补全菜单 (C6): render 只读候选/短状态, 查询只在输入路径启动
+                menu = self._file_menu.render(width, menu_budget)
             else:
                 menu = (
                     self._command_menu.render(width, menu_budget)
@@ -255,6 +261,25 @@ class MainScreenFrontend:
     def _sync_command_menu(self) -> None:
         if self._command_menu is not None:
             self._command_menu.sync(self._editor.get_text(), at_end=self._editor.cursor_at_end())
+
+    def _sync_file_menu(self) -> None:
+        """输入路径同步 (C7): 查询只从这里启动, render 不启动查询。
+
+        模态/模型菜单/审阅/文档焦点优先: 资格不成立即候选失效并取消。
+        """
+        if self._file_menu is None:
+            return
+        eligible = not (
+            self._document_focused()
+            or self._model_menu_active()
+            or self._modal_active()
+            or self._review_active()
+        )
+        self._file_menu.sync(self._editor, eligible=eligible)
+
+    def _file_menu_invalidate(self) -> None:
+        if self._file_menu is not None:
+            self._file_menu.invalidate()
 
     # --- 调度 (TuiBase.requestRender 移植) -----------------------------------------
 
@@ -389,6 +414,9 @@ class MainScreenFrontend:
             else:
                 modal_was_open = self._modal_active()
                 self._dispatch_key(item)
+                # C7: 文件菜单按当前草稿全文/逻辑光标/资格建立快照; 同步在按键
+                # 应用之后, 查询只从这里启动 (render 不启动)
+                self._sync_file_menu()
                 needs_render = True
                 if modal_was_open and not self._modal_active():
                     break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
@@ -412,11 +440,13 @@ class MainScreenFrontend:
 
     def _dispatch_key(self, key) -> None:
         if self._review_active():
+            self._file_menu_invalidate()  # C7: 审阅优先, 候选失效并取消
             self._sync_viewport_layout()
             self._disarm_escape_prefix()
             self._review.handle(key)
             return
         if self._modal_active():
+            self._file_menu_invalidate()  # C7: 模态优先, 候选失效并取消
             self.sensitive_input_used = True
             self._disarm_escape_prefix()
             self._modal.handle(key)
@@ -467,6 +497,7 @@ class MainScreenFrontend:
                 else:
                     if self._command_menu is not None:
                         self._command_menu.dismiss()  # 焦点期间菜单不同步不渲染
+                    self._file_menu_invalidate()  # C7: 文档焦点优先, 候选失效并取消
                     self._sync_viewport_layout()
                     self._viewport.enter_focus()
             return
@@ -534,6 +565,8 @@ class MainScreenFrontend:
             self._editor.insert_text(data)
             return
         if key.key in (Keys.ControlM,) or data == "\r":
+            if self._file_menu is not None and self._file_menu.handle_enter():
+                return  # C6: 菜单展示候选时 Enter 完成当前项; 第二次 Enter 才走原准入
             self._handle_enter()
             return
         if data == "\n" or key.key is Keys.ControlJ:
@@ -552,11 +585,15 @@ class MainScreenFrontend:
             self._editor.move_cursor(0, 1)
             return
         if key.key is Keys.Up:
+            if self._file_menu is not None and self._file_menu.move(-1):
+                return
             if self._command_menu is not None and self._command_menu.move(-1):
                 return
             self._editor.move_cursor(-1, 0)
             return
         if key.key is Keys.Down:
+            if self._file_menu is not None and self._file_menu.move(1):
+                return
             if self._command_menu is not None and self._command_menu.move(1):
                 return
             self._editor.move_cursor(1, 0)
@@ -566,6 +603,13 @@ class MainScreenFrontend:
             return
         if key.key is Keys.End:
             self._editor.move_to_line_end()
+            return
+        # Tab (C6): 文件补全菜单有候选时接受, 有 @ token 时跳过防抖启动查询并
+        # 消费该键; 无 @ 上下文保持原编辑行为 (插入制表符展开 4 空格)
+        if key.key is Keys.Tab or data == "\t":
+            if self._file_menu is not None and self._file_menu.handle_tab():
+                return
+            self._editor.insert_text(data if data else "\t")
             return
         # 可打印文本 (含 IME 上屏多字符): 原样插入
         if data and not data.startswith("\x1b") and all(ord(ch) >= 32 or ch == "\t" for ch in data):
@@ -579,6 +623,8 @@ class MainScreenFrontend:
             return False  # 审阅提供自己的同源命中图，菜单不能抢走本页输入。
         if self._modal_active() or self._model_menu_active():
             return True
+        if self._file_menu is not None and self._file_menu.candidates:
+            return True  # C6: 候选打开时沿用菜单的指针捕获, v1 无点击选择
         return self._command_menu is not None and self._command_menu.selected is not None
 
     def _dispatch_pointer(self, event: PointerEvent) -> str:
@@ -728,8 +774,13 @@ class MainScreenFrontend:
 
     def _dispatch_escape(self) -> None:
         self._sync_command_menu()
+        self._sync_file_menu()
         if self._model_menu_active() and self._model_menu.dismiss():
             # 模型菜单 Esc 只收起菜单 (契约 C7), 不触发会话取消
+            self.request_render_now()
+            return
+        if self._file_menu is not None and self._file_menu.dismiss():
+            # C6: Esc 只收起候选并锁住相同草稿/光标, 不触发会话取消
             self.request_render_now()
             return
         if self._command_menu is not None and self._command_menu.dismiss():
@@ -791,6 +842,13 @@ class MainScreenFrontend:
         finally:
             if self._review_active():
                 self._review.cancel()
+            if self._file_menu is not None:
+                # C7: 前端退出先封闭入口、取消防抖与当前查询并等待实际落定,
+                # 再恢复终端; 不把 asyncio 取消等同于子进程/iterator 释放
+                try:
+                    await self._file_menu.close()
+                except asyncio.CancelledError:
+                    pass
             # 终态冲刷: 退出前的待渲染请求 (如 gate 错误条目) 在收尾前落屏一次,
             # 不随 _stopped 丢弃 (规格: 终态事件不丢弃); 失败照常记录不阻断收尾
             if self._render_requested:

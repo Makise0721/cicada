@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Callable
 
 from cicada.ui.conversation_view import ConversationView
 from cicada.ui.commands import SlashCommandMenu
+from cicada.ui.file_menu import FileCompletionMenu
 from cicada.ui.frontend import MainScreenFrontend
 from cicada.ui.terminal_io import PromptToolkitTerminal, Terminal
 
@@ -109,6 +110,14 @@ async def run_tui_session(
         modal=view.login_modal,
         review=view.review_view,
         display_style=view.display_style,
+        # 文件补全 (project-context-v1 C3/C7): 候选端口注入应用只读出口;
+        # busy Enter 屏障事实来自 view 的准入闸门; 异步候选落定经 _request_render
+        file_menu=FileCompletionMenu(
+            view.editor,
+            complete=session.complete_files,
+            enter_barrier=view.enter_barrier,
+            on_update=_request_render,
+        ),
     )
     refs["frontend"] = frontend
 

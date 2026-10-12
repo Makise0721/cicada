@@ -34,7 +34,7 @@ def text_keys(text: str) -> list[KeyPress]:
 class Harness:
     """headless 前端驱动: FakeTerminal + VtScreen 镜像 + 可控文档。"""
 
-    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12, commands=False, on_submit=None, status_lines=None):
+    def __init__(self, *, escape_timeout: float = ESCAPE_PREFIX_TIMEOUT_S, columns=40, rows=12, commands=False, on_submit=None, status_lines=None, file_menu=None):
         self.terminal = FakeTerminal(columns, rows)
         self.vt = VtScreen(columns, rows)
         self.terminal.feed_screen = self.vt.feed
@@ -56,6 +56,7 @@ class Harness:
             escape_prefix_timeout=escape_timeout,
             command_menu=SlashCommandMenu() if commands else None,
             status_lines=status_lines,
+            file_menu=file_menu,
         )
         self.runner: asyncio.Task | None = None
 

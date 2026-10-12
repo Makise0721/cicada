@@ -183,6 +183,26 @@ class Editor:
         self._scroll_offset = 0
         self._touch()
 
+    def replace_span(self, line: int, start: int, end: int, text: str, *,
+                     cursor_offset: int | None = None) -> None:
+        """单行区间一次替换 (C6): 一次快照一次 undo, 不拆成删除加插入。
+
+        列索引按现有 Python 字符索引; 只处理一行合法区间, 越界拒绝。
+        cursor_offset=None 时光标落在替换文字尾。
+        """
+        if not 0 <= line < len(self.state.lines):
+            raise ValueError(f"line {line} out of range")
+        line_text = self.state.lines[line]
+        if not 0 <= start <= end <= len(line_text):
+            raise ValueError(f"span [{start}, {end}) out of range for line {line}")
+        if cursor_offset is not None and not 0 <= cursor_offset <= len(text):
+            raise ValueError("cursor_offset out of range for replacement text")
+        self._snapshot()
+        self.state.lines[line] = line_text[:start] + text + line_text[end:]
+        self.state.cursor_line = line
+        self._set_cursor_col(start + (len(text) if cursor_offset is None else cursor_offset))
+        self._touch()
+
     def insert_text(self, text: str) -> None:
         """在光标处插入 (含多行/粘贴原文); 行尾归一化, tab 展开为 4 空格。"""
         if not text:

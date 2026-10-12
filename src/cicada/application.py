@@ -94,6 +94,11 @@ from cicada.run_policy import (
     verification_policy,
 )
 from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
+from cicada.file_completion import FileCompletionResult
+from cicada.plugins.coding.file_completion import (
+    FILE_COMPLETION_CAPABILITY,
+    file_completion_plugin,
+)
 from cicada.plugins.coding.inventory import inventory_plugin
 from cicada.plugins.coding.change_review import (
     CHANGE_REVIEW_CAPABILITY, REVIEW_TIMEOUT_S, ChangeReview, change_review_plugin,
@@ -121,6 +126,7 @@ from cicada.plugins.skills import CATALOG_CAPABILITY, skills_plugin
 from cicada.prompting import PromptInfo
 from cicada.reporting import DeliveryDecision, decide_delivery
 from cicada.runtime.plugin import PluginDefinition
+from cicada.runtime.runtime import CapabilityError
 from cicada.skills import (
     LOAD_SKILL_TOOL_NAME,
     SKILLS_PROMPT_VERSION,
@@ -160,6 +166,7 @@ def default_definitions(
     definitions: list[PluginDefinition] = [
         workspace_plugin(workspace),
         inventory_plugin(),
+        file_completion_plugin(),
         change_review_plugin(),
         process_plugin(),
         read_plugin(),
@@ -617,6 +624,20 @@ class ApplicationSession:
     @property
     def review_active(self) -> bool:
         return self._review_active
+
+    async def complete_files(self, query: str, cancel: CancelToken) -> FileCompletionResult:
+        """只读文件候选出口 (C3): 不创建模型消息、ToolCall/ToolResult 或读取依据。
+
+        closing/closed 先拒绝新调用; 进行中的编码请求不阻止候选查询。未装配
+        coding.file_completion 的组合 (旧直接构造) 返回 capability_unavailable。
+        """
+        if self._closing or self._closed:
+            return FileCompletionResult((), "unavailable", reason="session_closed")
+        try:
+            port = self._app.runtime.capability(FILE_COMPLETION_CAPABILITY)
+        except CapabilityError:
+            return FileCompletionResult((), "unavailable", reason="capability_unavailable")
+        return await port.complete(query, cancel)
 
     def _check_review_admission(self) -> None:
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,

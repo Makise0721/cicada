@@ -703,6 +703,10 @@ class ConversationView:
         if self._on_exit is not None:
             self._on_exit()
 
+    def enter_barrier(self) -> bool:
+        """busy/finalizing Enter 屏障事实 (C7): 文件菜单确认让位于原静默屏障。"""
+        return is_enter_barrier(self._session, self._gate)
+
     # --- 斜线命令 ----------------------------------------------------------------------
 
     def _handle_command(self, text: str) -> bool:
