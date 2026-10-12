@@ -96,23 +96,27 @@ async def test_subworkspace_filters_uninitialized_gitlink_and_its_ancestors(tmp_
     (workspace / "module" / "child").mkdir(parents=True)
     (workspace / "d[1]" / "module").mkdir(parents=True)
     (workspace / "ordinary" / "child").mkdir(parents=True)
+    (workspace / "ordinary" / "module").mkdir()
+    (workspace / "Ä目录" / "module").mkdir(parents=True)
     (workspace / "ordinary" / "child" / "tracked.py").write_text("x", encoding="utf-8")
     (workspace / "ordinary" / "file.py").write_text("x", encoding="utf-8")
     git(tmp_path, "add", ".")
     git(tmp_path, "update-index", "--index-info", input=b"".join(
         b"160000 " + oid + b"\t" + name + b"\n"
-        for name in (b"sub/module", b"sub/d[1]/module")
+        for name in (b"sub/module", b"sub/d[1]/module", b"sub/ordinary/module", "sub/Ä目录/module".encode("utf-8"))
     ))
     # 外部 pathspec 环境不能把内部单层模式改成 literal 或递归匹配。
     monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
     service = CodingFileCompletion(Workspace.create(workspace))
     result = await service.complete("", CancelToken())
     assert result.scope == SCOPE_DIRECTORY
-    assert {c.relative_path for c in result.candidates} == {"d[1]/", "ordinary/"}
-    for query in ("module/", "module/child/", "d[1]/"):
+    assert {c.relative_path for c in result.candidates} == {"d[1]/", "ordinary/", "Ä目录/"}
+    for query in ("module/", "module/child/", "d[1]/", "ORDINARY/MODULE/", "ä目录/"):
         assert (await service.complete(query, CancelToken())).candidates == ()
     result = await service.complete("ordinary/", CancelToken())
     assert {c.relative_path for c in result.candidates} == {"ordinary/child/", "ordinary/file.py"}
+    result = await service.complete("ORDINARY/", CancelToken())
+    assert {c.relative_path for c in result.candidates} == {"ORDINARY/child/", "ORDINARY/file.py"}
 
 
 async def test_complete_maps_failures_to_stable_reasons(tmp_path, monkeypatch):

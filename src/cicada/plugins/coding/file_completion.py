@@ -178,16 +178,27 @@ class CodingFileCompletion:
     ) -> set[str]:
         """只查询导航链上各目录的直接 index 项，识别无 .git 的 gitlink。
 
-        显式 :(glob) 中 * 不跨 /；前缀由已验证 query 生成并转义 [，不能
+        显式 :(glob,icase) 中 * 不跨 /；前缀逐级检查后取实际大小写并转义 [，不能
         递归列后代或改变原共享读口的 literal 默认值。
         """
         head, _, _ = normalized.rpartition("/")
         prefixes = [""]
+        current = self._workspace.root
         for part in head.split("/") if head else ():
             if part not in ("", "."):
-                prefixes.append(prefixes[-1] + part + "/")
+                self._checkpoint(token, deadline)
+                current = current / part
+                if not _local_type(current):
+                    break
+                # 原始路径已逐级排除 reparse，随后取 Windows 实际大小写。
+                # Git icase 只处理 ASCII，不能独自覆盖 Ä/ä 等目录导航。
+                try:
+                    actual = Path(os.path.realpath(current)).relative_to(self._workspace.root)
+                except ValueError as exc:
+                    raise InventoryError("invalid_path", "local directory changed outside workspace") from exc
+                prefixes.append(actual.as_posix() + "/")
         arguments = ("ls-files", "--stage", "-z", "--", *(
-            ":(glob)" + glob.escape(prefix) + "*" for prefix in prefixes
+            ":(glob,icase)" + glob.escape(prefix) + "*" for prefix in prefixes
         ))
         self._checkpoint(token, deadline)
         data, _, _ = await read_git(
