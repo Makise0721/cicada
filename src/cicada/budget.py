@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Protocol, Sequence
 
 from cicada.core.messages import (
     AssistantMessage,
@@ -28,7 +28,7 @@ from cicada.core.messages import (
     ToolResultMessage,
     UserMessage,
 )
-from cicada.core.ports import ToolSpec
+from cicada.core.ports import ModelRequest, ToolSpec
 
 BUDGET_ESTIMATOR_NAME = "utf8-bytes-over-3-plus-template-overhead"
 BUDGET_ESTIMATOR_VERSION = "3"
@@ -39,6 +39,31 @@ SAFETY_MARGIN_RATIO = 0.10
 MESSAGE_TEMPLATE_OVERHEAD_TOKENS = 8
 
 EstimateSource = Literal["measured", "anchored", "estimated", "unknown"]
+
+
+@dataclass(frozen=True)
+class LocalTokenCount:
+    """固定公开模板的完整输入计数; 不代表服务端 usage."""
+
+    tokens: int | None
+    profile: str | None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.profile is not None and (not isinstance(self.profile, str) or not self.profile):
+            raise TypeError("local count profile must be a nonempty string or None")
+        if self.tokens is not None:
+            if type(self.tokens) is not int or self.tokens < 0 or not self.profile or self.reason is not None:
+                raise TypeError("invalid available local token count")
+        elif self.reason not in (
+            "dependency-unavailable", "asset-missing", "asset-invalid", "unsupported-profile",
+            "unsupported-input", "request-too-large", "count-failed",
+        ):
+            raise TypeError("invalid unavailable local token count")
+
+
+class RequestTokenCounter(Protocol):
+    def count_request(self, request: ModelRequest) -> LocalTokenCount: ...
 
 
 def _require_positive_int(value: Any, name: str) -> None:
@@ -115,6 +140,7 @@ class BudgetReport:
     source: EstimateSource
     estimator: str = BUDGET_ESTIMATOR_NAME
     estimator_version: str = BUDGET_ESTIMATOR_VERSION
+    local_count: LocalTokenCount | None = None
 
     @property
     def margin_remaining(self) -> int:

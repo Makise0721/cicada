@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
-from cicada.budget import BudgetConfig
+from cicada.budget import BudgetConfig, RequestTokenCounter
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelPort, ModelRequest, StreamEvent
 from cicada.user_config import SecretValue
@@ -74,6 +74,8 @@ class ModelBinding:
     budget: BudgetConfig
     summary_budget: BudgetConfig
     validate_request: Callable[[ModelRequest], None]
+    token_counter: RequestTokenCounter | None = None
+    summary_token_counter: RequestTokenCounter | None = None
 
 
 @dataclass(frozen=True)

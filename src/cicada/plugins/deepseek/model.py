@@ -16,7 +16,7 @@ from cicada.models import (
     CacheRequestObservation, ConfigurationRequest, ModelBinding, ModelOption, SafeModelIdentity,
 )
 from cicada.plugins.deepseek.protocol import (
-    BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request,
+    BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request, request_body_bytes,
 )
 from cicada.plugins.deepseek.sse import Completion, ProtocolError, SSEDecoder
 
@@ -111,6 +111,8 @@ class DeepSeekModel:
         self._observation: CacheRequestObservation | None = None
         self._send_sequence = 0
         self._shape_baseline: _RequestShape | None = None
+        from .tokenizer import FlashTokenCounter
+        self._token_counter = FlashTokenCounter(config) if config.model == "deepseek-flash" else None
 
     @property
     def cache_observation(self) -> CacheRequestObservation | None:
@@ -128,7 +130,7 @@ class DeepSeekModel:
         return ModelBinding(self, summary, self.config.identity, summary_config.identity,
                             BudgetConfig(self.config.num_ctx, self.config.max_tokens),
                             BudgetConfig(summary_config.num_ctx, summary_config.max_tokens),
-                            self.config.validate_request)
+                            self.config.validate_request, self._token_counter)
 
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
@@ -224,8 +226,9 @@ class DeepSeekModel:
         deadline = time.monotonic() + CALL_DEADLINE_S
         try:
             body = build_request(request, self.config)
-            built = self.client.build_request("POST", BASE_URL + "/chat/completions", json=body,
-                headers={"Authorization": "Bearer " + self._api_key, "Accept-Encoding": "identity"},
+            built = self.client.build_request("POST", BASE_URL + "/chat/completions", content=request_body_bytes(body),
+                headers={"Authorization": "Bearer " + self._api_key, "Accept-Encoding": "identity",
+                         "Content-Type": "application/json"},
                 timeout=DEFAULT_TIMEOUT)
             if len(built.content) > self.config.max_request_bytes:
                 raise ProtocolError("request exceeds byte limit; not sent")

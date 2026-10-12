@@ -331,6 +331,48 @@ async def test_check_mode_budget_covers_control_section(tmp_path):
         await session.aclose()
 
 
+async def test_complete_counter_two_admission_gates_and_finalized_qualification_error(tmp_path):
+    from cicada.budget import LocalTokenCount
+
+    class Counter:
+        def __init__(self):
+            self.requests = []
+        def count_request(self, request):
+            self.requests.append(request)
+            if request.request_context:
+                raise ValueError("safe qualification rejection")
+            return LocalTokenCount(10000, "test-profile")
+
+    model = FakeModel([])
+    session = await open_application(_config(tmp_path, model, budget=BudgetConfig(500, 1)))
+    counter = Counter()
+    session._budget_policy.token_counter = counter
+    try:
+        with pytest.raises(RuntimeError, match="context budget exceeded"):
+            await session.execute("small user")
+        assert len(counter.requests) == 1
+        assert counter.requests[0].messages[-1] == UserMessage("small user")
+        assert model.requests == [] and session.state == "idle"
+    finally:
+        await session.aclose()
+    root = _repo(tmp_path)
+    persistence = PersistenceConfig(identity=_identity(), session_id=None)
+    session = await open_application(_config(root, model, budget=_generous(), plan=_plan(root), persistence=persistence))
+    counter = Counter()
+    session._budget_policy.token_counter = counter
+    try:
+        outcome = await session.execute("checked user")
+        assert len(counter.requests) == 1  # 容量预检不调用完整 counter
+        assert counter.requests[0].request_context
+        assert outcome.result.stop_reason == "error" and outcome.result.error == "safe qualification rejection"
+        assert model.requests == [] and session.state == "idle"
+        assert outcome.persistence.saved is True
+        stored = session._store.recovery_snapshot().requests[-1].outcome
+        assert stored.finalized is True and stored.stop_reason == "error"
+    finally:
+        await session.aclose()
+
+
 # --- 请求边界接缝 (D1) -----------------------------------------------------------------
 
 

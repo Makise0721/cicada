@@ -19,6 +19,76 @@ REQUEST = ModelRequest((UserMessage("任务"),), (ToolSpec("read", "read", {"typ
 CTX = '<cicada-verification-context version="1">\n{"blocked":false}\n</cicada-verification-context>'
 
 
+def test_flash_full_template_matches_pinned_reference_and_ignores_unsent_metadata():
+    import copy
+    import runpy
+    from importlib import resources
+    from tokenizers import Tokenizer
+    from cicada.core.messages import ToolCall, ToolResult, ToolResultMessage
+    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter, render_body
+
+    root = resources.files("cicada.plugins.deepseek.tokenizer")
+    reference = runpy.run_path(str(root.joinpath("flash/reference.py.txt")))
+    tokenizer = Tokenizer.from_file(str(root.joinpath("flash/tokenizer.json")))
+    plain = ModelRequest((UserMessage("What is 2+2?"),), (), "You are a helpful assistant.")
+    call = ToolCall("c1", "lookup", '{"query":"value","count":5}')
+    history = (UserMessage("Look up a value"),
+               AssistantMessage("", (call,), "tool_use", reasoning=ReasoningContent("search first", True)),
+               ToolResultMessage(ToolResult("c1", "lookup", "result", details={"private": "not sent"})))
+    tools = (ToolSpec("lookup", "Look up a value", {"type": "object"}),)
+    tool_request = ModelRequest(history, tools, "Search tools.", CTX)
+    for config, request in [(DeepSeekConfig(), plain),
+                            (DeepSeekConfig(reasoning_effort="low"), tool_request),
+                            (DeepSeekConfig(reasoning_effort="max"), replace(tool_request, system_prompt="")),
+                            (DeepSeekConfig(think=False), tool_request)]:
+        body = build_request(request, config)
+        mapped = copy.deepcopy(body["messages"])
+        if body.get("tools"):
+            if mapped[0]["role"] != "system":
+                mapped.insert(0, {"role": "system", "content": ""})
+            mapped[0]["tools"] = body["tools"]
+        expected = reference["encode_messages"](
+            mapped, thinking_mode="thinking" if config.think else "chat",
+            reasoning_effort=body.get("reasoning_effort"),
+        )
+        rendered = render_body(copy.deepcopy(body))
+        assert rendered == expected
+        assert tokenizer.encode(rendered, add_special_tokens=False).ids == tokenizer.encode(expected, add_special_tokens=False).ids
+        assert rendered.count("<｜begin▁of▁sentence｜>") == 1
+        counter = FlashTokenCounter(config)
+        count = counter.count_request(request)
+        assert count.tokens == len(tokenizer.encode(expected, add_special_tokens=False).ids)
+        assert counter.count_request(request) is count
+    counter = FlashTokenCounter(DeepSeekConfig())
+    first = counter.count_request(tool_request)
+    changed = replace(tool_request, messages=(history[0], replace(history[1], error="not sent"),
+        ToolResultMessage(replace(history[2].result, details={"different": "not sent"}))))
+    assert counter.count_request(changed) is first
+    assert counter.count_request(replace(tool_request, request_context=CTX + " changed")) is not first
+
+
+def test_flash_assets_and_wire_limit_fail_safely_before_render(monkeypatch, tmp_path):
+    import sys
+    from cicada.plugins.deepseek import tokenizer as module
+    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter
+
+    missing = FlashTokenCounter(DeepSeekConfig())
+    with monkeypatch.context() as patch:
+        patch.setattr(module.resources, "files", lambda package: tmp_path)
+        assert missing.count_request(REQUEST).reason == "asset-missing"
+        (tmp_path / "flash").mkdir()
+        (tmp_path / "flash/manifest.json").write_bytes(b"corrupt")
+        assert FlashTokenCounter(DeepSeekConfig()).count_request(REQUEST).reason == "asset-invalid"
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "tokenizers", None)
+        assert FlashTokenCounter(DeepSeekConfig()).count_request(REQUEST).reason == "dependency-unavailable"
+    too_large = FlashTokenCounter(DeepSeekConfig(max_request_bytes=10))
+    monkeypatch.setattr(too_large, "_load", lambda: pytest.fail("oversized body must not load/render"))
+    assert too_large.count_request(REQUEST).reason == "request-too-large"
+    with pytest.raises(ValueError, match="requires tools"):
+        too_large.count_request(ModelRequest((UserMessage("x"),), (), request_context=CTX))
+
+
 def frame(delta=None, finish=None, usage=None):
     obj = {"choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]}
     if usage is not None:

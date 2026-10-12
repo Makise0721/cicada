@@ -1,0 +1,48 @@
+{
+  "alias": "deepseek-flash",
+  "reference_model": "DeepSeek-V4.1-Flash",
+  "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "revision": "2cba9e42aa026125f3ed06c6d98c1db82f7ca027",
+  "assets": {
+    "tokenizer.json": {
+      "source_path": "tokenizer.json",
+      "size": 6367257,
+      "git_blob": "6a15814dd25c934028034531da744c689f87ff21",
+      "sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
+    },
+    "tokenizer_config.json": {
+      "source_path": "tokenizer_config.json",
+      "size": 801,
+      "git_blob": "f3dad388a2bbfd6a8605bd02754acd86d9ca5112",
+      "sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    },
+    "reference.py.txt": {
+      "source_path": "encoding/encoding.py",
+      "size": 37316,
+      "git_blob": "92a67eab2a67d924a6a8279bc0f90e3f504ac40e",
+      "sha256": "502bdaec8a3fd88ebc24c4721a7038fbe42f2063c664638127056107920035c1"
+    },
+    "reference-README.md": {
+      "source_path": "encoding/README.md",
+      "size": 12120,
+      "git_blob": "c4da223cc2d97f8d80e3d0d2ece8b1a137381507",
+      "sha256": "a2f0fc3baea318c9cfbceca68cbfe50d37cf7da6605ace887f33148bcff7e3ae"
+    },
+    "LICENSE": {
+      "source_path": "LICENSE",
+      "size": 1084,
+      "git_blob": "d62e3bef9f054f21b7fc616365850fbf879a99ff",
+      "sha256": "f2c6c602815669d292889e5be8c802f2ed950653b77999b1584e8e6aed25d040"
+    }
+  },
+  "license": "MIT",
+  "adapter_version": "1",
+  "adapter_sha256": "f4102978843aab6841e0fadaf51df6a80a55317feeec3445b342250765359f28",
+  "counter_version": "1",
+  "tokenizers_version": "0.23.3",
+  "add_special_tokens": false,
+  "truncation": false,
+  "padding": false,
+  "support": "text-only; thinking on/off; effort low/high/max; ordered tools; DSML; verification tail",
+  "online_equivalence": "unverified; absent-system tools use a local empty-system mapping"
+}

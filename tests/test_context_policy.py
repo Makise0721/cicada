@@ -22,6 +22,76 @@ from cicada.plugins.fake_model import FakeModel
 from tests.support.budget import policy_config as _config
 
 
+async def test_complete_local_priority_fallback_and_dispatch_schema_snapshot():
+    from cicada.budget import LocalTokenCount
+
+    class Counter:
+        result = LocalTokenCount(20, "test-profile")
+        def count_request(self, request):
+            return self.result
+
+    counter = Counter()
+    request = _request("hello", tools=_specs("read"))
+
+    class MutatingModel:
+        async def stream(self, frozen, cancel):
+            assert frozen.tools[0].parameters == {"type": "object"}
+            request.tools[0].parameters["required"] = ["new"]
+            yield _stop(_measured(100))
+
+    policy = BudgetPolicy(MutatingModel(), _config(), token_counter=counter)
+    await anext(policy.stream(request, CancelToken()))
+    assert policy.last_report.input_estimate == 20
+    assert policy._assess(request).source == "estimated"  # 原对象变化不能复用旧实测
+    original = replace(request, tools=_specs("read"))
+    assert policy._assess(original).source == "measured"
+    extension = replace(original, messages=original.messages + (UserMessage("next"),))
+    report = policy._assess(extension)
+    assert report.input_estimate == 20 and report.source == "estimated"
+    assert report.estimator == "deepseek-local-template"
+    assert [c.label for c in report.components] == ["local_template_input", "output_reserve", "safety_margin"]
+    assert sum(c.tokens for c in report.components) == report.total_estimate
+    counter.result = LocalTokenCount(None, "test-profile", "asset-missing")
+    assert policy._assess(extension).source == "anchored"
+    assert policy._assess(extension).local_count.reason == "asset-missing"
+    counter.result = False
+    with pytest.raises(TypeError, match="LocalTokenCount"):
+        policy._assess(extension)
+
+
+async def test_count_qualification_rejection_and_cancel_after_compaction_are_terminal():
+    from cicada.budget import LocalTokenCount
+
+    class Counter:
+        def count_request(self, request):
+            if request.system_prompt == "bad":
+                raise ValueError("safe request qualification diagnostic")
+            return LocalTokenCount(10000, "test-profile")
+
+    model = FakeModel([])
+    policy = BudgetPolicy(model, _config(), token_counter=Counter())
+    bad = _request("x", system="bad")
+    events = [e async for e in policy.stream(bad, CancelToken())]
+    assert events == [StreamDone("error", "safe request qualification diagnostic")]
+    policy.config = _config(num_ctx=100)
+    async def compact():
+        policy.token_counter = Counter()
+        policy.token_counter.count_request = lambda request: (_ for _ in ()).throw(ValueError("after compact"))
+        return True
+    policy.set_auto_compact(compact)
+    events = [e async for e in policy.stream(_request("x"), CancelToken())]
+    assert events == [StreamDone("error", "after compact")]
+    token = CancelToken()
+    async def cancel_compact():
+        token.cancel()
+        return True
+    policy.token_counter = Counter()
+    policy.set_auto_compact(cancel_compact)
+    events = [e async for e in policy.stream(_request("x"), token)]
+    assert events == [StreamDone("aborted")]
+    assert model.requests == []
+
+
 def _specs(*names: str) -> tuple[ToolSpec, ...]:
     return tuple(
         ToolSpec(name, f"description of {name}", {"type": "object"}) for name in names

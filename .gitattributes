@@ -1,0 +1,2 @@
+# Tokenizer provenance and runtime validation require the original asset bytes.
+src/cicada/plugins/deepseek/tokenizer/** -text

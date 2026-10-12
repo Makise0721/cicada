@@ -1209,6 +1209,8 @@ class ApplicationSession:
         policy.summary_budget = binding.summary_budget
         policy.summary_identity = binding.summary_identity
         policy.validate_request = binding.validate_request
+        policy.token_counter = binding.token_counter
+        policy.summary_token_counter = binding.summary_token_counter
         policy.invalidate()
         # 04 (C6): /model 与 /login 从最新接受绑定准备, 不恢复启动缓存对象
         if isinstance(binding.model, ModelSelectionPort):
@@ -1428,6 +1430,16 @@ class ApplicationSession:
             )
         else:
             system_prompt = self._config.system_prompt
+            if self._cancel_token is not None and self._cancel_token.cancelled:
+                raise asyncio.CancelledError()
+            report = policy.assess_preflight(ModelRequest(
+                messages=messages, tools=self._request_tool_specs(), system_prompt=system_prompt,
+            ))
+            if self._cancel_token is not None and self._cancel_token.cancelled:
+                raise asyncio.CancelledError()
+            if report.total_estimate > config.num_ctx:
+                raise RuntimeError(f"request refused before start: {budget_exceeded_text(report)}")
+            return
         input_estimate, components = estimate_input_components(
             system_prompt, self._request_tool_specs(), messages, config
         )
@@ -1437,7 +1449,7 @@ class ApplicationSession:
                     "verification_context_allowance",
                     tail_allowance,
                     "estimated",
-                    note="upper bound of the RunPolicy verification context tail appended before send",
+                    note="capacity placeholder estimate for the RunPolicy verification context tail",
                 ),
             )
             input_estimate += tail_allowance
@@ -2694,6 +2706,8 @@ async def open_application(
             summary_budget=binding.summary_budget if binding is not None else None,
             summary_identity=binding.summary_identity if binding is not None else None,
             validate_request=binding.validate_request if binding is not None else None,
+            token_counter=binding.token_counter if binding is not None else None,
+            summary_token_counter=binding.summary_token_counter if binding is not None else None,
             projection=context_projection,
         )
         policy_state["budget_policy"] = budget

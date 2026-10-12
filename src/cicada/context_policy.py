@@ -31,9 +31,10 @@ Agent → RunPolicy → BudgetPolicy → 适配器; 内核零改动, 规范历�
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from cicada.budget import (
@@ -42,6 +43,8 @@ from cicada.budget import (
     BudgetReport,
     BudgetSnapshot,
     ComponentEstimate,
+    LocalTokenCount,
+    RequestTokenCounter,
     assemble_report,
     budget_exceeded_text,
     estimate_input_components,
@@ -244,6 +247,13 @@ def _is_prefix_extension(anchor: _UsageAnchor, request: ModelRequest) -> bool:
     )
 
 
+def _freeze_request(request: ModelRequest) -> ModelRequest:
+    """发送字段中的可变 schema 在评估前冻结; 消息的发送文本均为不可变值."""
+    return replace(request, tools=tuple(
+        replace(tool, parameters=copy.deepcopy(tool.parameters)) for tool in request.tools
+    ))
+
+
 class BudgetPolicy:
     """ModelPort 装饰器: 每轮权威预算准入 + 实测锚; 默认不启用 (由启动层显式组入)."""
 
@@ -258,6 +268,8 @@ class BudgetPolicy:
         summary_budget: BudgetConfig | None = None,
         summary_identity: SafeModelIdentity | None = None,
         validate_request: Callable[[ModelRequest], None] | None = None,
+        token_counter: RequestTokenCounter | None = None,
+        summary_token_counter: RequestTokenCounter | None = None,
     ) -> None:
         if not callable(getattr(inner, "stream", None)):
             raise TypeError("inner must be a ModelPort")
@@ -272,6 +284,8 @@ class BudgetPolicy:
         self.summary_budget = summary_budget or config
         self.summary_identity = summary_identity
         self.validate_request = validate_request or (lambda request: None)
+        self.token_counter = token_counter
+        self.summary_token_counter = summary_token_counter
         # 摘要通道与自动压缩回调由应用装配。
         self._summarize = summarize
         self._auto_compact = auto_compact
@@ -358,20 +372,35 @@ class BudgetPolicy:
         )
 
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
+        self._last_report = None
         if cancel.cancelled:
             yield StreamDone("aborted")
             return
         # D4: 投影替换发生在 RunPolicy 核对之后 (上游已全量扫描/证明), 本策略把
-        # 消息替换为 [摘要块] + 保留后缀; 无块时原样透传同一请求对象
-        projected = self._project(request)
-        report = self._assess(projected)
+        # 消息替换为 [摘要块] + 保留后缀, 再冻结本轮工具 schema。
+        projected = _freeze_request(self._project(request))
+        try:
+            report = self._assess(projected)
+        except ValueError as exc:
+            yield StreamDone("aborted") if cancel.cancelled else StreamDone("error", str(exc))
+            return
         self._last_report = report
+        if cancel.cancelled:
+            yield StreamDone("aborted")
+            return
         if report.total_estimate > self.config.num_ctx:
             # 权威准入失败: 先尝试本次 execute 至多一次的自动压缩 (D7), 对有效
             # 投影重估; 仍超限零发送, 由内核既有错误路径收尾 (D7 下道口)
             if await self._attempt_admission_auto_compact(cancel):
-                projected = self._project(request)
-                report = self._assess(projected)
+                if cancel.cancelled:
+                    yield StreamDone("aborted")
+                    return
+                projected = _freeze_request(self._project(request))
+                try:
+                    report = self._assess(projected)
+                except ValueError as exc:
+                    yield StreamDone("aborted") if cancel.cancelled else StreamDone("error", str(exc))
+                    return
                 self._last_report = report
             if report.total_estimate > self.config.num_ctx:
                 if cancel.cancelled:
@@ -380,10 +409,8 @@ class BudgetPolicy:
                     return
                 yield StreamDone("error", budget_exceeded_text(report))
                 return
-        try:
-            self.validate_request(projected)
-        except ValueError as exc:
-            yield StreamDone("error", str(exc))
+        if cancel.cancelled:
+            yield StreamDone("aborted")
             return
         async for event in self.inner.stream(projected, cancel):
             if isinstance(event, StreamDone):
@@ -413,9 +440,29 @@ class BudgetPolicy:
         return bool(await self._auto_compact())
 
 
-    def _assess(self, request: ModelRequest) -> BudgetReport:
-        anchor = self._anchor
-        if anchor is not None and _is_prefix_extension(anchor, request):
+    def assess_preflight(self, request: ModelRequest) -> BudgetReport:
+        """无验证模式的完整预检; 不使用锚、不发布正式报告."""
+        return self._assess(_freeze_request(request), use_anchor=False)
+
+    def _assess(self, request: ModelRequest, *, use_anchor: bool = True) -> BudgetReport:
+        self.validate_request(request)
+        local = self.token_counter.count_request(request) if self.token_counter is not None else None
+        if self.token_counter is not None and not isinstance(local, LocalTokenCount):
+            raise TypeError("counter must return LocalTokenCount")
+        # 同时防御违规 counter 绕过 DTO 的构造校验。
+        if local is not None:
+            local.__post_init__()
+        anchor = self._anchor if use_anchor else None
+        matches = anchor is not None and _is_prefix_extension(anchor, request)
+        exact = matches and len(anchor.messages) == len(request.messages)
+        if not exact and local is not None and local.tokens is not None:
+            report = assemble_report(
+                self.config, input_estimate=local.tokens,
+                input_components=(ComponentEstimate("local_template_input", local.tokens, "estimated"),),
+                source="estimated",
+            )
+            return replace(report, estimator="deepseek-local-template", estimator_version="1", local_count=local)
+        if matches:
             prefix = len(anchor.messages)
             input_total = anchor.input_tokens
             components: list[ComponentEstimate] = [
@@ -441,19 +488,19 @@ class BudgetPolicy:
                 )
                 input_total += tokens
             source = "measured" if prefix == len(request.messages) else "anchored"
-            return assemble_report(
+            return replace(assemble_report(
                 self.config, input_estimate=input_total, input_components=tuple(components), source=source
-            )
+            ), local_count=local)
         input_estimate, components = estimate_input_components(
             request.system_prompt, request.tools, request.messages, self.config,
             request_context=request.request_context,
         )
-        return assemble_report(
+        return replace(assemble_report(
             self.config,
             input_estimate=input_estimate,
             input_components=components,
             source="estimated",
-        )
+        ), local_count=local)
 
     def _consider_anchor(self, request: ModelRequest, report: BudgetReport, done: StreamDone) -> None:
         """终结非 error/aborted 且实测 input_tokens 可得非 0 时立锚 (spec D3)."""

@@ -7,6 +7,7 @@ dependencies = [
     "httpx>=0.28.1",
     "jsonschema>=4.23",
     "pyyaml>=6.0.1",
+    "tokenizers==0.23.3",
 ]
 
 [project.scripts]
