@@ -53,6 +53,10 @@ async def test_complete_matches_name_prefix_and_directory_scope(tmp_path):
     assert [c.relative_path for c in result.candidates] == ["src/main.py"]
     result = await service.complete("src/mai", CancelToken())
     assert [c.relative_path for c in result.candidates] == ["src/main.py"]
+    result = await service.complete("SRC/mai", CancelToken())
+    assert [c.relative_path for c in result.candidates] == ["src/main.py"]
+    result = await service.complete("./src/mai", CancelToken())
+    assert [c.relative_path for c in result.candidates] == ["src/main.py"]
     result = await service.complete("src/", CancelToken())
     # 空 fragment 基础分 0: 同深度按路径长度升序
     assert [c.relative_path for c in result.candidates][:2] == ["src/util/", "src/main.py"]
@@ -369,6 +373,26 @@ async def test_complete_propagates_cancellation(tmp_path):
     token.cancel()
     with pytest.raises(asyncio.CancelledError):
         await service.complete("", token)
+
+
+async def test_repeated_task_cancel_releases_completion_registration(tmp_path, monkeypatch):
+    service = CodingFileCompletion(Workspace.create(tmp_path))
+    started = asyncio.Event()
+
+    async def blocked(query, token):
+        started.set()
+        await token.wait()
+        token.throw_if_cancelled()
+
+    monkeypatch.setattr(service, "_complete", blocked)
+    task = asyncio.create_task(service.complete("", CancelToken()))
+    await started.wait()
+    task.cancel()
+    asyncio.get_running_loop().call_soon(task.cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    service.close()
+    await asyncio.wait_for(service.wait_settled(), 1)
 
 
 async def test_inventory_cleanup_timeout_defaults_and_completion_uses_none(tmp_path, monkeypatch):

@@ -59,10 +59,19 @@ class CodingFileCompletion:
             return await self._complete(query, token)
         finally:
             watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
+            cleanup = asyncio.gather(watcher, return_exceptions=True)
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
             token.cancel()  # 收尾不再需要内部资源存活; 幂等
             self._active.discard(settled)
             settled.set()
+            if cancelled:
+                raise asyncio.CancelledError
 
     def close(self) -> None:
         """关闭入口并通知全部活跃查询取消 (scope cleanup, 先于等待落定注册)。"""
@@ -84,6 +93,7 @@ class CodingFileCompletion:
             outer_wait.cancel()
             close_wait.cancel()
             inner.cancel()
+            await asyncio.gather(outer_wait, close_wait, return_exceptions=True)
 
     async def _complete(self, query: str, token: CancelToken) -> FileCompletionResult:
         token.throw_if_cancelled()
@@ -109,7 +119,18 @@ class CodingFileCompletion:
                     )
                     return await self._directory(normalized, token, deadline, blocked)
                 pool = _eligible_paths(inventory)
-                result = _search(pool, normalized)
+                head, _, fragment = normalized.rpartition("/")
+                current = self._workspace.root
+                # Windows 导航允许大小写变体；仍逐级检查原路径，拒绝 reparse。
+                for part in head.split("/") if head else ():
+                    self._checkpoint(token, deadline)
+                    if part in ("", "."):
+                        continue
+                    current = current / part
+                    if not _local_type(current):
+                        return FileCompletionResult((), "git")
+                relative = current.relative_to(self._workspace.root).as_posix()
+                result = _search(pool, (relative + "/" if relative != "." else "") + fragment)
                 self._checkpoint(token, deadline)
                 return result
         except asyncio.CancelledError:
@@ -282,16 +303,16 @@ def _search(
     """显式目录部分按原始路径逐级检查，仅保留该目录后代后参加统一评分。"""
     head, _, fragment = normalized.rpartition("/")
     if head:
-        prefix = head + "/"
+        prefix = head.casefold() + "/"
         segments = head.split("/")
-        available = {path for path, is_directory in pool if is_directory}
+        available = {path.casefold() for path, is_directory in pool if is_directory}
         for index in range(1, len(segments) + 1):
-            if "/".join(segments[:index]) + "/" not in available:
+            if "/".join(segments[:index]).casefold() + "/" not in available:
                 return FileCompletionResult((), "git")
         pool = [
             (path, is_directory)
             for path, is_directory in pool
-            if path.startswith(prefix) and path != prefix  # 目录自身不是其后代
+            if path.casefold().startswith(prefix) and path.casefold() != prefix
         ]
     candidates, truncated = rank_candidates(pool, fragment)
     return FileCompletionResult(candidates, "git", truncated=truncated)

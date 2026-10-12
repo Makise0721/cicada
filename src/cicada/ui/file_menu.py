@@ -251,7 +251,16 @@ class FileCompletionMenu:
         self._closed = True
         self.invalidate()
         if self._task is not None:
-            await asyncio.gather(self._task, return_exceptions=True)
+            settled = asyncio.gather(self._task, return_exceptions=True)
+            cancelled = False
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    cancelled = True
+            settled.result()
+            if cancelled:
+                raise asyncio.CancelledError
 
     # --- 接受 -----------------------------------------------------------------------
 

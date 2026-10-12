@@ -197,11 +197,9 @@ async def test_directory_accept_reopens_menu_for_continue():
 
 
 async def test_exit_cancels_pending_query_and_stops_cleanly():
-    release = asyncio.Event()
-
     async def slow(query, cancel):
-        await release.wait()
-        return FileCompletionResult((FILE,), "git")
+        await cancel.wait()
+        cancel.throw_if_cancelled()
 
     h = _harness(slow)
     try:
@@ -211,4 +209,33 @@ async def test_exit_cancels_pending_query_and_stops_cleanly():
         errors = await h.stop()  # 前端退出先取消并等待查询任务
         assert errors == []
     finally:
-        release.set()
+        await h.stop()
+
+
+async def test_repeated_exit_cancel_waits_for_completion_before_terminal_stop():
+    started, releasing, released = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def complete(query, cancel):
+        started.set()
+        await cancel.wait()
+        releasing.set()
+        await released.wait()  # 模拟必须实际等待的资源回收。
+        cancel.throw_if_cancelled()
+
+    h = _harness(complete)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("@s"))
+        await asyncio.wait_for(started.wait(), 2)
+        h.frontend.request_exit()
+        await asyncio.wait_for(releasing.wait(), 2)
+        h.runner.cancel()
+        asyncio.get_running_loop().call_soon(h.runner.cancel)
+        await asyncio.sleep(0.02)
+        assert not h.terminal.stopped and not h.runner.done()
+        released.set()
+        await asyncio.wait_for(asyncio.gather(h.runner, return_exceptions=True), 2)
+        assert h.terminal.stopped
+    finally:
+        released.set()
+        await h.stop()
