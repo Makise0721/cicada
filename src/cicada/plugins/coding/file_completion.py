@@ -178,8 +178,8 @@ class CodingFileCompletion:
     ) -> set[str]:
         """只查询导航链上各目录的直接 index 项，识别无 .git 的 gitlink。
 
-        显式 :(glob,icase) 中 * 不跨 /；前缀逐级检查后取实际大小写并转义 [，不能
-        递归列后代或改变原共享读口的 literal 默认值。
+        显式 :(glob,icase) 中 * 不跨 /；Unicode 前缀段有界扩宽后严格按
+        casefold 筛选同层元信息，不能递归列后代或改变原读口的 literal 默认值。
         """
         head, _, _ = normalized.rpartition("/")
         prefixes = [""]
@@ -198,8 +198,12 @@ class CodingFileCompletion:
                     raise InventoryError("invalid_path", "local directory changed outside workspace") from exc
                 prefixes.append(actual.as_posix() + "/")
         arguments = ("ls-files", "--stage", "-z", "--", *(
-            ":(glob,icase)" + glob.escape(prefix) + "*" for prefix in prefixes
+            ":(glob,icase)" + "/".join(
+                "*" if not part.isascii() else glob.escape(part)
+                for part in prefix.split("/")
+            ) + "*" for prefix in prefixes
         ))
+        wanted_prefixes = {prefix.casefold() for prefix in prefixes}
         self._checkpoint(token, deadline)
         data, _, _ = await read_git(
             self._workspace.root, arguments, token, MAX_GIT_OUTPUT_BYTES - output_bytes,
@@ -224,7 +228,9 @@ class CodingFileCompletion:
                 raise InventoryError("invalid_path", "invalid Git local metadata path") from exc
             if not path or any(part in ("", ".") for part in path.split("/")):
                 raise InventoryError("invalid_path", "invalid Git local metadata path")
-            if fields[0] in (b"160000", b"120000"):
+            parent, separator, _ = path.rpartition("/")
+            prefix = parent + "/" if separator else ""
+            if prefix.casefold() in wanted_prefixes and fields[0] in (b"160000", b"120000"):
                 blocked.add(path.casefold())
         self._checkpoint(token, deadline)
         return blocked

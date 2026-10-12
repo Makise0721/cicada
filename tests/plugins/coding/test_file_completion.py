@@ -103,7 +103,7 @@ async def test_subworkspace_filters_uninitialized_gitlink_and_its_ancestors(tmp_
     git(tmp_path, "add", ".")
     git(tmp_path, "update-index", "--index-info", input=b"".join(
         b"160000 " + oid + b"\t" + name + b"\n"
-        for name in (b"sub/module", b"sub/d[1]/module", b"sub/ordinary/module", "sub/Ä目录/module".encode("utf-8"))
+        for name in (b"sub/module", b"sub/d[1]/module", b"sub/ordinary/module", "sub/ä目录/module".encode("utf-8"))
     ))
     # 外部 pathspec 环境不能把内部单层模式改成 literal 或递归匹配。
     monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
