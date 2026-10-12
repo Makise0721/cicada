@@ -3,8 +3,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from cicada.core.messages import AssistantMessage, ToolResultMessage, UserMessage, validate_history_structure
 from cicada.core.ports import ModelRequest
 from cicada.models import SafeModelIdentity
@@ -17,6 +15,8 @@ REQUEST_LIMIT = 2 * 1024 * 1024
 
 def request_body_bytes(body: dict) -> bytes:
     """与实际 httpx json=body 的发送序列化共用同一入口, 无凭据/网络."""
+    import httpx
+
     return httpx.Request("POST", BASE_URL + "/chat/completions", json=body).content
 
 

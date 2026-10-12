@@ -1,11 +1,15 @@
 """DeepSeek 插件：环境凭据只在 setup 使用，client 归插件 scope 所有。"""
 
+from __future__ import annotations
+
 import os
-import httpx
+from typing import TYPE_CHECKING
 
 from cicada.runtime.plugin import PluginDefinition
 from cicada.plugins.deepseek.protocol import DeepSeekConfig
-from cicada.plugins.deepseek.model import DeepSeekModel
+
+if TYPE_CHECKING:
+    import httpx
 
 
 def deepseek_plugin(config: DeepSeekConfig | None = None, *, api_key: str | None = None,
@@ -13,6 +17,10 @@ def deepseek_plugin(config: DeepSeekConfig | None = None, *, api_key: str | None
     resolved = config or DeepSeekConfig()
 
     def setup(ctx) -> None:
+        import httpx
+
+        from cicada.plugins.deepseek.model import DeepSeekModel
+
         key = api_key if api_key is not None else os.environ.get("DEEPSEEK_API_KEY")
         if not isinstance(key, str) or not key.strip() or any(c in key for c in "\r\n"):
             raise ValueError("DEEPSEEK_API_KEY is missing or invalid")

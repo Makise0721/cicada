@@ -17,7 +17,7 @@ from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.skills import SkillInvocation
 from cicada.ui import theme
-from cicada.ui.commands import SlashCommandMenu
+from cicada.ui.commands import SLASH_COMMANDS, SlashCommandMenu
 from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.editor import Editor, EditorStyle
 from cicada.ui.frontend import MainScreenFrontend
@@ -98,7 +98,8 @@ def test_all_components_follow_explicit_environment(mode, width, tmp_path):
         assert CURSOR_MARKER in "".join(groups["editor"])
         assert "›" in "".join(groups["editor"])
         assert any("─" in line for line in groups["editor"])
-        menu.move(3)
+        model_index = next(index for index, item in enumerate(SLASH_COMMANDS) if item.command == "/model")
+        menu.move(model_index)
         models.move(1)
         assert "model" in strip_terminal_sequences(next(line for line in menu.render(60, 8) if "→ " in line))
         assert "模型二" in strip_terminal_sequences(next(line for line in models.render(width, 5) if "→ " in line))
