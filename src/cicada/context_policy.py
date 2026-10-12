@@ -102,6 +102,11 @@ def summary_prompt_text() -> str:
     )
 
 
+def build_summary_request(messages: tuple[Message, ...]) -> ModelRequest:
+    """已整形的摘要输入: 候选评估与最终发送共用, 无工具或验证尾部."""
+    return ModelRequest(messages=messages, tools=(), system_prompt=summary_prompt_text(), request_context="")
+
+
 SUMMARY_PROMPT_SHA256 = hashlib.sha256(summary_prompt_text().encode("utf-8")).hexdigest()
 
 
@@ -252,6 +257,32 @@ def _freeze_request(request: ModelRequest) -> ModelRequest:
     return replace(request, tools=tuple(
         replace(tool, parameters=copy.deepcopy(tool.parameters)) for tool in request.tools
     ))
+
+
+def _local_count(counter: RequestTokenCounter | None, request: ModelRequest) -> LocalTokenCount | None:
+    local = counter.count_request(request) if counter is not None else None
+    if counter is not None and not isinstance(local, LocalTokenCount):
+        raise TypeError("counter must return LocalTokenCount")
+    if local is not None:
+        local.__post_init__()
+    return local
+
+
+def _estimated_report(request: ModelRequest, config: BudgetConfig, local: LocalTokenCount | None) -> BudgetReport:
+    if local is not None and local.tokens is not None:
+        report = assemble_report(
+            config, input_estimate=local.tokens,
+            input_components=(ComponentEstimate("local_template_input", local.tokens, "estimated"),),
+            source="estimated",
+        )
+        return replace(report, estimator="deepseek-local-template", estimator_version="1", local_count=local)
+    input_estimate, components = estimate_input_components(
+        request.system_prompt, request.tools, request.messages, config,
+        request_context=request.request_context,
+    )
+    return replace(assemble_report(
+        config, input_estimate=input_estimate, input_components=components, source="estimated",
+    ), local_count=local)
 
 
 class BudgetPolicy:
@@ -444,24 +475,18 @@ class BudgetPolicy:
         """无验证模式的完整预检; 不使用锚、不发布正式报告."""
         return self._assess(_freeze_request(request), use_anchor=False)
 
+    def assess_summary(self, request: ModelRequest) -> BudgetReport:
+        """完整摘要评估; 使用独立绑定, 不读取普通锚或发布普通报告."""
+        return _estimated_report(request, self.summary_budget, _local_count(self.summary_token_counter, request))
+
     def _assess(self, request: ModelRequest, *, use_anchor: bool = True) -> BudgetReport:
         self.validate_request(request)
-        local = self.token_counter.count_request(request) if self.token_counter is not None else None
-        if self.token_counter is not None and not isinstance(local, LocalTokenCount):
-            raise TypeError("counter must return LocalTokenCount")
-        # 同时防御违规 counter 绕过 DTO 的构造校验。
-        if local is not None:
-            local.__post_init__()
+        local = _local_count(self.token_counter, request)
         anchor = self._anchor if use_anchor else None
         matches = anchor is not None and _is_prefix_extension(anchor, request)
         exact = matches and len(anchor.messages) == len(request.messages)
         if not exact and local is not None and local.tokens is not None:
-            report = assemble_report(
-                self.config, input_estimate=local.tokens,
-                input_components=(ComponentEstimate("local_template_input", local.tokens, "estimated"),),
-                source="estimated",
-            )
-            return replace(report, estimator="deepseek-local-template", estimator_version="1", local_count=local)
+            return _estimated_report(request, self.config, local)
         if matches:
             prefix = len(anchor.messages)
             input_total = anchor.input_tokens
@@ -491,16 +516,7 @@ class BudgetPolicy:
             return replace(assemble_report(
                 self.config, input_estimate=input_total, input_components=tuple(components), source=source
             ), local_count=local)
-        input_estimate, components = estimate_input_components(
-            request.system_prompt, request.tools, request.messages, self.config,
-            request_context=request.request_context,
-        )
-        return replace(assemble_report(
-            self.config,
-            input_estimate=input_estimate,
-            input_components=components,
-            source="estimated",
-        ), local_count=local)
+        return _estimated_report(request, self.config, local)
 
     def _consider_anchor(self, request: ModelRequest, report: BudgetReport, done: StreamDone) -> None:
         """终结非 error/aborted 且实测 input_tokens 可得非 0 时立锚 (spec D3)."""
@@ -541,7 +557,7 @@ class SummaryOutcome:
 
 
 async def generate_summary(
-    channel: ModelPort, messages: tuple[Message, ...], cancel: CancelToken
+    channel: ModelPort, messages: tuple[Message, ...] | ModelRequest, cancel: CancelToken
 ) -> SummaryOutcome:
     """独立无工具摘要调用 (D5): tools=() + 版本化摘要系统提示, 收集文本与终结.
 
@@ -553,7 +569,9 @@ async def generate_summary(
     """
     from cicada.persistence.contracts import SUMMARY_TEXT_MAX_BYTES
 
-    request = ModelRequest(messages=messages, tools=(), system_prompt=summary_prompt_text())
+    if cancel.cancelled:
+        return SummaryOutcome(ok=False, failure="aborted")
+    request = messages if isinstance(messages, ModelRequest) else build_summary_request(messages)
     text_parts: list[str] = []
     done: StreamDone | None = None
     try:

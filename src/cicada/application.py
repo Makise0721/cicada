@@ -43,9 +43,9 @@ from cicada.context_policy import (
     SummaryBlock,
     canonical_prefix_sha256,
     generate_summary,
+    build_summary_request,
     summary_block_message,
     summary_input_messages,
-    summary_prompt_text,
 )
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
@@ -403,7 +403,7 @@ class CompactionSealedError(RuntimeError):
 class _CompactionPlan:
     """一次手动压缩的切点计划 (D4): 覆盖区间与保留边界."""
 
-    messages: tuple[Message, ...]     # 摘要输入: 原始规范历史区间 (不经投影)
+    request: ModelRequest             # 完整摘要输入: 原始历史区间及固定最后 user
     first_request_seq: int
     last_request_seq: int
     message_count: int                # 本块覆盖消息数 (end - start)
@@ -1798,10 +1798,11 @@ class ApplicationSession:
         if self._compact_sealed:
             raise RuntimeError("application is closing; compaction is sealed")
         # 可压缩区间与摘要输入预算在置位屏障前判定: 拒绝不留下 busy/屏障 (D1)
-        plan = self._compaction_plan()
+        token = CancelToken()
+        plan = self._compaction_plan(token)
         self._compacting = True
         self._compact_done = asyncio.get_running_loop().create_future()
-        self._compact_token = CancelToken()
+        self._compact_token = token
         self._notify(OperationBusy(operation="compact"))
         try:
             return await self._run_compaction(
@@ -1825,7 +1826,14 @@ class ApplicationSession:
         成功先切换再传播外层 CancelledError。
         """
         channel = self._budget_policy.summarize_channel
-        outcome = await generate_summary(channel, plan.messages, cancel_token)
+        if self._compact_sealed:
+            return None
+        self._check_summary_admission(cancel_token)
+        report = self._budget_policy.assess_summary(plan.request)
+        self._check_summary_admission(cancel_token)
+        if report.total_estimate > report.limit:
+            raise RuntimeError("compaction unavailable: " + budget_exceeded_text(report))
+        outcome = await generate_summary(channel, plan.request, cancel_token)
         if not outcome.ok:
             if outcome.failure == "aborted" and self._compact_sealed:
                 # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)
@@ -1955,14 +1963,14 @@ class ApplicationSession:
         if self._storage_failed is not None:
             # storage_failed 锁存 (含请求中途由活动包装器锁存): 零摘要调用
             return False
+        token = self._cancel_token
+        assert token is not None, "auto compaction belongs to an execute attempt"
         try:
-            plan = self._compaction_plan()
+            plan = self._compaction_plan(token)
         except RuntimeError:
             return False
         if not policy.try_consume_admission_auto_attempt():
             return False
-        token = self._cancel_token
-        assert token is not None, "auto compaction belongs to an execute attempt"
         self._compacting = True
         self._compact_done = asyncio.get_running_loop().create_future()
         self._compact_token = token
@@ -1978,7 +1986,11 @@ class ApplicationSession:
             if self._compact_done is not None and not self._compact_done.done():
                 self._compact_done.set_result(None)
 
-    def _compaction_plan(self) -> _CompactionPlan:
+    def _check_summary_admission(self, cancel_token: CancelToken | None) -> None:
+        if self._compact_sealed or self._closing or self._closed or (cancel_token is not None and cancel_token.cancelled):
+            raise RuntimeError("summary generation failed (aborted); the model projection is unchanged")
+
+    def _compaction_plan(self, cancel_token: CancelToken | None = None) -> _CompactionPlan:
         """D4: 当前代次、已提交完整请求、保留最近 1 个; 摘要输入自身须满足预算.
 
         覆盖起点 = 当前投影保留起点 (再次压缩只追加新区间, 不重写旧摘要);
@@ -2005,19 +2017,14 @@ class ApplicationSession:
                 raise RuntimeError(
                     "compaction bookkeeping is inconsistent with the projection"
                 )
-        summary_system = summary_prompt_text()
         chosen_span: tuple[int, int, int] | None = None
         for span in reversed(eligible):
-            range_messages = summary_input_messages(
+            self._check_summary_admission(cancel_token)
+            request = build_summary_request(summary_input_messages(
                 tuple(self._history[start : span[2]])
-            )
-            input_estimate, components = estimate_input_components(
-                summary_system, (), range_messages, config
-            )
-            report = assemble_report(
-                config, input_estimate=input_estimate, input_components=components,
-                source="estimated",
-            )
+            ))
+            report = self._budget_policy.assess_summary(request)
+            self._check_summary_admission(cancel_token)
             if report.total_estimate <= config.num_ctx:
                 chosen_span = span
                 break
@@ -2027,9 +2034,7 @@ class ApplicationSession:
                 "the summary request budget"
             )
         return _CompactionPlan(
-            messages=summary_input_messages(
-                tuple(self._history[start : chosen_span[2]])
-            ),
+            request=request,
             first_request_seq=eligible[0][0],
             last_request_seq=chosen_span[0],
             message_count=chosen_span[2] - start,

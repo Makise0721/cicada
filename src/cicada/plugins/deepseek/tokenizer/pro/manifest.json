@@ -1,0 +1,48 @@
+{
+  "alias": "deepseek-v4-pro",
+  "reference_model": "DeepSeek-V4-Pro-0813",
+  "repo": "deepseek-ai/DeepSeek-V4-Pro-0813",
+  "revision": "72e1d3230f6c080a530b0a1d46f8eb4602340597",
+  "assets": {
+    "tokenizer.json": {
+      "source_path": "tokenizer.json",
+      "size": 6367146,
+      "git_blob": "628e3364caad11bdf9e67cea06eae7878122811d",
+      "sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf"
+    },
+    "tokenizer_config.json": {
+      "source_path": "tokenizer_config.json",
+      "size": 801,
+      "git_blob": "f3dad388a2bbfd6a8605bd02754acd86d9ca5112",
+      "sha256": "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+    },
+    "reference.py.txt": {
+      "source_path": "encoding/encoding_dsv4.py",
+      "size": 29001,
+      "git_blob": "66f2d30ece5a93e08fbab47aeb9f3541830930ef",
+      "sha256": "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6"
+    },
+    "reference-README.md": {
+      "source_path": "encoding/README.md",
+      "size": 9168,
+      "git_blob": "78d93a8a4dd24378356523992dea6517844657e1",
+      "sha256": "294ed6493ebfe5a487f172154d60c494899997fed8806fdd3352dd8e3c33f9de"
+    },
+    "LICENSE": {
+      "source_path": "LICENSE",
+      "size": 1084,
+      "git_blob": "d62e3bef9f054f21b7fc616365850fbf879a99ff",
+      "sha256": "f2c6c602815669d292889e5be8c802f2ed950653b77999b1584e8e6aed25d040"
+    }
+  },
+  "license": "MIT",
+  "adapter_version": "1",
+  "adapter_sha256": "196f7fc5f6585b4c92b378c643c161015a372f7070eabbfaf2e47f953c34dec3",
+  "counter_version": "1",
+  "tokenizers_version": "0.23.3",
+  "add_special_tokens": false,
+  "truncation": false,
+  "padding": false,
+  "support": "text-only; thinking on/off; effort low/high/max; ordered tools; DSML; verification tail",
+  "online_equivalence": "unverified; absent-system tools use a local empty-system mapping"
+}

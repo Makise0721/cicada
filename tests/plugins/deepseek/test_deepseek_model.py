@@ -19,17 +19,19 @@ REQUEST = ModelRequest((UserMessage("任务"),), (ToolSpec("read", "read", {"typ
 CTX = '<cicada-verification-context version="1">\n{"blocked":false}\n</cicada-verification-context>'
 
 
-def test_flash_full_template_matches_pinned_reference_and_ignores_unsent_metadata():
+@pytest.mark.parametrize("alias, folder", [("deepseek-flash", "flash"), ("deepseek-v4-pro", "pro")])
+def test_full_template_matches_pinned_reference_and_ignores_unsent_metadata(alias, folder):
     import copy
     import runpy
     from importlib import resources
     from tokenizers import Tokenizer
     from cicada.core.messages import ToolCall, ToolResult, ToolResultMessage
-    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter, render_body
+    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter, ProTokenCounter, render_body
+    counter_type = FlashTokenCounter if folder == "flash" else ProTokenCounter
 
     root = resources.files("cicada.plugins.deepseek.tokenizer")
-    reference = runpy.run_path(str(root.joinpath("flash/reference.py.txt")))
-    tokenizer = Tokenizer.from_file(str(root.joinpath("flash/tokenizer.json")))
+    reference = runpy.run_path(str(root.joinpath(folder + "/reference.py.txt")))
+    tokenizer = Tokenizer.from_file(str(root.joinpath(folder + "/tokenizer.json")))
     plain = ModelRequest((UserMessage("What is 2+2?"),), (), "You are a helpful assistant.")
     call = ToolCall("c1", "lookup", '{"query":"value","count":5}')
     history = (UserMessage("Look up a value"),
@@ -37,10 +39,10 @@ def test_flash_full_template_matches_pinned_reference_and_ignores_unsent_metadat
                ToolResultMessage(ToolResult("c1", "lookup", "result", details={"private": "not sent"})))
     tools = (ToolSpec("lookup", "Look up a value", {"type": "object"}),)
     tool_request = ModelRequest(history, tools, "Search tools.", CTX)
-    for config, request in [(DeepSeekConfig(), plain),
-                            (DeepSeekConfig(reasoning_effort="low"), tool_request),
-                            (DeepSeekConfig(reasoning_effort="max"), replace(tool_request, system_prompt="")),
-                            (DeepSeekConfig(think=False), tool_request)]:
+    for config, request in [(DeepSeekConfig(model=alias), plain),
+                            (DeepSeekConfig(model=alias, reasoning_effort="low"), tool_request),
+                            (DeepSeekConfig(model=alias, reasoning_effort="max"), replace(tool_request, system_prompt="")),
+                            (DeepSeekConfig(model=alias, think=False), tool_request)]:
         body = build_request(request, config)
         mapped = copy.deepcopy(body["messages"])
         if body.get("tools"):
@@ -55,11 +57,11 @@ def test_flash_full_template_matches_pinned_reference_and_ignores_unsent_metadat
         assert rendered == expected
         assert tokenizer.encode(rendered, add_special_tokens=False).ids == tokenizer.encode(expected, add_special_tokens=False).ids
         assert rendered.count("<｜begin▁of▁sentence｜>") == 1
-        counter = FlashTokenCounter(config)
+        counter = counter_type(config)
         count = counter.count_request(request)
         assert count.tokens == len(tokenizer.encode(expected, add_special_tokens=False).ids)
         assert counter.count_request(request) is count
-    counter = FlashTokenCounter(DeepSeekConfig())
+    counter = counter_type(DeepSeekConfig(model=alias))
     first = counter.count_request(tool_request)
     changed = replace(tool_request, messages=(history[0], replace(history[1], error="not sent"),
         ToolResultMessage(replace(history[2].result, details={"different": "not sent"}))))
@@ -67,22 +69,24 @@ def test_flash_full_template_matches_pinned_reference_and_ignores_unsent_metadat
     assert counter.count_request(replace(tool_request, request_context=CTX + " changed")) is not first
 
 
-def test_flash_assets_and_wire_limit_fail_safely_before_render(monkeypatch, tmp_path):
+@pytest.mark.parametrize("alias, folder", [("deepseek-flash", "flash"), ("deepseek-v4-pro", "pro")])
+def test_assets_and_wire_limit_fail_safely_before_render(monkeypatch, tmp_path, alias, folder):
     import sys
     from cicada.plugins.deepseek import tokenizer as module
-    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter
+    from cicada.plugins.deepseek.tokenizer import FlashTokenCounter, ProTokenCounter
+    counter_type = FlashTokenCounter if folder == "flash" else ProTokenCounter
 
-    missing = FlashTokenCounter(DeepSeekConfig())
+    missing = counter_type(DeepSeekConfig(model=alias))
     with monkeypatch.context() as patch:
         patch.setattr(module.resources, "files", lambda package: tmp_path)
         assert missing.count_request(REQUEST).reason == "asset-missing"
-        (tmp_path / "flash").mkdir()
-        (tmp_path / "flash/manifest.json").write_bytes(b"corrupt")
-        assert FlashTokenCounter(DeepSeekConfig()).count_request(REQUEST).reason == "asset-invalid"
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "manifest.json").write_bytes(b"corrupt")
+        assert counter_type(DeepSeekConfig(model=alias)).count_request(REQUEST).reason == "asset-invalid"
     with monkeypatch.context() as patch:
         patch.setitem(sys.modules, "tokenizers", None)
-        assert FlashTokenCounter(DeepSeekConfig()).count_request(REQUEST).reason == "dependency-unavailable"
-    too_large = FlashTokenCounter(DeepSeekConfig(max_request_bytes=10))
+        assert counter_type(DeepSeekConfig(model=alias)).count_request(REQUEST).reason == "dependency-unavailable"
+    too_large = counter_type(DeepSeekConfig(model=alias, max_request_bytes=10))
     monkeypatch.setattr(too_large, "_load", lambda: pytest.fail("oversized body must not load/render"))
     assert too_large.count_request(REQUEST).reason == "request-too-large"
     with pytest.raises(ValueError, match="requires tools"):

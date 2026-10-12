@@ -272,6 +272,70 @@ async def test_compaction_refuses_when_oldest_single_request_does_not_fit(tmp_pa
 # --- PA03: 分阶段取消 -------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("dispatch", ["send", "over-limit", "cancel"])
+async def test_summary_counts_whole_candidates_and_rechecks_dispatch(tmp_path, dispatch):
+    from cicada.budget import LocalTokenCount
+    from cicada.core.cancel import CancelToken
+    from cicada.context_policy import summary_input_messages, summary_prompt_text
+
+    session, _main, channel, store = await _manual_persistent_session(
+        tmp_path, script=[[StreamDone("stop")]] * 4,
+    )
+    try:
+        for text in ("one", "two", "three", "keep"):
+            await session.execute(text)
+        history = session.history
+        token = CancelToken()
+
+        class Counter:
+            def __init__(self):
+                self.requests = []
+
+            def count_request(self, request):
+                self.requests.append(request)
+                if len(self.requests) == 3:
+                    if dispatch == "cancel":
+                        token.cancel()
+                    if dispatch == "over-limit":
+                        return LocalTokenCount(10000, "summary-test")
+                # 非单调: 最长不合格, 中间合格, 最短也不合格。
+                return LocalTokenCount({7: 10000, 5: 100, 3: 10000}[len(request.messages)], "summary-test")
+
+        counter = Counter()
+        policy = session._budget_policy
+        policy.summary_budget = _budget(3000)
+        policy.summary_token_counter = counter
+        before_budget = session.budget
+        plan = session._compaction_plan(token)
+        assert plan.end_index == 4
+        expected = summary_input_messages(history[:4])
+        assert counter.requests[-1].messages == expected
+        assert plan.request is counter.requests[-1]
+        if dispatch == "send":
+            await session._run_compaction(plan, reason="manual", cancel_token=token)
+            assert channel.requests == [plan.request]
+            assert len(store.recovery_snapshot().summaries) == 1
+        else:
+            with pytest.raises(RuntimeError, match="aborted" if dispatch == "cancel" else "exceeds limit"):
+                await session._run_compaction(plan, reason="manual", cancel_token=token)
+            assert channel.requests == [] and store.recovery_snapshot().summaries == ()
+            assert session._context_projection.blocks == ()
+            assert session.budget == before_budget
+        assert len(counter.requests) == 3
+        assert counter.requests[-1] is plan.request
+        assert plan.request.system_prompt == summary_prompt_text()
+        assert plan.request.tools == () and plan.request.request_context == ""
+        assert session.history == history
+        # 已取消时, 候选计数不能再开始。
+        token.cancel()
+        with pytest.raises(RuntimeError, match="aborted"):
+            session._compaction_plan(token)
+        assert len(counter.requests) == 3
+    finally:
+        await session.aclose()
+        await store.aclose()
+
+
 async def test_cancel_before_dispatch_leaves_zero_writes(tmp_path):
     channel = _GatedSummary()
     session, _main, _channel_obj, store = await _manual_persistent_session(

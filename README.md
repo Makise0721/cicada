@@ -63,7 +63,7 @@ cicada
 
 ## 发送预算与上下文压缩
 
-真实模型发送前做预算准入：完整输入按启发式估计（非精确 token），加上输出预留与安全余量后的总估计超过有效 `--num-ctx`（请求值）即拒绝发送并说明原因；请求体字节上限是独立的请求体字节守卫，不充当 token 预算。TUI 底栏常驻最近预算评估及输入来源，完整分解见 `/status`。持久会话可用 `/compact` 手动压缩较早请求（原始记录保留）；请求超限时先自动压缩至多一次再重估；DeepSeek 不自动 HTTP 重试。非持久会话只有预算准入，无压缩。
+真实模型发送前做预算准入：完整输入优先使用相同请求的实测，其次按 Flash/Pro 各自固定公开模板完整计数（线上一致性未验证），不可用时回退启发式估计，加上输出预留与安全余量后的总估计超过有效 `--num-ctx`（请求值）即拒绝发送并说明原因；请求体字节上限是独立的请求体字节守卫，不充当 token 预算。TUI 底栏常驻最近预算评估及输入来源，完整分解见 `/status`。持久会话可用 `/compact` 手动压缩较早请求（原始记录保留）；请求超限时先自动压缩至多一次再重估；DeepSeek 不自动 HTTP 重试。非持久会话只有预算准入，无压缩。
 
 ## 常用参数
 
@@ -94,4 +94,4 @@ uv run --frozen python -m pytest -q   # fake / MockTransport 离线检查
 
 文件修改支持 Windows 本地 NTFS 普通文件；已有文件先 `read`，读后变化拒绝覆盖，新建同名冲突不覆盖。恢复会话后须重新读取；工具结果区分未提交、已提交和未知，未知保留暂存材料供核对。
 
-工具顺序执行；普通模式最多 50 轮、检查模式最多 25 轮模型循环。Flash 普通预算使用包内固定公开模板计数（线上一致性未验证），Pro/摘要仍用原估计，插件热替换尚未提供；运行时模型选择经 `/model` 菜单（Flash/Pro，保留对话历史与检查状态）。DeepSeek 已完成离线协议/工具/保存恢复检查，真实账号与模型质量未测；含思考的摘要输入以完整引用进入压缩。扩展：新模型实现 `ModelPort`、新工具实现 `Tool`（[src/cicada/core/ports.py](src/cicada/core/ports.py)），经 [PluginDefinition](src/cicada/runtime/plugin.py) 声明依赖后由 [boot.py](src/cicada/boot.py) 装配。
+工具顺序执行；普通模式最多 50 轮、检查模式最多 25 轮模型循环。Flash/Pro 普通与摘要预算均支持包内固定公开模板计数，插件热替换尚未提供；运行时模型选择经 `/model` 菜单（Flash/Pro，保留对话历史与检查状态）。DeepSeek 已完成离线协议/工具/保存恢复检查，真实账号与模型质量未测；含思考的摘要输入以完整引用进入压缩。扩展：新模型实现 `ModelPort`、新工具实现 `Tool`（[src/cicada/core/ports.py](src/cicada/core/ports.py)），经 [PluginDefinition](src/cicada/runtime/plugin.py) 声明依赖后由 [boot.py](src/cicada/boot.py) 装配。

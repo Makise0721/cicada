@@ -111,8 +111,9 @@ class DeepSeekModel:
         self._observation: CacheRequestObservation | None = None
         self._send_sequence = 0
         self._shape_baseline: _RequestShape | None = None
-        from .tokenizer import FlashTokenCounter
-        self._token_counter = FlashTokenCounter(config) if config.model == "deepseek-flash" else None
+        from .tokenizer import FlashTokenCounter, ProTokenCounter
+        counter_type = FlashTokenCounter if config.model == "deepseek-flash" else ProTokenCounter
+        self._token_counter = counter_type(config)
 
     @property
     def cache_observation(self) -> CacheRequestObservation | None:
@@ -130,7 +131,7 @@ class DeepSeekModel:
         return ModelBinding(self, summary, self.config.identity, summary_config.identity,
                             BudgetConfig(self.config.num_ctx, self.config.max_tokens),
                             BudgetConfig(summary_config.num_ctx, summary_config.max_tokens),
-                            self.config.validate_request, self._token_counter)
+                            self.config.validate_request, self._token_counter, summary._token_counter)
 
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
