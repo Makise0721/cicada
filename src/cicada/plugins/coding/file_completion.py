@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import os
 import stat
 from pathlib import Path
@@ -24,8 +25,10 @@ from cicada.file_completion import (
     rank_candidates,
 )
 from cicada.plugins.coding.inventory import (
-    DEFAULT_EXCLUSIONS, FileInventory, GitInventory, InventoryError,
+    DEFAULT_EXCLUSIONS, MAX_GIT_OUTPUT_BYTES, MAX_PATHS,
+    FileInventory, GitInventory, InventoryError,
 )
+from cicada.plugins.coding.git_io import GitIOError, read_git
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginContext, PluginDefinition
 
@@ -100,7 +103,11 @@ class CodingFileCompletion:
                 except InventoryError as exc:
                     if exc.kind not in ("not_git", "root_mismatch"):
                         raise
-                    return await self._directory(normalized, token, deadline)
+                    blocked = (
+                        await self._gitlinks(normalized, token, deadline, exc.output_bytes)
+                        if exc.kind == "root_mismatch" else set()
+                    )
+                    return await self._directory(normalized, token, deadline, blocked)
                 pool = _eligible_paths(inventory)
                 result = _search(pool, normalized)
                 self._checkpoint(token, deadline)
@@ -108,6 +115,8 @@ class CodingFileCompletion:
         except asyncio.CancelledError:
             raise  # 取消继续传播，不转为空匹配
         except InventoryError as exc:
+            return FileCompletionResult((), SCOPE_UNAVAILABLE, reason=exc.kind)
+        except GitIOError as exc:
             return FileCompletionResult((), SCOPE_UNAVAILABLE, reason=exc.kind)
         except TimeoutError:
             return FileCompletionResult((), SCOPE_UNAVAILABLE, reason="timeout")
@@ -122,6 +131,7 @@ class CodingFileCompletion:
 
     async def _directory(
         self, normalized: str, token: CancelToken, deadline: float,
+        blocked: set[str],
     ) -> FileCompletionResult:
         head, _, fragment = normalized.rpartition("/")
         current = self._workspace.root
@@ -131,7 +141,7 @@ class CodingFileCompletion:
             if part in ("", "."):
                 continue
             current = current / part
-            if not _local_type(current):
+            if current.relative_to(self._workspace.root).as_posix().casefold() in blocked or not _local_type(current):
                 return FileCompletionResult((), SCOPE_DIRECTORY)
         pool: list[tuple[str, bool]] = []
         truncated = False
@@ -149,6 +159,8 @@ class CodingFileCompletion:
                 if kind is None:
                     continue
                 path = Path(entry.path).relative_to(self._workspace.root).as_posix()
+                if path.casefold() in blocked:
+                    continue
                 try:
                     normalize_query(path)
                 except UnsupportedPathError:
@@ -160,6 +172,51 @@ class CodingFileCompletion:
         candidates, limited = rank_candidates(pool, fragment)
         self._checkpoint(token, deadline)
         return FileCompletionResult(candidates, SCOPE_DIRECTORY, truncated=truncated or limited)
+
+    async def _gitlinks(
+        self, normalized: str, token: CancelToken, deadline: float, output_bytes: int,
+    ) -> set[str]:
+        """只查询导航链上各目录的直接 index 项，识别无 .git 的 gitlink。
+
+        显式 :(glob) 中 * 不跨 /；前缀由已验证 query 生成并转义 [，不能
+        递归列后代或改变原共享读口的 literal 默认值。
+        """
+        head, _, _ = normalized.rpartition("/")
+        prefixes = [""]
+        for part in head.split("/") if head else ():
+            if part not in ("", "."):
+                prefixes.append(prefixes[-1] + part + "/")
+        arguments = ("ls-files", "--stage", "-z", "--", *(
+            ":(glob)" + glob.escape(prefix) + "*" for prefix in prefixes
+        ))
+        self._checkpoint(token, deadline)
+        data, _, _ = await read_git(
+            self._workspace.root, arguments, token, MAX_GIT_OUTPUT_BYTES - output_bytes,
+            cleanup_timeout_s=None, literal_pathspecs=False,
+        )
+        if data and not data.endswith(b"\0"):
+            raise InventoryError("invalid_inventory", "Git stage records lack terminating NUL")
+        blocked: set[str] = set()
+        for index, record in enumerate(data.split(b"\0")[:-1]):
+            if index % 32 == 0:
+                await asyncio.sleep(0)
+                self._checkpoint(token, deadline)
+            if index >= MAX_PATHS:
+                raise InventoryError("path_limit", "Git local metadata exceeds path limit")
+            header, separator, raw_path = record.partition(b"\t")
+            fields = header.split(b" ")
+            if not separator or len(fields) != 3 or fields[0] not in (b"100644", b"100755", b"120000", b"160000"):
+                raise InventoryError("invalid_inventory", "invalid Git local stage record")
+            try:
+                path = normalize_query(raw_path.decode("utf-8"))
+            except (UnicodeError, UnsupportedPathError) as exc:
+                raise InventoryError("invalid_path", "invalid Git local metadata path") from exc
+            if not path or any(part in ("", ".") for part in path.split("/")):
+                raise InventoryError("invalid_path", "invalid Git local metadata path")
+            if fields[0] in (b"160000", b"120000"):
+                blocked.add(path.casefold())
+        self._checkpoint(token, deadline)
+        return blocked
 
 
 def _local_type(path: Path) -> bool | None:

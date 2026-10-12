@@ -89,6 +89,32 @@ async def test_complete_filters_deleted_reparse_and_gitlink(tmp_path):
     assert paths == {"kept.py"}  # 已删除/软链/gitlink 均不入候选, 也不派生目录
 
 
+async def test_subworkspace_filters_uninitialized_gitlink_and_its_ancestors(tmp_path, monkeypatch):
+    git(tmp_path, "init", "-q")
+    oid = git(tmp_path, "hash-object", "-w", "--stdin", input=b"object").strip()
+    workspace = tmp_path / "sub"
+    (workspace / "module" / "child").mkdir(parents=True)
+    (workspace / "d[1]" / "module").mkdir(parents=True)
+    (workspace / "ordinary" / "child").mkdir(parents=True)
+    (workspace / "ordinary" / "child" / "tracked.py").write_text("x", encoding="utf-8")
+    (workspace / "ordinary" / "file.py").write_text("x", encoding="utf-8")
+    git(tmp_path, "add", ".")
+    git(tmp_path, "update-index", "--index-info", input=b"".join(
+        b"160000 " + oid + b"\t" + name + b"\n"
+        for name in (b"sub/module", b"sub/d[1]/module")
+    ))
+    # 外部 pathspec 环境不能把内部单层模式改成 literal 或递归匹配。
+    monkeypatch.setenv("GIT_LITERAL_PATHSPECS", "1")
+    service = CodingFileCompletion(Workspace.create(workspace))
+    result = await service.complete("", CancelToken())
+    assert result.scope == SCOPE_DIRECTORY
+    assert {c.relative_path for c in result.candidates} == {"d[1]/", "ordinary/"}
+    for query in ("module/", "module/child/", "d[1]/"):
+        assert (await service.complete(query, CancelToken())).candidates == ()
+    result = await service.complete("ordinary/", CancelToken())
+    assert {c.relative_path for c in result.candidates} == {"ordinary/child/", "ordinary/file.py"}
+
+
 async def test_complete_maps_failures_to_stable_reasons(tmp_path, monkeypatch):
     git(tmp_path, "init", "-q")
     sub = tmp_path / "sub"
@@ -311,7 +337,7 @@ async def test_directory_fallback_shares_probe_deadline(tmp_path, monkeypatch):
             reached.set()
             raise InventoryError("not_git", "controlled")
 
-    async def directory(self, normalized, token, deadline):
+    async def directory(self, normalized, token, deadline, blocked):
         assert reached.is_set()
         entered.set()
         # 只有重置 deadline 才能完整等待；共享 deadline 应在此取消。

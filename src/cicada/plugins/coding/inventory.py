@@ -28,8 +28,9 @@ QUERY_TIMEOUT_S = 10.0
 class InventoryError(WorkspaceError):
     """整个清单失败；不得把部分候选解释为完整搜索范围."""
 
-    def __init__(self, kind: str, message: str) -> None:
+    def __init__(self, kind: str, message: str, *, output_bytes: int = 0) -> None:
         self.kind = kind
+        self.output_bytes = output_bytes
         super().__init__(message)
 
 
@@ -120,7 +121,8 @@ class GitInventory:
         except UnicodeError as exc:
             raise InventoryError("invalid_path", "Git root is not UTF-8") from exc
         if git_root != root:
-            raise InventoryError("root_mismatch", f"workspace must be the Git worktree root: {git_root}")
+            raise InventoryError("root_mismatch", f"workspace must be the Git worktree root: {git_root}",
+                                 output_bytes=len(root_bytes))
         tracked = await self._git(("ls-files", "--cached", "--stage", "-z"), cancel, remaining)
         remaining -= len(tracked)
         untracked = await self._git(("ls-files", "--others", "--exclude-standard", "-z"), cancel, remaining)

@@ -20,6 +20,7 @@ async def read_git(
     *, input_data: bytes | None = None, allowed_codes: tuple[int, ...] = (0,),
     preview_bytes: int | None = None, cleanup_timeout_s: float | None = None,
     include_error_detail: bool = False, classify_not_git: bool = False,
+    literal_pathspecs: bool = True,
 ) -> tuple[bytes, int, bool]:
     """累计 stdout 有硬上限；预览可截断但继续有界排空，取消等实际回收。"""
     cancel.throw_if_cancelled()
@@ -32,9 +33,14 @@ async def read_git(
     root_probe = classify_not_git and arguments == ("rev-parse", "--show-toplevel")
     if root_probe:
         environment.update(LC_ALL="C", LANG="C", LANGUAGE="C")
+    if not literal_pathspecs:
+        # 仅供补全生成的显式 :(glob) 单层元信息查询；不接受外部 pathspec。
+        environment.update(GIT_LITERAL_PATHSPECS="0", GIT_GLOB_PATHSPECS="0",
+                           GIT_NOGLOB_PATHSPECS="0", GIT_ICASE_PATHSPECS="0")
     try:
         process = await asyncio.create_subprocess_exec(
-            "git", "--no-pager", "--literal-pathspecs", "-c", "core.fsmonitor=false",
+            "git", "--no-pager", *(("--literal-pathspecs",) if literal_pathspecs else ()),
+            "-c", "core.fsmonitor=false",
             "-c", "diff.external=", "-c", "core.quotepath=false", "-C", str(root), *arguments,
             stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=environment,
