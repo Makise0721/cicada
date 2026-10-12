@@ -8,11 +8,16 @@ raw bytes hash 与组装文本 hash 分别标注.
 P4 §1/§6: 工具名单来自启动层的实际注册配置 (默认含 glob/grep), 指定检查模式把
 启动者声明的 check-id/命令/timeout 如实写进提示, 但检查结果状态由运行时投影提供,
 不在提示里伪造. 本模块仍不导入插件层, 检查声明用本地 CheckPrompt 记录承载.
+
+project-context-v1 C1: select_instructions_file 只做启动来源选择 (显式 > 关闭 >
+根目录 AGENTS.md), 不读正文; mode 仅供显示, 不进入提示文本或持久身份.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +28,12 @@ MAX_INSTRUCTIONS_BYTES = 16 * 1024
 
 DEFAULT_TOOLS = ("read", "edit", "write", "powershell", "glob", "grep")
 CHECK_TOOL = "check"
+
+# project-context-v1 C1: 启动层指令来源选择的固定 mode 词表; 仅供显示,
+# 不进入提示文本、prompt hash 或 LaunchIdentity 的可比对字段。
+INSTRUCTIONS_MODES = ("explicit", "automatic", "disabled", "absent")
+INSTRUCTIONS_FILENAME = "AGENTS.md"
+INSTRUCTION_MODE_LABELS = {"explicit": "显式", "automatic": "自动"}
 
 
 class InstructionsError(ValueError):
@@ -47,6 +58,67 @@ class PromptInfo:
     instructions_path: Path | None
     instructions_sha256: str | None  # 源文件原始字节
     prompt_sha256: str  # 组装后文本的 UTF-8
+    instructions_mode: str | None = None  # 仅供显示; None = 未传 mode 的旧构造
+
+
+@dataclass(frozen=True)
+class InstructionSelection:
+    """启动层选出的指令来源 (C1); 正文仍由 load_instructions 有界读取一次.
+
+    mode 只用于显示, 不参与提示构造、hash 或持久身份; path 与 mode 的组合
+    必须一致 (explicit/automatic 有 path, disabled/absent 无 path).
+    """
+
+    path: str | None
+    mode: str
+
+    def __post_init__(self) -> None:
+        if self.mode not in INSTRUCTIONS_MODES:
+            raise ValueError(f"unknown instructions mode: {self.mode!r}")
+        if (self.path is not None) != (self.mode in ("explicit", "automatic")):
+            raise ValueError(
+                f"contradictory instructions selection: path={self.path!r} mode={self.mode!r}"
+            )
+
+
+def select_instructions_file(
+    workspace: Path, *, explicit_path: str | None = None, auto_enabled: bool = True
+) -> InstructionSelection:
+    """启动层指令来源选择: 显式文件 > 关闭自动 > 根目录 AGENTS.md (C1).
+
+    只选择来源, 不读正文。自动候选用 lstat 区分: 缺失是正常 absent;
+    reparse point、目录或不可访问抛 InstructionsError, 不以 exists() 吞掉
+    权限错误。显式路径沿用旧加载规则, 在此不做额外检查。
+    """
+    if explicit_path is not None:
+        return InstructionSelection(explicit_path, "explicit")
+    if not auto_enabled:
+        return InstructionSelection(None, "disabled")
+    candidate = workspace / INSTRUCTIONS_FILENAME
+    try:
+        st = os.lstat(candidate)
+    except FileNotFoundError:
+        return InstructionSelection(None, "absent")
+    except OSError as exc:
+        raise InstructionsError(f"cannot inspect instructions file {candidate}: {exc}") from exc
+    if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise InstructionsError(f"automatic instructions file {candidate} is a reparse point")
+    if stat.S_ISDIR(st.st_mode):
+        raise InstructionsError(f"automatic instructions file {candidate} is a directory")
+    return InstructionSelection(str(candidate), "automatic")
+
+
+def _resolve_instructions_mode(instructions_path: str | None, mode: str | None) -> str:
+    """组装前的 mode 一致性核对 (C1); None 按旧约定由是否传文件推导."""
+    if mode is None:
+        return "explicit" if instructions_path is not None else "absent"
+    if mode not in INSTRUCTIONS_MODES:
+        raise ValueError(f"unknown instructions mode: {mode!r}")
+    if (instructions_path is not None) != (mode in ("explicit", "automatic")):
+        raise ValueError(
+            f"contradictory instructions input: path={instructions_path!r} mode={mode!r}"
+        )
+    return mode
 
 
 def build_builtin_prompt(
@@ -135,6 +207,7 @@ def compose_system_prompt(
     tools: tuple[str, ...] = DEFAULT_TOOLS,
     checks: tuple[CheckPrompt, ...] = (),
     skills: SkillCatalogSnapshot | None = None,
+    instructions_mode: str | None = None,
 ) -> tuple[str, PromptInfo]:
     """组装系统提示: 内置提示在前, Skills 目录段紧随, 项目指令以明确来源标记追加在后.
 
@@ -142,7 +215,11 @@ def compose_system_prompt(
     `tools`/`checks` 来自启动层实际注册的插件配置; 默认等于普通模式。
     `skills` 为启用 Skills 的冻结快照: 版本切换为 SKILLS_PROMPT_VERSION, 目录段
     由快照纯构造 (超限抛 SkillPromptError); None 时输出与未启用逐位一致。
+    `instructions_mode` 是 C1 的仅信息关键字: 不改变提示文本/hash/版本, 只进
+    PromptInfo 供显示; 矛盾组合 (有路径但 disabled/absent, 无路径但
+    explicit/automatic) 在组装前拒绝。None 按旧约定推导 (有路径=explicit)。
     """
+    mode = _resolve_instructions_mode(instructions_path, instructions_mode)
     prompt = build_builtin_prompt(workspace, tools, checks)
     version = PROMPT_VERSION
     if skills is not None:
@@ -163,5 +240,6 @@ def compose_system_prompt(
         instructions_path=resolved,
         instructions_sha256=raw_hash,
         prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        instructions_mode=mode,
     )
     return prompt, info

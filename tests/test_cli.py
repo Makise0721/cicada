@@ -141,6 +141,96 @@ def test_script_mode_uses_builtin_prompt_and_prints_summary(tmp_path):
     assert "model_time_s=" in proc.stdout and "model_time_s=unknown" not in proc.stdout
 
 
+# --- project-context-v1 票 01: 根目录指令自动加载 (C1/C2) ---------------------------------
+
+
+def test_auto_instructions_loaded_explicit_overrides_and_can_disable(tmp_path, monkeypatch):
+    """自动选择根目录 AGENTS.md; 显式文件优先; --no-auto-instructions 关闭。"""
+    (tmp_path / "AGENTS.md").write_text("仓库约定：自动来源", encoding="utf-8")
+    mock = _ApiMock(monkeypatch)
+    proc = mock.run("--workspace", str(tmp_path), "任务")
+    assert proc.returncode == 0, proc.stderr
+    assert "instructions=" in proc.stdout and "AGENTS.md" in proc.stdout
+    # 实际指令进系统提示 (原组装链), 零额外读取
+    assert "仓库约定：自动来源" in mock.requests[0]["messages"][0]["content"]
+
+    mock2 = _ApiMock(monkeypatch)
+    proc = mock2.run("--workspace", str(tmp_path), "--no-auto-instructions", "任务")
+    assert proc.returncode == 0, proc.stderr
+    assert "instructions=" not in proc.stdout
+    assert "仓库约定：自动来源" not in mock2.requests[0]["messages"][0]["content"]
+
+    (tmp_path / "RULES.md").write_text("显式来源优先", encoding="utf-8")
+    mock3 = _ApiMock(monkeypatch)
+    proc = mock3.run(
+        "--workspace", str(tmp_path), "--instructions-file", "RULES.md", "任务"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "instructions=" in proc.stdout and "RULES.md" in proc.stdout
+    assert "显式来源优先" in mock3.requests[0]["messages"][0]["content"]
+    assert "仓库约定：自动来源" not in mock3.requests[0]["messages"][0]["content"]
+
+
+def test_auto_instructions_error_precedes_preflight_and_model_request(tmp_path):
+    """自动候选不可用 (目录) 与显式旧规则一样先于 preflight/凭据, 退出码 2。"""
+    (tmp_path / "AGENTS.md").mkdir()
+    proc = run_cli("--workspace", str(tmp_path), "--provider", "deepseek", "任务")
+    assert proc.returncode == 2
+    assert "invalid instructions file" in proc.stderr
+    assert "is a directory" in proc.stderr
+    # 关闭自动后同一工作区不报指令错误 (disabled 不查候选, 离线 fake 走完启动)
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+        "--no-auto-instructions", "任务",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "invalid instructions file" not in proc.stderr
+    assert "instructions=" not in proc.stdout
+
+
+def test_resume_instructions_identity_with_auto_source(tmp_path):
+    """恢复身份: 自动来源变化拒绝; 关闭自动/采用当前配置/显式同文件可恢复。"""
+    work = tmp_path / "ws"
+    work.mkdir()
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps([{"text": "答", "stop": True}]), encoding="utf-8")
+    first = run_cli("--workspace", str(work), "--script", str(script),
+                    "--save-session", "问")
+    assert first.returncode == 0, first.stderr
+    session_id = first.stdout.split("[session id=")[1].split(" ")[0]
+
+    # 保存后根目录出现 AGENTS.md: 普通恢复因规则变化拒绝, 点名冲突字段
+    (work / "AGENTS.md").write_text("新增的项目规则", encoding="utf-8")
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume", session_id, "再问")
+    assert proc.returncode == 2
+    assert "config conflicts" in proc.stderr
+    assert "instructions_sha256" in proc.stderr
+
+    # 关闭自动: 身份回到无指令, 可恢复旧无指令会话
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--no-auto-instructions", "--resume", session_id, "再问")
+    assert proc.returncode == 0, proc.stderr
+    assert f"[session id={session_id} mode=resume restored_requests=1]" in proc.stdout
+
+    # 采用当前配置: 显式接受新的自动指令, 记入新启动代次
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--resume-with-current-config", "--resume", session_id, "再问")
+    assert proc.returncode == 0, proc.stderr
+    assert "mode=resume" in proc.stdout
+
+    # 显式文件与保存时同路径同内容: 正常恢复 (自动候选存在也不影响)
+    (work / "RULES.md").write_text("显式规则", encoding="utf-8")
+    rules_first = run_cli("--workspace", str(work), "--script", str(script),
+                          "--instructions-file", "RULES.md", "--save-session", "问")
+    assert rules_first.returncode == 0, rules_first.stderr
+    rules_id = rules_first.stdout.split("[session id=")[1].split(" ")[0]
+    proc = run_cli("--workspace", str(work), "--script", str(script),
+                   "--instructions-file", "RULES.md", "--resume", rules_id, "再问")
+    assert proc.returncode == 0, proc.stderr
+    assert "mode=resume" in proc.stdout
+
+
 # --- P4 §5 检查模式输入边界: 全部 exit 2 -------------------------------------------------
 
 

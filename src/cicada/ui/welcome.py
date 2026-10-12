@@ -2,7 +2,7 @@
 
 职责 (规格 D1–D6 + r2 修订 / 契约 C1–C5):
 - WelcomeFacts 是 ConversationView 初始化时一次捕获的不可变安全值 (版本/工作区/
-  启动模型/思考/指令文件名/Skills 计数/恢复判定); 不持有 ApplicationConfig、
+  启动模型/思考/指令文件名与自动/显式模式/Skills 计数/恢复判定); 不持有 ApplicationConfig、
   LaunchIdentity 或凭据对象。事实只取自已发布的会话只读出口, 不读插件闭包,
   不调用 login_view。
 - WelcomeEntry 是 TranscriptEntry 实现, 每个 ConversationView 只追加一次。
@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from importlib import metadata as importlib_metadata
 from typing import TYPE_CHECKING, Mapping
 
+from cicada.prompting import INSTRUCTION_MODE_LABELS
 from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle
 from cicada.ui.main_screen import truncate_to_width
@@ -65,6 +66,7 @@ class WelcomeFacts:
     instructions_name: str | None  # None = 未指定
     skills_count: int | None
     resumed: bool
+    instructions_mode: str | None = None  # explicit/automatic; None = 旧构造 (只显文件名)
 
 
 def _clean_field(value: str, limit: int) -> str:
@@ -118,6 +120,7 @@ def capture_welcome_facts(session: ApplicationSession) -> WelcomeFacts:
         ),
         skills_count=None if skills is None else len(skills.infos),
         resumed=resumed,
+        instructions_mode=config.prompt_info.instructions_mode,
     )
 
 
@@ -193,7 +196,12 @@ class WelcomeEntry:
         return self.facts.model_label or _UNKNOWN
 
     def _instructions(self) -> str:
-        return self.facts.instructions_name if self.facts.instructions_name is not None else "未指定"
+        if self.facts.instructions_name is None:
+            return "未指定"
+        mode = INSTRUCTION_MODE_LABELS.get(self.facts.instructions_mode or "")
+        if mode is None:  # 旧构造无 mode: 保持只显短文件名的旧显示
+            return self.facts.instructions_name
+        return f"{self.facts.instructions_name} · {mode}"
 
     def _skills_brief(self) -> str:
         return "未启用" if self.facts.skills_count is None else f"{self.facts.skills_count} 个"

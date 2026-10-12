@@ -1,8 +1,9 @@
-"""prompting 纯函数聚焦测试: 内置提示形态、指令文件有界加载、哈希溯源."""
+"""prompting 纯函数聚焦测试: 内置提示形态、指令文件有界加载、哈希溯源、来源选择."""
 
 from __future__ import annotations
 
 import hashlib
+import os
 
 import pytest
 
@@ -15,6 +16,7 @@ from cicada.prompting import (
     build_builtin_prompt,
     compose_system_prompt,
     load_instructions,
+    select_instructions_file,
 )
 
 
@@ -123,6 +125,91 @@ def test_hash_stability_across_calls(tmp_path):
     _, info2 = compose_system_prompt(tmp_path, "a.md")
     assert info1.prompt_sha256 == info2.prompt_sha256
     assert info1.instructions_sha256 == info2.instructions_sha256
+
+
+# --- project-context-v1 C1: 启动来源选择与仅信息 mode -------------------------------------
+
+
+def test_select_instructions_modes(tmp_path):
+    # 缺失 = absent, 不报错; 存在 = automatic; 显式与关闭优先, 不查磁盘候选
+    assert select_instructions_file(tmp_path).mode == "absent"
+    assert select_instructions_file(tmp_path).path is None
+    (tmp_path / "AGENTS.md").write_text("规则", encoding="utf-8")
+    auto = select_instructions_file(tmp_path)
+    assert auto.mode == "automatic" and auto.path == str(tmp_path / "AGENTS.md")
+    other = select_instructions_file(tmp_path, explicit_path="TEAM.md")
+    assert other.mode == "explicit" and other.path == "TEAM.md"
+    off = select_instructions_file(tmp_path, auto_enabled=False)
+    assert off.mode == "disabled" and off.path is None
+    # 关闭自动时不检查根候选: 即便 AGENTS.md 是目录也不报错
+    (tmp_path / "AGENTS.md").unlink()
+    (tmp_path / "AGENTS.md").mkdir()
+    assert select_instructions_file(tmp_path, auto_enabled=False).mode == "disabled"
+
+
+def test_select_instructions_rejects_directory_and_reparse(tmp_path):
+    (tmp_path / "AGENTS.md").mkdir()
+    with pytest.raises(InstructionsError, match="directory"):
+        select_instructions_file(tmp_path)
+    (tmp_path / "AGENTS.md").rmdir()
+    link = tmp_path / "AGENTS.md"
+    try:
+        if os.name == "nt":
+            import _winapi
+
+            (tmp_path / "junction-target").mkdir()
+            _winapi.CreateJunction(str(tmp_path / "junction-target"), str(link))
+        else:
+            os.symlink("junction-target", link)
+    except OSError as exc:
+        pytest.skip(f"无法创建 reparse point: {exc}")
+    with pytest.raises(InstructionsError, match="reparse"):
+        select_instructions_file(tmp_path)
+
+
+def test_compose_rejects_contradictory_instructions_mode(tmp_path):
+    with pytest.raises(ValueError, match="contradictory"):
+        compose_system_prompt(tmp_path, "TEAM.md", instructions_mode="disabled")
+    with pytest.raises(ValueError, match="contradictory"):
+        compose_system_prompt(tmp_path, None, instructions_mode="automatic")
+    with pytest.raises(ValueError, match="unknown instructions mode"):
+        compose_system_prompt(tmp_path, None, instructions_mode="auto")
+
+
+def test_automatic_and_explicit_same_file_same_prompt_and_identity(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("先跑测试。", encoding="utf-8")
+    auto_prompt, auto_info = compose_system_prompt(
+        tmp_path, str(tmp_path / "AGENTS.md"), instructions_mode="automatic"
+    )
+    explicit_prompt, explicit_info = compose_system_prompt(
+        tmp_path, "AGENTS.md", instructions_mode="explicit"
+    )
+    # 同路径同字节: 提示逐位一致, raw/prompt hash 一致 (mode 不参与身份)
+    assert auto_prompt == explicit_prompt
+    assert auto_info.instructions_sha256 == explicit_info.instructions_sha256
+    assert auto_info.prompt_sha256 == explicit_info.prompt_sha256
+    assert auto_info.instructions_mode == "automatic"
+    assert explicit_info.instructions_mode == "explicit"
+    # mode 不进提示文本: 与不传 mode 的旧组装逐位一致 (旧推导 explicit)
+    legacy_prompt, legacy_info = compose_system_prompt(tmp_path, str(tmp_path / "AGENTS.md"))
+    assert auto_prompt == legacy_prompt
+    assert legacy_info.instructions_mode == "explicit"
+    # 空白文件: 不追加正文, 来源与 raw hash 保留
+    (tmp_path / "AGENTS.md").write_bytes(b"  \n")
+    blank_prompt, blank_info = compose_system_prompt(
+        tmp_path, str(tmp_path / "AGENTS.md"), instructions_mode="automatic"
+    )
+    assert "Project instructions" not in blank_prompt
+    assert blank_info.instructions_path == tmp_path / "AGENTS.md"
+    assert blank_info.instructions_sha256 == hashlib.sha256(b"  \n").hexdigest()
+
+def test_compose_default_derivation_unchanged(tmp_path):
+    # 纯默认调用 (不传 mode) 保持旧行为: 无路径=absent, 有路径=explicit
+    _, no_path = compose_system_prompt(tmp_path)
+    assert no_path.instructions_mode == "absent"
+    (tmp_path / "TEAM.md").write_text("规则", encoding="utf-8")
+    _, with_path = compose_system_prompt(tmp_path, "TEAM.md")
+    assert with_path.instructions_mode == "explicit"
 
 
 # --- P4 §1/§6: 实际工具名单与指定检查声明 -----------------------------------------------

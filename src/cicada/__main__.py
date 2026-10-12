@@ -10,7 +10,9 @@
 - 缺省: 真实模型默认 DeepSeek Flash thinking; 可用 --model 选择 API 模型。
 --script 与真实模型旗标 (--model/--think/--num-ctx) 互斥, 混用退出码 2.
 两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
-文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2.
+文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2. 无显式文件时自动选择
+workspace 根目录 AGENTS.md (C1); --no-auto-instructions 关闭自动选择, 自动候选
+不可用同样先于 preflight 报错。指令来源 mode 仅供显示, 不进入提示身份。
 
 --tui 进入交互终端 (生产组合: 共享应用 + Pi 主屏前端, 见 cicada.ui; 正常启动
 安静, /status 提供有界可追溯诊断, 检查事实由 RequestOutcome 投影); UI 可选依赖
@@ -101,6 +103,7 @@ from cicada.prompting import (
     InstructionsError,
     PromptInfo,
     compose_system_prompt,
+    select_instructions_file,
 )
 from cicada.reporting import build_delivery_section, build_run_summary
 from cicada.skills import (
@@ -487,12 +490,20 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if skills_snapshot is not None:
         prompt_tools = prompt_tools + ("load_skill",)
     try:
+        # C1: 启动层来源选择 (显式 > --no-auto-instructions > 根目录 AGENTS.md);
+        # 自动候选的 reparse/目录/不可读在此报错, 正文仍由组装链有界读取一次
+        selection = select_instructions_file(
+            workspace,
+            explicit_path=args.instructions_file,
+            auto_enabled=not args.no_auto_instructions,
+        )
         prompt, prompt_info = compose_system_prompt(
             workspace,
-            args.instructions_file,
+            selection.path,
             tools=prompt_tools,
             checks=check_prompts,
             skills=skills_snapshot,
+            instructions_mode=selection.mode,
         )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
@@ -830,6 +841,7 @@ async def _run_tui(
             str(info.instructions_path) if info.instructions_path is not None else None
         ),
         instructions_sha256=info.instructions_sha256,
+        instructions_mode=info.instructions_mode,
         verification_run_id=plan.verification_run_id if plan is not None else None,
         check_ids=tuple(check.check_id for check in plan.checks) if plan is not None else (),
         check_timeout_s=plan.checks[0].timeout_s if plan is not None else None,
@@ -902,6 +914,13 @@ credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
     )
     parser.add_argument(
         "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"
+    )
+    parser.add_argument(
+        "--no-auto-instructions", action="store_true",
+        help=(
+            "关闭根目录 AGENTS.md 自动加载 (无项目指令启动); "
+            "显式 --instructions-file 不受影响, 仍照常加载"
+        ),
     )
     parser.add_argument(
         "--skills-dir",

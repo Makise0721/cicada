@@ -122,13 +122,17 @@ async def test_instructions_filename_shown(tmp_path):
     root = _repo(tmp_path)
     config = dc_replace(
         _config(root, _script()),
-        prompt_info=dc_replace(_prompt_info(root), instructions_path=root / "AGENTS.md"),
+        prompt_info=dc_replace(
+            _prompt_info(root),
+            instructions_path=root / "AGENTS.md",
+            instructions_mode="automatic",
+        ),
     )
     session = await open_application(config)
     h = Harness(session)
     try:
         text = _text(h)
-        assert "[指令]" in text and "  AGENTS.md" in text
+        assert "[指令]" in text and "  AGENTS.md · 自动" in text
     finally:
         h.close()
         await session.aclose()
@@ -436,6 +440,11 @@ def test_narrow_resource_brief_fixed_order_at_47():
     # 未启用 Skills 的简述
     lines = WelcomeEntry(_facts(skills_count=None), plain=True).render(47)
     assert "指令: AGENTS.md · Skills: 未启用" in lines[3]
+    # project-context-v1 C2: 有 mode 时窄窗资源简述同样带 自动/显式 标签
+    lines = WelcomeEntry(
+        _facts(instructions_name="RULES.md", instructions_mode="explicit"), plain=True
+    ).render(47)
+    assert "指令: RULES.md · 显式 · Skills: 3 个" in lines[3]
 
 
 def test_minimal_block_two_lines_within_width():
@@ -576,7 +585,7 @@ def test_resume_fallback_without_persistence_uses_restored_facts():
         workspace=Path("/tmp/ws"),
         model_label="fake",
         persistence=None,
-        prompt_info=SimpleNamespace(instructions_path=None),
+        prompt_info=SimpleNamespace(instructions_path=None, instructions_mode=None),
     )
     stub = SimpleNamespace(
         config=config,

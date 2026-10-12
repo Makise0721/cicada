@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from cicada.prompting import INSTRUCTION_MODE_LABELS
+
 
 @dataclass(frozen=True)
 class UIDiagnostics:
@@ -27,6 +29,7 @@ class UIDiagnostics:
     check_ids: tuple[str, ...] = ()
     check_timeout_s: float | None = None
     max_turns: int | None = None
+    instructions_mode: str | None = None
 
 
 def diagnostics_lines(diagnostics: UIDiagnostics) -> list[str]:
@@ -38,8 +41,10 @@ def diagnostics_lines(diagnostics: UIDiagnostics) -> list[str]:
         f"prompt sha256: {diagnostics.prompt_sha256 or '不可得'}",
     ]
     if diagnostics.instructions_path is not None:
+        mode = INSTRUCTION_MODE_LABELS.get(diagnostics.instructions_mode or "")
+        mode_text = f" 模式={mode}" if mode else ""
         lines.append(
-            f"指令文件: {diagnostics.instructions_path}"
+            f"指令文件: {diagnostics.instructions_path}{mode_text}"
             f" sha256={diagnostics.instructions_sha256 or '不可得'}"
         )
     if diagnostics.verification_run_id is not None:
