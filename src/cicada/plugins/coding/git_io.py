@@ -19,7 +19,7 @@ async def read_git(
     root: Path, arguments: tuple[str, ...], cancel: CancelToken, budget: int,
     *, input_data: bytes | None = None, allowed_codes: tuple[int, ...] = (0,),
     preview_bytes: int | None = None, cleanup_timeout_s: float | None = None,
-    include_error_detail: bool = False,
+    include_error_detail: bool = False, classify_not_git: bool = False,
 ) -> tuple[bytes, int, bool]:
     """累计 stdout 有硬上限；预览可截断但继续有界排空，取消等实际回收。"""
     cancel.throw_if_cancelled()
@@ -29,6 +29,9 @@ async def read_git(
         "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS",
     } and not k.upper().startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
     environment.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    root_probe = classify_not_git and arguments == ("rev-parse", "--show-toplevel")
+    if root_probe:
+        environment.update(LC_ALL="C", LANG="C", LANGUAGE="C")
     try:
         process = await asyncio.create_subprocess_exec(
             "git", "--no-pager", "--literal-pathspecs", "-c", "core.fsmonitor=false",
@@ -53,11 +56,13 @@ async def read_git(
             output.extend(chunk[:max(0, keep - len(output))])
         return bytes(output), total > keep
 
-    async def read_stderr() -> bytes:
+    async def read_stderr() -> tuple[bytes, int]:
         tail = b""
+        total = 0
         while chunk := await process.stderr.read(4096):
+            total += len(chunk)
             tail = (tail + chunk)[-4096:]
-        return tail
+        return tail, total
 
     async def write_stdin() -> None:
         if input_data is not None:
@@ -77,12 +82,20 @@ async def read_git(
         done, _ = await asyncio.wait((operation, cancellation), return_when=asyncio.FIRST_COMPLETED)
         if cancellation in done:
             cancel.throw_if_cancelled()
-        (output, truncated), stderr, returncode, _ = await operation
+        (output, truncated), (stderr, stderr_size), returncode, _ = await operation
         if returncode not in allowed_codes:
             message = f"Git failed ({returncode})"
             if include_error_detail:
                 message += ": " + stderr.decode("utf-8", "replace")
-            raise GitIOError("git_failed", message)
+            # 仅受控 root 探针的完整固定诊断 + 128 + 空 stdout 可判定非 Git。
+            # 截断尾部、额外警告及其他 128 错误均不能触发目录回退。
+            not_git = (
+                root_probe and returncode == 128 and not output and not truncated
+                and stderr_size == len(stderr)
+                and stderr.replace(b"\r\n", b"\n")
+                == b"fatal: not a git repository (or any of the parent directories): .git\n"
+            )
+            raise GitIOError("not_git" if not_git else "git_failed", message)
         return output, returncode, truncated
     finally:
         async def cleanup() -> None:

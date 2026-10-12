@@ -25,6 +25,7 @@ def test_normalize_query_keeps_relative_paths_and_folds_backslash():
 @pytest.mark.parametrize("query", [
     "C:", "C:x", "C:/x", "\\\\server/share", "//server/share",
     "~", "~/x", "../x", "a/../b", "a\x01b", "a\x7fb", "x" * (MAX_QUERY_BYTES + 1),
+    "/outside", "a/x:stream", 'a/"x', "a\x80b",
 ])
 def test_normalize_query_rejects_unsafe_forms(query):
     with pytest.raises(UnsupportedPathError):

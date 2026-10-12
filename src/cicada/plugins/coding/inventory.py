@@ -72,7 +72,8 @@ class GitInventory:
 
     def __init__(self, workspace: Workspace, *, max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
                  max_paths: int = MAX_PATHS, timeout_s: float = QUERY_TIMEOUT_S,
-                 cleanup_timeout_s: float | None = 1.0) -> None:
+                 cleanup_timeout_s: float | None = 1.0,
+                 classify_not_git: bool = False) -> None:
         for name, value, ceiling in (("max_output_bytes", max_output_bytes, MAX_GIT_OUTPUT_BYTES),
                                      ("max_paths", max_paths, MAX_PATHS)):
             if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= ceiling:
@@ -90,6 +91,7 @@ class GitInventory:
         # 1.0 是既有监督上限 (不能据此宣称进程已回收); None 让共享 read_git 走
         # 实际等待回收分支，归需要真实所有权的需求 (如文件补全) 使用。
         self.cleanup_timeout_s = cleanup_timeout_s
+        self.classify_not_git = classify_not_git
 
     async def list_files(self, cancel: CancelToken) -> FileInventory:
         cancel.throw_if_cancelled()
@@ -108,7 +110,13 @@ class GitInventory:
         root_bytes = await self._git(("rev-parse", "--show-toplevel"), cancel, remaining)
         remaining -= len(root_bytes)
         try:
-            git_root = Path(os.path.realpath(root_bytes.decode("utf-8").rstrip("\r\n")))
+            root_text = root_bytes.decode("utf-8").rstrip("\r\n")
+            if self.classify_not_git and (
+                not root_text or any(ch in root_text for ch in "\r\n\0")
+                or not Path(root_text).is_absolute()
+            ):
+                raise InventoryError("invalid_inventory", "invalid Git root response")
+            git_root = Path(os.path.realpath(root_text))
         except UnicodeError as exc:
             raise InventoryError("invalid_path", "Git root is not UTF-8") from exc
         if git_root != root:
@@ -197,9 +205,26 @@ class GitInventory:
         try:
             output, _, _ = await read_git(self.workspace.root, arguments, cancel, budget,
                                           cleanup_timeout_s=self.cleanup_timeout_s,
-                                          include_error_detail=True)
+                                          include_error_detail=True,
+                                          classify_not_git=self.classify_not_git)
             return output
         except GitIOError as exc:
+            if exc.kind == "not_git":
+                # 损坏/空 .git 也可能给出标准 not_git 诊断；必须确认 Git
+                # 实际发现范围内没有仓库元信息，不能据此绕过损坏仓库。
+                ceilings = {
+                    Path(os.path.realpath(value)) for value in
+                    os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if value
+                }
+                for current in (self.workspace.root, *self.workspace.root.parents):
+                    cancel.throw_if_cancelled()
+                    if current != self.workspace.root and current in ceilings:
+                        break
+                    try:
+                        (current / ".git").lstat()
+                    except FileNotFoundError:
+                        continue
+                    raise InventoryError("git_failed", "Git root probe failed with repository metadata present") from exc
             message = (f"Git stdout exceeds {self.max_output_bytes} bytes"
                        if exc.kind == "output_limit" else str(exc))
             raise InventoryError(exc.kind, message) from exc

@@ -95,12 +95,14 @@ def normalize_query(query: str) -> str:
     if len(encoded) > MAX_QUERY_BYTES:
         raise UnsupportedPathError("query exceeds 4096 UTF-8 bytes")
     normalized = query.replace("\\", "/")
-    if any(ord(ch) < 0x20 or ch == "\x7f" for ch in normalized):
+    if any(ord(ch) < 0x20 or 0x7f <= ord(ch) <= 0x9f for ch in normalized):
         raise UnsupportedPathError("query contains control characters")
-    if normalized.startswith("~"):
+    if normalized.startswith(("~", "/")):
         raise UnsupportedPathError("query must stay inside the workspace")
     if PureWindowsPath(normalized).drive:
         raise UnsupportedPathError("query must be workspace-relative")
+    if any(ch in '<>:"|?*' for ch in normalized):
+        raise UnsupportedPathError("query is not a safe Windows path")
     if any(segment == ".." for segment in normalized.split("/")):
         raise UnsupportedPathError("query must not contain '..'")
     return normalized

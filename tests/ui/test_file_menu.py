@@ -367,18 +367,23 @@ async def test_unavailable_reason_maps_to_short_status():
     assert any("不是 Git 工作区" in line for line in rendered)
 
 
-async def test_truncated_annotation_shown_with_candidates():
+@pytest.mark.parametrize("scope,truncated,label", [
+    ("git", True, "仅显示前 20 项"),
+    ("directory", True, "当前目录 · 范围不完整"),
+    ("directory", False, "当前目录"),
+])
+async def test_truncated_annotation_shown_with_candidates(scope, truncated, label):
     many = tuple(FileCompletionCandidate(f"f{i:02}.py", False) for i in range(20))
 
     async def complete(query, cancel):
-        return _result(*many, truncated=True)
+        return FileCompletionResult(many, scope, truncated=truncated)
 
     editor = _editor("@")
     menu = _menu(editor, complete)
     menu.sync(editor, eligible=True)
     await asyncio.sleep(0.05)
     rendered = menu.render(40, 4)
-    assert any("仅显示前 20 项" in line for line in rendered)
+    assert any(label in line for line in rendered)
     assert len([line for line in rendered if "f" in line]) == 3  # 最多 4 行含状态行
 
 

@@ -4,11 +4,14 @@
 """
 
 import asyncio
+import stat
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from cicada.core.cancel import CancelToken
-from cicada.file_completion import SCOPE_GIT, SCOPE_UNAVAILABLE
+from cicada.file_completion import SCOPE_DIRECTORY, SCOPE_GIT, SCOPE_UNAVAILABLE
 from cicada.plugins.coding.file_completion import (
     FILE_COMPLETION_CAPABILITY,
     CodingFileCompletion,
@@ -90,19 +93,19 @@ async def test_complete_maps_failures_to_stable_reasons(tmp_path, monkeypatch):
     git(tmp_path, "init", "-q")
     sub = tmp_path / "sub"
     sub.mkdir()
+    (sub / "inside.py").write_text("x", encoding="utf-8")
     service = CodingFileCompletion(Workspace.create(sub))
     result = await service.complete("", CancelToken())
-    assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, "root_mismatch")
-    assert result.candidates == ()
+    assert (result.scope, result.reason) == (SCOPE_DIRECTORY, None)
+    assert [c.relative_path for c in result.candidates] == ["inside.py"]
 
-    # 非 Git 目录: 探针失败原样返回短原因, 不做局部回退 (票 03 才有受控 not_git 分类)
+    # 明确非 Git 目录进入局部模式，当前 workspace 之外的文件不会加入。
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     plain = tmp_path / "plain"
     plain.mkdir()
     service = CodingFileCompletion(Workspace.create(plain))
     result = await service.complete("", CancelToken())
-    assert result.scope == SCOPE_UNAVAILABLE
-    assert result.reason in ("git_failed", "git_unavailable")
+    assert result.scope == SCOPE_DIRECTORY and result.reason is None
     assert result.candidates == ()
 
     # 清单内部失败词表原样透传为稳定短原因
@@ -116,6 +119,211 @@ async def test_complete_maps_failures_to_stable_reasons(tmp_path, monkeypatch):
     monkeypatch.setattr("cicada.plugins.coding.file_completion.GitInventory", _Fail)
     result = await service.complete("", CancelToken())
     assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, "path_limit")
+
+
+async def test_local_navigation_exclusions_and_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = Workspace.create(tmp_path)
+    (tmp_path / "空 目录").mkdir()
+    (tmp_path / "空 目录" / "next").mkdir()
+    (tmp_path / "ignored.txt").write_text("x", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / "venv").write_text("a regular file", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / ".git").mkdir()  # 空/损坏仓库标记也排除，不能穿入。
+    module = tmp_path / "module"
+    module.mkdir()
+    (module / ".git").write_text("gitdir: elsewhere", encoding="utf-8")
+    service = CodingFileCompletion(root)
+    result = await service.complete("", CancelToken())
+    assert result.scope == SCOPE_DIRECTORY
+    assert {c.relative_path for c in result.candidates} == {
+        "空 目录/", "ignored.txt", ".gitignore", "venv",
+    }
+    result = await service.complete("空 目录/", CancelToken())
+    assert [c.relative_path for c in result.candidates] == ["空 目录/next/"]
+    assert (await service.complete("空 目录/next/", CancelToken())).candidates == ()
+    for query in ("nested/", "module/", ".venv/", "missing/", "venv/"):
+        assert (await service.complete(query, CancelToken())).candidates == ()
+    (tmp_path / "fresh.py").write_text("x", encoding="utf-8")
+    assert [c.relative_path for c in (await service.complete("fresh", CancelToken())).candidates] == ["fresh.py"]
+    (tmp_path / "fresh.py").unlink()
+    assert (await service.complete("fresh", CancelToken())).candidates == ()
+    for index in range(25):
+        (tmp_path / f"f{index:02}.py").write_text("x", encoding="utf-8")
+    result = await service.complete("f", CancelToken())
+    assert result.truncated and len(result.candidates) == 20
+    assert [c.relative_path for c in result.candidates] == [f"f{index:02}.py" for index in range(20)]
+
+
+async def test_local_reparse_is_not_followed_in_candidate_or_ancestor(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = Workspace.create(tmp_path)
+    jump = tmp_path / "jump"
+    jump.mkdir()
+    (jump / "hidden.py").write_text("x", encoding="utf-8")
+    original = type(jump).lstat
+
+    def lstat(path, *args, **kwargs):
+        if path == jump:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        if jump in path.parents:
+            pytest.fail("reparse ancestor must not be followed")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(type(jump), "lstat", lstat)
+    service = CodingFileCompletion(root)
+    assert (await service.complete("", CancelToken())).candidates == ()
+    assert (await service.complete("jump/", CancelToken())).candidates == ()
+
+
+async def test_local_iterator_limit_and_actual_release_on_cancel(tmp_path, monkeypatch):
+    from cicada.plugins.coding import file_completion as completion
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    root = Workspace.create(tmp_path)
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / "late.py").write_text("x", encoding="utf-8")
+
+    class Iterator:
+        def __init__(self, count):
+            self.count, self.visited, self.closed = count, 0, False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.visited == self.count:
+                raise StopIteration
+            self.visited += 1
+            path = tmp_path / (".venv" if self.visited <= 1024 else "late.py")
+            return SimpleNamespace(path=str(path))
+
+        def close(self):
+            self.closed = True
+
+    service = CodingFileCompletion(root)
+    for count in (1024, 1026):
+        iterator = Iterator(count)
+        monkeypatch.setattr(completion.os, "scandir", lambda path: iterator)
+        result = await service.complete("late", CancelToken())
+        assert result.scope == SCOPE_DIRECTORY and result.candidates == ()
+        assert result.truncated is (count > 1024)
+        assert iterator.visited == min(count, 1025) and iterator.closed
+
+    for stop in ("task", "token", "close"):
+        iterator = Iterator(1026)
+        service = CodingFileCompletion(root)
+        token = CancelToken()
+        monkeypatch.setattr(completion.os, "scandir", lambda path: iterator)
+        original_type = completion._local_type
+
+        def inspect(path):
+            if iterator.visited == 32:
+                if stop == "task":
+                    asyncio.current_task().cancel()
+                elif stop == "token":
+                    token.cancel()
+                else:
+                    service.close()
+            return original_type(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(completion, "_local_type", inspect)
+            with pytest.raises(asyncio.CancelledError):
+                await service.complete("", token)
+        await service.wait_settled()
+        assert iterator.closed and iterator.visited < 1025
+
+    iterator = Iterator(2)
+    service = CodingFileCompletion(root)
+    monkeypatch.setattr(completion.os, "scandir", lambda path: iterator)
+    def unreadable(path):
+        raise PermissionError("cannot inspect candidate")
+    monkeypatch.setattr(completion, "_local_type", unreadable)
+    result = await service.complete("", CancelToken())
+    assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, "path_unreadable")
+    assert iterator.closed
+
+
+async def test_root_probe_classifies_only_controlled_not_git(tmp_path, monkeypatch):
+    from cicada.plugins.coding.git_io import GitIOError, read_git
+
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    create_process = asyncio.create_subprocess_exec
+    diagnostic = "fatal: not a git repository (or any of the parent directories): .git\n"
+    cases = [
+        (128, diagnostic, "", "not_git"),
+        (1, diagnostic, "", "git_failed"),
+        (128, "fatal: detected dubious ownership in repository\n", "", "git_failed"),
+        (128, "warning: other failure\n" + diagnostic, "", "git_failed"),
+        (128, "x" * 4096 + diagnostic, "", "git_failed"),
+        (128, diagnostic, "unexpected", "git_failed"),
+        (128, "fatal: permission denied\n", "", "git_failed"),
+    ]
+    for code, stderr, stdout, kind in cases:
+        async def launch(*args, **kwargs):
+            assert kwargs["env"]["LC_ALL"] == kwargs["env"]["LANGUAGE"] == "C"
+            script = f"import sys; sys.stderr.write({stderr!r}); sys.stdout.write({stdout!r}); sys.exit({code})"
+            return await create_process(sys.executable, "-c", script, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
+        with pytest.raises(GitIOError) as caught:
+            await read_git(tmp_path, ("rev-parse", "--show-toplevel"), CancelToken(), 8192, classify_not_git=True)
+        assert caught.value.kind == kind
+
+
+async def test_corrupt_repository_and_git_failures_do_not_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    service = CodingFileCompletion(Workspace.create(tmp_path))
+    (tmp_path / "would-leak.py").write_text("x", encoding="utf-8")
+    (tmp_path / ".git").mkdir()  # Git 给出普通 not_git 诊断，但元信息存在。
+    result = await service.complete("", CancelToken())
+    assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, "git_failed")
+
+    class Fail:
+        def __init__(self, workspace, **kwargs):
+            pass
+
+        async def list_files(self, token):
+            raise InventoryError(kind, "private diagnostic")
+
+    monkeypatch.setattr("cicada.plugins.coding.file_completion.GitInventory", Fail)
+    for kind in ("git_unavailable", "git_failed", "path_unreadable", "invalid_inventory", "path_limit", "output_limit", "timeout"):
+        result = await service.complete("", CancelToken())
+        assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, kind)
+
+
+async def test_directory_fallback_shares_probe_deadline(tmp_path, monkeypatch):
+    from cicada.plugins.coding import file_completion as completion
+
+    root = Workspace.create(tmp_path)
+    reached = asyncio.Event()
+    entered = asyncio.Event()
+    class Probe:
+        def __init__(self, workspace, **kwargs):
+            pass
+
+        async def list_files(self, token):
+            await asyncio.sleep(0.12)
+            reached.set()
+            raise InventoryError("not_git", "controlled")
+
+    async def directory(self, normalized, token, deadline):
+        assert reached.is_set()
+        entered.set()
+        # 只有重置 deadline 才能完整等待；共享 deadline 应在此取消。
+        await asyncio.sleep(0.12)
+        pytest.fail("deadline was reset on fallback")
+
+    monkeypatch.setattr(completion, "QUERY_DEADLINE_S", 0.2)
+    monkeypatch.setattr(completion, "GitInventory", Probe)
+    monkeypatch.setattr(completion.CodingFileCompletion, "_directory", directory)
+    result = await CodingFileCompletion(root).complete("", CancelToken())
+    assert (result.scope, result.reason) == (SCOPE_UNAVAILABLE, "timeout")
+    assert entered.is_set()
 
 
 async def test_complete_rejects_unsupported_query_forms(tmp_path):

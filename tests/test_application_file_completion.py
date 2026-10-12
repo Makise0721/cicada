@@ -31,14 +31,24 @@ def _config(root: Path) -> object:
     )
 
 
-async def test_default_assembly_serves_git_candidates_via_readonly_exit(tmp_path):
-    root = _repo(tmp_path)
+@pytest.mark.parametrize("kind", ["git", "plain", "subworkspace"])
+async def test_default_assembly_serves_git_candidates_via_readonly_exit(tmp_path, monkeypatch, kind):
+    if kind == "plain":
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        root = tmp_path
+        (root / "sample.py").write_text("x", encoding="utf-8")
+    else:
+        root = _repo(tmp_path)
+        if kind == "subworkspace":
+            root = root / "subworkspace"
+            root.mkdir()
+            (root / "sample.py").write_text("x", encoding="utf-8")
     (root / "src").mkdir()
     (root / "src/main.py").write_text("x", encoding="utf-8")
     session = await open_application(_config(root))
     try:
         result = await session.complete_files("", CancelToken())
-        assert result.scope == "git"
+        assert result.scope == ("git" if kind == "git" else "directory")
         assert "sample.py" in {c.relative_path for c in result.candidates}
         result = await session.complete_files("src/", CancelToken())
         assert "src/main.py" in {c.relative_path for c in result.candidates}

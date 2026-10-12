@@ -1,30 +1,37 @@
-"""Git 工作区 @ 路径候选 (project-context-v1 C4): 复用 GitInventory 的实现与策略。
+"""@ 路径候选: Git 清单与普通目录/子工作区的单层枚举 (C4/C5)。
 
 每次 complete 持有独立 GitInventory (cleanup_timeout_s=None: 共享 read_git 走
 实际等待回收的已有分支)。插件拥有全部活跃 complete 调用及其资源: 关闭先封
 入口、通知取消、等待实际落定 (runtime scope 原生命周期钩子)，不注册模型工具、
-不改变工具名单/schema/fingerprint。仅已分类 not_git / root_mismatch 的局部
-回退属于票 03; 本票非 Git 失败原样返回 unavailable 短原因，不做目录回退。
+不改变工具名单/schema/fingerprint。仅已分类 not_git / root_mismatch 回退到
+当前 workspace 内的局部枚举；其他失败保持 unavailable。
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
+from pathlib import Path
 
 from cicada.core.cancel import CancelToken
 from cicada.file_completion import (
     SCOPE_UNAVAILABLE,
+    SCOPE_DIRECTORY,
     FileCompletionResult,
     UnsupportedPathError,
     normalize_query,
     rank_candidates,
 )
-from cicada.plugins.coding.inventory import FileInventory, GitInventory, InventoryError
+from cicada.plugins.coding.inventory import (
+    DEFAULT_EXCLUSIONS, FileInventory, GitInventory, InventoryError,
+)
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginContext, PluginDefinition
 
 FILE_COMPLETION_CAPABILITY = "coding.file_completion"
 QUERY_DEADLINE_S = 10.0
+MAX_DIRECTORY_ENTRIES = 1024
 
 
 class CodingFileCompletion:
@@ -82,21 +89,98 @@ class CodingFileCompletion:
         except UnsupportedPathError:
             return FileCompletionResult((), SCOPE_UNAVAILABLE, reason="unsupported_path")
         loop = asyncio.get_running_loop()
-        # 整次 complete 的 10 秒逻辑 deadline 覆盖 Git 探针与清单 (票 03 的局部
-        # 回退共享同一 deadline，不重置); 阻塞 OS 调用不保证硬墙钟终止。
+        deadline = loop.time() + QUERY_DEADLINE_S
+        # 同一 deadline 覆盖探针、清单/局部枚举及排序；OS 调用无硬墙钟保证。
         try:
-            async with asyncio.timeout(QUERY_DEADLINE_S):
-                inventory = await GitInventory(
-                    self._workspace, cleanup_timeout_s=None
-                ).list_files(token)
+            async with asyncio.timeout_at(deadline):
+                try:
+                    inventory = await GitInventory(
+                        self._workspace, cleanup_timeout_s=None, classify_not_git=True
+                    ).list_files(token)
+                except InventoryError as exc:
+                    if exc.kind not in ("not_git", "root_mismatch"):
+                        raise
+                    return await self._directory(normalized, token, deadline)
+                pool = _eligible_paths(inventory)
+                result = _search(pool, normalized)
+                self._checkpoint(token, deadline)
+                return result
         except asyncio.CancelledError:
             raise  # 取消继续传播，不转为空匹配
         except InventoryError as exc:
             return FileCompletionResult((), SCOPE_UNAVAILABLE, reason=exc.kind)
         except TimeoutError:
             return FileCompletionResult((), SCOPE_UNAVAILABLE, reason="timeout")
-        pool = _eligible_paths(inventory)
-        return _search(pool, normalized)
+        except OSError:
+            return FileCompletionResult((), SCOPE_UNAVAILABLE, reason="path_unreadable")
+
+    @staticmethod
+    def _checkpoint(token: CancelToken, deadline: float) -> None:
+        token.throw_if_cancelled()
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError
+
+    async def _directory(
+        self, normalized: str, token: CancelToken, deadline: float,
+    ) -> FileCompletionResult:
+        head, _, fragment = normalized.rpartition("/")
+        current = self._workspace.root
+        # 在原始路径逐级检查，不能先 resolve 丢失 reparse/嵌套仓库事实。
+        for part in head.split("/") if head else ():
+            self._checkpoint(token, deadline)
+            if part in ("", "."):
+                continue
+            current = current / part
+            if not _local_type(current):
+                return FileCompletionResult((), SCOPE_DIRECTORY)
+        pool: list[tuple[str, bool]] = []
+        truncated = False
+        self._checkpoint(token, deadline)
+        iterator = os.scandir(current)
+        try:
+            for index, entry in enumerate(iterator):
+                if index % 32 == 0:
+                    await asyncio.sleep(0)
+                    self._checkpoint(token, deadline)
+                if index == MAX_DIRECTORY_ENTRIES:
+                    truncated = True  # 额外一项只观察存在，不做 stat/匹配。
+                    break
+                kind = _local_type(Path(entry.path))
+                if kind is None:
+                    continue
+                path = Path(entry.path).relative_to(self._workspace.root).as_posix()
+                try:
+                    normalize_query(path)
+                except UnsupportedPathError:
+                    continue
+                pool.append((path + "/" if kind else path, kind))
+        finally:
+            iterator.close()  # 取消/超时/异常都在释放迭代器后交还所有权。
+        self._checkpoint(token, deadline)
+        candidates, limited = rank_candidates(pool, fragment)
+        self._checkpoint(token, deadline)
+        return FileCompletionResult(candidates, SCOPE_DIRECTORY, truncated=truncated or limited)
+
+
+def _local_type(path: Path) -> bool | None:
+    """普通目录=True、普通文件=False；缺失/reparse/产物目录/仓库=None。"""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return None
+    if stat.S_ISDIR(info.st_mode):
+        if path.name.casefold() in DEFAULT_EXCLUSIONS:
+            return None
+        try:
+            (path / ".git").lstat()
+        except FileNotFoundError:
+            return True
+        return None  # 嵌套仓库及已初始化 gitlink 仅查自己的 .git 元信息。
+    if stat.S_ISREG(info.st_mode) and path.name.casefold() != ".git":
+        return False
+    return None
 
 
 def _eligible_paths(inventory: FileInventory) -> list[tuple[str, bool]]:

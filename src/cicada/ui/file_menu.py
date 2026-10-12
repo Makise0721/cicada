@@ -20,6 +20,7 @@ from typing import Awaitable, Callable
 
 from cicada.core.cancel import CancelToken
 from cicada.file_completion import (
+    SCOPE_DIRECTORY,
     SCOPE_UNAVAILABLE,
     FileCompletionCandidate,
     FileCompletionResult,
@@ -355,7 +356,10 @@ class FileCompletionMenu:
             self._status = _UNAVAILABLE_STATUS + _sanitize(reason)
             self._notify()
             return
-        self._status = _TRUNCATED_STATUS if result.truncated else None
+        if result.scope == SCOPE_DIRECTORY:
+            self._status = "当前目录 · 范围不完整" if result.truncated else "当前目录"
+        else:
+            self._status = _TRUNCATED_STATUS if result.truncated else None
         self._candidates = result.candidates
         self._notify()
 
@@ -385,7 +389,7 @@ class FileCompletionMenu:
                         "  " + theme.fg(theme.MD_LINK, truncate_to_width(path, max(0, width - 2)))
                     )
             if overflow:
-                label = _TRUNCATED_STATUS if self._status is None else self._status
+                label = "" if self._status is None else self._status
                 if count < len(self._candidates):
                     label = f"{self._index + 1}/{len(self._candidates)} {label}"
                 lines.append(theme.fg(theme.FOOTER_DIM, truncate_to_width("  " + label, width)))
