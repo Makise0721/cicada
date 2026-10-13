@@ -774,7 +774,7 @@ async def test_persistent_topology_cleans_resources_before_store(tmp_path, monke
     order: list[str] = []
     original_plugin = app_module.session_store_plugin
 
-    def patched_plugin(store):
+    def patched_plugin(store, catalog=None):
         original_aclose = store.aclose
 
         async def recording_aclose():
@@ -782,7 +782,15 @@ async def test_persistent_topology_cleans_resources_before_store(tmp_path, monke
             await original_aclose()
 
         store.aclose = recording_aclose  # type: ignore[method-assign]
-        return original_plugin(store)
+        if catalog is not None:
+            original_catalog_close = catalog.aclose
+
+            async def recording_catalog_close():
+                order.append("catalog")
+                await original_catalog_close()
+
+            catalog.aclose = recording_catalog_close
+        return original_plugin(store, catalog)
 
     monkeypatch.setattr(app_module, "session_store_plugin", patched_plugin)
     config = dc_replace(
@@ -795,7 +803,7 @@ async def test_persistent_topology_cleans_resources_before_store(tmp_path, monke
     store = session._store
     await session.execute("问")
     await session.aclose()
-    assert order == ["model", "store"], f"store 必须最后清理, 实际 {order}"
+    assert order == ["model", "catalog", "store"], f"store 必须最后清理, 实际 {order}"
     reopened = open_session_store(
         directory=root / ".cicada" / "sessions", session_id=store.session_id, workspace=root,
     )

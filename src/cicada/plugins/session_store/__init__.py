@@ -1,8 +1,7 @@
 """会话保存恢复的 SQLite 存储能力 (会话保存恢复 v1).
 
-对外只暴露四样东西: open_session_store (打开/新建), session_store_plugin
-(把已打开的 store 交给 runtime 拥有), SQLiteSessionStore (port 实现),
-list_sessions (工作区只读分页列表, 05).
+打开/恢复、存储 port、原只读列表与有界目录观察 reader；插件把已创建的
+存储和 reader 交给 runtime 拥有，具体装配仍由应用负责。
 """
 
 from cicada.plugins.session_store.listing import list_sessions

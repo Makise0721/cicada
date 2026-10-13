@@ -115,7 +115,7 @@ class SessionCatalogReader:
     def _observe(self, stop: threading.Event) -> SessionCatalogSnapshot:
         deadline = time.monotonic() + CATALOG_TIMEOUT_S
         entries: list[SessionCatalogEntry] = []
-        cache_bytes = 0
+        cache_bytes = len(json.dumps(str(self.directory), ensure_ascii=False).encode("utf-8")) + 128
         reason = None
         try:
             iterator = os.scandir(self.directory)
@@ -142,7 +142,7 @@ class SessionCatalogReader:
                     size = len(json.dumps(
                         [asdict(entry), entry.search_fields], ensure_ascii=False,
                         separators=(",", ":"),
-                    ).encode("utf-8"))
+                    ).encode("utf-8", "replace"))
                     if cache_bytes + size > CATALOG_MAX_CACHE_BYTES:
                         reason = "cache-limit"
                         break
@@ -193,9 +193,11 @@ class SessionCatalogReader:
             # 检查字节上限后才把字段交给 Python；LIMIT 2 检查单行身份。
             lengths = ", ".join(f"length(CAST({field} AS BLOB))" for field in fields)
             rows = connection.execute(
-                f"SELECT schema_version, created_at, {lengths} FROM session LIMIT 2"
+                "SELECT CASE WHEN typeof(schema_version) = 'integer' THEN schema_version END,"
+                " CASE WHEN typeof(created_at) IN ('integer', 'real') THEN created_at END,"
+                f" {lengths} FROM session LIMIT 2"
             ).fetchall()
-            if len(rows) != 1 or rows[0][0] != version:
+            if len(rows) != 1 or type(rows[0][0]) is not int or rows[0][0] != version:
                 raise ValueError("invalid session row or schema version")
             row = rows[0]
             sizes = row[2:]
@@ -217,9 +219,15 @@ class SessionCatalogReader:
                 raise ValueError("invalid session short title")
             name = validate_session_name(values[3]) if version >= 4 else None
             created = _timestamp(row[1])
-            updated = _timestamp(connection.execute(
-                "SELECT MAX(created_at) FROM records"
-            ).fetchone()[0], optional=True)
+            latest, invalid_time = connection.execute(
+                "SELECT MAX(CASE WHEN typeof(created_at) IN ('integer', 'real')"
+                " THEN created_at END),"
+                " MAX(CASE WHEN typeof(created_at) NOT IN ('integer', 'real') THEN 1 ELSE 0 END)"
+                " FROM records"
+            ).fetchone()
+            if invalid_time:
+                raise ValueError("invalid record timestamp type")
+            updated = _timestamp(latest, optional=True)
             checkpoint()
             return SessionCatalogEntry(session_id, name, title, created, updated, occupied)
         except (OSError, sqlite3.Error, ValueError, TypeError, PersistenceError) as exc:

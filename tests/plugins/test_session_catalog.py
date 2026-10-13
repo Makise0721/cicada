@@ -77,6 +77,41 @@ async def test_catalog_scope_limits_and_top_level_failure(tmp_path, monkeypatch)
         await reader.aclose()
 
 
+async def test_catalog_numeric_fields_never_transfer_unbounded_blob(tmp_path, monkeypatch):
+    from cicada.plugins.session_store import catalog
+
+    store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
+    path = store.db_path
+    await store.aclose()
+    seen = []
+    original = catalog._timestamp
+
+    def timestamp(value, **kwargs):
+        seen.append(value)
+        assert not isinstance(value, (str, bytes)), 'numeric input must be bounded in SQL'
+        return original(value, **kwargs)
+
+    monkeypatch.setattr(catalog, '_timestamp', timestamp)
+    reader = SessionCatalogReader(directory=tmp_path, workspace=str(tmp_path))
+    try:
+        for column in ('schema_version', 'created_at'):
+            with sqlite3.connect(path) as db:
+                db.execute(f'UPDATE session SET {column}=zeroblob(1048576)')
+            entry, = (await reader.observe(CancelToken())).entries
+            assert entry.error
+            with sqlite3.connect(path) as db:
+                db.execute('UPDATE session SET schema_version=4, created_at=1')
+        with sqlite3.connect(path) as db:
+            # 坏档视图模拟时间列，预算 SQL 不得把聚合 BLOB 搬入 Python。
+            db.execute('DROP TABLE records')
+            db.execute('CREATE VIEW records AS SELECT zeroblob(1048576) AS created_at')
+        entry, = (await reader.observe(CancelToken())).entries
+        assert entry.error and 'timestamp type' in entry.error
+        assert seen and all(type(v) in (int, float, type(None)) for v in seen)
+    finally:
+        await reader.aclose()
+
+
 async def test_catalog_repeated_cancel_and_close_wait_actual_worker(tmp_path, monkeypatch):
     entered, release, reclaimed = threading.Event(), threading.Event(), threading.Event()
     reader = SessionCatalogReader(directory=tmp_path, workspace=None)
@@ -144,4 +179,13 @@ async def test_catalog_sql_deadline_closes_connection(tmp_path, monkeypatch):
     # 读连接释放，不妨碍原恢复取 lease。
     resumed = open_session_store(directory=tmp_path, session_id=path.stem, workspace=tmp_path)
     await resumed.aclose()
+    with original(path) as db:
+        db.execute('DROP TABLE records')
+        db.execute("CREATE VIEW records AS WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL"
+                   " SELECT x+1 FROM n WHERE x<10000000) SELECT x AS created_at FROM n")
+    monkeypatch.setattr(catalog, 'CATALOG_FILE_TIMEOUT_S', 0.01)
+    entry, = (await reader.observe(CancelToken())).entries
+    assert entry.error and 'interrupted' in entry.error
+    with pytest.raises(sqlite3.ProgrammingError, match='closed database'):
+        opened[-1].execute('SELECT 1')
     await reader.aclose()
