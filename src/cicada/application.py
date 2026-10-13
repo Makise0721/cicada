@@ -584,6 +584,7 @@ class ApplicationSession:
         review_reader: ChangeReview | None = None,
         catalog_reader: SessionCatalogPort | None = None,
         new_store_factory: Callable[[], SessionStorePort] | None = None,
+        resume_store_factory: Callable[[str], SessionStorePort] | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -633,6 +634,7 @@ class ApplicationSession:
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
         self._new_store_factory = new_store_factory
+        self._resume_store_factory = resume_store_factory
         self._session_cleanup_failed: str | None = None
         self._request_store: SessionStorePort | None = None
         self._request_epoch: str | None = None
@@ -723,7 +725,16 @@ class ApplicationSession:
         if self._catalog_reader is None:
             raise SessionManagementError("unavailable", "当前组合没有会话目录能力。")
         cancel.throw_if_cancelled()
-        task = asyncio.create_task(self._catalog_reader.observe(cancel))
+        async def observe_after_files():
+            for query_token in self._file_queries.values():
+                query_token.cancel()
+            if self._file_queries:
+                await self._settle_session_work(
+                    asyncio.gather(*tuple(self._file_queries), return_exceptions=True), cancel)
+            cancel.throw_if_cancelled()
+            return await self._catalog_reader.observe(cancel)
+
+        task = asyncio.create_task(observe_after_files())
         self._catalog_task, self._catalog_token = task, cancel
         cancelled = False
         try:
@@ -1040,27 +1051,44 @@ class ApplicationSession:
         return SessionManagementSubmission(task, token)
 
     def submit_new_session(self) -> SessionManagementSubmission:
+        return self._submit_session_switch("new")
+
+    def submit_resume_session(self, session_id: str, *,
+                              adopt_current_config: bool = False) -> SessionManagementSubmission:
+        try:
+            if not isinstance(session_id, str) or str(uuid.UUID(session_id)) != session_id:
+                raise ValueError
+            if not isinstance(adopt_current_config, bool):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise SessionManagementError("invalid-input", "恢复需要完整 UUID 与布尔配置选择。") from None
+        return self._submit_session_switch("resume", session_id, adopt_current_config)
+
+    def _submit_session_switch(self, operation: str, session_id: str | None = None,
+                               adopt_current_config: bool = False) -> SessionManagementSubmission:
         if self._closing or self._closed:
             raise SessionManagementError("closing", "应用正在关闭。")
-        if not isinstance(self._store, SessionStoreRoute) or self._new_store_factory is None:
-            raise SessionManagementError("unavailable", "当前会话没有保存路由，无法新建会话。")
+        factory = self._new_store_factory if operation == "new" else self._resume_store_factory
+        if not isinstance(self._store, SessionStoreRoute) or factory is None:
+            raise SessionManagementError("unavailable", "当前会话没有保存路由，无法切换会话。")
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
                      self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
         if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight
                 or self._login_in_flight or self.review_active
                 or any(task is not None and not task.done() for task in producers)):
-            raise SessionManagementError("busy", "新建需要空闲会话。")
+            raise SessionManagementError("busy", "切换需要空闲会话。")
         reason = (self._session_cleanup_failed or self._storage_failed or self._view_only_reason
                   or ("process_uncertain" if self.has_process_uncertain() else None))
-        if reason is not None:
-            raise SessionManagementError("blocked", "新建被阻断：" + reason)
+        if reason is not None and not (operation == "resume" and session_id == self._store.session_id):
+            raise SessionManagementError("blocked", "切换被阻断：" + reason)
         loop = asyncio.get_running_loop()
         self._session_in_flight = True
         self._session_done = loop.create_future()
         token = CancelToken()
         self._session_token = token
-        task = loop.create_task(self._new_session(self._store.capture(), self.session_generation, token))
+        task = loop.create_task(self._switch_session(
+            self._store.capture(), self.session_generation, token, operation, session_id, adopt_current_config))
         self._session_task = task
         task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         self._notify(OperationBusy("session"))
@@ -1078,8 +1106,9 @@ class ApplicationSession:
                 if task.done():
                     return task.result()
 
-    async def _new_session(self, source: SessionStorePort, generation: int,
-                           token: CancelToken) -> SessionManagementResult:
+    async def _switch_session(self, source: SessionStorePort, generation: int,
+                              token: CancelToken, operation: str, session_id: str | None,
+                              adopt_current_config: bool) -> SessionManagementResult:
         route = self._store
         assert isinstance(route, SessionStoreRoute)
         target = None
@@ -1091,8 +1120,12 @@ class ApplicationSession:
             token.throw_if_cancelled()
             if self._closing:
                 raise asyncio.CancelledError
+            if operation == "resume" and session_id == source.session_id:
+                return SessionManagementResult("resume", source.session_id, generation, False)
             # 线程结果属于本受拥有任务；重复取消先取得资源，再登记并清理。
-            target = await self._settle_session_work(asyncio.to_thread(self._new_store_factory), token)
+            opening = (asyncio.to_thread(self._new_store_factory) if operation == "new" else
+                       asyncio.to_thread(self._resume_store_factory, session_id))
+            target = await self._settle_session_work(opening, token)
             route.retain(target)
             token.throw_if_cancelled()
             if self._closing:
@@ -1100,11 +1133,37 @@ class ApplicationSession:
             identity = source.recovery_snapshot().identity
             if identity is None:
                 raise SessionManagementError("prepare-failed", "当前配置代次缺少身份。")
+            view_only_reason = None
+            if operation == "resume":
+                before = target.recovery_snapshot()
+                if before.identity is None:
+                    raise SessionManagementError("prepare-failed", "目标档缺少配置身份。")
+                changed = list(conflicting_launch_fields(before.identity.launch, identity.launch))
+                if before.identity.tool_fingerprint != identity.tool_fingerprint:
+                    changed.append("tool_fingerprint")
+                if changed and not adopt_current_config:
+                    raise SessionManagementError("config-conflict", "目标配置冲突：" + ", ".join(changed))
+                view_only_reason = _admit_persistent_resume(
+                    PersistenceConfig(identity=identity.launch, session_id=session_id,
+                                      adopt_current_config=True), before)
+                if adopt_current_config:
+                    sources = {**identity.launch.sources, "resume_config": "current"}
+                    if changed:
+                        sources["changed_fields"] = ",".join(changed)
+                    identity = replace(identity, launch=replace(identity.launch, sources=sources))
             epoch = await self._settle_session_work(target.start_epoch(identity), token)
             snapshot = target.recovery_snapshot()
             # 空档同样核对共享恢复构建；发布段之前完成所有可能失败的准备。
             proof = _build_prefix_proof(snapshot).proof if self._projection is not None else None
             blocks = _rebuild_context_projection(snapshot)
+            history = [isolate_message(message) for message in snapshot.canonical_history]
+            spans = []
+            span_start = 0
+            for request in snapshot.requests:
+                if request.context_generation == snapshot.context_generation:
+                    end = span_start + len(request.messages)
+                    spans.append((request.seq, span_start, end))
+                    span_start = end
             token.throw_if_cancelled()
             if self._closing or source is not route.capture() or generation != self.session_generation:
                 raise asyncio.CancelledError
@@ -1112,13 +1171,22 @@ class ApplicationSession:
             retired = route.publish(target)
             published = True
             self._epoch_id = epoch
-            self._persistence_mode = "save"
-            self._history.clear()
+            self._persistence_mode = "resume" if operation == "resume" else "save"
+            self._history[:] = history
             self._context_generation = snapshot.context_generation
-            self._committed_spans.clear()
-            self._restored_requests = ()
-            self._restored_request_count = self._restored_model_call_count = 0
-            self._restored_interrupted = self._restored_receipts = self._restored_summaries = ()
+            self._committed_spans[:] = spans
+            self._restored_requests = snapshot.requests
+            self._restored_request_count = len(snapshot.requests)
+            self._restored_model_call_count = sum(len(r.outcome.model_calls) for r in snapshot.requests)
+            self._restored_interrupted = snapshot.interrupted
+            self._restored_receipts = snapshot.restored_receipts
+            self._restored_summaries = snapshot.summaries
+            if view_only_reason is not None:
+                self._view_only_reason = f"{target.session_id}: {view_only_reason}"
+                if snapshot.recorded_process_uncertain:
+                    self._process_uncertain = True
+                    if self._service is not None:
+                        self._service.mark_process_uncertain(self._view_only_reason)
             self._summary_records.clear()
             self._saved_request_count = 0
             self._last_committed_seq = None
@@ -1139,13 +1207,13 @@ class ApplicationSession:
                 await settle(route.release(retired))
             except BaseException as exc:
                 self._session_cleanup_failed = str(exc)
-                raise SessionManagementError("cleanup-failed", "新会话已生效，旧档关闭失败：" + str(exc),
+                raise SessionManagementError("cleanup-failed", "目标会话已生效，旧档关闭失败：" + str(exc),
                                              published=True) from exc
-            return SessionManagementResult("new", target.session_id, self.session_generation, True)
+            return SessionManagementResult(operation, target.session_id, self.session_generation, True)
         except (asyncio.CancelledError, SessionManagementError):
             raise
         except Exception as exc:
-            raise SessionManagementError("prepare-failed", "新建准备失败：" + str(exc), published=published) from exc
+            raise SessionManagementError("prepare-failed", "切换准备失败：" + str(exc), published=published) from exc
         finally:
             try:
                 if target is not None and not published:
@@ -3303,6 +3371,9 @@ async def open_application(
                 new_store_factory=lambda: open_session_store(
                     directory=Path(config.workspace) / ".cicada" / "sessions",
                     session_id=None, workspace=config.workspace),
+                resume_store_factory=lambda session_id: open_session_store(
+                    directory=Path(config.workspace) / ".cicada" / "sessions",
+                    session_id=session_id, workspace=config.workspace),
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为

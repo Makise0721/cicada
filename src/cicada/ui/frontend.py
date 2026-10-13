@@ -60,6 +60,7 @@ from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
 from cicada.ui.review_view import ReviewView
+from cicada.ui.session_resume import SessionResumeModal
 from cicada.ui.terminal_io import (
     WHEEL_DELTA,
     InputBatchItem,
@@ -109,6 +110,7 @@ class MainScreenFrontend:
         footer_badge_spans: Callable[[], tuple[tuple[int, int, int], ...]] | None = None,
         review: ReviewView | None = None,
         file_menu: FileCompletionMenu | None = None,
+        session_modal: SessionResumeModal | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else DisplayStyle.capture()
         self._terminal = terminal
@@ -135,6 +137,7 @@ class MainScreenFrontend:
         self._modal = modal
         self._review = review
         self._file_menu = file_menu
+        self._session_modal = session_modal
         self.sensitive_input_used = False
         self.ui_failures: list[str] = []
         self.terminal_failed = False
@@ -167,6 +170,9 @@ class MainScreenFrontend:
             return self._compose_frame_lines(width)
 
     def _compose_frame_lines(self, width: int) -> list[str]:
+        if self._session_modal_active():
+            self._pending_frame_hits = ()
+            return self._session_modal.render(width, self._frame_rows)
         if self._review_active():
             layout = self._review.layout(width, self._frame_rows)
             self._pending_frame_hits = layout.hits
@@ -274,6 +280,7 @@ class MainScreenFrontend:
             or self._model_menu_active()
             or self._modal_active()
             or self._review_active()
+            or self._session_modal_active()
         )
         self._file_menu.sync(self._editor, eligible=eligible)
 
@@ -286,6 +293,12 @@ class MainScreenFrontend:
         self._file_menu_invalidate()
         if self._command_menu is not None:
             self._command_menu.dismiss()
+        if self._model_menu is not None:
+            self._model_menu.dismiss()
+        if self._viewport is not None:
+            self._viewport.exit_focus()
+        self._invalidate_pointer_frame()
+        self._disarm_escape_prefix()
 
     def reset_session_display(self) -> None:
         self.prepare_session_change()
@@ -412,6 +425,11 @@ class MainScreenFrontend:
     # --- 输入 --------------------------------------------------------------------
 
     def _on_input_batch(self, items: list[InputBatchItem]) -> None:
+        if self._session_modal_active():
+            self._session_modal.handle_batch([item for item in items if not isinstance(item, PointerEvent)])
+            self._invalidate_pointer_frame()
+            self.request_render_now()
+            return
         capture_before = self._pointer_capture_active()
         poisoned = False
         needs_render = False
@@ -428,12 +446,16 @@ class MainScreenFrontend:
                 elif outcome == _POINTER_RENDER:
                     needs_render = True
             else:
+                session_was_active = self._session_modal_active()
                 modal_was_open = self._modal_active()
                 self._dispatch_key(item)
                 # C7: 文件菜单按当前草稿全文/逻辑光标/资格建立快照; 同步在按键
                 # 应用之后, 查询只从这里启动 (render 不启动)
                 self._sync_file_menu()
                 needs_render = True
+                if session_was_active != self._session_modal_active():
+                    self._invalidate_pointer_frame()
+                    break
                 if modal_was_open and not self._modal_active():
                     break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
             if self._review is not None and self._review.generation != generation_before:
@@ -455,6 +477,10 @@ class MainScreenFrontend:
         self._render_immediate()
 
     def _dispatch_key(self, key) -> None:
+        if self._session_modal_active():
+            self._disarm_escape_prefix()
+            self._session_modal.handle_batch([key])
+            return
         if self._review_active():
             self._file_menu_invalidate()  # C7: 审阅优先, 候选失效并取消
             self._sync_viewport_layout()
@@ -637,7 +663,7 @@ class MainScreenFrontend:
         """模态与菜单先取得输入: 活跃时 pointer 被消费, 不穿透文档 (C4)。"""
         if self._review_active():
             return False  # 审阅提供自己的同源命中图，菜单不能抢走本页输入。
-        if self._modal_active() or self._model_menu_active():
+        if self._session_modal_active() or self._modal_active() or self._model_menu_active():
             return True
         if self._file_menu is not None and self._file_menu.candidates:
             return True  # C6: 候选打开时沿用菜单的指针捕获, v1 无点击选择
@@ -805,6 +831,9 @@ class MainScreenFrontend:
         if self._on_escape is not None:
             self._on_escape()
 
+    def _session_modal_active(self) -> bool:
+        return self._session_modal is not None and self._session_modal.active
+
     def _model_menu_active(self) -> bool:
         return self._model_menu is not None and self._model_menu.is_open
 
@@ -838,6 +867,7 @@ class MainScreenFrontend:
         -> terminal.stop 恢复模式), 取消也不例外 (US21: 取消退出的终端恢复)。
         """
         loop = asyncio.get_running_loop()
+        shutdown_cancelled = False
         try:
             self._terminal.start(self._on_input_batch, self._on_terminal_resize)
             mouse_error = getattr(self._terminal, "mouse_setup_error", None)
@@ -856,6 +886,11 @@ class MainScreenFrontend:
                     self.ui_failures.append('login terminal input failed')
                     self._exit_event.set()
         finally:
+            if self._session_modal is not None:
+                try:
+                    await self._session_modal.close()
+                except asyncio.CancelledError:
+                    shutdown_cancelled = True
             if self._review_active():
                 self._review.cancel()
             if self._file_menu is not None:
@@ -882,6 +917,8 @@ class MainScreenFrontend:
             stop_errors = self._terminal.stop()
             if self.sensitive_input_used and stop_errors:
                 stop_errors = ['login terminal restore errors']
+        if shutdown_cancelled:
+            raise asyncio.CancelledError
         return stop_errors
 
     def request_exit(self) -> None:

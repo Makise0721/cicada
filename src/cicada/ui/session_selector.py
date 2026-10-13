@@ -139,7 +139,7 @@ class SessionSelectorState:
             action = None
         return action, None
 
-    def render_lines(self, columns: int, rows: int = 24) -> list[str]:
+    def render_lines(self, columns: int, rows: int = 24, *, cursor_marker: str = "") -> list[str]:
         width, height = max(1, columns), max(1, rows)
         query_line = self._query_line(width)
         page = self.page_entries
@@ -170,9 +170,10 @@ class SessionSelectorState:
             lines.pop(1)
         if len(lines) > height:
             lines.pop(0)
-        return [truncate_to_width(sanitize_display(line), width) for line in lines[:height]]
+        return [self._query_line(width, cursor_marker) if line == query_line else
+                truncate_to_width(sanitize_display(line), width) for line in lines[:height]]
 
-    def _query_line(self, width: int) -> str:
+    def _query_line(self, width: int, cursor_marker: str = "") -> str:
         prefix = "搜索: " if width >= 8 else ""
         available = max(0, width - visible_width(prefix) - 1)
         left = self.query[:self.cursor]
@@ -180,7 +181,7 @@ class SessionSelectorState:
         while left and visible_width(left) > left_budget:
             left = left[1:]
         right = truncate_to_width(self.query[self.cursor:], available - visible_width(left))
-        return prefix + left + "|" + right
+        return prefix + left + cursor_marker + "|" + right
 
     def _entry_line(self, entry: SessionCatalogEntry, index: int) -> str:
         markers = (" [当前]" if entry.session_id == self.current_session_id else "")

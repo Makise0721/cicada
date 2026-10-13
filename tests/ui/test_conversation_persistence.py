@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+
+import pytest
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
@@ -425,5 +427,136 @@ async def test_clear_failure_shows_error_and_releases_barrier(tmp_path, monkeypa
         assert "清空提交失败" in rendered
         assert "disk gone" in rendered
     finally:
+        await session.aclose()
+        harness.close()
+
+
+async def test_resume_modal_search_cancel_conflict_adopt_and_aba_display(tmp_path):
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.commands import SlashCommandMenu
+    from cicada.ui.terminal_io import FakeTerminal
+    from test_persistence_application import _check_config, _CHECK_RUN
+
+    root = _repo(tmp_path)
+    session = await open_application(_check_config(root, (_CHECK_RUN, {"text": "A原文", "stop": True},)))
+    harness = Harness(session)
+    view = harness.view
+    frontend = MainScreenFrontend(FakeTerminal(40, 12), document_lines=view.document_lines,
+        layout_document=view.layout_document, editor=view.editor, on_submit=view.on_submit,
+        command_menu=SlashCommandMenu(), session_modal=view.session_modal)
+    view.on_session_prepare = frontend.prepare_session_change
+    view.on_session_changed = frontend.reset_session_display
+    enter, escape = KeyPress(Keys.ControlM, "\r"), KeyPress(Keys.Escape, "\x1b")
+
+    def search_select(session_id):
+        frontend._on_input_batch([KeyPress(Keys.BracketedPaste, session_id), enter, enter])
+
+    try:
+        await session.execute("A问题")
+        a_id = session.persistence.session_id
+        assert not view.on_submit("/new")
+        await view._new_task
+        b_id = session.persistence.session_id
+        view.editor.set_text("旧草稿 中文")
+        view.editor.move_cursor(0, -1)
+        before = (view.editor.state, view.editor.state.cursor_col, tuple(view.editor._undo._items))
+        assert not view.on_submit("/resume")
+        assert await _wait_until(lambda: not view.session_modal.state.loading)
+        for columns, rows in ((24, 4), (80, 12)):
+            lines = view.session_modal.render(columns, rows)
+            assert len(lines) <= rows
+        frontend._on_input_batch([KeyPress("中", "中"), escape, enter, KeyPress("x", "x")])
+        assert not view.session_modal.active and not view.enter_barrier()
+        assert before == (view.editor.state, view.editor.state.cursor_col, tuple(view.editor._undo._items))
+        assert session.persistence.session_id == b_id
+        assert not view.on_submit("/resume")
+        assert await _wait_until(lambda: not view.session_modal.state.loading)
+        search_select(b_id)
+        assert await _wait_until(lambda: not view.session_modal.active)
+        assert session.session_generation == 1 and before[0] is view.editor.state
+        # 新目标冲突时释放lease，用户显式按 C 才采用当前配置。
+        archive = session._resume_store_factory(a_id)
+        identity = archive.recovery_snapshot().identity
+        await archive.start_epoch(dc_replace(identity, launch=dc_replace(identity.launch, think=True)))
+        await archive.aclose()
+        assert not view.on_submit("/resume")
+        assert await _wait_until(lambda: not view.session_modal.state.loading)
+        search_select(a_id)
+        assert await _wait_until(lambda: view.session_modal._conflict is not None)
+        assert "think" in "\n".join(view.session_modal.render(100, 12))
+        assert session.persistence.session_id == b_id and before[0] is view.editor.state
+        frontend._on_input_batch([KeyPress("c", "c"), enter])
+        assert await _wait_until(lambda: not view.session_modal.active)
+        assert session.persistence.session_id == a_id and view.editor.is_empty()
+        assert "A原文" in "\n".join(harness.lines(80))
+        restored_action = view.layout_document(80).hits[0].action
+        totals = view.transcript.metrics_fact()
+        await session.submit_resume_session(b_id).wait()
+        await session.submit_resume_session(a_id).wait()
+        assert session.session_generation == 4 and view.transcript.metrics_fact() == totals
+        assert view.layout_document(80).hits[0].action != restored_action
+        current_lines = harness.lines(80)
+        view.execute_display_action(restored_action)
+        assert harness.lines(80) == current_lines, "旧A工具显示动作不能复活到新A"
+    finally:
+        await view.session_modal.close()
+        frontend._stopped = True
+        await session.aclose()
+        harness.close()
+
+
+async def test_resume_query_cancel_refresh_and_frontend_close_wait_real_worker(tmp_path, monkeypatch):
+    import threading
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.terminal_io import FakeTerminal
+
+    session = await open_application(_persistence_config(_repo(tmp_path), _script(), session_id=None))
+    harness = Harness(session)
+    view = harness.view
+    terminal = FakeTerminal(40, 12)
+    frontend = MainScreenFrontend(terminal, document_lines=view.document_lines, editor=view.editor,
+                                 on_submit=view.on_submit, session_modal=view.session_modal)
+    view.on_session_prepare = frontend.prepare_session_change
+    entered, release = threading.Event(), threading.Event()
+    reader = session._catalog_reader
+    original = reader._observe
+    calls = []
+
+    def gated(stop):
+        calls.append(stop)
+        entered.set()
+        assert release.wait(5)
+        return original(stop)
+
+    monkeypatch.setattr(reader, "_observe", gated)
+    view.editor.set_text("/resume")
+    runner = asyncio.create_task(frontend.run_async())
+    try:
+        await asyncio.sleep(0)
+        assert not view.on_submit("/resume")
+        assert await asyncio.to_thread(entered.wait, 5)
+        frontend._on_input_batch([KeyPress(Keys.ControlR, "\x12")])
+        frontend._on_input_batch([KeyPress(Keys.ControlC, "\x03"), KeyPress(Keys.ControlM, "\r")])
+        assert view.session_modal.active and view.enter_barrier() and len(calls) == 1
+        frontend._on_input_batch([KeyPress(Keys.ControlM, "\r"), KeyPress("x", "x")])
+        assert view.editor.get_text() == "/resume"
+        frontend.request_exit()
+        await asyncio.sleep(0)
+        runner.cancel()
+        await asyncio.sleep(0)
+        assert not runner.done() and not terminal.stopped
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await runner
+        assert not view.session_modal.active and len(calls) == 1 and terminal.stopped
+    finally:
+        release.set()
+        if not runner.done():
+            frontend.request_exit()
+            await runner
         await session.aclose()
         harness.close()

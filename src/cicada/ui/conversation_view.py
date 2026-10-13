@@ -115,6 +115,7 @@ from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
 from cicada.user_config import LoginSubmission, UserConfigError
 from cicada.ui.restore_view import project_restored_history
+from cicada.ui.session_resume import SessionResumeModal
 from cicada.ui.theme import FooterComponent
 from cicada.ui.document_layout import (
     ACTION_EFFORT_CYCLE,
@@ -186,6 +187,8 @@ class ConversationView:
         self.on_session_prepare: Callable[[], None] | None = None
         self.on_session_changed: Callable[[], None] | None = None
         self._view_closed = False
+        self.session_modal = SessionResumeModal(session, on_update=self._session_modal_updated,
+                                                on_error=self.transcript.append_error)
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
         # 票据 03: 思考强度等待任务的强引用与事务目标 (底栏 pending 展示事实)
@@ -241,6 +244,14 @@ class ConversationView:
 
     # --- 生命周期 -----------------------------------------------------------------
 
+    def _session_modal_updated(self) -> None:
+        if self.session_modal.active:
+            self._gate.note_session_started()
+        else:
+            self._gate.note_session_settled()
+        if not self._view_closed and self._on_update:
+            self._on_update()
+
     def _review_updated(self) -> None:
         if self.review_view.active:
             self._gate.note_review_started()
@@ -252,6 +263,7 @@ class ConversationView:
     def close(self) -> None:
         """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
         self._view_closed = True
+        self.session_modal.cancel()
         self.review_view.cancel()
         if self._new_submission is not None:
             self._new_submission.cancel()
@@ -282,7 +294,15 @@ class ConversationView:
             self._active_run_id = self._model_stage = None
             self.model_menu.dismiss()
             self._editor.clear()
-            self.transcript.append_system("已新建会话，验证状态保留。")
+            self.transcript.append_system("已切换会话，验证状态保留。" if update.persistence.mode == "resume"
+                                          else "已新建会话，验证状态保留。")
+            project_restored_history(
+                self.transcript, self.tools, requests=update.snapshot.requests,
+                interrupted=update.snapshot.interrupted,
+                summaries=update.snapshot.summaries if self._session.budget is not None else (),
+                namespace=f"restored:{update.session_generation}")
+            if self._session.view_only_reason:
+                self.transcript.append_system("恢复为查看状态（新请求被拒绝）：" + self._session.view_only_reason)
             if self.on_session_changed is not None:
                 self.on_session_changed()
         elif isinstance(update, AgentEventReceived):
@@ -626,6 +646,9 @@ class ConversationView:
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
         取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self.session_modal.active:
+            self.session_modal.cancel()
+            return
         if self._gate.session_managing:
             if self._new_submission is not None:
                 self._new_submission.cancel()
@@ -649,6 +672,9 @@ class ConversationView:
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
         持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self.session_modal.active:
+            self.session_modal.cancel()
+            return
         if self._gate.session_managing:
             if self._new_submission is not None:
                 self._new_submission.cancel()
@@ -791,6 +817,13 @@ class ConversationView:
             return True
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)
+        if command == "/resume":
+            if self.model_menu.is_open or self.login_modal.is_open or self.review_view.active:
+                return False
+            if self.on_session_prepare:
+                self.on_session_prepare()
+            self.session_modal.open()
+            return False  # 模态使用独立搜索输入，取消完整保留草稿/光标/undo。
         if command == "/new":
             self._gate.note_session_started()
             try:
@@ -1463,6 +1496,7 @@ def build(
         "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
         "modal": view.login_modal,
         "review": view.review_view,
+        "session_modal": view.session_modal,
     }
 
 

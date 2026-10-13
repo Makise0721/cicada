@@ -1359,8 +1359,9 @@ async def test_new_keeps_process_calls_but_discards_old_summary_projection_and_a
         await session.aclose()
 
 
+@pytest.mark.parametrize("operation", ["new", "resume"])
 @pytest.mark.parametrize("phase", ["opening", "epoch"])
-async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(tmp_path, monkeypatch, phase):
+async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(tmp_path, monkeypatch, phase, operation):
     from cicada.application import SessionChanged
 
     root = _repo(tmp_path)
@@ -1369,6 +1370,13 @@ async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(
     entered, release = threading.Event(), threading.Event()
     targets = []
     factory = session._new_store_factory
+    resume_id = None
+    if operation == "resume":
+        archive = factory()
+        await archive.start_epoch(source.recovery_snapshot().identity)
+        resume_id = archive.session_id
+        await archive.aclose()
+        factory = lambda: session._resume_store_factory(resume_id)
 
     def gated_factory():
         target = factory()
@@ -1385,10 +1393,16 @@ async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(
             target._immediate = gated_epoch
         return target
 
-    monkeypatch.setattr(session, "_new_store_factory", gated_factory)
+    if operation == "new":
+        monkeypatch.setattr(session, "_new_store_factory", gated_factory)
+    else:
+        resume_factory = session._resume_store_factory
+        factory = lambda: resume_factory(resume_id)
+        monkeypatch.setattr(session, "_resume_store_factory", lambda session_id: gated_factory())
     updates = []
     session.subscribe(updates.append)
-    submission = session.submit_new_session()
+    submission = (session.submit_new_session() if operation == "new" else
+                  session.submit_resume_session(resume_id))
     assert await asyncio.to_thread(entered.wait, 5)
     waiter = asyncio.create_task(submission.wait())
     await asyncio.sleep(0)
@@ -1409,18 +1423,27 @@ async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(
     assert targets[0]._closed and source._closed and session._store._owned == []
     # 空档或epoch提交留在磁盘，取消不假装撤销。
     reopened = open_session_store(directory=source.db_path.parent, session_id=targets[0].session_id, workspace=root)
-    assert (reopened.recovery_snapshot().identity is not None) == (phase == "epoch")
+    assert (reopened.recovery_snapshot().identity is not None) == (phase == "epoch" or operation == "resume")
     await reopened.aclose()
 
 
+@pytest.mark.parametrize("operation", ["new", "resume"])
 @pytest.mark.parametrize("published", [False, True])
-async def test_new_cleanup_failure_keeps_resource_and_blocks_followups(tmp_path, monkeypatch, published):
+async def test_new_cleanup_failure_keeps_resource_and_blocks_followups(tmp_path, monkeypatch, published, operation):
     from cicada.application import SessionManagementError
 
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script(), session_id=None))
     route, source = session._store, session._store.capture()
     factory = session._new_store_factory
+    resume_id = None
+    if operation == "resume":
+        archive = factory()
+        await archive.start_epoch(source.recovery_snapshot().identity)
+        resume_id = archive.session_id
+        await archive.aclose()
+        resume_factory = session._resume_store_factory
+        factory = lambda: resume_factory(resume_id)
     targets = []
 
     async def failed_close():
@@ -1436,13 +1459,18 @@ async def test_new_cleanup_failure_keeps_resource_and_blocks_followups(tmp_path,
             target.aclose = failed_close
         return target
 
-    monkeypatch.setattr(session, "_new_store_factory", target_factory)
+    if operation == "new":
+        monkeypatch.setattr(session, "_new_store_factory", target_factory)
+    else:
+        monkeypatch.setattr(session, "_resume_store_factory", lambda session_id: target_factory())
     source_close = source.aclose
     if published:
         monkeypatch.setattr(source, "aclose", failed_close)
     try:
         with pytest.raises(SessionManagementError) as error:
-            await session.submit_new_session().wait()
+            submission = (session.submit_new_session() if operation == "new" else
+                          session.submit_resume_session(resume_id))
+            await submission.wait()
         assert error.value.code == "cleanup-failed" and error.value.published == published
         assert (route.capture() is targets[0]) == published
         assert len(route._owned) == 2
@@ -1827,3 +1855,134 @@ async def test_cancelled_native_creation_preserves_application_history_and_saved
     assert restored.details == tool_result.details
     assert resumed.restored_requests[-1].outcome.stop_reason == "aborted"
     await resumed.aclose()
+
+
+async def test_resume_aba_rebuilds_summary_proof_spans_and_preserves_actual_receipt_owners(tmp_path):
+    from cicada.budget import BudgetConfig
+    from tests.support.summary import ScriptedSummary
+
+    session = await open_application(dc_replace(_check_config(_repo(tmp_path), (
+        _CHECK_RUN, {"text": "A检查", "stop": True}, {"text": "A答", "stop": True},
+        {"text": "B答", "stop": True}, _CHECK_RUN, {"text": "B检查", "stop": True},
+        {"text": "A续写", "stop": True},
+    )), budget=BudgetConfig(num_ctx=1_000_000, num_predict=2048)))
+    session._budget_policy._summarize = ScriptedSummary()
+    try:
+        a_id = session.persistence.session_id
+        first = await session.execute("A第一问")
+        await session.execute("A第二问")
+        await session.compact_context()
+        expected = (session.history, session.summary_records, session._context_projection.blocks,
+                    tuple(session._committed_spans), session._projection)
+        epoch_a = session.persistence.epoch_id
+        await session.submit_new_session().wait()
+        b_id = session.persistence.session_id
+        await session.execute("B无检查")
+        assert session._store.recovery_snapshot().restored_receipts == ()
+        b = await session.execute("B实际检查")
+        owners = dict(session._receipt_owners)
+        calls, summaries = session.process_model_calls, session.process_summary_calls
+        service, run = session._service, session.verification_run_id
+        await session.submit_resume_session(a_id).wait()
+        assert session.history == expected[0] and session.summary_records == expected[1]
+        assert session._context_projection.blocks == expected[2]
+        assert tuple(session._committed_spans) == expected[3] and session._projection is expected[4]
+        assert session.persistence.epoch_id != epoch_a and session.session_generation == 2
+        assert session._service is service and session.verification_run_id == run
+        assert session.process_model_calls == calls and session.process_summary_calls == summaries
+        assert session.budget.anchor is None and session._receipt_owners == owners
+        assert {r.receipt_id for r in session.restored_receipts} == {first.view.receipts[0].receipt_id}
+        epochs = session._store.recovery_snapshot().epoch_count
+        result = await session.submit_resume_session(a_id).wait()
+        assert not result.changed and session.session_generation == 2
+        assert session._store.recovery_snapshot().epoch_count == epochs
+        await session.execute("A后继无检查")
+        assert len(session._store.recovery_snapshot().restored_receipts) == 1
+        await session.submit_resume_session(b_id).wait()
+        assert session.session_generation == 3 and session.summary_records == ()
+        assert [r.prompt for r in session.restored_requests] == ["B无检查", "B实际检查"]
+        assert session.restored_receipts[0].request_id == b.persistence.request_id
+        await session.submit_resume_session(a_id).wait()
+        assert [r.prompt for r in session.restored_requests] == ["A第一问", "A第二问", "A后继无检查"]
+    finally:
+        await session.aclose()
+
+
+async def test_resume_config_conflict_preserves_source_and_explicit_adopt_records_difference(tmp_path):
+    from cicada.application import SessionManagementError
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "源仍可用", "stop": True}), session_id=None))
+    source = session._store.capture()
+    archive = session._new_store_factory()
+    identity = source.recovery_snapshot().identity
+    await archive.start_epoch(dc_replace(identity, launch=dc_replace(identity.launch, think=True)))
+    target_id, path = archive.session_id, archive.db_path
+    await archive.aclose()
+    try:
+        with pytest.raises(SessionManagementError) as conflict:
+            await session.submit_resume_session(target_id).wait()
+        assert conflict.value.code == "config-conflict" and "think" in str(conflict.value)
+        assert session._store.capture() is source and session.session_generation == 0
+        inspect = open_session_store(directory=path.parent, session_id=target_id, workspace=root)
+        assert inspect.recovery_snapshot().epoch_count == 1
+        await inspect.aclose()
+        assert (await session.execute("健康源可继续")).persistence.saved
+        await session.submit_resume_session(target_id, adopt_current_config=True).wait()
+        snapshot = session._store.recovery_snapshot()
+        assert snapshot.identity.launch.think == identity.launch.think and snapshot.epoch_count == 2
+        assert snapshot.identity.launch.sources["resume_config"] == "current"
+        assert snapshot.identity.launch.sources["changed_fields"] == "think"
+        assert session._store._owned == [session._store.capture()]
+    finally:
+        await session.aclose()
+
+
+async def test_resume_block_published_only_and_latches_target_source(tmp_path, monkeypatch):
+    from cicada.application import SessionManagementError
+
+    session = await open_application(_config(_repo(tmp_path), _script(), session_id=None))
+    source = session._store.capture()
+    target = session._new_store_factory()
+    epoch = await target.start_epoch(source.recovery_snapshot().identity)
+    request = await target.begin_request(epoch, "未完成任务")
+    await target.begin_process(request, tool_name="powershell", call_id="unfinished", arguments={})
+    target_id = target.session_id
+    await target.aclose()
+    factory = session._resume_store_factory
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def gated_factory(session_id):
+        opened = factory(session_id)
+        original = opened.start_epoch
+        async def start(identity):
+            result = await original(identity)
+            entered.set()
+            await release.wait()
+            return result
+        opened.start_epoch = start
+        return opened
+
+    monkeypatch.setattr(session, "_resume_store_factory", gated_factory)
+    try:
+        cancelled = session.submit_resume_session(target_id)
+        await entered.wait()
+        cancelled.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled.wait()
+        assert session.view_only_reason is None and session._store.capture() is source
+        monkeypatch.setattr(session, "_resume_store_factory", factory)
+        await session.submit_resume_session(target_id).wait()
+        assert target_id in session.view_only_reason and "unfinished" in session.view_only_reason
+        assert session.restored_interrupted[0].request_id == request
+        for action in (session.submit_new_session, lambda: session.submit_resume_session(source.session_id)):
+            with pytest.raises(SessionManagementError) as error:
+                action()
+            assert error.value.code == "blocked"
+        with pytest.raises(RuntimeError, match="view-only"):
+            await session.execute("不能绕过")
+        assert (await session.observe_session_catalog(CancelToken())).complete
+    finally:
+        release.set()
+        await session.aclose()

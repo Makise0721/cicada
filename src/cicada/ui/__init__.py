@@ -109,6 +109,7 @@ async def run_tui_session(
         on_model_confirm=view.confirm_model_selection,
         modal=view.login_modal,
         review=view.review_view,
+        session_modal=view.session_modal,
         display_style=view.display_style,
         # 文件补全 (project-context-v1 C3/C7): 候选端口注入应用只读出口;
         # busy Enter 屏障事实来自 view 的准入闸门; 异步候选落定经 _request_render

@@ -49,6 +49,7 @@ def project_restored_history(
     requests: tuple[RestoredRequest, ...],
     interrupted: tuple[InterruptedRequest, ...],
     summaries: tuple[SummaryRecord, ...] = (),
+    namespace: str = RESTORED_RUN_PREFIX,
 ) -> None:
     """把恢复快照投影进显示文档; 无恢复事实时不产生任何条目.
 
@@ -71,7 +72,7 @@ def project_restored_history(
         if last_generation is not None and request.context_generation != last_generation:
             transcript.append_system(CLEAR_BOUNDARY_TEXT)
         last_generation = request.context_generation
-        _project_request(transcript, tools, request)
+        _project_request(transcript, tools, request, namespace)
         for record in boundaries.get((request.context_generation, request.seq), ()):
             transcript.append_system(_compaction_boundary_text(record))
     for item in interrupted:
@@ -82,9 +83,9 @@ def project_restored_history(
 
 
 def _project_request(
-    transcript: Transcript, tools: ToolDocument, request: RestoredRequest
+    transcript: Transcript, tools: ToolDocument, request: RestoredRequest, namespace: str
 ) -> None:
-    key = f"{RESTORED_RUN_PREFIX}:{request.request_id}"
+    key = f"{namespace}:{request.request_id}"
     transcript.append_system(f"── 历史请求 #{request.seq} · epoch {request.epoch_id[:8]} ──")
     turn = 0
     assistant_count = 0
