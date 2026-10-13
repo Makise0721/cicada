@@ -125,7 +125,7 @@ def test_selector_bad_entries_visible_but_not_selectable(tmp_path):
     terminal = FakeTerminal(columns=100, rows=12)
     session_id, _ = _run_selector(terminal, directory, keys=[ENTER])
     text = terminal.output_text
-    assert "00000000-1111-4222-8333-444444444444" in text
+    assert "00000000 [坏档:" in text
     assert "坏档" in text, "坏档如实标注"
     assert session_id == good, "坏档不可选, 默认选定好会话"
 
@@ -161,6 +161,7 @@ def test_selector_bad_archive_enter_refused_until_escape(tmp_path):
         terminal.emit([ENTER])
         await asyncio.sleep(0.05)
         assert not task.done(), "坏档行 Enter 被拒, 选择器保持运行"
+        assert "ID: 00000000-1111-4222-8333-444444444444" in terminal.output_text
         terminal.emit([ESCAPE])
         return await asyncio.wait_for(task, timeout=10)
 

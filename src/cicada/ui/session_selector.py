@@ -10,7 +10,7 @@ from prompt_toolkit.keys import Keys
 from cicada.persistence.contracts import (
     CATALOG_QUERY_MAX_CHARS, LIST_SESSIONS_PAGE_SIZE, SessionCatalogEntry, SessionCatalogSnapshot,
 )
-from cicada.ui.main_screen import truncate_to_width
+from cicada.ui.main_screen import truncate_to_width, visible_width
 from cicada.ui.rendering import sanitize_display
 
 SELECTOR_TITLE = "选择要恢复的会话"
@@ -141,9 +141,10 @@ class SessionSelectorState:
 
     def render_lines(self, columns: int, rows: int = 24) -> list[str]:
         width, height = max(1, columns), max(1, rows)
-        query_line = "搜索: " + self.query[:self.cursor] + "|" + self.query[self.cursor:]
+        query_line = self._query_line(width)
         page = self.page_entries
-        capacity = max(1, height - 5)
+        show_identity = bool(page) and height >= 7
+        capacity = max(1, height - (6 if show_identity else 5))
         self.window_offset = min(self.window_offset, max(0, len(page) - capacity))
         if self.row < self.window_offset:
             self.window_offset = self.row
@@ -163,12 +164,23 @@ class SessionSelectorState:
         footer = f"第 {self.page_index + 1}/{self.page_count} 页  匹配 {len(self.entries)}"
         if page:
             footer += f"  行 {self.window_offset + 1}–{min(len(page), self.window_offset + capacity)}/{len(page)}"
-        lines = [SELECTOR_TITLE, SELECTOR_HINT, query_line, *content, footer, self.notice or scope]
+        details = ["ID: " + self.selected.session_id] if show_identity else []
+        lines = [SELECTOR_TITLE, SELECTOR_HINT, query_line, *content, *details, footer, self.notice or scope]
         if len(lines) > height:
             lines.pop(1)
         if len(lines) > height:
             lines.pop(0)
         return [truncate_to_width(sanitize_display(line), width) for line in lines[:height]]
+
+    def _query_line(self, width: int) -> str:
+        prefix = "搜索: " if width >= 8 else ""
+        available = max(0, width - visible_width(prefix) - 1)
+        left = self.query[:self.cursor]
+        left_budget = available if self.cursor == len(self.query) else available * 2 // 3
+        while left and visible_width(left) > left_budget:
+            left = left[1:]
+        right = truncate_to_width(self.query[self.cursor:], available - visible_width(left))
+        return prefix + left + "|" + right
 
     def _entry_line(self, entry: SessionCatalogEntry, index: int) -> str:
         markers = (" [当前]" if entry.session_id == self.current_session_id else "")
@@ -181,4 +193,4 @@ class SessionSelectorState:
         except (OSError, OverflowError, ValueError):
             updated = "时间不可显示"
         title = entry.user_name or entry.short_title or "未命名"
-        return f"{'>' if index == self.row else ' '} {title}{markers}  {entry.session_id}  {updated}"
+        return f"{'>' if index == self.row else ' '} {entry.session_id[:8]}{markers}  {title}  {updated}"
