@@ -366,6 +366,14 @@ class Transcript:
 
     # --- 条目管理 ----------------------------------------------------------------
 
+    def reset_session(self) -> None:
+        """切换显示来源；保留进程计量及单调显示身份，丢弃旧条目/索引。"""
+        self._entries.clear()
+        self._entry_ids.clear()
+        self._assistant_index.clear()
+        self._reasoning_expanded = False
+        self._finished_runs.clear()
+
     def _add(self, entry: TranscriptEntry) -> None:
         self._entries.append(entry)
         self._entry_ids.append(self._next_display_id)

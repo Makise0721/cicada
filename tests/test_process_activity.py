@@ -401,6 +401,9 @@ class _Sink:
     def active_request_id(self) -> str | None:
         return self._request_id
 
+    def record_check_receipt(self, receipt_id: str) -> None:
+        pass
+
     def latch_storage_failure(self, detail: str) -> None:
         self.failures.append(detail)
 

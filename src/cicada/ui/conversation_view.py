@@ -80,6 +80,7 @@ from cicada.application import (
     SessionManagementError,
     SessionManagementSubmission,
     SessionNameChanged,
+    SessionChanged,
 )
 from cicada.budget import BudgetReport, BudgetSnapshot
 from cicada.persistence.contracts import validate_session_name
@@ -180,6 +181,11 @@ class ConversationView:
         self._compact_task: asyncio.Task | None = None
         self._name_submission: SessionManagementSubmission | None = None
         self._name_task: asyncio.Task | None = None
+        self._new_submission: SessionManagementSubmission | None = None
+        self._new_task: asyncio.Task | None = None
+        self.on_session_prepare: Callable[[], None] | None = None
+        self.on_session_changed: Callable[[], None] | None = None
+        self._view_closed = False
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
         # 票据 03: 思考强度等待任务的强引用与事务目标 (底栏 pending 展示事实)
@@ -245,7 +251,10 @@ class ConversationView:
 
     def close(self) -> None:
         """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
+        self._view_closed = True
         self.review_view.cancel()
+        if self._new_submission is not None:
+            self._new_submission.cancel()
         if self._name_submission is not None:
             self._name_submission.cancel()
         self._unsubscribe()
@@ -263,7 +272,20 @@ class ConversationView:
     # --- 应用事件投影 ----------------------------------------------------------------
 
     def _on_application_update(self, update: ApplicationUpdate) -> None:
-        if isinstance(update, AgentEventReceived):
+        if isinstance(update, SessionChanged):
+            if update.session_generation != self._session.session_generation:
+                return
+            self.tools = ToolDocument()
+            self.transcript.reset_session()
+            self._checks = CheckProjection(self._session)
+            self._current_turn.clear()
+            self._active_run_id = self._model_stage = None
+            self.model_menu.dismiss()
+            self._editor.clear()
+            self.transcript.append_system("已新建会话，验证状态保留。")
+            if self.on_session_changed is not None:
+                self.on_session_changed()
+        elif isinstance(update, AgentEventReceived):
             self._project_agent_event(update.event)
         elif isinstance(update, RequestPhaseChanged):
             self._checks.note_phase(update.run_id, update.phase)
@@ -605,6 +627,8 @@ class ConversationView:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
         取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
         if self._gate.session_managing:
+            if self._new_submission is not None:
+                self._new_submission.cancel()
             if self._name_submission is not None:
                 self._name_submission.cancel()
             return
@@ -626,6 +650,8 @@ class ConversationView:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
         持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
         if self._gate.session_managing:
+            if self._new_submission is not None:
+                self._new_submission.cancel()
             if self._name_submission is not None:
                 self._name_submission.cancel()
             return
@@ -765,6 +791,19 @@ class ConversationView:
             return True
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)
+        if command == "/new":
+            self._gate.note_session_started()
+            try:
+                if self.on_session_prepare is not None:
+                    self.on_session_prepare()
+                submission = self._session.submit_new_session()
+            except SessionManagementError as exc:
+                self._gate.note_session_rejected()
+                self.transcript.append_error(str(exc))
+                return False
+            self._new_submission = submission
+            self._new_task = asyncio.create_task(self._run_new_session(submission))
+            return False  # 发布成功事件才清草稿，准备失败/取消保留编辑器全部状态。
         if command == "/clear":
             if self._session.persistence is not None:
                 # 05: 持久清空经共享 async clear_context() 可靠提交; 命令处置时
@@ -861,6 +900,27 @@ class ConversationView:
             self._gate.note_session_settled()
             self._sync_spinner()
             if self._on_update is not None:
+                self._on_update()
+
+    async def _run_new_session(self, submission: SessionManagementSubmission) -> None:
+        waiter = asyncio.create_task(submission.wait())
+        try:
+            while True:
+                try:
+                    await asyncio.shield(waiter)
+                    break
+                except asyncio.CancelledError:
+                    submission.cancel()
+                    if waiter.done():
+                        break
+                except Exception as exc:
+                    if not self._view_closed:
+                        self.transcript.append_error(str(exc))
+                    break
+        finally:
+            self._new_submission = None
+            self._gate.note_session_settled()
+            if not self._view_closed and self._on_update is not None:
                 self._on_update()
 
     def _open_login(self) -> bool:
@@ -1078,6 +1138,8 @@ class ConversationView:
                 session_lines.append(f"保存失败已锁存: {persistence.storage_failed}")
             if self._session.view_only_reason is not None:
                 session_lines.append(f"查看状态: {self._session.view_only_reason}")
+            if self._session.session_cleanup_failed is not None:
+                session_lines.append(f"会话清理失败已锁存: {self._session.session_cleanup_failed}")
             if self._session.has_process_uncertain():
                 session_lines.append(PROCESS_UNCERTAIN_LABEL)
         diagnostics = self._diagnostics() if self._diagnostics is not None else []

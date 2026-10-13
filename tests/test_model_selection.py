@@ -200,7 +200,7 @@ async def test_accepted_commit_blocks_operations_until_publication(tmp_path, mon
             assert not close.done()
             if action == "close-timeout":
                 await asyncio.sleep(0.05)
-                assert not close.done() and not session._store._closed
+                assert not close.done() and not session._store.capture()._closed
                 assert session._close_problems and changes == []
         release.set()
         if action == "cancel":
@@ -220,7 +220,7 @@ async def test_accepted_commit_blocks_operations_until_publication(tmp_path, mon
 async def test_sql_failure_rolls_back_and_latches_storage(tmp_path):
     session = await open_application(config(_repo(tmp_path), transport([])))
     try:
-        await session._store._dispatch(lambda: session._store._conn.execute(
+        await session._store.capture()._dispatch(lambda: session._store.capture()._conn.execute(
             "CREATE TRIGGER reject_model BEFORE INSERT ON epoch BEGIN SELECT RAISE(ABORT, 'injected'); END"
         ))
         old = session.persistence.epoch_id
@@ -239,7 +239,7 @@ async def test_sql_failure_rolls_back_and_latches_storage(tmp_path):
 @pytest.mark.parametrize("refusal", ["epoch", "pending", "activity"])
 async def test_transaction_refuses_unsafe_state_without_interrupting(tmp_path, refusal):
     session = await open_application(config(_repo(tmp_path), transport([])))
-    store = session._store
+    store = session._store.capture()
     try:
         epoch = session.persistence.epoch_id
         if refusal in ("pending", "activity"):
@@ -269,7 +269,7 @@ async def test_pointer_wins_timestamp_and_reverse_uuid(tmp_path, monkeypatch):
         monkeypatch.setattr(module.time, "time", lambda: 1.0)
         await session.select_model("deepseek-v4-pro")
         await session.select_model("deepseek-flash")
-        path = session._store.db_path
+        path = session._store.capture().db_path
         sid = session.persistence.session_id
     finally:
         await session.aclose()
@@ -394,7 +394,7 @@ async def test_selection_validates_effective_projection_not_covered_partial(tmp_
 
 async def test_cancelled_handle_wait_keeps_actual_transaction_and_repeat_result(tmp_path, monkeypatch):
     session = await open_application(config(_repo(tmp_path), transport([])))
-    store = session._store
+    store = session._store.capture()
     started, release = threading.Event(), threading.Event()
     immediate = store._immediate
     def gated():

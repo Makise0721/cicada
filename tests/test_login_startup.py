@@ -58,7 +58,7 @@ def test_login_saved_defaults_reach_next_real_cli_request(monkeypatch, tmp_path,
     assert loaded.defaults.reasoning_effort == 'low'
     for needle in ('next-start-sentinel', loaded.defaults.credential_ref):
         assert needle not in out + err + terminal.output_text
-        assert needle.encode() not in sessions[0]._store.db_path.read_bytes()
+        assert needle.encode() not in sessions[0]._store.capture().db_path.read_bytes()
     code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--save-session', 'next question'], root)
     assert code == 0 and len(requests) == 1, err
     authorization, body = requests[0]

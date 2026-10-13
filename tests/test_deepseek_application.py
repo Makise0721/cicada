@@ -92,7 +92,7 @@ async def test_tools_new_user_restart_and_nonthinking_summary_use_real_bindings(
     again = await open_application(config(root, httpx.MockTransport(handle), session_id))
     try:
         assert again.summary_records[-1].call_identity == record.call_identity
-        assert b"offline-test-key" not in again._store.db_path.read_bytes()
+        assert b"offline-test-key" not in again._store.capture().db_path.read_bytes()
     finally:
         await again.aclose()
 

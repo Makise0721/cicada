@@ -26,6 +26,89 @@ from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.persistence.contracts import LaunchIdentity
 
 
+async def test_new_command_publish_resets_display_but_waits_for_real_retirement(tmp_path, monkeypatch):
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.ui.commands import SlashCommandMenu
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.terminal_io import FakeTerminal
+
+    root = _repo(tmp_path)
+    session = await open_application(_persistence_config(root, _script(
+        {"text": "旧会话回答", "stop": True}, {"text": "新回答", "stop": True}), session_id=None))
+    harness = Harness(session)
+    view = harness.view
+    frontend = MainScreenFrontend(FakeTerminal(), document_lines=view.document_lines,
+        layout_document=view.layout_document, editor=view.editor, on_submit=view.on_submit,
+        command_menu=SlashCommandMenu())
+    view.on_session_prepare = frontend.prepare_session_change
+    view.on_session_changed = frontend.reset_session_display
+    source = session._store.capture()
+    close_entered, close_release = asyncio.Event(), asyncio.Event()
+    original = source.aclose
+
+    async def gated_close():
+        close_entered.set()
+        await close_release.wait()
+        await original()
+
+    monkeypatch.setattr(source, "aclose", gated_close)
+    enter = KeyPress(Keys.ControlM, "\r")
+    try:
+        harness.submit("旧会话问题")
+        assert await _wait_until(lambda: session_idle(session) and not view.enter_barrier())
+        totals = view.transcript.metrics_fact()
+        view.editor.set_text("/new")
+        frontend._on_input_batch([enter, KeyPress("x", "x"), enter])
+        assert session.session_management_active and view.enter_barrier()
+        assert view.editor.get_text() == "/newx", "准备中保留草稿且同批Enter不能编码"
+        await close_entered.wait()
+        assert session.session_generation == 1 and view.editor.is_empty()
+        assert session.session_management_active and view.enter_barrier()
+        assert "旧会话" not in "\n".join(harness.lines(80))
+        assert view.transcript.metrics_fact() == totals
+        view.handle_ctrl_c()  # 发布后取消不能伪装没有切换。
+        close_release.set()
+        await view._new_task
+        assert not view.enter_barrier()
+        assert harness.submit("新问题")
+        assert await _wait_until(lambda: session_idle(session) and not view.enter_barrier())
+        assert session.persistence.saved_request_count == 1
+        for width in (24, 80):
+            assert "旧会话" not in "\n".join(harness.lines(width))
+    finally:
+        close_release.set()
+        frontend._stopped = True
+        await session.aclose()
+        harness.close()
+
+
+async def test_new_prepare_rejection_preserves_full_draft_and_old_session(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    session = await open_application(_persistence_config(root, _script(), session_id=None))
+    harness = Harness(session)
+    view = harness.view
+    source = session.persistence.session_id
+
+    def failed_open():
+        raise OSError("prepare injected failure")
+
+    monkeypatch.setattr(session, "_new_store_factory", failed_open)
+    view.editor.set_text("/new")
+    before = (view.editor.state, tuple(view.editor.state.lines), view.editor.state.cursor_line,
+              view.editor.state.cursor_col, view.editor._undo.__dict__.copy())
+    try:
+        assert not view.on_submit("/new")
+        await view._new_task
+        assert (view.editor.state, tuple(view.editor.state.lines), view.editor.state.cursor_line,
+              view.editor.state.cursor_col, view.editor._undo.__dict__.copy()) == before
+        assert session.persistence.session_id == source and session.session_generation == 0
+        assert not view.enter_barrier() and "prepare injected failure" in "\n".join(harness.lines(80))
+    finally:
+        await session.aclose()
+        harness.close()
+
+
 async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
     from prompt_toolkit.key_binding.key_processor import KeyPress
     from prompt_toolkit.keys import Keys
@@ -220,7 +303,7 @@ async def test_save_failure_shown_and_followups_refused(tmp_path, monkeypatch):
     async def failing(*args, **kwargs):
         raise StorageWriteError("disk gone")
 
-    session._store.commit_request = failing  # type: ignore[method-assign]
+    session._store.capture().commit_request = failing  # type: ignore[method-assign]
     harness = Harness(session)
     try:
         assert harness.submit("第一问")

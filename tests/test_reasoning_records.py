@@ -266,7 +266,7 @@ async def test_changed_archived_reasoning_breaks_summary_source_proof(tmp_path, 
         )
         await session._store.commit_summary(record)
         session_id = session.persistence.session_id
-        path = session._store.db_path
+        path = session._store.capture().db_path
     finally:
         await session.aclose()
     restored = await open_application(_config(root, FakeModel([]), session_id))

@@ -102,7 +102,7 @@ async def test_session_catalog_owned_during_cancel_close_and_idle_blocks(tmp_pat
         await task
     await close
     assert session.state == 'closed' and not session.catalog_active
-    resumed = open_session_store(directory=session._store.db_path.parent,
+    resumed = open_session_store(directory=session._store.capture().db_path.parent,
                                  session_id=session.persistence.session_id, workspace=root)
     await resumed.aclose()
 
@@ -113,7 +113,7 @@ async def test_session_name_roundtrip_noop_and_metadata_only(tmp_path, monkeypat
 
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "回答", "stop": True}), session_id=None))
-    store = session._store
+    store = session._store.capture()
     updates = []
     session.subscribe(updates.append)
     try:
@@ -170,7 +170,7 @@ async def test_accepted_name_cancellation_retains_result_and_reservation(tmp_pat
 
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script(), session_id=None))
-    store = session._store
+    store = session._store.capture()
     path, session_id = store.db_path, store.session_id
     entered, release = threading.Event(), threading.Event()
     original = store._immediate
@@ -239,7 +239,7 @@ async def test_name_rejection_cancellation_and_write_failure(tmp_path, monkeypat
             await cancelled.wait()
         assert not session.session_management_active and session.persistence.user_name is None
         # 真实 SQLite 写拒绝；不是用应用抛异常冒充事务失败。
-        with sqlite3.connect(session._store.db_path) as connection:
+        with sqlite3.connect(session._store.capture().db_path) as connection:
             connection.execute("CREATE TRIGGER name_failure BEFORE UPDATE OF user_name ON session "
                                "BEGIN SELECT RAISE(ABORT, 'injected name write failure'); END")
         failed = session.submit_session_name('失败名')
@@ -425,7 +425,7 @@ async def test_begin_failure_makes_no_model_call_and_latches_storage_failed(tmp_
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "不应到达", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
     await store.aclose()  # 模拟存储不可用: begin 无法可靠提交
     model = session._app.agent._model
     assert isinstance(model, FakeModel)
@@ -443,7 +443,7 @@ async def test_commit_failure_keeps_facts_latches_and_exit_code_one(tmp_path):
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "回答", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
 
     async def failing_commit(request_id, *, messages, outcome, receipts=()):
         raise PersistenceError("disk gone")
@@ -509,7 +509,7 @@ async def test_resume_with_pending_intent_without_unproven_activity_continues(tm
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
 
     async def failing_commit(request_id, *, messages, outcome, receipts=()):
         raise PersistenceError("commit lost")
@@ -800,7 +800,7 @@ async def test_persistent_topology_cleans_resources_before_store(tmp_path, monke
     )
     session = await open_application(config)
     assert session.persistence is not None
-    store = session._store
+    store = session._store.capture()
     await session.execute("问")
     await session.aclose()
     assert order == ["model", "catalog", "store"], f"store 必须最后清理, 实际 {order}"
@@ -966,7 +966,7 @@ async def test_close_waits_for_inflight_clear_producer(tmp_path):
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
     await session.execute("问")
-    store = session._store
+    store = session._store.capture()
     release = asyncio.Event()
     original_clear = store.commit_clear
 
@@ -998,7 +998,7 @@ async def test_repeated_outer_cancel_during_commit_keeps_completion(tmp_path):
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
     release = asyncio.Event()
     original_commit = store.commit_request
 
@@ -1032,7 +1032,7 @@ async def test_begin_cancel_waits_for_result_then_closing_without_mislatch(tmp_p
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
     model = session._app.agent._model
     assert isinstance(model, FakeModel)
     release = asyncio.Event()
@@ -1073,7 +1073,7 @@ async def test_begin_relation_conflict_not_latched_as_storage_failure(tmp_path, 
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
-    store = session._store
+    store = session._store.capture()
 
     async def pending_conflict(epoch_id, prompt):
         raise PersistenceError(
@@ -1093,7 +1093,7 @@ async def test_begin_relation_conflict_not_latched_as_storage_failure(tmp_path, 
     async def write_failure(epoch_id, prompt):
         raise StorageWriteError("disk gone")
 
-    session2._store.begin_request = write_failure  # type: ignore[method-assign]
+    session2._store.capture().begin_request = write_failure  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="session save failed before the request started"):
         await session2.execute("问")
     assert session2.persistence.storage_failed is not None
@@ -1106,7 +1106,7 @@ async def test_clear_cancel_syncs_memory_before_propagating(tmp_path):
     session = await open_application(_config(root, _script({"text": "答", "stop": True}),
                                             session_id=None))
     await session.execute("问")
-    store = session._store
+    store = session._store.capture()
     release = asyncio.Event()
     original_clear = store.commit_clear
 
@@ -1234,6 +1234,178 @@ async def test_check_mode_save_resume_old_pass_is_historical_new_ledger_independ
     await store.aclose()
 
 
+async def test_new_session_keeps_verifier_and_routes_actual_read_edit_receipts(tmp_path):
+    from cicada.application import SessionChanged, SessionManagementError
+    from cicada.persistence.routing import SessionStoreRoute
+
+    root = _repo(tmp_path)
+    edit = {"tool_calls": [
+        {"id": "read-b", "name": "read", "arguments": {"path": "sample.py"}},
+        {"id": "edit-b", "name": "edit", "arguments": {"path": "sample.py", "edits": [
+            {"old_text": "VALUE = 1", "new_text": "VALUE = 2"}]}},
+        {"id": "check-b", "name": "check", "arguments": {"action": "run", "check_id": "check-1"}},
+    ], "tool_use": True}
+    session = await open_application(_check_config(root, (
+        _CHECK_RUN, {"text": "A", "stop": True}, {"text": "B无检查", "stop": True},
+        edit, {"text": "B已修改检查", "stop": True})))
+    route = session._store
+    assert isinstance(route, SessionStoreRoute)
+    updates = []
+    session.subscribe(updates.append)
+    try:
+        a = await session.execute("A检查")
+        source = route.capture()
+        assert a.persistence.saved and len(source.recovery_snapshot().restored_receipts) == 1
+        stable = (session._app, session._service, session._projection, session._context_projection,
+                  session.verification_run_id, session._service.baseline_capture)
+        submission = session.submit_new_session()
+        assert session.session_management_active
+        with pytest.raises(SessionManagementError):
+            session.submit_new_session()
+        with pytest.raises(RuntimeError):
+            await session.execute("同步预约拒绝")
+        result = await submission.wait()
+        assert result == await submission.wait() and result.session_generation == 1
+        target = route.capture()
+        assert target is not source and target.session_id != source.session_id
+        assert stable == (session._app, session._service, session._projection, session._context_projection,
+                          session.verification_run_id, session._service.baseline_capture)
+        assert session._app.runtime.capability("session.store") is route
+        assert session.history == () and session._last_outcome is None
+        assert session.persistence.saved_request_count == 0
+        assert next(u for u in updates if isinstance(u, SessionChanged)).snapshot.requests == ()
+        b = await session.execute("B只回答")
+        assert b.persistence.saved and len(b.view.receipts) == 1
+        assert target.recovery_snapshot().restored_receipts == (), "共享检查视图不能复制A回执"
+        c = await session.execute("B读改检查")
+        assert c.exit_code == 0 and "VALUE = 2" in (root / "sample.py").read_text()
+        snapshot = target.recovery_snapshot()
+        assert len(snapshot.restored_receipts) == 1
+        receipt = snapshot.restored_receipts[0]
+        assert receipt.request_id == c.persistence.request_id and receipt.epoch_id == session.persistence.epoch_id
+        assert receipt.receipt_id != a.view.receipts[0].receipt_id
+        assert snapshot.process_activities[0].request_id == c.persistence.request_id
+        assert source._closed and route._owned == [target]
+        # old lease 已实际释放，原档可重开且没有B的消息/回执。
+        reopened = open_session_store(directory=source.db_path.parent, session_id=source.session_id, workspace=root)
+        assert len(reopened.recovery_snapshot().requests) == 1
+        await reopened.aclose()
+        target_id = target.session_id
+    finally:
+        await session.aclose()
+    resumed = await open_application(_check_config(root, ({"text": "重启", "stop": True},), session_id=target_id))
+    try:
+        assert len(resumed.restored_requests) == 2 and len(resumed.restored_receipts) == 1
+        assert (await resumed.execute("续写B")).persistence.saved
+    finally:
+        await resumed.aclose()
+
+
+@pytest.mark.parametrize("phase", ["opening", "epoch"])
+async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(tmp_path, monkeypatch, phase):
+    from cicada.application import SessionChanged
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(), session_id=None))
+    source = session._store.capture()
+    entered, release = threading.Event(), threading.Event()
+    targets = []
+    factory = session._new_store_factory
+
+    def gated_factory():
+        target = factory()
+        targets.append(target)
+        if phase == "opening":
+            entered.set()
+            assert release.wait(5)
+        else:
+            immediate = target._immediate
+            def gated_epoch():
+                entered.set()
+                assert release.wait(5)
+                immediate()
+            target._immediate = gated_epoch
+        return target
+
+    monkeypatch.setattr(session, "_new_store_factory", gated_factory)
+    updates = []
+    session.subscribe(updates.append)
+    submission = session.submit_new_session()
+    assert await asyncio.to_thread(entered.wait, 5)
+    waiter = asyncio.create_task(submission.wait())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    submission.cancel()
+    submission.cancel()
+    close = asyncio.create_task(session.aclose())
+    await asyncio.sleep(0)
+    assert not close.done() and session.session_management_active
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await submission.wait()
+    await close
+    assert session._store.capture() is source and session.session_generation == 0
+    assert not any(isinstance(u, SessionChanged) for u in updates)
+    assert targets[0]._closed and source._closed and session._store._owned == []
+    # 空档或epoch提交留在磁盘，取消不假装撤销。
+    reopened = open_session_store(directory=source.db_path.parent, session_id=targets[0].session_id, workspace=root)
+    assert (reopened.recovery_snapshot().identity is not None) == (phase == "epoch")
+    await reopened.aclose()
+
+
+@pytest.mark.parametrize("published", [False, True])
+async def test_new_cleanup_failure_keeps_resource_and_blocks_followups(tmp_path, monkeypatch, published):
+    from cicada.application import SessionManagementError
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(), session_id=None))
+    route, source = session._store, session._store.capture()
+    factory = session._new_store_factory
+    targets = []
+
+    async def failed_close():
+        raise StorageWriteError("close injected failure")
+
+    def target_factory():
+        target = factory()
+        targets.append(target)
+        if not published:
+            async def failed_epoch(identity):
+                raise StorageWriteError("epoch injected failure")
+            target.start_epoch = failed_epoch
+            target.aclose = failed_close
+        return target
+
+    monkeypatch.setattr(session, "_new_store_factory", target_factory)
+    source_close = source.aclose
+    if published:
+        monkeypatch.setattr(source, "aclose", failed_close)
+    try:
+        with pytest.raises(SessionManagementError) as error:
+            await session.submit_new_session().wait()
+        assert error.value.code == "cleanup-failed" and error.value.published == published
+        assert (route.capture() is targets[0]) == published
+        assert len(route._owned) == 2
+        with pytest.raises(LeaseHeldError):
+            open_session_store(directory=source.db_path.parent,
+                               session_id=(source if published else targets[0]).session_id, workspace=root)
+        with pytest.raises(SessionManagementError) as blocked:
+            session.submit_new_session()
+        assert blocked.value.code == "blocked"
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await session.execute("不能绕过")
+        assert (await session.observe_session_catalog(CancelToken())).complete
+    finally:
+        source.aclose = source_close
+        if not published:
+            # 恢复真实清理；锁存仍持续，运行中没有解锁入口。
+            targets[0].aclose = targets[0].__class__.aclose.__get__(targets[0])
+        await session.aclose()
+    assert route._owned == []
+
+
 async def test_prefix_tamper_after_resume_refuses_before_sending(tmp_path):
     """A09: 恢复后前缀被改动 -> 发送前拒绝, 内层模型零请求."""
     root = _repo(tmp_path)
@@ -1316,7 +1488,7 @@ async def test_clear_failure_keeps_memory_and_prefix_proof(tmp_path):
     ), session_id=session_id))
     assert session._projection is not None
     assert session._projection.proof.length == 2, "恢复前缀为初始历史"
-    store = session._store
+    store = session._store.capture()
 
     async def failing_clear(epoch_id):
         raise PersistenceError("disk gone")

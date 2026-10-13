@@ -232,7 +232,7 @@ async def test_accepted_commit_waits_real_result_then_publishes(tmp_path, action
 async def test_storage_failure_keeps_old_effort_and_latches(tmp_path):
     session = await open_application(config(_repo(tmp_path), transport([])))
     try:
-        await session._store._dispatch(lambda: session._store._conn.execute(
+        await session._store.capture()._dispatch(lambda: session._store.capture()._conn.execute(
             "CREATE TRIGGER reject_model BEFORE INSERT ON epoch BEGIN SELECT RAISE(ABORT, 'injected'); END"
         ))
         old = session.persistence.epoch_id

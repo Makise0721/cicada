@@ -65,6 +65,7 @@ from cicada.models import (
 )
 from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
+from cicada.persistence.routing import SessionStoreRoute, settle
 from cicada.persistence.contracts import (
     ArchiveLimitError,
     InterruptedRequest,
@@ -348,6 +349,13 @@ class SessionNameChanged:
 
 
 @dataclass(frozen=True)
+class SessionChanged:
+    session_generation: int
+    persistence: PersistenceState
+    snapshot: RecoverySnapshot
+
+
+@dataclass(frozen=True)
 class SessionManagementResult:
     operation: Literal["name", "new", "resume"]
     session_id: str
@@ -442,7 +450,7 @@ ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
     | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
-    | SessionNameChanged
+    | SessionNameChanged | SessionChanged
 )
 
 
@@ -492,6 +500,9 @@ def _isolate_outcome(outcome: RequestOutcome) -> RequestOutcome:
 
 
 def _isolate_update(update: ApplicationUpdate) -> ApplicationUpdate:
+    if isinstance(update, SessionChanged):
+        from copy import deepcopy
+        return replace(update, snapshot=deepcopy(update.snapshot))
     if isinstance(update, AgentEventReceived):
         return AgentEventReceived(event=_isolate_event(update.event))
     if isinstance(update, RequestCompleted):
@@ -571,6 +582,7 @@ class ApplicationSession:
         login_environment: Callable[[], str | None] | None = None,
         review_reader: ChangeReview | None = None,
         catalog_reader: SessionCatalogPort | None = None,
+        new_store_factory: Callable[[], SessionStorePort] | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -584,6 +596,7 @@ class ApplicationSession:
         self._catalog_reader = catalog_reader
         self._catalog_task: asyncio.Task | None = None
         self._catalog_token: CancelToken | None = None
+        self._file_queries: dict[asyncio.Task, CancelToken] = {}
         self._review_active = False
         self._review_id: str | None = None
         self._review_snapshot: ReviewSnapshot | None = None
@@ -618,6 +631,12 @@ class ApplicationSession:
         self._context_projection = context_projection if context_projection is not None else ContextProjection()
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
+        self._new_store_factory = new_store_factory
+        self._session_cleanup_failed: str | None = None
+        self._request_store: SessionStorePort | None = None
+        self._request_epoch: str | None = None
+        self._request_generation = 0
+        self._receipt_owners: dict[str, tuple[str, str, str]] = {}
         self._user_name = store.recovery_snapshot().user_name if store is not None else None
         self._epoch_id = epoch_id
         self._persistence_mode = persistence_mode
@@ -726,13 +745,22 @@ class ApplicationSession:
         closing/closed 先拒绝新调用; 进行中的编码请求不阻止候选查询。未装配
         coding.file_completion 的组合 (旧直接构造) 返回 capability_unavailable。
         """
-        if self._closing or self._closed:
+        if self._closing or self._closed or self._session_in_flight:
             return FileCompletionResult((), "unavailable", reason="session_closed")
         try:
             port = self._app.runtime.capability(FILE_COMPLETION_CAPABILITY)
         except CapabilityError:
             return FileCompletionResult((), "unavailable", reason="capability_unavailable")
-        return await port.complete(query, cancel)
+        task = asyncio.create_task(port.complete(query, cancel))
+        self._file_queries[task] = cancel
+        generation = self.session_generation
+        try:
+            result = await self._settle_session_work(task, cancel)
+            if generation != self.session_generation:
+                return FileCompletionResult((), "unavailable", reason="session_closed")
+            return result
+        finally:
+            self._file_queries.pop(task, None)
 
     def _check_review_admission(self) -> None:
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
@@ -972,6 +1000,10 @@ class ApplicationSession:
         return self._session_in_flight
 
     @property
+    def session_cleanup_failed(self) -> str | None:
+        return self._session_cleanup_failed
+
+    @property
     def session_short_title(self) -> str:
         return self._store.recovery_snapshot().short_title if self._store is not None else ""
 
@@ -1002,6 +1034,127 @@ class ApplicationSession:
         task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         self._notify(OperationBusy("session"))
         return SessionManagementSubmission(task, token)
+
+    def submit_new_session(self) -> SessionManagementSubmission:
+        if self._closing or self._closed:
+            raise SessionManagementError("closing", "应用正在关闭。")
+        if not isinstance(self._store, SessionStoreRoute) or self._new_store_factory is None:
+            raise SessionManagementError("unavailable", "当前会话没有保存路由，无法新建会话。")
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+        if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
+                or self._clearing or self._compacting or self._model_in_flight
+                or self._login_in_flight or self.review_active
+                or any(task is not None and not task.done() for task in producers)):
+            raise SessionManagementError("busy", "新建需要空闲会话。")
+        reason = (self._session_cleanup_failed or self._storage_failed or self._view_only_reason
+                  or ("process_uncertain" if self.has_process_uncertain() else None))
+        if reason is not None:
+            raise SessionManagementError("blocked", "新建被阻断：" + reason)
+        loop = asyncio.get_running_loop()
+        self._session_in_flight = True
+        self._session_done = loop.create_future()
+        token = CancelToken()
+        self._session_token = token
+        task = loop.create_task(self._new_session(self._store.capture(), self.session_generation, token))
+        self._session_task = task
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        self._notify(OperationBusy("session"))
+        for query_token in self._file_queries.values():
+            query_token.cancel()
+        return SessionManagementSubmission(task, token)
+
+    async def _settle_session_work(self, awaitable, token: CancelToken):
+        task = asyncio.ensure_future(awaitable)
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                token.cancel()
+                if task.done():
+                    return task.result()
+
+    async def _new_session(self, source: SessionStorePort, generation: int,
+                           token: CancelToken) -> SessionManagementResult:
+        route = self._store
+        assert isinstance(route, SessionStoreRoute)
+        target = None
+        published = False
+        try:
+            if self._file_queries:
+                await self._settle_session_work(
+                    asyncio.gather(*tuple(self._file_queries), return_exceptions=True), token)
+            token.throw_if_cancelled()
+            if self._closing:
+                raise asyncio.CancelledError
+            # 线程结果属于本受拥有任务；重复取消先取得资源，再登记并清理。
+            target = await self._settle_session_work(asyncio.to_thread(self._new_store_factory), token)
+            route.retain(target)
+            token.throw_if_cancelled()
+            if self._closing:
+                raise asyncio.CancelledError
+            identity = source.recovery_snapshot().identity
+            if identity is None:
+                raise SessionManagementError("prepare-failed", "当前配置代次缺少身份。")
+            epoch = await self._settle_session_work(target.start_epoch(identity), token)
+            snapshot = target.recovery_snapshot()
+            # 空档同样核对共享恢复构建；发布段之前完成所有可能失败的准备。
+            proof = _build_prefix_proof(snapshot).proof if self._projection is not None else None
+            blocks = _rebuild_context_projection(snapshot)
+            token.throw_if_cancelled()
+            if self._closing or source is not route.capture() or generation != self.session_generation:
+                raise asyncio.CancelledError
+            # 发布无 await；runtime、Verifier、读取依据及进程累计列表保持。
+            retired = route.publish(target)
+            published = True
+            self._epoch_id = epoch
+            self._persistence_mode = "save"
+            self._history.clear()
+            self._context_generation = snapshot.context_generation
+            self._committed_spans.clear()
+            self._restored_requests = ()
+            self._restored_request_count = self._restored_model_call_count = 0
+            self._restored_interrupted = self._restored_receipts = self._restored_summaries = ()
+            self._summary_records.clear()
+            self._saved_request_count = 0
+            self._last_committed_seq = None
+            self._request_id = None
+            self._request_store = None
+            self._request_epoch = None
+            self._last_outcome = None
+            self._review_targets.clear()
+            self._user_name = snapshot.user_name
+            if self._projection is not None:
+                self._projection.proof = proof
+            self._context_projection.adopt(blocks)
+            if self._budget_policy is not None:
+                self._budget_policy.invalidate()
+            self._session_generation += 1
+            self._notify(SessionChanged(self.session_generation, self.persistence, snapshot))
+            try:
+                await settle(route.release(retired))
+            except BaseException as exc:
+                self._session_cleanup_failed = str(exc)
+                raise SessionManagementError("cleanup-failed", "新会话已生效，旧档关闭失败：" + str(exc),
+                                             published=True) from exc
+            return SessionManagementResult("new", target.session_id, self.session_generation, True)
+        except (asyncio.CancelledError, SessionManagementError):
+            raise
+        except Exception as exc:
+            raise SessionManagementError("prepare-failed", "新建准备失败：" + str(exc), published=published) from exc
+        finally:
+            try:
+                if target is not None and not published:
+                    try:
+                        await settle(route.release(target))
+                    except BaseException as exc:
+                        self._session_cleanup_failed = str(exc)
+                        raise SessionManagementError("cleanup-failed", "准备档关闭失败：" + str(exc)) from exc
+            finally:
+                self._session_in_flight = False
+                self._session_token = None
+                if self._session_done is not None and not self._session_done.done():
+                    self._session_done.set_result(None)
 
     async def _set_session_name(
         self, store: SessionStorePort, epoch_id: str, name: str | None, token: CancelToken,
@@ -1403,6 +1556,8 @@ class ApplicationSession:
             self._model_configuration = binding.model
 
     async def execute(self, prompt: str) -> RequestOutcome:
+        if self._session_cleanup_failed is not None:
+            raise RuntimeError("session cleanup failed: " + self._session_cleanup_failed)
         if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; execute is refused")
         if self.review_active:
@@ -1461,6 +1616,9 @@ class ApplicationSession:
         # 阶段收口审查 STG-F1: 从首次预估到 begin 落定期间同步占住互斥
         # (预估内自动压缩另由 _compacting 覆盖); 失败/取消/完成均经 finally 释放
         self._begin_in_flight = True
+        self._request_store = self._store.capture() if isinstance(self._store, SessionStoreRoute) else self._store
+        self._request_epoch = self._epoch_id
+        self._request_generation = self.session_generation
         try:
             # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
             # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
@@ -1472,7 +1630,7 @@ class ApplicationSession:
                 ))
             if self._store is not None:
                 begin_task = asyncio.ensure_future(
-                    self._store.begin_request(self._epoch_id or "", prompt)
+                    self._request_store.begin_request(self._request_epoch or "", prompt)
                 )
                 begin_error: PersistenceError | None = None
                 begin_cancelled = False
@@ -1764,7 +1922,7 @@ class ApplicationSession:
 
     async def _commit_request(self, result: RunResult, outcome: RequestOutcome) -> RequestPersistenceFacts:
         """完整请求单事务提交; 返回持久事实, 失败不抛出而是锁存 storage_failed."""
-        assert self._request_id is not None and self._store is not None
+        assert self._request_id is not None and self._request_store is not None
         decision = outcome.decision
         facts = RequestOutcomeFacts(
             run_id=result.run_id,
@@ -1781,7 +1939,7 @@ class ApplicationSession:
         messages = tuple(isolate_message(m) for m in result.messages)
         receipts = self._new_receipts(outcome)
         try:
-            seq = await self._store.commit_request(
+            seq = await self._request_store.commit_request(
                 self._request_id, messages=messages, outcome=facts, receipts=receipts
             )
         except PersistenceError as exc:
@@ -1797,13 +1955,14 @@ class ApplicationSession:
     def _new_receipts(self, outcome: RequestOutcome) -> tuple[StoredReceipt, ...]:
         """本请求新产生的检查回执 (尚未持久化的); 与请求记录同事务落库 (03)."""
         view = outcome.view
-        if self._config.plan is None or view is None or self._epoch_id is None:
+        if self._config.plan is None or self._request_epoch is None or self._request_store is None:
             return ()
+        receipts = self._service.receipts if self._service is not None else (view.receipts if view else ())
         return tuple(
             StoredReceipt(
                 verification_run_id=receipt.verification_run_id,
                 receipt_id=receipt.receipt_id,
-                epoch_id=self._epoch_id,
+                epoch_id=self._request_epoch,
                 request_id=self._request_id or "",
                 definition_fingerprint=_receipt_fingerprint(
                     receipt.check_id, receipt.command, receipt.timeout_s
@@ -1815,9 +1974,18 @@ class ApplicationSession:
                 output_complete=receipt.output_complete,
                 failure_kind=receipt.failure_kind,
             )
-            for receipt in view.receipts
+            for receipt in receipts
             if receipt.receipt_id not in self._persisted_receipt_ids
+            and self._receipt_owners.get(receipt.receipt_id) == (
+                self._request_store.session_id, self._request_id, self._request_epoch)
         )
+
+    def record_check_receipt(self, receipt_id: str) -> None:
+        """活动包装器在取得真实新回执时绑定其请求，Verifier 不读取路由。"""
+        if (self._request_store is not None and self._request_id is not None
+                and self._request_epoch is not None and self._request_generation == self.session_generation):
+            self._receipt_owners.setdefault(receipt_id, (
+                self._request_store.session_id, self._request_id, self._request_epoch))
 
     # --- 取消 / 清空 ---------------------------------------------------------------
 
@@ -2463,6 +2631,8 @@ class ApplicationSession:
                 self._catalog_token.cancel()
             if self._session_token is not None:
                 self._session_token.cancel()
+            for query_token in self._file_queries.values():
+                query_token.cancel()
             self.cancel_review()
             self._cancel_login_save()
             self.cancel_login()
@@ -2480,6 +2650,8 @@ class ApplicationSession:
         if self._catalog_task is not None:
             # 目录 worker 的实际 finally 先于 runtime/store 清理，无监督替代。
             await asyncio.gather(self._catalog_task, return_exceptions=True)
+        if self._file_queries:
+            await asyncio.gather(*tuple(self._file_queries), return_exceptions=True)
         if self._login_task is not None and not self._login_task.done():
             # 不以监督超时代替文件 worker 的真实终结，不提前关闭资源。
             await asyncio.shield(self._login_task)
@@ -2948,10 +3120,11 @@ async def open_application(
     # 皆无 = 仅路由检测, 不加包装
     model_policy = _model_policy
 
-    store: SQLiteSessionStore | None = None
+    store: SessionStoreRoute | None = None
     snapshot: RecoverySnapshot | None = None
     if config.persistence is not None:
-        store, snapshot = _open_persistent_store(config)
+        concrete_store, snapshot = _open_persistent_store(config)
+        store = SessionStoreRoute(concrete_store)
     if store is not None and plan is not None:
         history_projection = HistoricalProjection()
 
@@ -3102,6 +3275,9 @@ async def open_application(
                 login_store_factory=login_store_factory, login_environment=login_environment,
                 review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
                 catalog_reader=app.runtime.capability(SESSION_CATALOG_CAPABILITY),
+                new_store_factory=lambda: open_session_store(
+                    directory=Path(config.workspace) / ".cicada" / "sessions",
+                    session_id=None, workspace=config.workspace),
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为

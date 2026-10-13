@@ -24,6 +24,7 @@ from cicada.persistence.contracts import (
     SessionStorePort,
 )
 from cicada.run_policy import LAUNCH_FAILURE_MARKERS, PRE_EXECUTION_MARKERS
+from cicada.persistence.routing import SessionStoreRoute
 
 # powershell 全部登记; check 仅 action=run (status 查询不登记为进程启动, 契约 §4.2);
 # read/edit/write/glob/grep 不是进程工具.
@@ -88,6 +89,8 @@ class ActivitySink(Protocol):
 
     def latch_storage_failure(self, detail: str) -> None: ...
 
+    def record_check_receipt(self, receipt_id: str) -> None: ...
+
 
 class ActivityCoordinator:
     """bootstrap 前创建、会话构造后绑定; 包装器经它取请求身份并锁存存储故障."""
@@ -104,6 +107,12 @@ class ActivityCoordinator:
     def latch_storage_failure(self, detail: str) -> None:
         if self._sink is not None:
             self._sink.latch_storage_failure(detail)
+
+    def record_check_receipt(self, result: ToolResult) -> None:
+        if result.name == "check" and isinstance(result.details, dict):
+            receipt_id = result.details.get("receipt_id")
+            if isinstance(receipt_id, str) and receipt_id and self._sink is not None:
+                self._sink.record_check_receipt(receipt_id)
 
 
 async def _settle(awaitable) -> Any:
@@ -136,8 +145,9 @@ class ProcessActivityWrapper:
         if request_id is None:
             # 防御: 包装器只在持久装配中出现; 非活动请求内不登记但保持工具可用
             return await self._inner.execute(arguments, ctx)
+        store = self._store.capture() if isinstance(self._store, SessionStoreRoute) else self._store
         try:
-            activity_id, cancelled = await self._begin(request_id, tool_name, ctx, arguments)
+            activity_id, cancelled = await self._begin(store, request_id, tool_name, ctx, arguments)
         except PersistenceError as exc:
             # 开始写入失败: 命令零执行, 锁存 storage_failed, 返回既有未启动哨兵;
             # 不锁存 process_uncertain (契约 §4.3)
@@ -147,7 +157,7 @@ class ProcessActivityWrapper:
         if cancelled:
             # 开始写入成功后的外层取消: 写可靠的未启动终结, 不传播 CancelledError
             try:
-                await _settle(self._store.end_process(activity_id, ProcessTerminalFacts(
+                await _settle(store.end_process(activity_id, ProcessTerminalFacts(
                     kind="not_started", reason="outer cancellation before execution",
                 )))
             except PersistenceError as exc:
@@ -158,7 +168,7 @@ class ProcessActivityWrapper:
         except BaseException as exc:
             # 异常/不可得结果: 保留已登记活动为未证终结, 再交还内核协议 (契约 §4.5)
             try:
-                await _settle(self._store.end_process(activity_id, ProcessTerminalFacts(
+                await _settle(store.end_process(activity_id, ProcessTerminalFacts(
                     kind="unproven_terminal", reason=f"tool raised {type(exc).__name__}",
                 )))
             except PersistenceError as persistence_exc:
@@ -167,7 +177,8 @@ class ProcessActivityWrapper:
                 )
             raise
         try:
-            await _settle(self._store.end_process(activity_id, classify_terminal(result)))
+            self._coordinator.record_check_receipt(result)
+            await _settle(store.end_process(activity_id, classify_terminal(result)))
         except PersistenceError as exc:
             # 终结写入失败: 保留真实 ToolResult, 取消 token 停止后继活动;
             # 不得把已执行命令改写成未执行 (契约 §4.5)
@@ -176,9 +187,9 @@ class ProcessActivityWrapper:
         return result
 
     async def _begin(
-        self, request_id: str, tool_name: str, ctx: ToolContext, arguments: dict[str, Any]
+        self, store: SessionStorePort, request_id: str, tool_name: str, ctx: ToolContext, arguments: dict[str, Any]
     ) -> tuple[str, bool]:
-        task = asyncio.ensure_future(self._store.begin_process(
+        task = asyncio.ensure_future(store.begin_process(
             request_id, tool_name=tool_name, call_id=ctx.call_id, arguments=dict(arguments),
         ))
         cancelled = False

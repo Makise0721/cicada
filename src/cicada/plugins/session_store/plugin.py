@@ -9,15 +9,14 @@ store 由应用协调器在 bootstrap 前打开; 插件只负责 provide 与最�
 
 from __future__ import annotations
 
-from cicada.plugins.session_store.store import SQLiteSessionStore
-from cicada.persistence.contracts import SessionCatalogPort
+from cicada.persistence.contracts import SessionCatalogPort, SessionStorePort
 from cicada.runtime.plugin import PluginContext, PluginDefinition
 
 SESSION_STORE_CAPABILITY = "session.store"
 SESSION_CATALOG_CAPABILITY = "session.catalog"
 
 
-def session_store_plugin(store: SQLiteSessionStore, catalog: SessionCatalogPort | None = None) -> PluginDefinition:
+def session_store_plugin(store: SessionStorePort, catalog: SessionCatalogPort | None = None) -> PluginDefinition:
     def setup(ctx: PluginContext) -> None:
         ctx.provide(SESSION_STORE_CAPABILITY, store)
         ctx.defer(store.aclose)

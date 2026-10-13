@@ -281,6 +281,22 @@ class MainScreenFrontend:
         if self._file_menu is not None:
             self._file_menu.invalidate()
 
+    def prepare_session_change(self) -> None:
+        """同步封住候选入口；应用在管理预约内等待已启动查询真实落定。"""
+        self._file_menu_invalidate()
+        if self._command_menu is not None:
+            self._command_menu.dismiss()
+
+    def reset_session_display(self) -> None:
+        self.prepare_session_change()
+        if self._viewport is not None:
+            self._viewport = DocumentViewport()
+        self._invalidate_pointer_frame()
+        self._wheel_accumulator = 0
+        self._disarm_escape_prefix()
+        self._screen.reset_render_state()
+        self.request_render()
+
     # --- 调度 (TuiBase.requestRender 移植) -----------------------------------------
 
     def request_render(self, force: bool = False) -> None:

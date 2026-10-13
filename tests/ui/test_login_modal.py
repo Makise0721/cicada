@@ -74,7 +74,7 @@ async def test_real_vt_login_replace_masks_secret_saves_once_and_preserves_draft
         await h.settle()
         for needle in ('modal-sentinel', snapshot.defaults.credential_ref, h.view._session._login_view.revision):
             assert needle not in h.terminal.output_text + repr(h.view.transcript) + repr(session.history)
-            assert needle.encode() not in session._store.db_path.read_bytes()
+            assert needle.encode() not in session._store.capture().db_path.read_bytes()
     finally:
         await h.stop()
         await session.aclose()

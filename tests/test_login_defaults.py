@@ -40,7 +40,7 @@ async def test_save_defaults_preserves_current_session_and_reopens_new_values(tm
         assert snapshot.credential.reveal() == 'new-sentinel'
         for forbidden in ('new-sentinel', snapshot.defaults.credential_ref, view.revision):
             assert forbidden not in repr(updates) + repr(session.history)
-            assert forbidden.encode() not in session._store.db_path.read_bytes()
+            assert forbidden.encode() not in session._store.capture().db_path.read_bytes()
     finally:
         await session.aclose()
 

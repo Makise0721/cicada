@@ -122,7 +122,7 @@ async def test_apply_replaces_key_and_thinking_across_requests_summary_model_and
         assert 'save-and-apply' in view.actions
         session.cancel_login()
         session_id = session.persistence.session_id
-        db_bytes = session._store.db_path.read_bytes()
+        db_bytes = session._store.capture().db_path.read_bytes()
         config_toml = (store.root / 'config.toml').read_bytes()
         credentials = (store.root / 'credentials.json').read_text(encoding='utf-8')
     finally:
@@ -316,9 +316,9 @@ async def test_apply_storage_failure_keeps_old_route_and_latches_storage(tmp_pat
     session, store = await open_session(tmp_path)
     try:
         before = (session.persistence.epoch_id, session._model_route.binding.identity)
-        session._store._conn.execute(
+        session._store.capture()._conn.execute(
             "CREATE TRIGGER reject_epoch BEFORE INSERT ON epoch BEGIN SELECT RAISE(ABORT, 'injected'); END")
-        session._store._conn.commit()
+        session._store.capture()._conn.commit()
         result = await session.configure_login(submission(session.login_view(), think=False))
         assert result.defaults_saved and not result.session_applied
         assert result.application_outcome == 'failed' and result.error_code == 'storage-failed'
@@ -328,7 +328,7 @@ async def test_apply_storage_failure_keeps_old_route_and_latches_storage(tmp_pat
         with pytest.raises(RuntimeError, match='storage_failed'):
             await session.execute('锁存拒绝新请求')
         assert not FileUserConfigStore(store.root).load().defaults.think  # 保存事实不回滚
-        rows = sqlite3.connect(session._store.db_path).execute(
+        rows = sqlite3.connect(session._store.capture().db_path).execute(
             'SELECT COUNT(*) FROM epoch').fetchone()
         assert rows[0] == 1  # 失败事务全回滚, 无半截 epoch
     finally:

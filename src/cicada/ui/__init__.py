@@ -120,15 +120,19 @@ async def run_tui_session(
         ),
     )
     refs["frontend"] = frontend
+    view.on_session_prepare = frontend.prepare_session_change
+    view.on_session_changed = frontend.reset_session_display
 
     # 关闭结果观察者: 独立于前端, 保留订阅直到 ApplicationClosed 送达
     close_state = _CloseState()
 
     def observe_close(update: "ApplicationUpdate") -> None:
-        from cicada.application import ApplicationClosed, RequestCompleted
+        from cicada.application import ApplicationClosed, RequestCompleted, SessionChanged
 
         if isinstance(update, RequestCompleted):
             close_state.last_exit_code = update.outcome.exit_code
+        elif isinstance(update, SessionChanged):
+            close_state.last_exit_code = None
         elif isinstance(update, ApplicationClosed):
             close_state.closed_error = update.error
 
