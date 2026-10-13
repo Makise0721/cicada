@@ -553,7 +553,7 @@ class ConversationView:
         if self._gate.clearing:
             return "正在清空…"
         if self._gate.session_managing:
-            return "正在保存名称…"
+            return "正在新建会话…" if self._new_submission is not None else "正在保存名称…"
         if self._gate.compacting:
             return "正在压缩…"
         if self._effort_pending is not None and self._gate.model_selecting:

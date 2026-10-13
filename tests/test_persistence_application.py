@@ -1301,6 +1301,64 @@ async def test_new_session_keeps_verifier_and_routes_actual_read_edit_receipts(t
         await resumed.aclose()
 
 
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_failed_check_new_receipt_is_saved_under_actual_request(tmp_path, monkeypatch, failure):
+    from cicada.application import SessionManagementError
+
+    session = await open_application(_check_config(_repo(tmp_path), (
+        _CHECK_RUN, {"text": "检查后回答", "stop": True})))
+
+    async def failed_runner(*args, **kwargs):
+        raise failure("runner interrupted")
+
+    monkeypatch.setattr(session._service.runner, "run", failed_runner)
+    try:
+        outcome = await session.execute("检查异常仍完整保存")
+        assert outcome.persistence.saved
+        real = session._service.receipts
+        stored = session._store.recovery_snapshot().restored_receipts
+        assert len(real) == len(stored) == 1
+        assert stored[0].receipt_id == real[0].receipt_id
+        assert stored[0].request_id == outcome.persistence.request_id
+        assert stored[0].epoch_id == session.persistence.epoch_id
+        with pytest.raises(SessionManagementError) as blocked:
+            session.submit_new_session()
+        assert blocked.value.code == "blocked"
+    finally:
+        await session.aclose()
+
+
+async def test_new_keeps_process_calls_but_discards_old_summary_projection_and_anchor(tmp_path):
+    from cicada.budget import BudgetConfig
+    from tests.support.summary import ScriptedSummary, DEFAULT_SUMMARY_METRICS
+
+    root = _repo(tmp_path)
+    turns = [[TextDelta("回答"), StreamDone("stop", metrics=ModelMetrics(input_tokens=42, output_tokens=1))]
+             for _ in range(4)]
+    session = await open_application(dc_replace(_config(root, turns, session_id=None),
+        budget=BudgetConfig(num_ctx=1_000_000, num_predict=2048)))
+    session._budget_policy._summarize = ScriptedSummary(metrics=DEFAULT_SUMMARY_METRICS)
+    try:
+        await session.execute("A1")
+        await session.execute("A2")
+        await session.compact_context()
+        await session.execute("A3")
+        calls, summaries = session.process_model_calls, session.process_summary_calls
+        assert len(calls) == 3 and len(summaries) == 1 and summaries[0].metrics == DEFAULT_SUMMARY_METRICS
+        policy, projection = session._budget_policy, session._context_projection
+        assert policy._anchor is not None and projection.retained_start > 0
+        await session.submit_new_session().wait()
+        assert session.process_model_calls == calls and session.process_summary_calls == summaries
+        assert session.summary_records == () and projection.retained_start == 0
+        assert policy._anchor is None and policy.last_report is None
+        assert session._budget_policy is policy and session._context_projection is projection
+        await session.execute("B1")
+        assert len(session.process_model_calls) == 4 and session.process_summary_calls == summaries
+        assert all(message not in session.history for message in (UserMessage("A1"), UserMessage("A2"), UserMessage("A3")))
+    finally:
+        await session.aclose()
+
+
 @pytest.mark.parametrize("phase", ["opening", "epoch"])
 async def test_new_cancel_and_close_wait_for_owned_prepare_without_late_publish(tmp_path, monkeypatch, phase):
     from cicada.application import SessionChanged

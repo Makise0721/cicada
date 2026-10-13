@@ -41,6 +41,7 @@ from cicada.context_policy import (
     ContextProjection,
     ProjectionRelationError,
     SummaryBlock,
+    SummaryOutcome,
     canonical_prefix_sha256,
     generate_summary,
     build_summary_request,
@@ -49,7 +50,7 @@ from cicada.context_policy import (
 )
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
-from cicada.core.events import Event, RunFinished, RunStarted, ToolCompleted
+from cicada.core.events import Event, ModelCallCompleted, RunFinished, RunStarted, ToolCompleted
 from cicada.core.messages import (
     Message,
     ToolResultMessage,
@@ -637,6 +638,9 @@ class ApplicationSession:
         self._request_epoch: str | None = None
         self._request_generation = 0
         self._receipt_owners: dict[str, tuple[str, str, str]] = {}
+        self._request_receipts_before: frozenset[str] = frozenset()
+        self._process_model_calls: list[ModelCallCompleted] = []
+        self._process_summary_calls: list[SummaryOutcome] = []
         self._user_name = store.recovery_snapshot().user_name if store is not None else None
         self._epoch_id = epoch_id
         self._persistence_mode = persistence_mode
@@ -1295,6 +1299,8 @@ class ApplicationSession:
                 self.observer_errors.append(exc)
 
     def _on_core_event(self, event: Event) -> None:
+        if isinstance(event, ModelCallCompleted):
+            self._process_model_calls.append(event)
         self._notify(AgentEventReceived(event))
         if isinstance(event, RunStarted):
             self._run_id = event.run_id
@@ -1619,6 +1625,9 @@ class ApplicationSession:
         self._request_store = self._store.capture() if isinstance(self._store, SessionStoreRoute) else self._store
         self._request_epoch = self._epoch_id
         self._request_generation = self.session_generation
+        self._request_receipts_before = frozenset(
+            receipt.receipt_id for receipt in self._service.receipts
+        ) if self._service is not None and self._request_store is not None else frozenset()
         try:
             # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
             # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
@@ -1980,12 +1989,23 @@ class ApplicationSession:
                 self._request_store.session_id, self._request_id, self._request_epoch)
         )
 
-    def record_check_receipt(self, receipt_id: str) -> None:
-        """活动包装器在取得真实新回执时绑定其请求，Verifier 不读取路由。"""
+    def record_check_receipts(self) -> None:
+        """工具正常/异常落定时绑定真实账本差集，Verifier 不读取路由。"""
         if (self._request_store is not None and self._request_id is not None
-                and self._request_epoch is not None and self._request_generation == self.session_generation):
-            self._receipt_owners.setdefault(receipt_id, (
-                self._request_store.session_id, self._request_id, self._request_epoch))
+                and self._request_epoch is not None and self._request_generation == self.session_generation
+                and self._service is not None):
+            for receipt in self._service.receipts:
+                if receipt.receipt_id not in self._request_receipts_before:
+                    self._receipt_owners.setdefault(receipt.receipt_id, (
+                        self._request_store.session_id, self._request_id, self._request_epoch))
+
+    @property
+    def process_model_calls(self) -> tuple[ModelCallCompleted, ...]:
+        return tuple(self._process_model_calls)
+
+    @property
+    def process_summary_calls(self) -> tuple[SummaryOutcome, ...]:
+        return tuple(self._process_summary_calls)
 
     # --- 取消 / 清空 ---------------------------------------------------------------
 
@@ -2193,7 +2213,12 @@ class ApplicationSession:
         self._check_summary_admission(cancel_token)
         if report.total_estimate > report.limit:
             raise RuntimeError("compaction unavailable: " + budget_exceeded_text(report))
-        outcome = await generate_summary(channel, plan.request, cancel_token)
+        try:
+            outcome = await generate_summary(channel, plan.request, cancel_token)
+        except asyncio.CancelledError:
+            self._process_summary_calls.append(SummaryOutcome(ok=False, failure="aborted"))
+            raise
+        self._process_summary_calls.append(outcome)
         if not outcome.ok:
             if outcome.failure == "aborted" and self._compact_sealed:
                 # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)

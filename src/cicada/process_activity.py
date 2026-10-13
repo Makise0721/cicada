@@ -89,7 +89,7 @@ class ActivitySink(Protocol):
 
     def latch_storage_failure(self, detail: str) -> None: ...
 
-    def record_check_receipt(self, receipt_id: str) -> None: ...
+    def record_check_receipts(self) -> None: ...
 
 
 class ActivityCoordinator:
@@ -108,11 +108,9 @@ class ActivityCoordinator:
         if self._sink is not None:
             self._sink.latch_storage_failure(detail)
 
-    def record_check_receipt(self, result: ToolResult) -> None:
-        if result.name == "check" and isinstance(result.details, dict):
-            receipt_id = result.details.get("receipt_id")
-            if isinstance(receipt_id, str) and receipt_id and self._sink is not None:
-                self._sink.record_check_receipt(receipt_id)
+    def record_check_receipts(self) -> None:
+        if self._sink is not None:
+            self._sink.record_check_receipts()
 
 
 async def _settle(awaitable) -> Any:
@@ -166,6 +164,7 @@ class ProcessActivityWrapper:
         try:
             result = await self._inner.execute(arguments, ctx)
         except BaseException as exc:
+            self._coordinator.record_check_receipts()
             # 异常/不可得结果: 保留已登记活动为未证终结, 再交还内核协议 (契约 §4.5)
             try:
                 await _settle(store.end_process(activity_id, ProcessTerminalFacts(
@@ -177,7 +176,7 @@ class ProcessActivityWrapper:
                 )
             raise
         try:
-            self._coordinator.record_check_receipt(result)
+            self._coordinator.record_check_receipts()
             await _settle(store.end_process(activity_id, classify_terminal(result)))
         except PersistenceError as exc:
             # 终结写入失败: 保留真实 ToolResult, 取消 token 停止后继活动;
