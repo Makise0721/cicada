@@ -71,11 +71,35 @@ async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
         assert harness.submit('/name bad\n')
         assert session.persistence.user_name is None and session.history == ()
         assert not view._gate.session_managing
+        await asyncio.sleep(0)
+        view.editor.set_text('/name ' + 'x' * 81)
+        frontend._on_input_batch([enter, KeyPress('x', 'x'), enter])
+        assert not session.session_management_active and not view._gate.session_managing
+        assert view.editor.get_text() == 'x' and session.history == ()
+        await asyncio.sleep(0)
+        assert not view.enter_barrier(), '拒绝批结束后没有遗留管理预约'
         for width in (24, 80):
             harness.lines(width)
     finally:
         frontend._stopped = True
         await session.aclose()
+        harness.close()
+    ephemeral = await open_application(_config(root, _script()))
+    harness = Harness(ephemeral)
+    view = harness.view
+    frontend = MainScreenFrontend(
+        FakeTerminal(80, 24), document_lines=view.document_lines, layout_document=view.layout_document,
+        editor=view.editor, on_submit=view.on_submit, command_menu=SlashCommandMenu(),
+    )
+    try:
+        view.editor.set_text('/name unavailable')
+        frontend._on_input_batch([enter, KeyPress('x', 'x'), enter])
+        await asyncio.sleep(0)
+        assert not view._gate.busy() and ephemeral.history == ()
+        assert view.editor.get_text() == 'x' and not view.enter_barrier()
+    finally:
+        frontend._stopped = True
+        await ephemeral.aclose()
         harness.close()
 
 

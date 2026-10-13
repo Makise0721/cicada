@@ -834,7 +834,7 @@ class ConversationView:
             self._gate.note_session_started()
             submission = self._session.submit_session_name(None if name == "--clear" else name)
         except (ValueError, SessionManagementError) as exc:
-            self._gate.note_session_settled()
+            self._gate.note_session_rejected()
             self.transcript.append_error(str(exc))
             return True
         self._name_submission = submission

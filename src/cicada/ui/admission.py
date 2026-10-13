@@ -43,6 +43,7 @@ class AdmissionGate:
         self._login_active = False
         self._review_active = False
         self._session_managing = False
+        self._session_rejected_in_batch = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
         self.on_error: Callable[[str], None] | None = None
 
@@ -81,6 +82,19 @@ class AdmissionGate:
     def note_session_settled(self) -> None:
         self._session_managing = False
 
+    @property
+    def session_rejected_in_batch(self) -> bool:
+        return self._session_rejected_in_batch
+
+    def note_session_rejected(self) -> None:
+        """释放管理占位，但当前同步输入批余下 Enter 仍静默。"""
+        self._session_managing = False
+        self._session_rejected_in_batch = True
+        asyncio.get_running_loop().call_soon(self._settle_session_input_batch)
+
+    def _settle_session_input_batch(self) -> None:
+        self._session_rejected_in_batch = False
+
     # --- 准入 ----------------------------------------------------------------------
 
     def try_admit(self, prompt: str) -> asyncio.Task | None:
@@ -91,7 +105,7 @@ class AdmissionGate:
         """
         if self._reservation_open:
             return None
-        if self._session_managing or getattr(self._session, "session_management_active", False):
+        if self._session_rejected_in_batch or self._session_managing or getattr(self._session, "session_management_active", False):
             return None
         if self._clearing or self._compacting or self._model_selecting or self._login_active or self._review_active or getattr(self._session, "review_active", False):
             return None
@@ -198,6 +212,7 @@ class AdmissionGate:
         try_admit 的 state 检查保证, 此处只做状态卫生。"""
         self._pending_cancel = False
         self._session_managing = False
+        self._session_rejected_in_batch = False
         self._reservation_open = False
         self._task = None
         self._clearing = False
@@ -231,7 +246,7 @@ def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """
     if gate.busy():
         return True
-    if gate.session_managing or getattr(session, "session_management_active", False):
+    if gate.session_rejected_in_batch or gate.session_managing or getattr(session, "session_management_active", False):
         return True
     if gate.clearing or gate.compacting or gate.model_selecting or gate.login_active or gate.review_active or getattr(session, "review_active", False):
         return True
