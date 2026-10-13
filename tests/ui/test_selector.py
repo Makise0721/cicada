@@ -125,7 +125,7 @@ def test_selector_bad_entries_visible_but_not_selectable(tmp_path):
     terminal = FakeTerminal(columns=100, rows=12)
     session_id, _ = _run_selector(terminal, directory, keys=[ENTER])
     text = terminal.output_text
-    assert "00000000 [坏档:" in text
+    assert "00000000" in text
     assert "坏档" in text, "坏档如实标注"
     assert session_id == good, "坏档不可选, 默认选定好会话"
 

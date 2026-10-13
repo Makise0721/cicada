@@ -12,6 +12,8 @@ from cicada.persistence.contracts import (
 )
 from cicada.ui.main_screen import truncate_to_width, visible_width
 from cicada.ui.rendering import sanitize_display
+from cicada.ui import theme
+from cicada.ui.display_style import current_style
 
 SELECTOR_TITLE = "选择要恢复的会话"
 SELECTOR_HINT = "↑/↓ 选择  PgUp/PgDn 翻页  ←/→ 光标  Ctrl+R 刷新  Enter 恢复  Esc 取消"
@@ -141,57 +143,99 @@ class SessionSelectorState:
 
     def render_lines(self, columns: int, rows: int = 24, *, cursor_marker: str = "") -> list[str]:
         width, height = max(1, columns), max(1, rows)
-        query_line = self._query_line(width)
         page = self.page_entries
         show_identity = bool(page) and height >= 7
-        capacity = max(1, height - (6 if show_identity else 5))
+        spaced = height >= 12
+        show_hint = height >= 6
+        overhead = 4 + int(show_identity) + int(show_hint) + 2 * int(spaced)
+        capacity = max(1, height - overhead)
         self.window_offset = min(self.window_offset, max(0, len(page) - capacity))
         if self.row < self.window_offset:
             self.window_offset = self.row
         elif self.row >= self.window_offset + capacity:
             self.window_offset = self.row - capacity + 1
         if self.loading:
-            content = ["正在读取会话…"]
+            content = [self._muted_line("正在读取会话…", width)]
         elif self.error:
-            content = ["读取失败: " + self.error]
+            content = [theme.fg(theme.DIFF_REMOVED, truncate_to_width(sanitize_display("读取失败: " + self.error), width))]
         elif not self.entries:
-            content = [("当前已读取范围无匹配，列表不完整" if self.snapshot and not self.snapshot.complete
-                        else "无匹配会话" if self.query else "（本工作区暂无会话存档）")]
+            content = [self._muted_line("当前已读取范围无匹配，列表不完整" if self.snapshot and not self.snapshot.complete
+                        else "无匹配会话" if self.query else "（本工作区暂无会话存档）", width)]
         else:
-            content = [self._entry_line(entry, index) for index, entry in
+            content = [self._entry_line(entry, index, width) for index, entry in
                        enumerate(page[self.window_offset:self.window_offset + capacity], self.window_offset)]
         scope = "列表不完整: " + self.snapshot.reason if self.snapshot and not self.snapshot.complete else "终结事实未读取"
-        footer = f"第 {self.page_index + 1}/{self.page_count} 页  匹配 {len(self.entries)}"
+        footer = f"第 {self.page_index + 1}/{self.page_count} 页 · 匹配 {len(self.entries)}"
         if page:
-            footer += f"  行 {self.window_offset + 1}–{min(len(page), self.window_offset + capacity)}/{len(page)}"
-        details = ["ID: " + self.selected.session_id] if show_identity else []
-        lines = [SELECTOR_TITLE, SELECTOR_HINT, query_line, *content, *details, footer, self.notice or scope]
-        if len(lines) > height:
-            lines.pop(1)
-        if len(lines) > height:
-            lines.pop(0)
-        return [self._query_line(width, cursor_marker) if line == query_line else
-                truncate_to_width(sanitize_display(line), width) for line in lines[:height]]
+            footer += f" · 行 {self.window_offset + 1}–{min(len(page), self.window_offset + capacity)}/{len(page)}"
+        details = []
+        if show_identity:
+            detail = "ID: " + self.selected.session_id
+            if self.selected.error:
+                detail += " · 坏档: " + self.selected.error
+            details = [self._muted_line(detail, width)]
+        title = truncate_to_width(" " + SELECTOR_TITLE, width)
+        lines = [theme.fg_open(theme.EDITOR_BORDER) + current_style().sgr("1") + title + current_style().sgr("0")]
+        if spaced:
+            lines.append("")
+        lines.append(self._query_line(width, cursor_marker))
+        if spaced:
+            lines.append("")
+        lines.extend(content)
+        lines.extend(details)
+        lines.append(self._muted_line(footer, width))
+        lines.append(self._muted_line(self.notice or scope, width))
+        if show_hint:
+            lines.append(self._muted_line(SELECTOR_HINT, width))
+        # 极低窗口优先保留搜索及当前候选；正常窗口的行预算包含全部页脚。
+        if height < 4:
+            lines = [self._query_line(width, cursor_marker), *content]
+        return lines[:height]
+
+    @staticmethod
+    def _muted_line(text: str, width: int) -> str:
+        return theme.fg(theme.MUTED_GRAY, truncate_to_width(sanitize_display(" " + text), width))
 
     def _query_line(self, width: int, cursor_marker: str = "") -> str:
-        prefix = "搜索: " if width >= 8 else ""
+        prefix = " 搜索 › " if width >= 12 else "› " if width >= 3 else ""
         available = max(0, width - visible_width(prefix) - 1)
         left = self.query[:self.cursor]
         left_budget = available if self.cursor == len(self.query) else available * 2 // 3
         while left and visible_width(left) > left_budget:
             left = left[1:]
         right = truncate_to_width(self.query[self.cursor:], available - visible_width(left))
-        return prefix + left + cursor_marker + "|" + right
+        hint = ""
+        if not self.query:
+            hint = truncate_to_width(" 名称 / ID / 首问", available)
+        return (theme.fg(theme.EDITOR_BORDER, prefix)
+                + theme.fg(theme.ASSISTANT_TEXT, left)
+                + cursor_marker + theme.fg(theme.EDITOR_BORDER, "|")
+                + theme.fg(theme.ASSISTANT_TEXT, right)
+                + theme.fg(theme.EDITOR_PLACEHOLDER, hint))
 
-    def _entry_line(self, entry: SessionCatalogEntry, index: int) -> str:
-        markers = (" [当前]" if entry.session_id == self.current_session_id else "")
+    def _entry_line(self, entry: SessionCatalogEntry, index: int, width: int) -> str:
+        markers = (["当前"] if entry.session_id == self.current_session_id else [])
         if entry.error:
-            markers += " [坏档: " + entry.error[:60] + "]"
+            markers.append("坏档")
         if entry.occupied:
-            markers += " [占用]"
+            markers.append("占用")
         try:
             updated = strftime("%m-%d %H:%M", localtime(entry.updated_at)) if entry.updated_at is not None else "无记录"
         except (OSError, OverflowError, ValueError):
             updated = "时间不可显示"
-        title = entry.user_name or entry.short_title or "未命名"
-        return f"{'>' if index == self.row else ' '} {entry.session_id[:8]}{markers}  {title}  {updated}"
+        title = sanitize_display(entry.user_name or entry.short_title or "未命名")
+        metadata = " · ".join([*markers, entry.session_id[:8] if width >= 32 else entry.session_id[:4]])
+        if width >= 64 and visible_width(metadata) + 14 <= width // 2:
+            metadata += " · " + " " * max(0, 11 - visible_width(updated)) + updated
+        metadata = truncate_to_width(sanitize_display(metadata), max(0, width // 2))
+        prefix = "→ " if index == self.row else "  "
+        label = truncate_to_width(title, max(0, width - 4 - visible_width(metadata)))
+        gap = " " * max(0, width - visible_width(prefix + label + metadata))
+        if width < 6:
+            prefix, label, gap, metadata = truncate_to_width(prefix + title, width), "", "", ""
+        selected = index == self.row
+        color = theme.DIFF_REMOVED if entry.error else theme.MD_LINK if selected else theme.ASSISTANT_TEXT
+        return ((theme.bg_open(theme.MENU_SEL_BG) if selected else "")
+                + theme.fg_open(theme.EDITOR_BORDER) + prefix
+                + theme.fg_open(color) + label
+                + gap + theme.fg_open(theme.MUTED_GRAY) + metadata + current_style().sgr("0"))

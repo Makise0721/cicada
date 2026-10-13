@@ -8,7 +8,9 @@ from prompt_toolkit.keys import Keys
 
 from cicada.application import ApplicationSession, SessionManagementError
 from cicada.core.cancel import CancelToken
-from cicada.ui.main_screen import CURSOR_MARKER, truncate_to_width
+from cicada.ui.main_screen import CURSOR_MARKER, truncate_to_width, wrap_text_ansi
+from cicada.ui import theme
+from cicada.ui.display_style import current_style
 from cicada.ui.rendering import sanitize_display
 from cicada.ui.session_selector import SessionSelectorState
 
@@ -157,13 +159,21 @@ class SessionResumeModal:
             self.on_update()
 
     def render(self, width: int, rows: int) -> list[str]:
+        width, rows = max(1, width), max(1, rows)
         if not self.visible or self._submission is not None:
-            return [truncate_to_width("正在切换会话…" if self._submission else "正在结束查询…", width)]
+            return [theme.fg(theme.MUTED_GRAY, truncate_to_width("正在切换会话…" if self._submission else "正在结束查询…", width))]
         if self._conflict:
             session_id, message = self._conflict
-            lines = ["目标配置冲突", "ID: " + session_id, sanitize_display(message),
-                     "C 采用当前配置  Ctrl+R 返回列表  Esc 取消"]
-            return [truncate_to_width(line, width) for line in lines][:max(1, rows)]
+            title = theme.fg_open(theme.EDITOR_BORDER) + current_style().sgr("1")
+            title += truncate_to_width(" 目标配置冲突", width) + current_style().sgr("0")
+            identity = theme.fg(theme.MUTED_GRAY, truncate_to_width(" ID: " + session_id, width))
+            body = wrap_text_ansi(sanitize_display(message), max(1, width - 2))
+            lines = [title, identity]
+            lines.extend(theme.fg(theme.ASSISTANT_TEXT, truncate_to_width(" " + line, width))
+                         for line in body[:max(0, rows - 3)])
+            lines.append(theme.fg(theme.MUTED_GRAY, truncate_to_width(
+                " C 采用当前配置  Ctrl+R 返回列表  Esc 取消", width)))
+            return lines[:rows]
         return self.state.render_lines(width, rows, cursor_marker=CURSOR_MARKER)
 
     async def close(self) -> None:

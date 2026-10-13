@@ -14,6 +14,7 @@ from cicada.core.cancel import CancelToken
 from cicada.persistence.contracts import LIST_SESSIONS_PAGE_SIZE, SessionCatalogSnapshot
 from cicada.ui.session_selector import SELECTOR_TITLE, SessionSelectorState
 from cicada.ui.terminal_io import Terminal
+from cicada.ui.display_style import DisplayStyle
 
 _CLEAR_SCREEN = "\x1b[2J\x1b[H"
 
@@ -37,12 +38,15 @@ async def run_session_selector(
     closed = False
     refresh_pending = False
     failure: Exception | None = None
+    display_style = DisplayStyle.capture()
 
     def render() -> None:
         nonlocal failure, closed, generation
         if not closed:
             try:
-                terminal.write(_CLEAR_SCREEN + "\n".join(state.render_lines(terminal.columns, terminal.rows)) + "\n")
+                with display_style.use():
+                    lines = state.render_lines(terminal.columns, terminal.rows)
+                terminal.write(_CLEAR_SCREEN + "\n".join(lines) + "\n")
             except Exception as exc:
                 failure, closed = exc, True
                 generation += 1
