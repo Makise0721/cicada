@@ -30,6 +30,7 @@ from cicada.persistence.contracts import (
     InterruptedRequest,
     LaunchIdentity,
     LeaseHeldError,
+    NameSubmission,
     PersistenceError,
     PersistenceState,
     RequestOutcomeFacts,
@@ -44,6 +45,7 @@ from cicada.persistence.contracts import (
     UnknownArchiveVersionError,
     WorkspaceMismatchError,
     conflicting_launch_fields,
+    validate_session_name,
 )
 
 __all__ = [
@@ -61,6 +63,8 @@ __all__ = [
     "InterruptedRequest",
     "LaunchIdentity",
     "LeaseHeldError",
+    "NameSubmission",
+    "validate_session_name",
     "PersistenceError",
     "PersistenceState",
     "RecoverySnapshot",

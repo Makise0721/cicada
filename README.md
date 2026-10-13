@@ -55,7 +55,7 @@ cicada
 
 持久会话覆盖单次 CLI 与 TUI：
 
-- `--tui` 默认自动保存；`--save-session` 供单次模式落盘。存档位于 `<workspace>/.cicada/sessions/<id>.sqlite3`。
+- `--tui` 默认自动保存；`--save-session` 供单次模式落盘。存档位于 `<workspace>/.cicada/sessions/<id>.sqlite3`。空闲时 `/name <名称>` 命名，裸 `/name` 查看，`/name --clear` 清除并回退首问摘要。
 - `--resume <id>` 恢复：完整历史恢复、旧工具不重放、追加保存。省略的 provider、模型、模式和限额继承存档，显式参数与存档冲突点名拒绝；检查模式存档恢复需显式给出相同 `--check-command`；不再支持的 provider 明确拒绝普通恢复。`--tui` 下省略 ID 启动会话选择器（Esc 取消，退出码 0）。
 - `--resume-with-current-config` 显式采用当前 API 配置恢复（差异不拒绝，记入新启动代次）；旧历史及模型归属保留，恢复阻断仍有效。
 - `--list-sessions` 只读分页列表，无需模型探测；标注占用/恢复阻断/坏档。

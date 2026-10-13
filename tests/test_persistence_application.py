@@ -63,6 +63,163 @@ from test_application import _repo, _script  # 复用既有工作区/剧本构�
 from tests.support.app import identity as _identity, prompt_info as _prompt_info
 
 
+async def test_session_name_roundtrip_noop_and_metadata_only(tmp_path, monkeypatch):
+    from cicada.application import SessionManagementError, SessionNameChanged
+    from cicada.plugins.session_store import list_sessions
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script({"text": "回答", "stop": True}), session_id=None))
+    store = session._store
+    updates = []
+    session.subscribe(updates.append)
+    try:
+        # 空档可命名；排序时间仍未知，UUID 保持。
+        submission = session.submit_session_name("  中文 任务  ")
+        assert session.session_management_active
+        with pytest.raises(SessionManagementError) as busy:
+            session.submit_session_name("另一项")
+        assert busy.value.code == "busy"
+        result = await submission.wait()
+        assert result == await submission.wait() and result.changed
+        empty = list_sessions(directory=store.db_path.parent).entries[0]
+        assert empty.user_name == "中文 任务" and empty.updated_at is None
+        await session.execute("自动首问")
+        before = store.recovery_snapshot()
+        history, outcome, epoch = session.history, session._last_outcome, session.persistence.epoch_id
+        with sqlite3.connect(store.db_path) as connection:
+            tables = {name: connection.execute(f'SELECT * FROM {name}').fetchall() for name in (
+                'records', 'request_intents', 'epoch', 'process_activity', 'historical_receipts', 'summaries')}
+        assert (await session.submit_session_name("重命名").wait()).changed
+        with sqlite3.connect(store.db_path) as connection:
+            assert tables == {name: connection.execute(f'SELECT * FROM {name}').fetchall() for name in tables}
+        assert store.recovery_snapshot() == dc_replace(before, user_name="重命名")
+        assert (session.history, session._last_outcome, session.persistence.epoch_id) == (history, outcome, epoch)
+        assert session.session_generation == 0 and session.persistence.saved_request_count == 1
+        event_count = len([u for u in updates if isinstance(u, SessionNameChanged)])
+        original = store.submit_name
+        monkeypatch.setattr(store, 'submit_name', lambda *a, **k: pytest.fail('no-op dispatched SQL'))
+        assert not (await session.submit_session_name(" 重命名 ").wait()).changed
+        assert len([u for u in updates if isinstance(u, SessionNameChanged)]) == event_count
+        monkeypatch.setattr(store, 'submit_name', original)
+        assert (await session.submit_session_name(None).wait()).changed
+        assert store.recovery_snapshot().short_title == "自动首问"
+        monkeypatch.setattr(store, 'submit_name', lambda *a, **k: pytest.fail('clear no-op dispatched SQL'))
+        assert not (await session.submit_session_name(None).wait()).changed
+        monkeypatch.setattr(store, 'submit_name', original)
+        await session.submit_session_name("重启可读").wait()
+        session_id = session.persistence.session_id
+    finally:
+        await session.aclose()
+    resumed = await open_application(_config(root, _script(), session_id=session_id))
+    try:
+        assert resumed.persistence.user_name == "重启可读"
+        assert resumed.history == history
+        assert list_sessions(directory=store.db_path.parent).entries[0].user_name == "重启可读"
+    finally:
+        await resumed.aclose()
+
+
+@pytest.mark.parametrize('close', [False, True])
+async def test_accepted_name_cancellation_retains_result_and_reservation(tmp_path, monkeypatch, close):
+    from cicada.application import SessionManagementError, SessionNameChanged
+    from cicada.plugins.session_store import open_session_store
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(), session_id=None))
+    store = session._store
+    path, session_id = store.db_path, store.session_id
+    entered, release = threading.Event(), threading.Event()
+    original = store._immediate
+    def slow():
+        entered.set()
+        assert release.wait(10), 'name transaction release timed out'
+        original()
+    monkeypatch.setattr(store, '_immediate', slow)
+    updates = []
+    session.subscribe(updates.append)
+    submission = session.submit_session_name("已接受名称")
+    waiter = asyncio.create_task(submission.wait())
+    closing = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        # 取消等待和合作取消均不能取消已经接受的事务。
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        submission.cancel()
+        submission.cancel()
+        with pytest.raises(RuntimeError, match='session management'):
+            await session.execute("不能穿透")
+        with pytest.raises(RuntimeError, match='session management'):
+            await session.clear_context()
+        with pytest.raises(RuntimeError, match='session management'):
+            await session.compact_context()
+        with pytest.raises(SessionManagementError):
+            session.submit_session_name("不能覆盖")
+        if close:
+            closing = asyncio.create_task(session.aclose())
+            await asyncio.sleep(0)
+            assert not closing.done()
+        release.set()
+        assert (await submission.wait()).changed
+        assert await submission.wait() == await submission.wait()
+        if closing is not None:
+            await closing
+        assert any(isinstance(u, SessionNameChanged) and u.user_name == "已接受名称" for u in updates)
+        assert session.persistence.user_name == "已接受名称"
+    finally:
+        release.set()
+        await session.aclose()
+    reopened = open_session_store(directory=path.parent, session_id=session_id, workspace=root)
+    try:
+        assert reopened.recovery_snapshot().user_name == "已接受名称"
+    finally:
+        await reopened.aclose()
+
+
+async def test_name_rejection_cancellation_and_write_failure(tmp_path, monkeypatch):
+    from cicada.application import SessionManagementError, SessionNameChanged
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(), session_id=None))
+    updates = []
+    session.subscribe(updates.append)
+    try:
+        for name in (' ', 'x\ny', 'x\t', 'x\u200dy', '\ud800', 'x' * 81, 123):
+            with pytest.raises(SessionManagementError) as invalid:
+                session.submit_session_name(name)
+            assert invalid.value.code == 'invalid-input'
+        cancelled = session.submit_session_name('取消于接受前')
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled.wait()
+        assert not session.session_management_active and session.persistence.user_name is None
+        # 真实 SQLite 写拒绝；不是用应用抛异常冒充事务失败。
+        with sqlite3.connect(session._store.db_path) as connection:
+            connection.execute("CREATE TRIGGER name_failure BEFORE UPDATE OF user_name ON session "
+                               "BEGIN SELECT RAISE(ABORT, 'injected name write failure'); END")
+        failed = session.submit_session_name('失败名')
+        for _ in range(2):
+            with pytest.raises(SessionManagementError) as error:
+                await failed.wait()
+            assert error.value.code == 'write-failed'
+        assert session.persistence.storage_failed is not None
+        assert session.persistence.user_name is None
+        assert not any(isinstance(u, SessionNameChanged) for u in updates)
+        assert session.history == () and session._last_outcome is None
+        with pytest.raises(RuntimeError, match='storage_failed'):
+            await session.execute('拒绝后继')
+    finally:
+        await session.aclose()
+    ephemeral = await open_application(_plain_config(root, _script()))
+    try:
+        with pytest.raises(SessionManagementError) as error:
+            ephemeral.submit_session_name('不可保存')
+        assert error.value.code == 'unavailable' and ephemeral.history == ()
+    finally:
+        await ephemeral.aclose()
+
+
 def _texts(messages) -> list[str]:
     """按消息类型取展示文本; 工具结果以 <tool:{name}> 标记."""
     return [

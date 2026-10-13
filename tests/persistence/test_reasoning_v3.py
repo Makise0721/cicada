@@ -49,6 +49,66 @@ def _versions_and_pointer(path):
         ).fetchone()
 
 
+def _legacy_name_archive(tmp_path, version):
+    directory, session_id, path = _legacy(tmp_path, min(version, 2))
+    if version == 3:
+        with sqlite3.connect(path) as connection:
+            epoch_id = connection.execute('SELECT epoch_id FROM epoch').fetchone()[0]
+            connection.execute('ALTER TABLE session ADD COLUMN current_epoch_id TEXT REFERENCES epoch(epoch_id)')
+            connection.execute('UPDATE session SET schema_version=3, current_epoch_id=?', (epoch_id,))
+            connection.execute('PRAGMA user_version=3')
+    return directory, session_id, path
+
+
+@pytest.mark.parametrize('version', [1, 2, 3])
+async def test_v4_migration_failure_rolls_back_all_earlier_steps(tmp_path, monkeypatch, version):
+    directory, session_id, path = _legacy_name_archive(tmp_path, version)
+    before = path.read_bytes()
+    assert read_session_identity(directory=directory, session_id=session_id, workspace=tmp_path)
+    assert list_sessions(directory=directory).entries[0].user_name is None
+    assert before == path.read_bytes()
+    steps = list(store_module._V4_MIGRATION_STEPS)
+    def fail(connection):
+        raise RuntimeError('injected v4 final step')
+    monkeypatch.setattr(store_module, '_V4_MIGRATION_STEPS', (*steps[:2], fail))
+    with pytest.raises(RuntimeError, match='v4 final step'):
+        open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
+    assert before == path.read_bytes(), '不得半升级 v1/v2/v3'
+    monkeypatch.setattr(store_module, '_V4_MIGRATION_STEPS', tuple(steps))
+    store = open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
+    try:
+        snapshot = store.recovery_snapshot()
+        assert snapshot.user_name is None
+        epoch_id = store._state.current_epoch_id
+        handle = store.submit_name('中文名称', expected_epoch_id=epoch_id)
+        assert await handle.wait() == await handle.wait() == '中文名称'
+        assert store.recovery_snapshot() == replace(snapshot, user_name='中文名称')
+        assert _versions_and_pointer(path) == (4, (4, epoch_id))
+        with pytest.raises(store_module.UnknownArchiveVersionError):
+            monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 3)
+            read_session_identity(directory=directory, session_id=session_id, workspace=tmp_path)
+        monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 4)
+    finally:
+        await store.aclose()
+
+
+async def test_corrupt_v4_names_refused_without_rewriting_archive(tmp_path):
+    store = open_session_store(directory=tmp_path / 'sessions', session_id=None, workspace=tmp_path)
+    await store.start_epoch(_identity())
+    path, session_id = store.db_path, store.session_id
+    await store.aclose()
+    for name in (' untrimmed ', 'x\u200dy', b'not text', 'x' * 81):
+        with sqlite3.connect(path) as connection:
+            connection.execute('UPDATE session SET user_name=?', (name,))
+        before = path.read_bytes()
+        with pytest.raises(ArchiveFormatError, match='session name'):
+            open_session_store(directory=path.parent, session_id=session_id, workspace=tmp_path)
+        with pytest.raises(ArchiveFormatError, match='session name'):
+            read_session_identity(directory=path.parent, session_id=session_id, workspace=tmp_path)
+        assert list_sessions(directory=path.parent).entries[0].error
+        assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("version", [1, 2])
 async def test_legacy_migration_preserves_payloads_and_identity(tmp_path, version):
     directory, session_id, path = _legacy(tmp_path, version)
@@ -72,7 +132,7 @@ async def test_legacy_migration_preserves_payloads_and_identity(tmp_path, versio
     try:
         snapshot = store.recovery_snapshot()
         assert snapshot.canonical_history == (UserMessage("第一问"), AssistantMessage("回答"))
-        assert _versions_and_pointer(path) == (3, (3, epoch_id))
+        assert _versions_and_pointer(path) == (4, (4, epoch_id))
         if version == 2:
             assert snapshot.summaries == (record,)
             assert snapshot.summaries[0].prefix_sha256 == canonical_prefix_sha256(snapshot.canonical_history)
@@ -125,7 +185,7 @@ m.open_session_store(directory=Path({str(directory)!r}), session_id={session_id!
     store = open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
     try:
         assert len(store.recovery_snapshot().requests) == 1
-        assert _versions_and_pointer(path)[0] == 3
+        assert _versions_and_pointer(path)[0] == 4
     finally:
         await store.aclose()
 
@@ -153,7 +213,7 @@ async def test_old_pre_read_and_upgrade_agree_on_open_or_legacy_order(tmp_path, 
 async def test_v3_pointer_wins_same_timestamp_reverse_uuid_and_survives_closed_epoch(tmp_path, monkeypatch):
     store = open_session_store(directory=tmp_path / "sessions", session_id=None, workspace=tmp_path)
     path = store.db_path
-    assert _versions_and_pointer(path) == (3, (3, None))
+    assert _versions_and_pointer(path) == (4, (4, None))
     first_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
     second_id = "00000000-0000-4000-8000-000000000000"
     ids = iter([first_id, second_id])

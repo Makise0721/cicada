@@ -75,6 +75,7 @@ from cicada.persistence.contracts import (
     SummaryRecord,
     UnknownArchiveVersionError,
     WorkspaceMismatchError,
+    validate_session_name,
 )
 
 SESSION_STORE_DRAIN_TIMEOUT_S = 30.0
@@ -92,7 +93,8 @@ _SCHEMA_STATEMENTS = (
         canonical_workspace TEXT NOT NULL,
         created_at REAL NOT NULL,
         short_title TEXT NOT NULL,
-        current_epoch_id TEXT REFERENCES epoch(epoch_id)
+        current_epoch_id TEXT REFERENCES epoch(epoch_id),
+        user_name TEXT NULL
     )
     """,
     """
@@ -208,6 +210,12 @@ _V3_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     lambda connection: connection.execute("PRAGMA user_version = 3"),
 )
 
+_V4_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    lambda connection: connection.execute("ALTER TABLE session ADD COLUMN user_name TEXT NULL"),
+    lambda connection: connection.execute("UPDATE session SET schema_version = 4"),
+    lambda connection: connection.execute("PRAGMA user_version = 4"),
+)
+
 
 def _verify_v2_structure(connection: sqlite3.Connection) -> None:
     """迁移提交前的 v2 结构核对: 双版本标记与新表在位 (PA04, 提交前最后一道)."""
@@ -289,6 +297,7 @@ class _LoadedState:
     receipts: dict[str, StoredReceipt] = field(default_factory=dict)
     summaries: list[SummaryRecord] = field(default_factory=list)   # 全部代次, 按写入序
     schema_version: int = SESSION_SCHEMA_VERSION                    # 打开时的存档版本
+    user_name: str | None = None
 
 
 # --- store 实现 -------------------------------------------------------------------------
@@ -299,6 +308,14 @@ class _ModelChangeSubmission:
         self._future = future
 
     async def wait(self) -> str:
+        return await asyncio.shield(self._future)
+
+
+class _NameSubmission:
+    def __init__(self, future: asyncio.Future) -> None:
+        self._future = future
+
+    async def wait(self) -> str | None:
         return await asyncio.shield(self._future)
 
 
@@ -428,6 +445,31 @@ class SQLiteSessionStore:
             return epoch_id
 
         return _ModelChangeSubmission(self._enqueue(job))
+
+    def submit_name(self, user_name: str | None, *, expected_epoch_id: str) -> _NameSubmission:
+        user_name = validate_session_name(user_name)
+        session_id = self.session_id
+
+        def job() -> str | None:
+            self._check_db_size(0)
+            self._immediate()
+            try:
+                row = self._conn.execute("SELECT session_id, current_epoch_id FROM session").fetchone()
+                if row != (session_id, expected_epoch_id) or self._state.current_epoch_id != expected_epoch_id:
+                    raise PersistenceError("session name conflicts with the current session/epoch")
+                if self._conn.execute(
+                    "SELECT 1 FROM request_intents WHERE status = 'pending' LIMIT 1"
+                ).fetchone() is not None:
+                    raise PersistenceError("session name requires no pending request")
+                self._conn.execute("UPDATE session SET user_name = ?", (user_name,))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._state.user_name = user_name
+            return user_name
+
+        return _NameSubmission(self._enqueue(job))
 
     async def begin_request(self, epoch_id: str, prompt: str) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
@@ -1003,6 +1045,7 @@ class SQLiteSessionStore:
             canonical_workspace=self._state.canonical_workspace,
             created_at=self._state.created_at,
             short_title=self._state.short_title,
+            user_name=self._state.user_name,
             identity=self._state.identity,
             epoch_count=self._state.epoch_count,
             context_generation=current,
@@ -1191,7 +1234,7 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
             if archive_version >= 2:
                 state.summaries = _load_summaries(connection, state)
             if archive_version < SESSION_SCHEMA_VERSION:
-                _upgrade_to_v3(connection, state)
+                _upgrade_to_v4(connection, state)
                 state.schema_version = SESSION_SCHEMA_VERSION
         except sqlite3.OperationalError as exc:
             connection.close()
@@ -1262,7 +1305,7 @@ def _check_identity(connection: sqlite3.Connection) -> int:
     version = int(row[0]) if row is not None else 0
     if version == SESSION_SCHEMA_VERSION:
         return version
-    if version in (1, 2) and SESSION_SCHEMA_VERSION > version:
+    if version in (1, 2, 3) and SESSION_SCHEMA_VERSION > version:
         return version  # 历史档: 原子升级路径 (PA04)
     if version > SESSION_SCHEMA_VERSION or version not in (0, 1):
         raise UnknownArchiveVersionError(
@@ -1299,24 +1342,27 @@ def _check_schema_tables(connection: sqlite3.Connection, expected: frozenset[str
         raise ArchiveFormatError(f"session archive is missing tables: {sorted(missing)}")
 
 
-def _upgrade_to_v3(connection: sqlite3.Connection, state: _LoadedState) -> None:
-    """已验证 v1/v2 → v3 单事务升级; 不回写请求或摘要 JSON."""
+def _upgrade_to_v4(connection: sqlite3.Connection, state: _LoadedState) -> None:
+    """已完整验证的 v1–v3 单事务升级，不回写请求或摘要 JSON。"""
     _immediate_txn(connection)
     try:
         if state.schema_version == 1:
             for step in _V2_MIGRATION_STEPS:
                 step(connection)
             _verify_v2_structure(connection)
-        for step in _V3_MIGRATION_STEPS:
+        if state.schema_version < 3:
+            for step in _V3_MIGRATION_STEPS:
+                step(connection)
+            connection.execute(
+                "UPDATE session SET current_epoch_id = ?", (state.current_epoch_id,)
+            )
+        for step in _V4_MIGRATION_STEPS:
             step(connection)
-        connection.execute(
-            "UPDATE session SET current_epoch_id = ?", (state.current_epoch_id,)
-        )
-        if _check_identity(connection) != 3:
-            raise ArchiveFormatError("v3 migration did not confirm user_version")
-        row = connection.execute("SELECT schema_version, current_epoch_id FROM session").fetchone()
-        if row != (3, state.current_epoch_id):
-            raise ArchiveFormatError("v3 migration did not confirm session pointer")
+        if _check_identity(connection) != 4:
+            raise ArchiveFormatError("v4 migration did not confirm user_version")
+        row = connection.execute("SELECT schema_version, current_epoch_id, user_name FROM session").fetchone()
+        if row != (4, state.current_epoch_id, None):
+            raise ArchiveFormatError("v4 migration did not confirm session metadata")
         connection.execute("COMMIT")
     except BaseException:
         connection.execute("ROLLBACK")
@@ -1381,6 +1427,12 @@ def _load_state(
             f"session belongs to workspace {stored_workspace!r}, not {canonical_workspace!r}"
         )
     short_title = str(short_title)
+    user_name = None
+    if archive_version >= 4:
+        try:
+            user_name = validate_session_name(connection.execute("SELECT user_name FROM session").fetchone()[0])
+        except ValueError as exc:
+            raise ArchiveFormatError(f"session name is corrupt: {exc}") from exc
     if len(short_title) > SHORT_TITLE_MAX_CHARS:
         raise ArchiveFormatError(
             f"session short title exceeds the limit ({SHORT_TITLE_MAX_CHARS} chars)"
@@ -1390,6 +1442,7 @@ def _load_state(
         canonical_workspace=str(stored_workspace),
         created_at=float(created_at),
         short_title=short_title,
+        user_name=user_name,
         schema_version=int(archive_version),
     )
 

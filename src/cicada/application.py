@@ -84,6 +84,7 @@ from cicada.persistence.contracts import (
     SummaryRecord,
     conflicting_launch_fields,
     receipt_terminal_trustworthy,
+    validate_session_name,
 )
 from cicada.process_activity import ActivityCoordinator, ProcessActivityWrapper
 from cicada.run_policy import (
@@ -326,7 +327,43 @@ class OperationBusy:
     与 ContextCompacted 标记.
     """
 
-    operation: Literal["clear", "compact", "model", "login"]
+    operation: Literal["clear", "compact", "model", "login", "session"]
+
+
+@dataclass(frozen=True)
+class SessionNameChanged:
+    session_id: str
+    user_name: str | None
+    session_generation: int
+
+
+@dataclass(frozen=True)
+class SessionManagementResult:
+    operation: Literal["name", "new", "resume"]
+    session_id: str
+    session_generation: int
+    changed: bool
+
+
+class SessionManagementError(RuntimeError):
+    def __init__(self, code: str, message: str, *, published: bool = False) -> None:
+        self.code = code
+        self.published = published
+        super().__init__(message[:512])
+
+
+class SessionManagementSubmission:
+    """应用拥有事务任务；wait 取消仅取消本次等待，cancel 发合作取消。"""
+
+    def __init__(self, task: asyncio.Task, token: CancelToken) -> None:
+        self._task = task
+        self._token = token
+
+    async def wait(self) -> SessionManagementResult:
+        return await asyncio.shield(self._task)
+
+    def cancel(self) -> None:
+        self._token.cancel()
 
 
 @dataclass(frozen=True)
@@ -395,6 +432,7 @@ ApplicationUpdate = (
     AgentEventReceived | RequestPhaseChanged | RequestCompleted | HistoryCleared
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
     | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
+    | SessionNameChanged
 )
 
 
@@ -548,6 +586,11 @@ class ApplicationSession:
         self._model_in_flight = False
         self._model_done: asyncio.Future | None = None
         self._model_task: asyncio.Task | None = None
+        self._session_in_flight = False
+        self._session_done: asyncio.Future | None = None
+        self._session_task: asyncio.Task | None = None
+        self._session_token: CancelToken | None = None
+        self._session_generation = 0
         self._login_store_factory = login_store_factory
         self._login_environment = login_environment
         self._login_store: UserConfigStore | None = None
@@ -561,6 +604,7 @@ class ApplicationSession:
         self._context_projection = context_projection if context_projection is not None else ContextProjection()
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
+        self._user_name = store.recovery_snapshot().user_name if store is not None else None
         self._epoch_id = epoch_id
         self._persistence_mode = persistence_mode
         self._restored_requests = restored_requests
@@ -644,6 +688,7 @@ class ApplicationSession:
                      self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
         if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
+                or self._session_in_flight
                 or any(task is not None and not task.done() for task in producers)):
             raise ReviewError("busy", "审阅需要空闲会话，等当前操作实际结束后再打开。")
         if self._review_active and self._review_id is None:
@@ -864,7 +909,74 @@ class ApplicationSession:
             saved_request_count=self._saved_request_count,
             last_committed_seq=self._last_committed_seq,
             storage_failed=self._storage_failed,
+            user_name=self._user_name,
         )
+
+    @property
+    def session_generation(self) -> int:
+        return self._session_generation
+
+    @property
+    def session_management_active(self) -> bool:
+        return self._session_in_flight
+
+    @property
+    def session_short_title(self) -> str:
+        return self._store.recovery_snapshot().short_title if self._store is not None else ""
+
+    def submit_session_name(self, user_name: str | None) -> SessionManagementSubmission:
+        try:
+            name = validate_session_name(user_name, trim=True)
+        except ValueError as exc:
+            raise SessionManagementError("invalid-input", str(exc)) from exc
+        if self._closing or self._closed:
+            raise SessionManagementError("closing", "应用正在关闭。")
+        if self._store is None:
+            raise SessionManagementError("unavailable", "当前会话未启用保存，无法持久命名。")
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+        if (self._state != "idle" or self._session_in_flight or self._begin_in_flight
+                or self._clearing or self._compacting or self._model_in_flight
+                or self._login_in_flight or self.review_active
+                or any(task is not None and not task.done() for task in producers)):
+            raise SessionManagementError("busy", "命名需要空闲会话。")
+        store, epoch_id = self._store, self._epoch_id or ""
+        loop = asyncio.get_running_loop()
+        self._session_in_flight = True
+        self._session_done = loop.create_future()
+        token = CancelToken()
+        self._session_token = token
+        task = loop.create_task(self._set_session_name(store, epoch_id, name, token))
+        self._session_task = task
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        self._notify(OperationBusy("session"))
+        return SessionManagementSubmission(task, token)
+
+    async def _set_session_name(
+        self, store: SessionStorePort, epoch_id: str, name: str | None, token: CancelToken,
+    ) -> SessionManagementResult:
+        try:
+            token.throw_if_cancelled()
+            if self._closing or self._closed:
+                raise asyncio.CancelledError
+            if store.recovery_snapshot().user_name == name:
+                return SessionManagementResult("name", store.session_id, self.session_generation, False)
+            try:
+                submission = store.submit_name(name, expected_epoch_id=epoch_id)
+                saved_name = await submission.wait()
+            except (StorageWriteError, StorageUnavailableError, ArchiveLimitError) as exc:
+                self._latch_storage_failed(str(exc))
+                raise SessionManagementError("write-failed", "名称保存失败：" + str(exc)) from exc
+            except (PersistenceError, ValueError) as exc:
+                raise SessionManagementError("prepare-failed", str(exc)) from exc
+            self._user_name = saved_name
+            self._notify(SessionNameChanged(store.session_id, saved_name, self.session_generation))
+            return SessionManagementResult("name", store.session_id, self.session_generation, True)
+        finally:
+            self._session_in_flight = False
+            self._session_token = None
+            if self._session_done is not None and not self._session_done.done():
+                self._session_done.set_result(None)
 
     @property
     def restored_requests(self) -> tuple[RestoredRequest, ...]:
@@ -1021,7 +1133,7 @@ class ApplicationSession:
             raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
             raise ModelSelectionError(f"{blocked} requires an idle, open session")
-        if self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
+        if self._session_in_flight or self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
             raise ModelSelectionError("another operation is in progress")
         if self._view_only_reason or self._storage_failed or self._process_uncertain:
             raise ModelSelectionError(f"{blocked} is blocked by the session state")
@@ -1240,6 +1352,8 @@ class ApplicationSession:
             self._model_configuration = binding.model
 
     async def execute(self, prompt: str) -> RequestOutcome:
+        if self._session_in_flight:
+            raise RuntimeError("session management is in progress; execute is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; execute is refused")
         if self._login_in_flight:
@@ -1669,6 +1783,8 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
+        if self._session_in_flight:
+            raise RuntimeError("session management is in progress; clear is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
@@ -1693,6 +1809,8 @@ class ApplicationSession:
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
         清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
+        if self._session_in_flight:
+            raise RuntimeError("session management is in progress; clear is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
@@ -1771,6 +1889,8 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
+        if self._session_in_flight:
+            raise RuntimeError("session management is in progress; compact is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; compact is refused")
         if self._login_in_flight:
@@ -2097,7 +2217,7 @@ class ApplicationSession:
         return lines
 
     def _check_login_admission(self) -> None:
-        if (self.review_active or self._closing or self._closed or self._state != 'idle' or
+        if (self._session_in_flight or self.review_active or self._closing or self._closed or self._state != 'idle' or
                 self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
             raise UserConfigError('login', 'operation-in-progress')
 
@@ -2288,6 +2408,8 @@ class ApplicationSession:
         """幂等关闭; 重复调用共享同一次关闭任务和结果, 不重复 stop."""
         if self._close_task is None:
             self._closing = True
+            if self._session_token is not None:
+                self._session_token.cancel()
             self.cancel_review()
             self._cancel_login_save()
             self.cancel_login()
@@ -2341,6 +2463,9 @@ class ApplicationSession:
         # 监督超时记录诊断, 不能替代事务明确结果; model 生产者仍受拥有。
         if self._model_done is not None and not self._model_done.done():
             await asyncio.shield(self._model_done)
+        # 命名提交已接受时，取得真实结果并发布后才清理存储和观察者。
+        if self._session_done is not None and not self._session_done.done():
+            await asyncio.shield(self._session_done)
         # 解除核心到应用的订阅; 应用 observer 保留到 ApplicationClosed 送达后
         self._unsubscribe_core()
         stop_error: str | None = None

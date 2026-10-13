@@ -29,6 +29,7 @@ SLASH_COMMANDS = (
     SlashCommand("/login", "保存登录配置（可在空闲 DeepSeek 会话保存并应用）"),
     SlashCommand("/compact", "摘要较早对话以释放上下文（需持久会话）"),
     SlashCommand("/clear", "清空模型历史（已显示记录保留）"),
+    SlashCommand("/name", "会话名称：/name <名称> · --clear 清除"),
     SlashCommand("/exit", "退出程序"),
 )
 

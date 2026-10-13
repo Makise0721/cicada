@@ -28,6 +28,7 @@ from cicada.persistence.contracts import (
     SessionSummary,
     StoredReceipt,
     receipt_terminal_trustworthy,
+    validate_session_name,
 )
 
 
@@ -103,6 +104,8 @@ def _read_summary(connection: sqlite3.Connection, session_id: str, occupied: boo
     if len(row) != 1:
         raise ValueError(f"session table has {len(row)} rows")
     stored_id, short_title, created_at = row[0]
+    user_name = (validate_session_name(connection.execute("SELECT user_name FROM session").fetchone()[0])
+                 if version >= 4 else None)
     if str(stored_id) != session_id:
         raise ValueError("file name does not match the archived session id")
     updated_at = connection.execute("SELECT MAX(created_at) FROM records").fetchone()[0]
@@ -115,6 +118,7 @@ def _read_summary(connection: sqlite3.Connection, session_id: str, occupied: boo
     return SessionSummary(
         session_id=str(stored_id),
         short_title=str(short_title),
+        user_name=user_name,
         created_at=float(created_at),
         updated_at=float(updated_at) if updated_at is not None else None,
         committed_requests=int(committed),

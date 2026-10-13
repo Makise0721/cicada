@@ -174,7 +174,7 @@ def render_session_page(page: SessionPage) -> list[str]:
             if entry.updated_at is not None else "无记录"
         )
         line = (
-            f"{entry.session_id}  {_clip(entry.short_title, _LIST_TITLE_MAX_CHARS)}  "
+            f"{entry.session_id}  {_clip(entry.user_name or entry.short_title or '未命名', _LIST_TITLE_MAX_CHARS)}  "
             f"更新={updated}  请求={entry.committed_requests} 中断={entry.interrupted_requests}"
         )
         if entry.occupied:

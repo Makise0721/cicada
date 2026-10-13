@@ -26,6 +26,59 @@ from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.persistence.contracts import LaunchIdentity
 
 
+async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.__main__ import render_session_page
+    from cicada.plugins.session_store import list_sessions
+    from cicada.ui.commands import SlashCommandMenu
+    from cicada.ui.frontend import MainScreenFrontend
+    from cicada.ui.terminal_io import FakeTerminal
+    from cicada.ui.selector import _entry_line
+
+    root = _repo(tmp_path)
+    session = await open_application(_persistence_config(root, _script(), session_id=None))
+    harness = Harness(session)
+    view = harness.view
+    frontend = MainScreenFrontend(
+        FakeTerminal(80, 24), document_lines=view.document_lines, layout_document=view.layout_document,
+        editor=view.editor, on_submit=view.on_submit, command_menu=SlashCommandMenu(),
+    )
+    enter = KeyPress(Keys.ControlM, '\r')
+    try:
+        view.editor.set_text('/name 中文 空档')
+        frontend._on_input_batch([enter, KeyPress('x', 'x'), enter])
+        assert view._gate.session_managing and session.session_management_active
+        assert view.editor.get_text() == 'x'
+        assert session.history == ()
+        await view._name_task
+        assert not view.enter_barrier() and view.editor.get_text() == 'x'
+        assert session.persistence.user_name == '中文 空档'
+        assert harness.submit('/name')
+        assert harness.submit('/status')
+        assert '中文 空档' in '\n'.join(harness.lines(80))
+        directory = root / '.cicada' / 'sessions'
+        page = list_sessions(directory=directory)
+        assert '中文 空档' in '\n'.join(render_session_page(page))
+        assert '中文 空档' in _entry_line(page.entries[0], 80)
+        assert harness.submit('/name --clear extra')
+        await view._name_task
+        assert session.persistence.user_name == '--clear extra', '保留参数只精确匹配'
+        assert harness.submit('/name --clear')
+        await view._name_task
+        assert session.persistence.user_name is None
+        assert '未命名' in '\n'.join(render_session_page(list_sessions(directory=directory)))
+        assert harness.submit('/name bad\n')
+        assert session.persistence.user_name is None and session.history == ()
+        assert not view._gate.session_managing
+        for width in (24, 80):
+            harness.lines(width)
+    finally:
+        frontend._stopped = True
+        await session.aclose()
+        harness.close()
+
+
 def _persistence_config(root: Path, script: list, *, session_id: str | None):
     from cicada.application import PersistenceConfig as _PC
 

@@ -138,7 +138,7 @@ def _entry_line(entry: SessionSummary, width: int) -> str:
         strftime("%m-%d %H:%M", localtime(entry.updated_at))
         if entry.updated_at is not None else "无记录"
     )
-    title = sanitize_display(entry.short_title)
+    title = sanitize_display(entry.user_name or entry.short_title or "未命名")
     if len(title) > _TITLE_MAX_CHARS:
         title = title[: _TITLE_MAX_CHARS - 1] + "…"
     # 标记紧跟标题: 窄窗截断时优先保留占用/阻断/坏档事实

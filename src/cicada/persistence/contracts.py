@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
+import unicodedata
 
 from cicada.core.events import ModelCallCompleted
 from cicada.core.messages import Message, StopReason
@@ -17,7 +18,7 @@ from cicada.models import SafeModelIdentity
 
 # --- 版本与限额 (contracts §2; 调整须新版本, 不在同一版本默默改变语义) -----------------
 
-SESSION_SCHEMA_VERSION = 3
+SESSION_SCHEMA_VERSION = 4
 # SQLite application_id: "CIC1" 的 32 位编码, 区分 Cicada 会话库
 SESSION_APPLICATION_ID = 0x43494331
 
@@ -29,6 +30,23 @@ MAX_MESSAGES = 200_000                    # 会话内消息总数上限
 MAX_JSON_DEPTH = 32                       # 嵌套 JSON 深度上限
 
 SHORT_TITLE_MAX_CHARS = 80                # 列表短标题的有界文字
+SESSION_NAME_MAX_CHARS = 80
+
+
+def validate_session_name(value: str | None, *, trim: bool = False) -> str | None:
+    """名称写读同源校验；仅应用输入允许 trim，存档必须已是规范值。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("session name must be a string or None")
+    if any(unicodedata.category(char) in ("Cc", "Cf", "Cs", "Zl", "Zp") for char in value):
+        raise ValueError("session name must be a single line without control characters")
+    name = value.strip()
+    if not name or len(name) > SESSION_NAME_MAX_CHARS:
+        raise ValueError(f"session name must contain 1–{SESSION_NAME_MAX_CHARS} characters")
+    if not trim and name != value:
+        raise ValueError("archived session name must be trimmed")
+    return name
 
 # 03: 回执行标识/说明字段的有界长度; 写侧构造与加载侧解码对称拒绝
 RECEIPT_ID_MAX_CHARS = 256               # receipt_id/verification_run_id/epoch_id/request_id
@@ -461,6 +479,7 @@ class RecoverySnapshot:
     process_activities: tuple[ProcessActivityFacts, ...] = ()   # 全部代次的进程活动
     restored_receipts: tuple[StoredReceipt, ...] = ()           # 历史检查回执 (03)
     summaries: tuple[SummaryRecord, ...] = ()                   # 当前代次摘要记录 (02, v2)
+    user_name: str | None = None
 
     @property
     def recorded_process_uncertain(self) -> bool:
@@ -516,6 +535,7 @@ class SessionSummary:
     unproven_activities: int
     untrusted_receipts: int
     error: str | None = None
+    user_name: str | None = None
 
     @property
     def blocked(self) -> bool:
@@ -544,6 +564,7 @@ class PersistenceState:
     saved_request_count: int
     last_committed_seq: int | None
     storage_failed: str | None       # 非空 = 已锁存 storage_failed, 拒绝后续编码请求
+    user_name: str | None = None
 
 
 # --- 存储 port --------------------------------------------------------------------------
@@ -554,6 +575,13 @@ class ModelChangeSubmission(Protocol):
     """同步接受的配置事务; 可重复等待, 调用方取消不取消事务."""
 
     async def wait(self) -> str: ...
+
+
+@runtime_checkable
+class NameSubmission(Protocol):
+    """同步入队的名称事务；取消等待不取消事务，可重复等待真实结果。"""
+
+    async def wait(self) -> str | None: ...
 
 
 @runtime_checkable
@@ -579,6 +607,12 @@ class SessionStorePort(Protocol):
         self, identity: StoredIdentity, *, expected_epoch_id: str
     ) -> ModelChangeSubmission:
         """返回即已入队; 原子更新配置边界, 不改变请求/历史代次."""
+        ...
+
+    def submit_name(
+        self, user_name: str | None, *, expected_epoch_id: str
+    ) -> NameSubmission:
+        """同步校验并入队；事务只更新名称，提交成功才更新快照。"""
         ...
 
     async def begin_request(self, epoch_id: str, prompt: str) -> str:

@@ -77,8 +77,12 @@ from cicada.application import (
     ReasoningEffortChanged,
     RequestCompleted,
     RequestPhaseChanged,
+    SessionManagementError,
+    SessionManagementSubmission,
+    SessionNameChanged,
 )
 from cicada.budget import BudgetReport, BudgetSnapshot
+from cicada.persistence.contracts import validate_session_name
 from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
@@ -174,6 +178,8 @@ class ConversationView:
         self.review_view = ReviewView(session, self._editor, self._review_updated, self.transcript.append_error)
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
         self._compact_task: asyncio.Task | None = None
+        self._name_submission: SessionManagementSubmission | None = None
+        self._name_task: asyncio.Task | None = None
         # DeepSeek 04: 模型选择等待任务的强引用 (同 PA05 理由); 菜单组件归本层拥有
         self._model_task: asyncio.Task | None = None
         # 票据 03: 思考强度等待任务的强引用与事务目标 (底栏 pending 展示事实)
@@ -240,6 +246,8 @@ class ConversationView:
     def close(self) -> None:
         """退订应用事件并停掉状态行动画 (组合层不拥有 session 关闭, aclose 归宿主路径)。"""
         self.review_view.cancel()
+        if self._name_submission is not None:
+            self._name_submission.cancel()
         self._unsubscribe()
         self.login_modal.dismiss()
         self._session.cancel_login()
@@ -291,9 +299,17 @@ class ConversationView:
                 self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
             elif update.operation == 'login':
                 self._gate.note_login_started()
+            elif update.operation == 'session':
+                self._gate.note_session_started()
             else:
                 # model: 屏障在菜单确认时已同步置位, 此处兜底; 进度由状态行表达
                 self._gate.note_model_started()
+        elif isinstance(update, SessionNameChanged):
+            if update.session_generation == self._session.session_generation:
+                self.transcript.append_system(
+                    "已保存会话名称：" + update.user_name if update.user_name is not None
+                    else "已清除会话名称。"
+                )
         elif isinstance(update, ModelChanged):
             # DeepSeek 04 (C7): 底栏从有效配置读取 (启动诊断仍是启动事实);
             # 确认条目如实记录边界, 历史/摘要/验证状态由应用保留
@@ -514,6 +530,8 @@ class ConversationView:
             return None
         if self._gate.clearing:
             return "正在清空…"
+        if self._gate.session_managing:
+            return "正在保存名称…"
         if self._gate.compacting:
             return "正在压缩…"
         if self._effort_pending is not None and self._gate.model_selecting:
@@ -586,6 +604,10 @@ class ConversationView:
     def handle_ctrl_c(self) -> None:
         """Ctrl+C: executing/cancelling 公共 cancel (幂等); reservation 窗口记录
         取消意图; 持久清空/压缩/模型选择提交中/finalizing/closing/closed 静默; 空闲清草稿。"""
+        if self._gate.session_managing:
+            if self._name_submission is not None:
+                self._name_submission.cancel()
+            return
         if self.review_view.active:
             self.review_view.cancel()
             return
@@ -603,6 +625,10 @@ class ConversationView:
     def handle_escape(self) -> None:
         """Escape: executing/cancelling 公共 cancel; reservation 窗口记录取消意图;
         持久清空/压缩/模型选择提交中与空闲均无动作; finalizing/closing/closed 静默。"""
+        if self._gate.session_managing:
+            if self._name_submission is not None:
+                self._name_submission.cancel()
+            return
         if self.review_view.active:
             self.review_view.cancel()
             return
@@ -737,6 +763,8 @@ class ConversationView:
         if command == "/status":
             self.transcript.append_information("会话信息", self._status_sections())
             return True
+        if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
+            return self._handle_name_command(text)
         if command == "/clear":
             if self._session.persistence is not None:
                 # 05: 持久清空经共享 async clear_context() 可靠提交; 命令处置时
@@ -792,6 +820,48 @@ class ConversationView:
             return self._handle_skill_command(text.lstrip())
         self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
         return False  # 未知命令提示且草稿保留
+
+    def _handle_name_command(self, text: str) -> bool:
+        if text == "/name":
+            state = self._session.persistence
+            title = ((state.user_name or self._session.session_short_title or "未命名")
+                     if state is not None else "当前会话未启用保存")
+            self.transcript.append_system(title + "\n/name <名称> · /name --clear")
+            return True
+        # 保留完整参数，校验控制字符后再 trim；只精确保留 --clear。
+        try:
+            name = validate_session_name(text[5:], trim=True)
+            self._gate.note_session_started()
+            submission = self._session.submit_session_name(None if name == "--clear" else name)
+        except (ValueError, SessionManagementError) as exc:
+            self._gate.note_session_settled()
+            self.transcript.append_error(str(exc))
+            return True
+        self._name_submission = submission
+        self._name_task = asyncio.create_task(self._run_session_name(submission))
+        self._sync_spinner()
+        return True
+
+    async def _run_session_name(self, submission: SessionManagementSubmission) -> None:
+        waiter = asyncio.create_task(submission.wait())
+        try:
+            while True:
+                try:
+                    await asyncio.shield(waiter)
+                    break
+                except asyncio.CancelledError:
+                    # 重复取消 UI 等待者也不能提前释放；事务自身取消则已经落定。
+                    if waiter.done():
+                        break
+                except Exception as exc:
+                    self.transcript.append_error(str(exc))
+                    break
+        finally:
+            self._name_submission = None
+            self._gate.note_session_settled()
+            self._sync_spinner()
+            if self._on_update is not None:
+                self._on_update()
 
     def _open_login(self) -> bool:
         self._gate.note_login_started()  # 同步屏障先于读取/任务创建。
@@ -995,6 +1065,7 @@ class ConversationView:
             # 05: 会话/保存/恢复来源事实进入状态页
             session_lines.extend([
                 f"会话 ID: {persistence.session_id}",
+                f"名称: {persistence.user_name or self._session.session_short_title or '未命名'}",
                 f"模式: {persistence.mode} · epoch {persistence.epoch_id[:8]}",
                 (
                     f"上下文代次: {persistence.context_generation} · "
