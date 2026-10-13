@@ -12,6 +12,7 @@ from typing import Literal, Protocol, runtime_checkable
 import unicodedata
 
 from cicada.core.events import ModelCallCompleted
+from cicada.core.cancel import CancelToken
 from cicada.core.messages import Message, StopReason
 from cicada.core.ports import ModelMetrics
 from cicada.models import SafeModelIdentity
@@ -31,6 +32,48 @@ MAX_JSON_DEPTH = 32                       # 嵌套 JSON 深度上限
 
 SHORT_TITLE_MAX_CHARS = 80                # 列表短标题的有界文字
 SESSION_NAME_MAX_CHARS = 80
+CATALOG_MAX_ENTRIES = 1_000
+CATALOG_MAX_DIRECTORY_ITEMS = 10_000
+CATALOG_MAX_CACHE_BYTES = 2 * 1024 * 1024
+CATALOG_MAX_ERROR_BYTES = 512
+CATALOG_TIMEOUT_S = 5.0
+CATALOG_FILE_TIMEOUT_S = 0.1
+CATALOG_QUERY_MAX_CHARS = 256
+
+
+@dataclass(frozen=True)
+class SessionCatalogEntry:
+    session_id: str
+    user_name: str | None
+    short_title: str
+    created_at: float | None
+    updated_at: float | None
+    occupied: bool
+    error: str | None = None
+
+    @property
+    def search_fields(self) -> tuple[str, ...]:
+        return tuple(value.casefold() for value in
+                     (self.user_name or "", self.short_title, self.session_id))
+
+
+@dataclass(frozen=True)
+class SessionCatalogSnapshot:
+    observation_id: str
+    directory: str
+    entries: tuple[SessionCatalogEntry, ...]
+    complete: bool
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.complete and not self.reason:
+            raise ValueError("an incomplete catalog must explain its scope")
+
+
+class SessionCatalogPort(Protocol):
+    async def observe(self, cancel: CancelToken) -> SessionCatalogSnapshot: ...
+
+    async def aclose(self) -> None: ...
 
 
 def validate_session_name(value: str | None, *, trim: bool = False) -> str | None:

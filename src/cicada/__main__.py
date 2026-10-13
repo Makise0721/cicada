@@ -336,9 +336,16 @@ async def _launch_session_selector(workspace: Path) -> str | None:
     from cicada.ui.terminal_io import PromptToolkitTerminal
 
     terminal = PromptToolkitTerminal()
-    session_id, restore_errors = await run_session_selector(
-        terminal, workspace / ".cicada" / "sessions"
-    )
+    from cicada.application import make_session_catalog_reader
+
+    directory = workspace / ".cicada" / "sessions"
+    reader = make_session_catalog_reader(directory=directory, workspace=str(workspace))
+    try:
+        session_id, restore_errors = await run_session_selector(
+            terminal, directory, observe=reader.observe,
+        )
+    finally:
+        await reader.aclose()
     if restore_errors:
         print("terminal restore errors: " + "; ".join(restore_errors), file=sys.stderr)
     return session_id

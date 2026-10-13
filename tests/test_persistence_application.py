@@ -63,6 +63,50 @@ from test_application import _repo, _script  # 复用既有工作区/剧本构�
 from tests.support.app import identity as _identity, prompt_info as _prompt_info
 
 
+async def test_session_catalog_owned_during_cancel_close_and_idle_blocks(tmp_path, monkeypatch):
+    from cicada.application import SessionManagementError
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(), session_id=None))
+    reader = session._catalog_reader
+    snapshot = await session.observe_session_catalog(CancelToken())
+    assert snapshot.entries[0].session_id == session.persistence.session_id
+    session._storage_failed = 'existing failure'
+    assert (await session.observe_session_catalog(CancelToken())).complete
+    entered, release = threading.Event(), threading.Event()
+    original = reader._observe
+
+    def blocked(stop):
+        entered.set()
+        assert release.wait(5)
+        return original(stop)
+
+    monkeypatch.setattr(reader, '_observe', blocked)
+    task = asyncio.create_task(session.observe_session_catalog(CancelToken()))
+    assert await asyncio.to_thread(entered.wait, 5)
+    try:
+        with pytest.raises(SessionManagementError) as busy:
+            session.submit_session_name('busy')
+        assert busy.value.code == 'busy'
+        with pytest.raises(SessionManagementError):
+            await session.observe_session_catalog(CancelToken())
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        close = asyncio.create_task(session.aclose())
+        await asyncio.sleep(0)
+        assert not task.done() and not close.done() and session.catalog_active
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await close
+    assert session.state == 'closed' and not session.catalog_active
+    resumed = open_session_store(directory=session._store.db_path.parent,
+                                 session_id=session.persistence.session_id, workspace=root)
+    await resumed.aclose()
+
+
 async def test_session_name_roundtrip_noop_and_metadata_only(tmp_path, monkeypatch):
     from cicada.application import SessionManagementError, SessionNameChanged
     from cicada.plugins.session_store import list_sessions

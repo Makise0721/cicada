@@ -16,6 +16,8 @@ UP = KeyPress(Keys.Up, "\x1b[A")
 DOWN = KeyPress(Keys.Down, "\x1b[B")
 RIGHT = KeyPress(Keys.Right, "\x1b[C")
 LEFT = KeyPress(Keys.Left, "\x1b[D")
+PAGE_DOWN = KeyPress(Keys.PageDown, "\x1b[6~")
+PAGE_UP = KeyPress(Keys.PageUp, "\x1b[5~")
 ESCAPE = KeyPress(Keys.Escape, "\x1b")
 ENTER = KeyPress(Keys.ControlM, "\r")
 
@@ -108,7 +110,8 @@ def test_selector_lists_and_selects(tmp_path):
 
     text = terminal.output_text
     assert "第一场会话" in text and "第二场会话" in text
-    assert "请求=1" in text
+    assert "终结事实未读取" in text
+    assert "请求=" not in text and "阻断" not in text
     for line in text.splitlines():
         assert len(re.sub(r"\x1b\[[0-9;]*m", "", line)) <= 100, "选择器输出行有界"
 
@@ -133,12 +136,12 @@ def test_selector_pagination(tmp_path):
     ids = [asyncio.run(_make_session(directory, title=f"会话 {index}")) for index in range(3)]
 
     terminal = FakeTerminal(columns=60, rows=12)
-    session_id, _ = _run_selector(terminal, directory, keys=[RIGHT, ENTER], limit=2)
+    session_id, _ = _run_selector(terminal, directory, keys=[PAGE_DOWN, ENTER], limit=2)
     assert "第 2/2 页" in terminal.output_text
     assert session_id == ids[0], "第二页含最旧会话 (按最近提交降序)"
 
     terminal = FakeTerminal(columns=60, rows=12)
-    session_id, _ = _run_selector(terminal, directory, keys=[RIGHT, LEFT, ENTER], limit=2)
+    session_id, _ = _run_selector(terminal, directory, keys=[PAGE_DOWN, PAGE_UP, ENTER], limit=2)
     assert session_id == ids[2], "翻回第一页后选定最近会话"
 
 
@@ -163,3 +166,52 @@ def test_selector_bad_archive_enter_refused_until_escape(tmp_path):
 
     session_id, errors = asyncio.run(drive())
     assert session_id is None and errors == []
+
+
+async def test_selector_refresh_rejects_late_result_and_drains_on_cancel(tmp_path):
+    from cicada.persistence.contracts import SessionCatalogEntry, SessionCatalogSnapshot
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    second = asyncio.Event()
+    calls = 0
+
+    async def observe(cancel):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+            # 故意模拟 reader 返回迟到成功；UI 必须失效它。
+            return SessionCatalogSnapshot('old', str(tmp_path), (
+                SessionCatalogEntry('old-id', '迟到旧观察', '', None, None, False),), True)
+        second.set()
+        await cancel.wait()
+        await release.wait()
+        raise asyncio.CancelledError
+
+    terminal = FakeTerminal()
+    task = asyncio.create_task(run_session_selector(terminal, tmp_path, observe=observe))
+    await entered.wait()
+    terminal.emit([KeyPress(Keys.ControlR, '\x12')])
+    terminal.emit([KeyPress(Keys.ControlR, '\x12')])
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    await second.wait()
+    assert calls == 2 and '迟到旧观察' not in terminal.output_text
+    release.clear()
+    terminal.emit([ESCAPE])
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done() and not terminal.stopped
+    release.set()
+    import pytest
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    count = len(terminal.written)
+    terminal.emit([ENTER])
+    terminal.set_size(20, 4)
+    assert len(terminal.written) == count and terminal.stopped

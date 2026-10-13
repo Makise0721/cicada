@@ -77,6 +77,8 @@ from cicada.persistence.contracts import (
     RequestPersistenceFacts,
     RestoredRequest,
     SessionStorePort,
+    SessionCatalogPort,
+    SessionCatalogSnapshot,
     StorageUnavailableError,
     StorageWriteError,
     StoredIdentity,
@@ -94,7 +96,10 @@ from cicada.run_policy import (
     RunPolicy,
     verification_policy,
 )
-from cicada.plugins.session_store import SQLiteSessionStore, open_session_store, session_store_plugin
+from cicada.plugins.session_store import (
+    SESSION_CATALOG_CAPABILITY, SessionCatalogReader, SQLiteSessionStore,
+    open_session_store, session_store_plugin,
+)
 from cicada.file_completion import FileCompletionResult
 from cicada.plugins.coding.file_completion import (
     FILE_COMPLETION_CAPABILITY,
@@ -153,6 +158,11 @@ CHECK_TOOL_CAPABILITIES = TOOL_CAPABILITIES + ("tool.check",)
 REQUEST_FINALIZE_SUPERVISION_S = 15.0
 CLOSE_SUPERVISION_S = 15.0
 _UNDEAD_GRACE_S = 2.0
+
+
+def make_session_catalog_reader(*, directory: Path, workspace: str | None = None) -> SessionCatalogPort:
+    """组合层创建 reader；None 仅供旧任意目录启动调用兼容。"""
+    return SessionCatalogReader(directory=directory, workspace=workspace)
 
 
 def default_definitions(
@@ -560,6 +570,7 @@ class ApplicationSession:
         login_store_factory: Callable[[], UserConfigStore] | None = None,
         login_environment: Callable[[], str | None] | None = None,
         review_reader: ChangeReview | None = None,
+        catalog_reader: SessionCatalogPort | None = None,
     ) -> None:
         self._app = app
         self._config = config
@@ -570,6 +581,9 @@ class ApplicationSession:
         self._model_route = model_route
         self._summary_route = summary_route
         self._review_reader = review_reader
+        self._catalog_reader = catalog_reader
+        self._catalog_task: asyncio.Task | None = None
+        self._catalog_token: CancelToken | None = None
         self._review_active = False
         self._review_id: str | None = None
         self._review_snapshot: ReviewSnapshot | None = None
@@ -669,6 +683,43 @@ class ApplicationSession:
     def review_active(self) -> bool:
         return self._review_active
 
+    @property
+    def catalog_active(self) -> bool:
+        return self._catalog_task is not None
+
+    async def observe_session_catalog(self, cancel: CancelToken) -> SessionCatalogSnapshot:
+        if self._closing or self._closed:
+            raise SessionManagementError("closing", "应用正在关闭。")
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+        if (self._state != "idle" or self._begin_in_flight or self._clearing or self._compacting
+                or self._model_in_flight or self._login_in_flight or self._session_in_flight or self.catalog_active
+                or self.review_active
+                or any(task is not None and not task.done() for task in producers)):
+            raise SessionManagementError("busy", "会话目录需要空闲会话。")
+        if self._catalog_reader is None:
+            raise SessionManagementError("unavailable", "当前组合没有会话目录能力。")
+        cancel.throw_if_cancelled()
+        task = asyncio.create_task(self._catalog_reader.observe(cancel))
+        self._catalog_task, self._catalog_token = task, cancel
+        cancelled = False
+        try:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    cancel.cancel()
+            if cancelled or cancel.cancelled or self._closing:
+                if not task.cancelled():
+                    task.exception()
+                raise asyncio.CancelledError
+            return task.result()
+        finally:
+            if self._catalog_task is task:
+                self._catalog_task = None
+                self._catalog_token = None
+
     async def complete_files(self, query: str, cancel: CancelToken) -> FileCompletionResult:
         """只读文件候选出口 (C3): 不创建模型消息、ToolCall/ToolResult 或读取依据。
 
@@ -688,7 +739,7 @@ class ApplicationSession:
                      self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
         if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
-                or self._session_in_flight
+                or self._session_in_flight or self.catalog_active
                 or any(task is not None and not task.done() for task in producers)):
             raise ReviewError("busy", "审阅需要空闲会话，等当前操作实际结束后再打开。")
         if self._review_active and self._review_id is None:
@@ -935,7 +986,7 @@ class ApplicationSession:
             raise SessionManagementError("unavailable", "当前会话未启用保存，无法持久命名。")
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
                      self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
-        if (self._state != "idle" or self._session_in_flight or self._begin_in_flight
+        if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight
                 or self._login_in_flight or self.review_active
                 or any(task is not None and not task.done() for task in producers)):
@@ -1133,7 +1184,7 @@ class ApplicationSession:
             raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
             raise ModelSelectionError(f"{blocked} requires an idle, open session")
-        if self._session_in_flight or self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
+        if self._session_in_flight or self.catalog_active or self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
             raise ModelSelectionError("another operation is in progress")
         if self._view_only_reason or self._storage_failed or self._process_uncertain:
             raise ModelSelectionError(f"{blocked} is blocked by the session state")
@@ -1352,7 +1403,7 @@ class ApplicationSession:
             self._model_configuration = binding.model
 
     async def execute(self, prompt: str) -> RequestOutcome:
-        if self._session_in_flight:
+        if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; execute is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; execute is refused")
@@ -1783,7 +1834,7 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
-        if self._session_in_flight:
+        if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; clear is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; clear is refused")
@@ -1809,7 +1860,7 @@ class ApplicationSession:
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
         清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
-        if self._session_in_flight:
+        if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; clear is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; clear is refused")
@@ -1889,7 +1940,7 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
-        if self._session_in_flight:
+        if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; compact is refused")
         if self.review_active:
             raise RuntimeError("review is in progress; compact is refused")
@@ -2217,7 +2268,7 @@ class ApplicationSession:
         return lines
 
     def _check_login_admission(self) -> None:
-        if (self._session_in_flight or self.review_active or self._closing or self._closed or self._state != 'idle' or
+        if (self._session_in_flight or self.catalog_active or self.review_active or self._closing or self._closed or self._state != 'idle' or
                 self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
             raise UserConfigError('login', 'operation-in-progress')
 
@@ -2408,6 +2459,8 @@ class ApplicationSession:
         """幂等关闭; 重复调用共享同一次关闭任务和结果, 不重复 stop."""
         if self._close_task is None:
             self._closing = True
+            if self._catalog_token is not None:
+                self._catalog_token.cancel()
             if self._session_token is not None:
                 self._session_token.cancel()
             self.cancel_review()
@@ -2424,6 +2477,9 @@ class ApplicationSession:
         deadline = time.monotonic() + CLOSE_SUPERVISION_S
         self._close_deadline = deadline
         self._close_latch.set()
+        if self._catalog_task is not None:
+            # 目录 worker 的实际 finally 先于 runtime/store 清理，无监督替代。
+            await asyncio.gather(self._catalog_task, return_exceptions=True)
         if self._login_task is not None and not self._login_task.done():
             # 不以监督超时代替文件 worker 的真实终结，不提前关闭资源。
             await asyncio.shield(self._login_task)
@@ -2916,8 +2972,12 @@ async def open_application(
         tool_capabilities = tool_capabilities + ("tool.load_skill",)
 
     definitions: list[PluginDefinition] = []
+    catalog = None
     if store is not None:
-        definitions.append(session_store_plugin(store))
+        catalog = make_session_catalog_reader(
+            directory=Path(config.workspace) / ".cicada" / "sessions", workspace=str(config.workspace),
+        )
+        definitions.append(session_store_plugin(store, catalog))
         definitions.extend(_bind_store_last_cleanup(
             default_definitions(config.workspace, config.model_plugin, plan, skills=config.skills)
         ))
@@ -3041,6 +3101,7 @@ async def open_application(
                 context_projection=context_projection,
                 login_store_factory=login_store_factory, login_environment=login_environment,
                 review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
+                catalog_reader=app.runtime.capability(SESSION_CATALOG_CAPABILITY),
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
