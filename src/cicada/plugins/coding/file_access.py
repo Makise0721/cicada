@@ -6,6 +6,12 @@
   区分 not_written / committed / unknown; 协程取消不掩盖已写事实;
   write 对不存在的目标以 MoveFileExW flags=0 创建, 同名竞争不覆盖;
 - 版本依据只在当前进程内有效, 不接受模型/ToolResult/存储输入, 不持久化.
+
+请求还原点触点 (request-snapshot-revert C1/C2, 只增两处):
+- 可选捕获汇 (Workspace.capture_sink, 默认 None): 发布前捕获 before/after 字节并落盘,
+  失败即拒绝本次修改 (not_written/restore_capture_failed), 不静默产生不可还原改动;
+- 按路径失效读取依据入口 (invalidate_read_basis): 还原写回后由应用显式失效, 不绕过版本防御.
+两处都不改本模块的公开语义: 无捕获汇时行为与既有逐位一致.
 """
 
 from __future__ import annotations
@@ -18,9 +24,10 @@ import stat
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, Protocol, runtime_checkable
 
 from cicada.plugins.coding import file_commit_windows as native
 from cicada.plugins.coding.workspace import PathNotAllowedError, Workspace
@@ -34,6 +41,37 @@ REGISTRY_LIMIT = 4096
 STATE_NOT_WRITTEN = "not_written"
 STATE_COMMITTED = "committed"
 STATE_UNKNOWN = "unknown"
+
+# C4: 捕获失败是本次修改的原因, 不伪装成版本冲突/发布失败
+REASON_RESTORE_CAPTURE_FAILED = "restore_capture_failed"
+
+
+@dataclass(frozen=True)
+class CaptureTicket:
+    """一次捕获的回执: 判据是内容哈希与聚合身份, 不携带正文."""
+
+    point_id: str
+    relative_path: str
+    op: str  # create | modify
+    before_sha256: str | None
+    after_sha256: str | None
+    size_bytes: int
+
+
+@runtime_checkable
+class CaptureSink(Protocol):
+    """可选捕获汇 (Workspace.capture_sink, 默认 None); 声明发布路径实际调用的两个方法.
+
+    两个方法都是同步阻塞调用, 在 FileAccess 队列内、发布前/发布后执行。
+    capture 异常拒绝发布；settle 异常保留预行 unknown，不改写已发生的发布事实。
+    """
+
+    def capture(self, *, path: str, op: str, before: bytes | None,
+                after: bytes) -> CaptureTicket: ...
+
+    def settle(self, ticket: CaptureTicket, *, commit_state: str,
+               winerror: int | None = None) -> None: ...
+
 
 # 登记失效 (需重读) 的结果; not_written 的可预期拒绝不动登记
 _INVALIDATING_REASONS = frozenset({"version_conflict", "conflict_at_commit", "current_unverified"})
@@ -131,6 +169,22 @@ class FileAccess:
     def remember_read(self, snapshot: ReadSnapshot) -> None:
         """成功生成 read 结果后登记版本依据 (调用前后不得插入 await)."""
         self._remember(snapshot.stamp)
+
+    def invalidate_read_basis(self, raw_paths: Iterable[str]) -> tuple[str, ...]:
+        """按路径失效读取版本依据 (还原写回后调用); 返回实际失效的 canonical 路径.
+
+        下次编辑必须重新 read, 不绕过既有版本防御; 只有登记项被移除, 不影响其他路径.
+        路径按 canonical 小写 key 归一, 与本模块写路径同一口径。
+        """
+        invalidated: list[str] = []
+        for raw in raw_paths:
+            try:
+                key = str(self._workspace.resolve_for_write(raw)).casefold()
+            except PathNotAllowedError:
+                key = str(self._workspace.resolve(raw)).casefold()
+            if self._registry.pop(key, None) is not None:
+                invalidated.append(key)
+        return tuple(invalidated)
 
     def _remember(self, stamp: FileStamp) -> None:
         self._registry[stamp.key] = stamp
@@ -318,10 +372,14 @@ class FileAccess:
                         caller_cancelled=True,
                     )
                 staging = self._workspace.root / ".cicada" / "mutations" / uuid.uuid4().hex
+                ticket, refusal = await asyncio.to_thread(
+                    self._capture_before, target, "create", None, new_bytes)
+                if refusal is not None:
+                    return refusal
                 outcome = await asyncio.to_thread(
                     self._publish_creation, staging, target, original, new_bytes, stop
                 )
-                return self._settle(outcome, key)
+                return await self._settle(outcome, key, ticket)
             return _outcome(STATE_NOT_WRITTEN, "not_found", str(target),
                             f"file not found: {target}")
         except OSError as exc:
@@ -382,13 +440,59 @@ class FileAccess:
             )
 
         staging = self._workspace.root / ".cicada" / "mutations" / uuid.uuid4().hex
+        ticket, refusal = await asyncio.to_thread(
+            self._capture_before, target, "modify", snapshot.data, new_bytes)
+        if refusal is not None:
+            return refusal
         outcome = await asyncio.to_thread(
             self._publish_replacement, staging, target, original, current, new_bytes, stop
         )
-        return self._settle(outcome, key)
+        return await self._settle(outcome, key, ticket)
 
-    def _settle(self, outcome: MutationOutcome, key: str) -> MutationOutcome:
-        """登记策略: 完整核对相符才更新; 冲突/未知/当前不符失效."""
+    # ---- 还原点捕获 (C2: 队列内、发布前; 无捕获汇时零行为差异) ----
+
+    def _capture_before(
+        self, target: Path, op: str, before: bytes | None, after: bytes
+    ) -> tuple[CaptureTicket | None, MutationOutcome | None]:
+        """发布前把 before/after 字节交给捕获汇; 失败拒绝本次修改 (fail-closed).
+
+        失败原因只记 restore_capture_failed, 不伪装版本冲突或发布失败; 发布尚未
+        开始, 因此本次 not_written 是事实而非推断 (目标文件未被触碰)。
+        """
+        sink = self._workspace.capture_sink
+        if sink is None:
+            return None, None
+        try:
+            try:
+                relative = str(target.relative_to(self._workspace.root))
+            except ValueError:
+                relative = str(target)
+            ticket = sink.capture(path=relative, op=op, before=before, after=after)
+        except Exception as exc:
+            # 捕获汇缺失/上下文未建立/任何 IO 失败: 一律 fail-closed, 不静默降级
+            return None, _outcome(
+                STATE_NOT_WRITTEN, REASON_RESTORE_CAPTURE_FAILED, str(target),
+                f"restore capture failed before publication; the file was not modified: {exc}",
+                before_stamp=None,
+            )
+        return ticket, None
+
+    async def _settle(self, outcome: MutationOutcome, key: str,
+                      ticket: CaptureTicket | None = None) -> MutationOutcome:
+        """登记策略: 完整核对相符才更新; 冲突/未知/当前不符失效.
+
+        捕获汇存在时先追加结算行 (发布已落定); 结算本身失败不改写提交事实——
+        提交是否发生不取决于索引写入, 故只保留预行 (unknown), 不假报其它状态。
+        """
+        if ticket is not None:
+            sink = self._workspace.capture_sink
+            if sink is not None:
+                try:
+                    await asyncio.to_thread(
+                        sink.settle, ticket, commit_state=outcome.state,
+                        winerror=outcome.winerror)
+                except Exception:
+                    pass  # 预行已如实记录 unknown; 提交事实由 mutation 结果单独承担
         verified = (
             outcome.state == STATE_COMMITTED
             and outcome.reason == "applied"

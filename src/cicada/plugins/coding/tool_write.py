@@ -104,6 +104,12 @@ class WriteTool:
                 )
             elif outcome.reason == "cancelled_before_commit":
                 parts.append("the file was not modified; retry after the cancellation")
+            elif outcome.reason == "restore_capture_failed":
+                parts.append(
+                    "the file was not created or modified; the restore point could not be "
+                    "captured (check the workspace disk, or disable restore capture to "
+                    "write anyway)"
+                )
             return self._result(ctx, "\n".join(parts), details, is_error=True)
 
         if created:

@@ -201,6 +201,11 @@ class EditTool:
                 parts.append(f"read {display} again, then edit with fresh content")
             elif outcome.reason == "cancelled_before_commit":
                 parts.append("the file was not modified; retry after the cancellation")
+            elif outcome.reason == "restore_capture_failed":
+                parts.append(
+                    "the file was not modified; the restore point could not be captured "
+                    "(check the workspace disk, or disable restore capture to edit anyway)"
+                )
             content = "\n".join(parts)
             return self._error_result(ctx, content, details)
 

@@ -115,6 +115,11 @@ from cicada.review import (
     ReviewCheckDetails, ReviewCheckRow, ReviewError, ReviewPreview, ReviewSnapshot,
 )
 from cicada.plugins.coding.process import process_plugin
+from cicada.plugins.coding.restore_store import (
+    RESTORE_CAPABILITY,
+    RestoreStore,
+    restore_plugin,
+)
 from cicada.plugins.coding.tool_check import check_plugin
 from cicada.plugins.coding.tool_edit import edit_plugin
 from cicada.plugins.coding.tool_glob import glob_plugin
@@ -169,12 +174,13 @@ def make_session_catalog_reader(*, directory: Path, workspace: str | None = None
 
 def default_definitions(
     workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None,
-    *, skills: SkillCatalogSnapshot | None = None
+    *, skills: SkillCatalogSnapshot | None = None, restore: bool = False,
 ) -> list[PluginDefinition]:
     """内置 Coding 能力 + 模型插件 (+ 检查模式验证服务 + Skills 能力) 的启动名单.
 
     skills 为启用 Skills 的冻结快照: 追加目录能力与 load_skill 工具插件;
-    None 时名单与未启用逐位一致。
+    None 时名单与未启用逐位一致。restore 为真时追加还原点引擎 (C2: 仅持久会话
+    且配置开启捕获的组合才装配), 为假时不安装捕获汇, edit/write 行为逐位不变。
     """
     definitions: list[PluginDefinition] = [
         workspace_plugin(workspace),
@@ -196,6 +202,8 @@ def default_definitions(
         if not isinstance(skills, SkillCatalogSnapshot):
             raise ValueError("skills must be a SkillCatalogSnapshot or None")
         definitions.append(skills_plugin(skills))
+    if restore:
+        definitions.append(restore_plugin())
     definitions.append(model_plugin)
     return definitions
 
@@ -248,6 +256,9 @@ class ApplicationConfig:
     budget: BudgetConfig | None = None
     # 02 尾随扩展: 启用 Skills 的冻结快照; None = 旧行为逐位保持
     skills: SkillCatalogSnapshot | None = None
+    # 请求级快照与撤回 01 (C2): restore_capture 默认开启; 关闭时不安装捕获汇,
+    # 编辑照常工作且不产生还原点 (受限环境出口)
+    restore_capture: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -258,6 +269,8 @@ class ApplicationConfig:
             raise ValueError("max_turns must be a positive integer")
         if self.plan is not None and not isinstance(self.plan, VerificationPlan):
             raise ValueError("plan must be a VerificationPlan or None")
+        if not isinstance(self.restore_capture, bool):
+            raise ValueError("restore_capture must be a bool")
         if self.persistence is not None:
             if not isinstance(self.persistence, PersistenceConfig):
                 raise ValueError("persistence must be a PersistenceConfig or None")
@@ -585,6 +598,8 @@ class ApplicationSession:
         catalog_reader: SessionCatalogPort | None = None,
         new_store_factory: Callable[[], SessionStorePort] | None = None,
         resume_store_factory: Callable[[str], SessionStorePort] | None = None,
+        restore_store: RestoreStore | None = None,
+        restore_warnings: tuple[str, ...] = (),
     ) -> None:
         self._app = app
         self._config = config
@@ -635,6 +650,11 @@ class ApplicationSession:
         self._store = store
         self._new_store_factory = new_store_factory
         self._resume_store_factory = resume_store_factory
+        # 请求级快照与撤回 01: 捕获汇 (仅持久会话 + restore_capture 开启时非 None);
+        # None 时 begin/note_commit/end 三处接线全部短路, 行为与既有逐位一致
+        self._restore_store = restore_store
+        # C3: 启动机会式清理的告警事实 (只读呈现; 清理失败不阻断启动)
+        self._restore_warnings: tuple[str, ...] = tuple(restore_warnings)
         self._session_cleanup_failed: str | None = None
         self._request_store: SessionStorePort | None = None
         self._request_epoch: str | None = None
@@ -1009,6 +1029,11 @@ class ApplicationSession:
     @property
     def session_generation(self) -> int:
         return self._session_generation
+
+    @property
+    def restore_warnings(self) -> tuple[str, ...]:
+        """启动机会式清理的告警事实 (C3); 无告警/未启用捕获时为空."""
+        return self._restore_warnings
 
     @property
     def session_management_active(self) -> bool:
@@ -1748,7 +1773,12 @@ class ApplicationSession:
         # token 已在接缝处建立 (03): 覆盖预估/自动压缩/begin/全部轮次
         self._active_done = loop.create_future()
         self._notify(RequestPhaseChanged(None, "executing"))
+        restore_opened = False
         try:
+            # 请求级快照与撤回 01 (C2): 捕获上下文在 begin 成功后建立 (request_id、
+            # epoch_id、session_id); 建立失败即拒绝本次请求并诊断, 不静默降级为
+            # 无捕获请求, 也经同一 closing 路径收尾。非持久/关闭捕获时零副作用。
+            restore_opened = self._open_restore_capture()
             result = await self._app.agent.run(prompt, token, history=tuple(self._history))
             # 内核结束 != 应用空闲: 显式进入收尾状态, 完成前不接受新请求 (T07);
             # closed 是终态, close 监督超时后的迟到完成不得改写它 (02-R-F1)
@@ -1757,38 +1787,52 @@ class ApplicationSession:
             outcome = await self._finalize_request(result)
         except BaseException:
             # 异常路径也不得把应用留在"可执行"状态: 内核/UI 异常一律经关闭路径处理
+            await self._close_restore_capture(restore_opened, interrupted=True)
             if self._state != "closed":
                 self._state = "closing"
                 self._closing = True
-            raise
-        finally:
             if self._active_done is not None and not self._active_done.done():
                 self._active_done.set_result(None)
+            raise
         # 先更新隔离的 state/history, 再通知订阅者; 应用把后缀追加一次
-        if self._store is not None:
-            # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1。
-            # 提交 completion 由协调器持有: 外层重复取消不取消事务、不当作未发生
-            commit_task = asyncio.ensure_future(self._commit_request(result, outcome))
-            while True:
-                try:
-                    persisted = await asyncio.shield(commit_task)
-                    break
-                except asyncio.CancelledError:
-                    continue
-            outcome = replace(
-                outcome,
-                persistence=persisted,
-                exit_code=1 if not persisted.saved else outcome.exit_code,
-            )
-            if persisted.saved:
-                # 提交成功: 当前代次新增一个完整请求区间 (压缩切点/覆盖范围取数, D4)
-                self._committed_spans.append(
-                    (
-                        persisted.seq or 0,
-                        len(self._history),
-                        len(self._history) + len(result.messages),
-                    )
+        # 捕获上下文在 commit 收尾后清除 (C2): note_commit 已在上一步取到真实 seq;
+        # 提交未成功 (落盘故障) 时按中断如实标注来源, 已捕获部分仍可还原。放 finally:
+        # 提交路径自身抛错也不能让上下文跨请求残留 (残留会让下一请求被误拒)。
+        interrupted = True
+        completion_failed = True
+        try:
+            if self._store is not None:
+                # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1。
+                # 提交 completion 由协调器持有: 外层重复取消不取消事务、不当作未发生
+                commit_task = asyncio.ensure_future(self._commit_request(result, outcome))
+                while True:
+                    try:
+                        persisted = await asyncio.shield(commit_task)
+                        break
+                    except asyncio.CancelledError:
+                        continue
+                outcome = replace(
+                    outcome,
+                    persistence=persisted,
+                    exit_code=1 if not persisted.saved else outcome.exit_code,
                 )
+                interrupted = (
+                    outcome.persistence is not None and not outcome.persistence.saved
+                )
+                if persisted.saved:
+                    # 提交成功: 当前代次新增一个完整请求区间 (压缩切点/覆盖范围取数, D4)
+                    self._committed_spans.append(
+                        (
+                            persisted.seq or 0,
+                            len(self._history),
+                            len(self._history) + len(result.messages),
+                        )
+                    )
+            completion_failed = False
+        finally:
+            await self._close_restore_capture(restore_opened, interrupted=interrupted)
+            if completion_failed and self._active_done is not None and not self._active_done.done():
+                self._active_done.set_result(None)
         self._history.extend(isolate_message(m) for m in result.messages)
         if outcome.view is not None and outcome.view.process_uncertain:
             self._process_uncertain = True
@@ -1804,7 +1848,53 @@ class ApplicationSession:
         # 不从 CheckProjection/_last_completed 反取权威, 也不从 restored_requests 恢复
         self._last_outcome = _isolate_outcome(outcome)
         self._notify(RequestCompleted(outcome))
+        # 请求拥有持久提交、seq补记和捕获收尾的真实IO；内核结束不释放此信号。
+        if self._active_done is not None and not self._active_done.done():
+            self._active_done.set_result(None)
         return outcome
+
+    def _open_restore_capture(self) -> bool:
+        """begin 成功后建立本请求的捕获上下文 (C2); 失败即拒绝请求并诊断.
+
+        只有持久会话 + 捕获开启时才存在捕获汇; 未安装时本方法零副作用并返回 False,
+        edit/write 行为与既有逐位一致。上下文建立失败属编程错误 (未建立), 不静默
+        降级为无捕获请求, 也不清除他人上下文。返回是否由本次调用建立。
+        """
+        store = self._restore_store
+        if store is None:
+            return False
+        session_id = self._store.session_id if self._store is not None else None
+        try:
+            store.begin_request(self._request_id or "", self._request_epoch or "",
+                                session_id or "")
+        except Exception as exc:
+            raise RuntimeError(
+                "cannot open the restore capture context for this request; "
+                f"the request was refused before any model call: {exc}"
+            ) from exc
+        return True
+
+    async def _close_restore_capture(self, opened: bool, interrupted: bool = False) -> None:
+        """清除本次请求建立的捕获上下文 (幂等); interrupted 时如实标注该点来源.
+
+        未由本次请求建立 (opened=False) 时不动上下文, 避免误清他人状态; 清除失败
+        不阻断请求收尾: 捕获上下文只是编辑准入的守卫, 会话提交事实与规范历史不
+        取决于它。
+        """
+        if not opened or self._restore_store is None:
+            return
+        task = asyncio.create_task(asyncio.to_thread(
+            self._restore_store.end_request, interrupted=interrupted))
+        try:
+            while True:
+                try:
+                    await asyncio.shield(task)
+                    break
+                except asyncio.CancelledError:
+                    continue  # 实际 IO 落定后才清除请求归属并允许关闭
+        except Exception:
+            pass
+        self._restore_warnings += self._restore_store.take_warnings()
 
     def _request_tool_specs(self) -> tuple[ToolSpec, ...]:
         """当前组装解析后的实际工具声明 (与 _tool_fingerprint 同一取数面).
@@ -2027,6 +2117,13 @@ class ApplicationSession:
         self._saved_request_count += 1
         self._last_committed_seq = seq
         self._persisted_receipt_ids.update(receipt.receipt_id for receipt in receipts)
+        if self._restore_store is not None:
+            # C2 取值裁决: commit 取得真实 seq 后补记 (幂等元数据更新, 不重写 entries);
+            # 补记失败不改写会话提交事实, 点保持 seq=null 如实呈现
+            try:
+                await asyncio.to_thread(self._restore_store.note_commit, seq)
+            except Exception:
+                pass
         return RequestPersistenceFacts(request_id=self._request_id, saved=True, seq=seq)
 
     def _new_receipts(self, outcome: RequestOutcome) -> tuple[StoredReceipt, ...]:
@@ -3061,6 +3158,32 @@ def _bind_store_last_cleanup(
     ]
 
 
+async def _open_restore_store(app: App, enabled: bool) -> tuple[RestoreStore | None, tuple[str, ...]]:
+    """取得本会话的还原点引擎并做启动机会式清理 (C3); 未装配时返回 (None, ()).
+
+    清理失败只作为告警事实返回 (不阻断启动, 不换方式绕过); 能力缺失说明装配与
+    config.restore_capture 不一致, 属组装错误, fail-loud 而不是静默禁用捕获。
+    """
+    if not enabled:
+        return None, ()
+    store = app.runtime.capability(RESTORE_CAPABILITY)
+    if not isinstance(store, RestoreStore):
+        raise ApplicationOpenError(
+            f"capability {RESTORE_CAPABILITY!r} did not provide the restore store"
+        )
+    worker = asyncio.create_task(asyncio.to_thread(store.maintenance))
+    cancelled = False
+    while True:
+        try:
+            warnings = await asyncio.shield(worker)
+            break
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError()
+    return store, warnings
+
+
 def _open_persistent_store(
     config: ApplicationConfig,
 ) -> tuple[SQLiteSessionStore, RecoverySnapshot]:
@@ -3239,17 +3362,21 @@ async def open_application(
 
     definitions: list[PluginDefinition] = []
     catalog = None
+    # C2: 仅持久会话 + 配置开启捕获才装配还原点引擎; 关闭或单次模式不安装捕获汇
+    restore_enabled = store is not None and config.restore_capture
     if store is not None:
         catalog = make_session_catalog_reader(
             directory=Path(config.workspace) / ".cicada" / "sessions", workspace=str(config.workspace),
         )
         definitions.append(session_store_plugin(store, catalog))
         definitions.extend(_bind_store_last_cleanup(
-            default_definitions(config.workspace, config.model_plugin, plan, skills=config.skills)
+            default_definitions(config.workspace, config.model_plugin, plan,
+                                skills=config.skills, restore=restore_enabled)
         ))
     else:
         definitions.extend(
-            default_definitions(config.workspace, config.model_plugin, plan, skills=config.skills)
+            default_definitions(config.workspace, config.model_plugin, plan,
+                                skills=config.skills, restore=restore_enabled)
         )
 
     if store is not None:
@@ -3293,6 +3420,7 @@ async def open_application(
     if store is not None and snapshot is not None and config.persistence is not None:
         # 指纹核对/启动代次/会话构造的每条失败路径都必须释放 app (store 随 runtime 清理)
         try:
+            restore_store, restore_warnings = await _open_restore_store(app, restore_enabled)
             fingerprint = _tool_fingerprint(app)
             saved_identity = snapshot.identity
             adopt = config.persistence.adopt_current_config
@@ -3374,6 +3502,8 @@ async def open_application(
                 resume_store_factory=lambda session_id: open_session_store(
                     directory=Path(config.workspace) / ".cicada" / "sessions",
                     session_id=session_id, workspace=config.workspace),
+                restore_store=restore_store,
+                restore_warnings=restore_warnings,
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为

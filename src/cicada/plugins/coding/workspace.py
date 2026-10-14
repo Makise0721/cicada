@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeVar
 
 if TYPE_CHECKING:
-    from cicada.plugins.coding.file_access import FileAccess
+    from cicada.plugins.coding.file_access import CaptureSink, FileAccess
     from cicada.runtime.plugin import PluginContext
 
 from cicada.runtime.plugin import PluginDefinition
@@ -49,6 +49,8 @@ class Workspace:
     _output_seq: "itertools.count[int]" = field(default_factory=itertools.count, repr=False, compare=False)
     files: "FileAccess" = field(init=False, repr=False, compare=False)
     """进程内文件访问 Module: 版本依据/队列/暂存/发布 (file_access.py)."""
+    _capture_sink: "CaptureSink | None" = field(default=None, repr=False, compare=False)
+    """可选还原点捕获汇 (request-snapshot-revert C1); 默认 None = 行为与既有一致."""
 
     def __post_init__(self) -> None:
         # 延迟导入打破 workspace -> file_access -> workspace 的模块环
@@ -63,6 +65,17 @@ class Workspace:
         output_dir = canonical_root / ".cicada" / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
         return cls(root=canonical_root, output_dir=output_dir)
+
+    @property
+    def capture_sink(self) -> "CaptureSink | None":
+        """当前捕获汇; None 表示本次组合不捕获还原点 (C2)."""
+        return self._capture_sink
+
+    def install_restore_capture(self, sink: "CaptureSink") -> None:
+        """由 coding.restore 插件在启动时安装一次性捕获汇 (不可替换)."""
+        if self._capture_sink is not None and self._capture_sink is not sink:
+            raise WorkspaceError("a restore capture sink is already installed")
+        self._capture_sink = sink
 
     def resolve(self, raw: str) -> Path:
         """解析合法 Windows 路径: ~ 展开、相对 root、规范化绝对路径; 不做存在性假设."""

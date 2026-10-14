@@ -295,6 +295,136 @@ def _plain_config(root: Path, script: list):
     )
 
 
+@pytest.mark.parametrize("capture", [True, False])
+async def test_restore_capture_owned_by_persistent_request_and_session_route(tmp_path, capture):
+    """生产应用接线：配置开关、请求seq、A→B→A归属、Git隔离与schema保持。"""
+    root = _repo(tmp_path)
+    writes = _script(*[
+        entry for name in ("a", "b", "a2") for entry in (
+            {"tool_calls": [{"id": name, "name": "write", "arguments": {
+                "path": f"{name}.txt", "content": name}}]},
+            {"text": "done", "stop": True},
+        )
+    ])
+    session = await open_application(dc_replace(
+        _config(root, writes, session_id=None), restore_capture=capture))
+    try:
+        a = session.persistence.session_id
+        first = await session.execute("A first")
+        epoch_a = session.persistence.epoch_id
+        await session.submit_new_session().wait()
+        b = session.persistence.session_id
+        second = await session.execute("B first")
+        await session.submit_resume_session(a).wait()
+        third = await session.execute("A second")
+        assert first.persistence.saved and second.persistence.saved and third.persistence.saved
+        if capture:
+            from cicada.plugins.coding.restore_store import RestoreStore
+            store = RestoreStore(root)
+            ap, bp = store.read_points(a), store.read_points(b)
+            assert [p.seq for p in ap] == [third.persistence.seq, first.persistence.seq]
+            assert [p.seq for p in bp] == [second.persistence.seq]
+            assert ap[1].epoch_id == epoch_a and ap[0].epoch_id != epoch_a
+            assert [p.entries[0].path for p in ap] == ["a2.txt", "a.txt"]
+            assert bp[0].entries[0].path == "b.txt"
+            assert all(p.source == "committed" for p in (*ap, *bp))
+            assert session._restore_store.active_point_id is None
+            from tests.support.app import git
+            assert git(root, "check-ignore", ".cicada/restore/blobs/test").strip()
+            inventory = session._app.runtime.capability("coding.inventory")
+            from cicada.core.cancel import CancelToken
+            assert all(".cicada" not in str(e.relative_path) for e in
+                       (await inventory.list_files(CancelToken())).files)
+        else:
+            assert session._restore_store is None and not (root / ".cicada/restore").exists()
+        with sqlite3.connect(session._store.capture().db_path) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    finally:
+        await session.aclose()
+
+
+async def test_cancel_during_restore_capture_waits_for_owned_worker(tmp_path, monkeypatch):
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(
+        {"tool_calls": [{"id": "write", "name": "write", "arguments": {
+            "path": "cancelled.txt", "content": "bytes"}}]},
+        {"text": "must not run", "stop": True},
+    ), session_id=None))
+    store = session._restore_store
+    entered, release = threading.Event(), threading.Event()
+    original = store.capture
+
+    def blocked(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        return original(**kwargs)
+
+    monkeypatch.setattr(store, "capture", blocked)
+    task = asyncio.create_task(session.execute("capture cancellation"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        assert not task.done() and store._context is not None
+    finally:
+        release.set()
+    try:
+        outcome = await asyncio.wait_for(task, 10)
+        assert outcome.result.stop_reason == "aborted" and outcome.persistence.saved
+        mutation = next(m.result.details["mutation"] for m in outcome.result.messages
+                        if isinstance(m, ToolResultMessage))
+        assert mutation["state"] == "not_written" and mutation["caller_cancelled"]
+        assert not (root / "cancelled.txt").exists() and store._context is None
+        assert all(not lock.locked() for lock in
+                   session._app.runtime.capability("coding.workspace")._locks.values())
+    finally:
+        await session.aclose()
+
+
+@pytest.mark.parametrize("cross_deadline", [False, True])
+async def test_close_tracks_restore_cleanup_until_actual_settlement(tmp_path, monkeypatch, cross_deadline):
+    """收尾线程属于请求；关闭监督超时只作诊断，不冒称实际释放。"""
+    import cicada.application as app_module
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, _script(
+        {"tool_calls": [{"id": "write", "name": "write", "arguments": {
+            "path": "a.txt", "content": "bytes"}}]},
+        {"text": "done", "stop": True},
+    ), session_id=None))
+    store = session._restore_store
+    entered, release = threading.Event(), threading.Event()
+    original = store.end_request
+
+    def blocked(**kwargs):
+        entered.set()
+        assert release.wait(10)
+        original(**kwargs)
+
+    monkeypatch.setattr(store, "end_request", blocked)
+    if cross_deadline:
+        monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.05)
+    task = asyncio.create_task(session.execute("close at capture cleanup"))
+    close = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        close = asyncio.create_task(session.aclose())
+        if cross_deadline:
+            await asyncio.wait_for(close, 5)
+            assert session.state == "closed" and session._close_problems
+        else:
+            await asyncio.sleep(0)
+            assert not close.done()
+        assert not task.done() and not session._active_done.done()
+        assert store._context is not None
+    finally:
+        release.set()
+    outcome = await asyncio.wait_for(task, 10)
+    await asyncio.wait_for(close, 5)
+    assert outcome.persistence.saved and store._context is None
+    assert session._active_done.done() and session.state == "closed"
+
+
 # --- 默认不落盘 / 保存 / 恢复续写 (A01) -------------------------------------------------------
 
 
@@ -1836,6 +1966,10 @@ async def test_cancelled_native_creation_preserves_application_history_and_saved
         release.set()
     outcome = await asyncio.wait_for(task, 10)
     assert outcome.result.stop_reason == "aborted" and outcome.persistence.saved
+    point = session._restore_store.read_points(session.persistence.session_id)[0]
+    assert point.seq == outcome.persistence.seq and point.source == "committed"
+    assert point.commit_state == "committed"
+    assert session._restore_store.active_point_id is None
     assert len(session._app.agent._model.requests) == 1
     tool_result = next(m.result for m in session.history if isinstance(m, ToolResultMessage))
     assert tool_result.details["mutation"]["state"] == "committed"

@@ -638,8 +638,13 @@ async def test_queued_cancel_returns_not_written_without_worker(tmp_path, monkey
 async def test_publish_error_1176_stays_unknown_with_retained_materials(tmp_path, monkeypatch):
     """无法证明未提交的原生失败 (1176) 保持 unknown, 材料保留, 依据失效 (A06)."""
     ws, tool = make(tmp_path)
+    from cicada.plugins.coding.restore_store import RestoreStore
+    store = RestoreStore(ws.root)
+    ws.install_restore_capture(store)
+    store.begin_request("unknown-request", "epoch", "session")
     f = ws.root / "a.txt"
     f.write_text("one\n", encoding="utf-8")
+    before = f.read_bytes()
     await read_basis(ws, "a.txt")
 
     def failing_replace(target, replacement, backup):
@@ -652,6 +657,11 @@ async def test_publish_error_1176_stays_unknown_with_retained_materials(tmp_path
     assert mutation["state"] == "unknown"
     assert mutation["reason"] == "publish_failed"
     assert mutation["winerror"] == 1176
+    store.end_request(interrupted=True)
+    point = store.read_points("session")[0]
+    assert point.commit_state == "unknown" and point.source == "interrupted"
+    assert store.read_blob(point.entries[0].before_sha256) == before
+    assert store.read_blob(point.entries[0].after_sha256) == before.replace(b"one", b"x")
     assert mutation["retained_paths"], "unknown 必须保留材料路径"
     for path in mutation["retained_paths"]:
         assert Path(path).exists()

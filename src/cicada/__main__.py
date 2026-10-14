@@ -755,6 +755,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         persistence=persistence_config,
         budget=budget_config,
         skills=skills_snapshot,
+        restore_capture=not args.no_restore_capture,
     )
     if args.tui:
         assert run_tui_session_fn is not None
@@ -777,6 +778,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         )
         if session.restored_interrupted:
             print(f"[session interrupted_requests={len(session.restored_interrupted)}]")
+        # C3: 启动机会式清理的告警事实; 清理失败只留痕, 不阻断启动
+        for warning in session.restore_warnings:
+            print(f"[restore maintenance: {warning}]", file=sys.stderr)
         if session.view_only_reason is not None:
             # A15: 未证终结活动的恢复仅可查看; CLI 新 prompt 零执行并退出码 3 (契约 §6)
             print(f"[session view-only: {session.view_only_reason}]", file=sys.stderr)
@@ -948,6 +952,13 @@ credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
         help=(
             f"指定检查命令 (可重复, 最多 {MAX_CHECK_COMMANDS} 条, 每条 ≤{CHECK_COMMAND_MAX_BYTES} bytes); "
             "给出即进入检查模式, 按顺序分配 check-1..check-N"
+        ),
+    )
+    parser.add_argument(
+        "--no-restore-capture", action="store_true",
+        help=(
+            "关闭请求还原点捕获 (默认开启): 关闭后 edit/write 照常执行, "
+            "但本会话不产生新还原点; 仅持久会话 (--tui/--save-session/--resume) 受影响"
         ),
     )
     parser.add_argument(
