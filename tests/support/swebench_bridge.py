@@ -231,7 +231,7 @@ class ContainerSupervisor:
     def query_by_label(self, label: str) -> str | None:
         """按精确 owner label 查询现存容器; 不按名称猜测归属。"""
         record = self.docker.run(
-            "ps", "-a", "--filter", f"label={DOCKER_LABEL_OWNER}={label}", "--format", "{{.ID}}", timeout_s=5)
+            "ps", "-a", "--no-trunc", "--filter", f"label={DOCKER_LABEL_OWNER}={label}", "--format", "{{.ID}}", timeout_s=5)
         if record.exit_code != 0:
             raise BridgeError("cannot query owned containers")
         ids = [line for line in record.stdout.splitlines() if line.strip()]
@@ -246,7 +246,7 @@ class ContainerSupervisor:
         stop = self.docker.run("stop", "-t", "1", cid, timeout_s=10)
         rm = self.docker.run("rm", "-f", cid, timeout_s=5)
         gone = self.query_by_label(label) is None
-        confirmed = rm.exit_code == 0 and gone
+        confirmed = gone  # 并发收尾可能已删除；精确查询成功且无容器才确认。
         self.register_exit(label, cid, "confirmed" if confirmed else "uncertain")
         return "confirmed" if confirmed else "uncertain"
 

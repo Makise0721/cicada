@@ -99,3 +99,22 @@ def test_owner_seals_and_cleans_after_checker_is_killed(tmp_path):
             checker.communicate(timeout=5)
     assert not resource.exists()
     assert not owner.thread.is_alive() and not owner.watch.is_alive()
+
+
+def test_cleanup_accepts_racing_removal_only_after_successful_absence_query(tmp_path):
+    from tests.support.swebench_bridge import ContainerSupervisor, CommandRecord, BridgeError
+
+    class Docker:
+        def run(self, *args, **kwargs):
+            code = 1 if args[0] in ("stop", "rm") else 0
+            return CommandRecord(list(args), code, "", "", 0)
+
+    supervisor = ContainerSupervisor(tmp_path, Docker())
+    assert supervisor.stop_and_remove("owned-label", "owned-id") == "confirmed"
+
+    class BrokenQuery(Docker):
+        def run(self, *args, **kwargs):
+            return CommandRecord(list(args), 1, "", "", 0)
+
+    with pytest.raises(BridgeError):
+        ContainerSupervisor(tmp_path, BrokenQuery()).stop_and_remove("owned-label", "owned-id")

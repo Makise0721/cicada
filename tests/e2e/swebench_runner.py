@@ -578,7 +578,7 @@ def cmd_prepare(args) -> int:
         print(json.dumps({"outcome": "prepared", "run_root": str(run_root),
                           "elapsed_s": receipt["elapsed_s"]}, ensure_ascii=False))
         return 0
-    except (PrepareFailed, BridgeError, PatchScopeError, OSError, ValueError) as exc:
+    except (PrepareFailed, BridgeError, PatchScopeError, OSError, ValueError, RuntimeError) as exc:
         receipt["outcome"] = "prepare-failed"
         receipt["failures"].append({"type": type(exc).__name__, "message": str(exc)[:500]})
         dump()
