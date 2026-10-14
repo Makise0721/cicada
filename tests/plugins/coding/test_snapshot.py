@@ -346,3 +346,22 @@ async def test_snapshot_plugin_resolves_at_real_bootstrap(repo):
 def test_snapshot_constants_stay_within_the_published_ceiling():
     assert MAX_FILE_BYTES == 16 * 1024 * 1024
     assert MAX_TOTAL_BYTES == 128 * 1024 * 1024
+
+
+async def test_git_symlink_stub_binds_payload_and_mode_without_following(repo):
+    (repo / "link").write_bytes(b"missing-target")
+    oid = git(repo, "hash-object", "-w", "--stdin", input=b"missing-target").strip()
+    git(repo, "update-index", "--index-info", input=b"120000 " + oid + b" 0\tlink\n")
+    snapshotter = make(repo)
+    first = await snapshotter.capture(CancelToken())
+    entry = entries_of(first)["link"]
+    assert entry.git_mode == "120000" and entry.size_bytes == len(b"missing-target")
+    assert first.snapshot.schema_version == 2
+    (repo / "link").write_bytes(b"other-target")
+    changed = await snapshotter.capture(CancelToken())
+    assert changed.available and changed.snapshot.snapshot_ref != first.snapshot.snapshot_ref
+    (repo / "link").write_bytes(b"missing-target")
+    git(repo, "update-index", "--index-info", input=b"100644 " + oid + b" 0\tlink\n")
+    mode_changed = await snapshotter.capture(CancelToken())
+    assert entries_of(mode_changed)["link"].sha256 == entry.sha256
+    assert mode_changed.snapshot.snapshot_ref != first.snapshot.snapshot_ref

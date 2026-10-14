@@ -859,3 +859,21 @@ async def test_file_mutations_use_actual_snapshot_without_granting_receipt_autho
     retained = await verifier.refresh(CancelToken())
     assert retained.snapshot_ref == after.snapshot_ref and retained.receipts == (receipt,)
     assert not retained.process_uncertain and retained.checks[0].freshness == "stale"
+
+
+async def test_symlink_stub_mode_only_change_expires_check_and_has_evidence(repo):
+    (repo / "link").write_bytes(b"missing-target")
+    oid = git(repo, "hash-object", "-w", "--stdin", input=b"missing-target").strip()
+    git(repo, "update-index", "--index-info", input=b"120000 " + oid + b" 0\tlink\n")
+    verifier = await initialized(repo, passing("exit 0"))
+    receipt = await verifier.run_check("check-1", CancelToken())
+    assert receipt.verification_status == "passed" and receipt.schema_version == 1
+    git(repo, "update-index", "--index-info", input=b"100644 " + oid + b" 0\tlink\n")
+    view = await verifier.refresh(CancelToken())
+    assert view.checks[0].freshness == "stale"
+    evidence = await verifier.finalize(CancelToken())
+    assert evidence.complete
+    change, = evidence.changes
+    assert change.kind == "modified" and change.before_sha256 == change.after_sha256
+    assert (change.before_git_mode, change.after_git_mode) == ("120000", "100644")
+    assert "before_git_mode: 120000" in evidence.artifact_path.read_text(encoding="utf-8")

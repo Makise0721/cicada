@@ -189,11 +189,11 @@ class GitInventory:
             raise InventoryError("timeout", "Git inventory query deadline exceeded")
 
     def _inspect_path(self, parts: list[str]) -> tuple[bool | None, tuple[str, ...], bool]:
-        current = self.workspace.root
+        current = str(self.workspace.root)
         for index, part in enumerate(parts):
-            current = current / part
+            current = current + os.sep + part
             try:
-                info = current.lstat()
+                info = os.lstat(current)
             except FileNotFoundError:
                 return False, (), False
             directory = stat.S_ISDIR(info.st_mode)

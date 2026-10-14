@@ -16,6 +16,7 @@ from cicada.plugins.coding.inventory import DEFAULT_EXCLUSIONS, POLICY_ID
 
 VERIFICATION_CAPABILITY = "coding.verification"
 SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 ExecutionStatus = Literal["exited", "launch_failed", "timed_out", "cancelled", "error"]
 VerificationStatus = Literal["passed", "failed", "blocked"]
 CheckStatus = Literal["not_run", "passed", "failed", "blocked"]
@@ -66,6 +67,7 @@ class SnapshotEntry:
     exists: bool
     size_bytes: int | None
     sha256: str | None  # tombstone: exists=False, size_bytes=None, sha256=None。
+    git_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,7 @@ class Snapshot:
     entries: tuple[SnapshotEntry, ...]
     policy_id: str = POLICY_ID
     exclusions: tuple[str, ...] = DEFAULT_EXCLUSIONS
-    schema_version: int = SCHEMA_VERSION
+    schema_version: int = SNAPSHOT_SCHEMA_VERSION
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,8 @@ class FileChange:
     binary: bool
     bom_changed: bool
     newline_changed: bool
+    before_git_mode: str | None = None
+    after_git_mode: str | None = None
 
 
 @dataclass(frozen=True)

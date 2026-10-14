@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import stat
 import time
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from cicada.plugins.coding.inventory import (
     InventoryEntry,
 )
 from cicada.plugins.coding.verification_contracts import (
-    SCHEMA_VERSION,
+    SNAPSHOT_SCHEMA_VERSION,
     Snapshot,
     SnapshotCapture,
     SnapshotEntry,
@@ -180,6 +181,7 @@ class Snapshotter:
         self._checkpoint(cancel, deadline)
         inventory = await self._inventory(cancel)
         observed: set[str] = set()
+        modes: dict[str, str | None] = {}
         try:
             for index, entry in enumerate(inventory.files):
                 if index % _CHECKPOINT_EVERY == 0:
@@ -187,13 +189,16 @@ class Snapshotter:
                     self._checkpoint(cancel, deadline)
                 if entry.is_submodule:
                     raise _CaptureError("submodule", f"scope contains a submodule: {entry.relative_path}")
-                if entry.is_reparse:
+                if len(entry.git_modes) > 1:
+                    raise _CaptureError("conflict", f"scope has conflicting Git modes: {entry.relative_path}")
+                if entry.reparse_paths:
                     raise _CaptureError(
                         "reparse",
                         f"scope path crosses a reparse point: {entry.reparse_paths[0] if entry.reparse_paths else entry.relative_path}",
                     )
                 _validate_relative_path(entry.relative_path)
                 observed.add(entry.relative_path)
+                modes[entry.relative_path] = entry.git_modes[0] if entry.git_modes else None
         finally:
             # 清单一旦可靠返回, 已验证路径立即单调进入账本: 后续内容读取失败或被改
             # ignored 都不能让"本 run 曾观察到"的路径退出范围。账本累计与"本次捕获
@@ -207,7 +212,7 @@ class Snapshotter:
             exists, sha256, size = await self._read_content(path, cancel, deadline, total_bytes)
             if size:
                 total_bytes += size
-            observations[path] = SnapshotEntry(path, exists, size, sha256)
+            observations[path] = SnapshotEntry(path, exists, size, sha256, modes.get(path))
         return _LedgerScan(observations, frozenset(observed), inventory.root)
 
     async def _inventory(self, cancel: CancelToken) -> FileInventory:
@@ -226,10 +231,10 @@ class Snapshotter:
         读取前后 stat 不一致、超单文件/累计上限、reparse 祖先或读取故障都抛
         `_CaptureError`, 调用方整次捕获 unavailable。
         """
-        target = self.workspace.root
+        target = str(self.workspace.root)
         parts = path.split("/")
         for index, part in enumerate(parts):
-            target = target / part
+            target = target + os.sep + part
             info = self._lstat(target, path)
             if info is None:
                 return False, None, None
@@ -271,6 +276,8 @@ class Snapshotter:
             raise
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise _CaptureError("unreadable", f"cannot read {path}: {exc}") from exc
         after = self._lstat(target, path)
@@ -281,9 +288,9 @@ class Snapshotter:
         return True, digest.hexdigest(), read_bytes
 
     @staticmethod
-    def _lstat(target: Path, path: str):
+    def _lstat(target: str, path: str):
         try:
-            return target.lstat()
+            return os.lstat(target)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -356,7 +363,7 @@ def snapshot_ref(
     或不同累计路径集合下不是同一个快照, 所以 `snapshot_ref` 不能只由 entries 决定。
     """
     digest = hashlib.sha256()
-    _feed(digest, "cicada-snapshot", SCHEMA_VERSION, policy_id, exclusions, scope_id)
+    _feed(digest, "cicada-snapshot", SNAPSHOT_SCHEMA_VERSION, policy_id, exclusions, scope_id)
     for entry in entries:
         _feed(
             digest,
@@ -364,6 +371,7 @@ def snapshot_ref(
             "1" if entry.exists else "0",
             "" if entry.size_bytes is None else entry.size_bytes,
             entry.sha256 or "",
+            entry.git_mode or "",
         )
     return f"snap-{digest.hexdigest()}"
 

@@ -113,6 +113,7 @@ class _BaselineFile:
     sha256: str
     size_bytes: int
     data: bytes
+    git_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -802,7 +803,7 @@ class Verifier:
                 continue
             data = _read_verified(self.workspace.root, entry, self.snapshotter.max_file_bytes)
             files[entry.relative_path] = _BaselineFile(
-                entry.relative_path, entry.sha256, len(data), data)
+                entry.relative_path, entry.sha256, len(data), data, entry.git_mode)
         path = self._artifact_path("baseline")
         with open(path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps({
@@ -819,6 +820,7 @@ class Verifier:
                     "exists": True,
                     "sha256": record.sha256,
                     "size_bytes": record.size_bytes,
+                    "git_mode": record.git_mode,
                     "data_b64": base64.b64encode(record.data).decode("ascii"),
                 }, ensure_ascii=False, sort_keys=True) + "\n")
         return _Baseline(snapshot.snapshot_ref, snapshot.scope_id, path,
@@ -843,7 +845,8 @@ class Verifier:
                 data = base64.b64decode(record["data_b64"])
                 if (_sha256_bytes(data) != record["sha256"]
                         or _sha256_bytes(data) != original.sha256
-                        or len(data) != record["size_bytes"]):
+                        or len(data) != record["size_bytes"]
+                        or record.get("git_mode") != original.git_mode):
                     raise ValueError(f"baseline content hash mismatch for {key!r}")
                 seen.add(key)
         if header is None or header.get("snapshot_ref") != baseline.snapshot_ref:
@@ -860,6 +863,7 @@ class Verifier:
             entry.relative_path for entry in final.entries
             if baseline.files.get(entry.relative_path) is None
             or baseline.files[entry.relative_path].sha256 != entry.sha256
+            or baseline.files[entry.relative_path].git_mode != entry.git_mode
         }
         loaded: dict[str, bytes] = {}
         for relative_path in sorted(candidates, key=lambda p: (p.casefold(), p)):
@@ -1035,7 +1039,10 @@ def _changes(
         before = files.get(entry.relative_path)
         before_sha = before.sha256 if before is not None else None
         after_sha = entry.sha256 if entry.exists else None
-        if (before is None) == (not entry.exists) and before_sha == after_sha:
+        before_mode = before.git_mode if before is not None else None
+        after_mode = entry.git_mode if entry.exists else None
+        if ((before is None) == (not entry.exists) and before_sha == after_sha
+                and before_mode == after_mode):
             continue
         if before is None:
             kind = "added"
@@ -1049,6 +1056,8 @@ def _changes(
             relative_path=entry.relative_path,
             kind=kind,
             before_sha256=before_sha,
+            before_git_mode=before_mode,
+            after_git_mode=after_mode,
             after_sha256=after_sha,
             binary=_is_binary(before_bytes) or _is_binary(after_bytes),
             bom_changed=_has_bom(before_bytes) != _has_bom(after_bytes),
@@ -1065,6 +1074,9 @@ def _diff_block(
         f"--- before_sha256: {change.before_sha256}",
         f"+++ after_sha256: {change.after_sha256}",
     ]
+    if change.before_git_mode != change.after_git_mode:
+        lines.extend((f"--- before_git_mode: {change.before_git_mode}",
+                      f"+++ after_git_mode: {change.after_git_mode}"))
     flags = [
         name for name, active in (
             ("binary", change.binary),
