@@ -107,7 +107,7 @@ class AdmissionGate:
             return None
         if self._session_rejected_in_batch or self._session_managing or getattr(self._session, "session_management_active", False):
             return None
-        if self._clearing or self._compacting or self._model_selecting or self._login_active or self._review_active or getattr(self._session, "review_active", False):
+        if self._clearing or self._compacting or self._model_selecting or self._login_active or self._review_active or (getattr(self._session, "review_active", False) or getattr(self._session, "rewind_active", False)):
             return None
         if self._session.state != "idle":
             return None
@@ -248,7 +248,7 @@ def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
         return True
     if gate.session_rejected_in_batch or gate.session_managing or getattr(session, "session_management_active", False):
         return True
-    if gate.clearing or gate.compacting or gate.model_selecting or gate.login_active or gate.review_active or getattr(session, "review_active", False):
+    if gate.clearing or gate.compacting or gate.model_selecting or gate.login_active or gate.review_active or (getattr(session, "review_active", False) or getattr(session, "rewind_active", False)):
         return True
     return session.state in (
         "executing",

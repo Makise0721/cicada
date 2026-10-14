@@ -97,6 +97,7 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.ui.review_view import ACTION_REVIEW, ReviewView
+from cicada.ui.rewind_view import ACTION_REWIND, RewindView
 from cicada.ui.admission import AdmissionGate, cancel_if_active, is_enter_barrier
 from cicada.ui.checks import (
     PROCESS_UNCERTAIN_LABEL,
@@ -178,6 +179,7 @@ class ConversationView:
         self._gate = AdmissionGate(session)
         self._gate.on_error = self._on_gate_error
         self.review_view = ReviewView(session, self._editor, self._review_updated, self.transcript.append_error)
+        self.rewind_view = RewindView(session, self._editor, self._review_updated, self.transcript.append_error)
         # 02: 压缩等待任务的强引用 (PA05: 迟到收尾任务不被垃圾回收, 保留诊断面)
         self._compact_task: asyncio.Task | None = None
         self._name_submission: SessionManagementSubmission | None = None
@@ -253,7 +255,7 @@ class ConversationView:
             self._on_update()
 
     def _review_updated(self) -> None:
-        if self.review_view.active:
+        if (self.review_view.active or self.rewind_view.active):
             self._gate.note_review_started()
         else:
             self._gate.note_review_settled()
@@ -265,6 +267,7 @@ class ConversationView:
         self._view_closed = True
         self.session_modal.cancel()
         self.review_view.cancel()
+        self.rewind_view.cancel()
         if self._new_submission is not None:
             self._new_submission.cancel()
         if self._name_submission is not None:
@@ -510,9 +513,11 @@ class ConversationView:
         只改展示状态 (组/工具/思考/Skill toggle、工具分页), 不触请求、工具或
         草稿; 未知/失效目标静默返回 False。jump_latest 由视口内部消费, 不到这里。
         """
+        if action.kind == ACTION_REWIND:
+            return self.rewind_view.execute(action)
         if action.kind == ACTION_REVIEW:
             return self.review_view.execute(action)
-        if self.review_view.active:
+        if (self.review_view.active or self.rewind_view.active):
             return False
         kind = action.kind
         target = action.target_id
@@ -655,8 +660,9 @@ class ConversationView:
             if self._name_submission is not None:
                 self._name_submission.cancel()
             return
-        if self.review_view.active:
+        if (self.review_view.active or self.rewind_view.active):
             self.review_view.cancel()
+            self.rewind_view.cancel()
             return
         if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
@@ -681,8 +687,9 @@ class ConversationView:
             if self._name_submission is not None:
                 self._name_submission.cancel()
             return
-        if self.review_view.active:
+        if (self.review_view.active or self.rewind_view.active):
             self.review_view.cancel()
+            self.rewind_view.cancel()
             return
         if self._gate.clearing or self._gate.compacting or self._gate.model_selecting or self._gate.login_active:
             return
@@ -694,7 +701,7 @@ class ConversationView:
     def handle_ctrl_o(self) -> None:
         """Ctrl+O (紧凑交互 01, C2): 统一所有工具组/单工具/Skill 为同一开合状态
         并作为后续默认值; 只改展示, 不触请求或工具。"""
-        if self.review_view.active:
+        if (self.review_view.active or self.rewind_view.active):
             return
         expanded = self.tools.toggle_expand()
         self.transcript.set_skills_expanded(expanded)
@@ -818,7 +825,7 @@ class ConversationView:
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)
         if command == "/resume":
-            if self.model_menu.is_open or self.login_modal.is_open or self.review_view.active:
+            if self.model_menu.is_open or self.login_modal.is_open or (self.review_view.active or self.rewind_view.active):
                 return False
             if self.on_session_prepare:
                 self.on_session_prepare()
@@ -874,6 +881,13 @@ class ConversationView:
         if command == "/exit":
             self.handle_exit()
             return True
+        if command.startswith("/rewind") and (len(command) == 7 or command[7].isspace()):
+            if command != "/rewind":
+                self.transcript.append_system("用法：/rewind（不接受参数）")
+                return True
+            if self.model_menu.is_open or self.login_modal.is_open:
+                return False
+            return self.rewind_view.open()
         if command.startswith("/diff") and (len(command) == 5 or command[5].isspace()):
             if command != "/diff":
                 self.transcript.append_system("用法：/diff（不接受参数）")
@@ -1496,6 +1510,7 @@ def build(
         "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
         "modal": view.login_modal,
         "review": view.review_view,
+        "rewind": view.rewind_view,
         "session_modal": view.session_modal,
     }
 

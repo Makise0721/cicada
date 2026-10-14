@@ -412,7 +412,10 @@ class RestoreStore:
             raise RestoreStoreError(f"not a content address: {sha256!r}")
         target = self._blobs_dir() / sha256
         self._check_own(target)
-        data = target.read_bytes()
+        with target.open("rb") as stream:
+            data = stream.read(16 * 1024 * 1024 + 1)
+        if len(data) > 16 * 1024 * 1024:
+            raise RestoreStoreError("blob exceeds the 16 MiB file limit")
         if _sha256(data) != sha256:
             raise RestoreStoreError(f"blob content does not match its name: {target}")
         return data
@@ -689,11 +692,11 @@ class RestoreStore:
             path = self._blobs_dir() / sha256
             self._check_own(path)
             info = path.stat()
-            if not stat.S_ISREG(info.st_mode) or _sha256(path.read_bytes()) != sha256:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 16 * 1024 * 1024:
                 return None
+            return len(self.read_blob(sha256))
         except (OSError, RestoreStoreError):
             return None
-        return info.st_size if stat.S_ISREG(info.st_mode) else None
 
 
 def _index_row(context: _RequestContext, *, row: str, point_id: str, kind: str,

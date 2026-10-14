@@ -115,9 +115,13 @@ from cicada.review import (
     ReviewCheckDetails, ReviewCheckRow, ReviewError, ReviewPreview, ReviewSnapshot,
 )
 from cicada.plugins.coding.process import process_plugin
+from cicada.restore_points import (
+    REWIND_TIMEOUT_S, RewindError, RewindListView, RewindPointView, RewindPreview,
+)
+from cicada.plugins.coding.rewind_reader import RewindReader
 from cicada.plugins.coding.restore_store import (
     RESTORE_CAPABILITY,
-    RestoreStore,
+    RestoreStore, RestoreStoreError,
     restore_plugin,
 )
 from cicada.plugins.coding.tool_check import check_plugin
@@ -614,6 +618,10 @@ class ApplicationSession:
         self._catalog_task: asyncio.Task | None = None
         self._catalog_token: CancelToken | None = None
         self._file_queries: dict[asyncio.Task, CancelToken] = {}
+        self._rewind_active = False
+        self._rewind_reader: RewindReader | None = None
+        self._rewind_task: asyncio.Task | None = None
+        self._rewind_token: CancelToken | None = None
         self._review_active = False
         self._review_id: str | None = None
         self._review_snapshot: ReviewSnapshot | None = None
@@ -725,6 +733,84 @@ class ApplicationSession:
     # --- 只读快照 ------------------------------------------------------------------
 
     @property
+    def rewind_active(self) -> bool:
+        return self._rewind_active
+
+    async def open_rewind(self) -> RewindListView:
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, self._review_task,
+                     self._rewind_task, *self._undead_tasks)
+        if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
+                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
+                or self._session_in_flight or self.catalog_active or self.review_active
+                or (self.rewind_active and self._rewind_reader is None)
+                or any(task is not None and not task.done() for task in producers)):
+            raise RewindError("busy", "查看还原点需要空闲会话，等当前操作实际结束后再打开。")
+        if self._store is None:
+            raise RewindError("unavailable", "还原点查看需要持久会话。")
+        # 关闭捕获只影响后继写入，仍可只读查看本会话已有历史点。
+        store = self._restore_store or RestoreStore(Path(self._config.workspace))
+        workspace = self._app.runtime.capability("coding.workspace")
+        reader = RewindReader(store, workspace, self._store.session_id, self._epoch_id)
+        self._rewind_active = True
+        self._rewind_reader = reader
+        try:
+            return await self._rewind_io(reader.capture)
+        except BaseException:
+            self.cancel_rewind()
+            raise
+
+    async def read_rewind_point(self, point_id: str) -> RewindPointView:
+        reader = self._require_rewind()
+        return await self._rewind_io(lambda token: reader.read_point(point_id, token))
+
+    async def read_rewind_preview(self, point_id: str, entry_id: str) -> RewindPreview:
+        reader = self._require_rewind()
+        return await self._rewind_io(lambda token: reader.preview(point_id, entry_id, token))
+
+    def _require_rewind(self) -> RewindReader:
+        if not self.rewind_active or self._rewind_reader is None or self._closing:
+            raise RewindError("invalid_target", "还原点页面已关闭。")
+        if self._rewind_task is not None and not self._rewind_task.done():
+            raise RewindError("busy", "还原点读取尚未结束。")
+        return self._rewind_reader
+
+    async def _rewind_io(self, operation):
+        reader = self._rewind_reader
+        token = CancelToken()
+        task = asyncio.create_task(asyncio.to_thread(operation, token))
+        self._rewind_task, self._rewind_token = task, token
+        task.add_done_callback(self._rewind_io_settled)
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), REWIND_TIMEOUT_S)
+            if self._rewind_reader is not reader or self._closing:
+                raise RewindError("invalid_target", "还原点页面已关闭。")
+            return result
+        except asyncio.TimeoutError:
+            self.cancel_rewind()
+            raise RewindError("unavailable", "还原点读取超时，正在等待实际读取结束。") from None
+        except asyncio.CancelledError:
+            self.cancel_rewind()
+            raise
+        except (OSError, RestoreStoreError):
+            raise RewindError("unavailable", "还原点数据不可读或已损坏。") from None
+
+    def _rewind_io_settled(self, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+        if self._rewind_task is task:
+            self._rewind_token = None
+            if self._rewind_reader is None:
+                self._rewind_active = False
+
+    def cancel_rewind(self) -> None:
+        self._rewind_reader = None
+        if self._rewind_token is not None:
+            self._rewind_token.cancel()
+        if self._rewind_task is None or self._rewind_task.done():
+            self._rewind_active = False
+
+    @property
     def review_active(self) -> bool:
         return self._review_active
 
@@ -736,10 +822,10 @@ class ApplicationSession:
         if self._closing or self._closed:
             raise SessionManagementError("closing", "应用正在关闭。")
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
         if (self._state != "idle" or self._begin_in_flight or self._clearing or self._compacting
                 or self._model_in_flight or self._login_in_flight or self._session_in_flight or self.catalog_active
-                or self.review_active
+                or self.review_active or self.rewind_active
                 or any(task is not None and not task.done() for task in producers)):
             raise SessionManagementError("busy", "会话目录需要空闲会话。")
         if self._catalog_reader is None:
@@ -799,10 +885,10 @@ class ApplicationSession:
 
     def _check_review_admission(self) -> None:
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
         if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
-                or self._session_in_flight or self.catalog_active
+                or self._session_in_flight or self.catalog_active or self.rewind_active
                 or any(task is not None and not task.done() for task in producers)):
             raise ReviewError("busy", "审阅需要空闲会话，等当前操作实际结束后再打开。")
         if self._review_active and self._review_id is None:
@@ -1057,10 +1143,10 @@ class ApplicationSession:
         if self._store is None:
             raise SessionManagementError("unavailable", "当前会话未启用保存，无法持久命名。")
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
         if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight
-                or self._login_in_flight or self.review_active
+                or self._login_in_flight or self.review_active or self.rewind_active
                 or any(task is not None and not task.done() for task in producers)):
             raise SessionManagementError("busy", "命名需要空闲会话。")
         store, epoch_id = self._store, self._epoch_id or ""
@@ -1097,10 +1183,10 @@ class ApplicationSession:
         if not isinstance(self._store, SessionStoreRoute) or factory is None:
             raise SessionManagementError("unavailable", "当前会话没有保存路由，无法切换会话。")
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, *self._undead_tasks)
+                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
         if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
                 or self._clearing or self._compacting or self._model_in_flight
-                or self._login_in_flight or self.review_active
+                or self._login_in_flight or self.review_active or self.rewind_active
                 or any(task is not None and not task.done() for task in producers)):
             raise SessionManagementError("busy", "切换需要空闲会话。")
         reason = (self._session_cleanup_failed or self._storage_failed or self._view_only_reason
@@ -1430,7 +1516,7 @@ class ApplicationSession:
 
     def _check_model_transaction_admission(self, blocked: str) -> None:
         """select_model 与 set_reasoning_effort 共用的独占事务准入 (C6)."""
-        if self.review_active:
+        if self.review_active or self.rewind_active:
             raise ModelSelectionError("review is in progress")
         if self._login_in_flight:
             raise ModelSelectionError("login configuration is in progress")
@@ -1659,7 +1745,7 @@ class ApplicationSession:
             raise RuntimeError("session cleanup failed: " + self._session_cleanup_failed)
         if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; execute is refused")
-        if self.review_active:
+        if self.review_active or self.rewind_active:
             raise RuntimeError("review is in progress; execute is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; execute is refused")
@@ -2189,7 +2275,7 @@ class ApplicationSession:
         """
         if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; clear is refused")
-        if self.review_active:
+        if self.review_active or self.rewind_active:
             raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; clear is refused")
@@ -2215,7 +2301,7 @@ class ApplicationSession:
         """
         if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; clear is refused")
-        if self.review_active:
+        if self.review_active or self.rewind_active:
             raise RuntimeError("review is in progress; clear is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; clear is refused")
@@ -2295,7 +2381,7 @@ class ApplicationSession:
         """
         if self._session_in_flight or self.catalog_active:
             raise RuntimeError("session management is in progress; compact is refused")
-        if self.review_active:
+        if self.review_active or self.rewind_active:
             raise RuntimeError("review is in progress; compact is refused")
         if self._login_in_flight:
             raise RuntimeError("login configuration is in progress; compact is refused")
@@ -2626,7 +2712,7 @@ class ApplicationSession:
         return lines
 
     def _check_login_admission(self) -> None:
-        if (self._session_in_flight or self.catalog_active or self.review_active or self._closing or self._closed or self._state != 'idle' or
+        if (self._session_in_flight or self.catalog_active or self.review_active or self.rewind_active or self._closing or self._closed or self._state != 'idle' or
                 self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
             raise UserConfigError('login', 'operation-in-progress')
 
@@ -2824,6 +2910,7 @@ class ApplicationSession:
             for query_token in self._file_queries.values():
                 query_token.cancel()
             self.cancel_review()
+            self.cancel_rewind()
             self._cancel_login_save()
             self.cancel_login()
             self._close_task = asyncio.get_running_loop().create_task(self._close())
@@ -2853,7 +2940,7 @@ class ApplicationSession:
         # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
         # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
         producers = [
-            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done, self._review_task)
+            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done, self._review_task, self._rewind_task)
             if done is not None and not done.done()
         ]
         if producers and self._cancel_token is not None:
@@ -2870,11 +2957,11 @@ class ApplicationSession:
                 )
                 break  # 截止时间已耗尽; 未完成生产者保持强引用与关闭诊断
             except asyncio.CancelledError:
-                if producer is not self._review_task or not producer.done():
+                if producer not in (self._review_task, self._rewind_task) or not producer.done():
                     raise
                 # reader 的协作取消是正常页面收尾，不取消应用 close。
             except Exception:
-                if producer is not self._review_task:
+                if producer not in (self._review_task, self._rewind_task):
                     raise
                 self._close_problems.append("review reading failed during close")
         # 配置接受后不能在 COMMIT 与内存发布之间释放 store/client 或观察者。

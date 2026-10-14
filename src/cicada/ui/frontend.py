@@ -60,6 +60,7 @@ from cicada.ui.main_screen import MainScreen, strip_terminal_sequences
 from cicada.ui.model_menu import ModelMenu
 from cicada.ui.login_wizard import LoginModal
 from cicada.ui.review_view import ReviewView
+from cicada.ui.rewind_view import RewindView
 from cicada.ui.session_resume import SessionResumeModal
 from cicada.ui.terminal_io import (
     WHEEL_DELTA,
@@ -109,6 +110,7 @@ class MainScreenFrontend:
         on_shift_tab: Callable[[], None] | None = None,
         footer_badge_spans: Callable[[], tuple[tuple[int, int, int], ...]] | None = None,
         review: ReviewView | None = None,
+        rewind: RewindView | None = None,
         file_menu: FileCompletionMenu | None = None,
         session_modal: SessionResumeModal | None = None,
     ) -> None:
@@ -136,6 +138,7 @@ class MainScreenFrontend:
         self._on_model_confirm = on_model_confirm
         self._modal = modal
         self._review = review
+        self._rewind = rewind
         self._file_menu = file_menu
         self._session_modal = session_modal
         self.sensitive_input_used = False
@@ -174,7 +177,7 @@ class MainScreenFrontend:
             self._pending_frame_hits = ()
             return self._session_modal.render(width, self._frame_rows)
         if self._review_active():
-            layout = self._review.layout(width, self._frame_rows)
+            layout = self._page.layout(width, self._frame_rows)
             self._pending_frame_hits = layout.hits
             return list(layout.lines)
         if self._modal_active():
@@ -367,7 +370,7 @@ class MainScreenFrontend:
         exc = self._render_frame_captured()
         if exc is not None:
             if self._review_active():
-                self._review.cancel()
+                self._page.cancel()
             self.ui_failures.append('login render failed' if self.sensitive_input_used else f"render failed: {exc!r}")
             self._attempt_recovery()
 
@@ -435,7 +438,7 @@ class MainScreenFrontend:
         needs_render = False
         for item in items:
             review_before = self._review_active()
-            generation_before = self._review.generation if self._review is not None else 0
+            generation_before = self._page.generation if self._page is not None else 0
             if isinstance(item, PointerEvent):
                 if poisoned:
                     continue  # 动作执行后的同批旧 pointer 丢弃直至新帧成功 (C4)
@@ -458,7 +461,7 @@ class MainScreenFrontend:
                     break
                 if modal_was_open and not self._modal_active():
                     break  # 取消后的同批输入不能落入聊天编辑器或提交新请求。
-            if self._review is not None and self._review.generation != generation_before:
+            if self._page is not None and self._page.generation != generation_before:
                 self._invalidate_pointer_frame()
                 poisoned = True
             if review_before != self._review_active():
@@ -485,7 +488,7 @@ class MainScreenFrontend:
             self._file_menu_invalidate()  # C7: 审阅优先, 候选失效并取消
             self._sync_viewport_layout()
             self._disarm_escape_prefix()
-            self._review.handle(key)
+            self._page.handle(key)
             return
         if self._modal_active():
             self._file_menu_invalidate()  # C7: 模态优先, 候选失效并取消
@@ -734,7 +737,7 @@ class MainScreenFrontend:
         if not notches:
             return _POINTER_NONE
         if self._review_active():
-            self._review.wheel(notches)
+            self._page.wheel(notches)
         else:
             self._viewport.wheel_scroll(notches)
         self._frame_hits = None  # 视口位移后命中行失效, 等新帧 (C4)
@@ -840,8 +843,14 @@ class MainScreenFrontend:
     def _modal_active(self) -> bool:
         return self._modal is not None and self._modal.is_open
 
+    @property
+    def _page(self) -> ReviewView | RewindView | None:
+        if self._rewind is not None and self._rewind.active:
+            return self._rewind
+        return self._review
+
     def _review_active(self) -> bool:
-        return self._review is not None and self._review.active
+        return self._page is not None and self._page.active
 
     def _confirm_model_menu(self) -> None:
         """模型菜单 Enter: 收起并把 option ID 交回组合层 (屏障/任务归组合层与应用)。"""
@@ -892,7 +901,7 @@ class MainScreenFrontend:
                 except asyncio.CancelledError:
                     shutdown_cancelled = True
             if self._review_active():
-                self._review.cancel()
+                self._page.cancel()
             if self._file_menu is not None:
                 # C7: 前端退出先封闭入口、取消防抖与当前查询并等待实际落定,
                 # 再恢复终端; 不把 asyncio 取消等同于子进程/iterator 释放
