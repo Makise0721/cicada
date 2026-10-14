@@ -137,6 +137,8 @@ class RewindRestorer:
                     raise RewindError("stale", "删除前文件变化，未删除")
                 delete = ctypes.WinDLL("kernel32", use_last_error=True).DeleteFileW
                 delete.argtypes, delete.restype = [wintypes.LPCWSTR], wintypes.BOOL
+                if cancel.cancelled:
+                    return "cancelled"
                 if not delete(str(target)):
                     raise native.NativePublishError("DeleteFileW", ctypes.get_last_error())
             return "deleted"
@@ -156,6 +158,9 @@ class RewindRestorer:
         except BaseException:
             staged.unlink()
             raise
+        if cancel.cancelled:
+            staged.unlink()
+            return "cancelled"
         if current is None:
             native.create_file(target, staged)
         else:
