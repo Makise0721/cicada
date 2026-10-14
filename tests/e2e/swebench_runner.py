@@ -430,15 +430,22 @@ def verify_workspace_identity(workspace_dir: Path, container_ls_files: str,
 
 def evaluate_calibration(spec, patch_bytes: bytes | None, evidence_dir: Path,
                          f2p: list[str], p2p: list[str], timeout_s: float):
+    def verify():
+        verify_downloaded_materials()
+        for name, digest in spec["verifier_sha256"].items():
+            if sha256_file(spec["verifier_dir"] / name) != digest:
+                raise PrepareFailed("calibration verifier identity changed")
+    verify()
     docker = DockerCLI()
     supervisor = ContainerSupervisor(spec["evidence_dir"], docker)
-    evaluator = ContainerEvaluator(docker, supervisor)
-    return evaluator.evaluate(
+    result = ContainerEvaluator(docker, supervisor).evaluate(
         bridge.ContainerSpec(
             image=IMAGE_TAG, image_digest=spec["image"]["digest"],
             verifier_dir=spec["verifier_dir"], owner_label=supervisor.owner_label(
                 "calibration-empty" if patch_bytes is None else "calibration-gold")),
         patch_bytes, evidence_dir, f2p, p2p, timeout_s=timeout_s)
+    verify()
+    return result
 
 
 def cmd_prepare(args) -> int:
@@ -539,7 +546,8 @@ def cmd_prepare(args) -> int:
         receipt["empty_export"] = empty_export.to_json()
 
         # 校准反证: 空补丁失败、参考补丁成功; 各一次, 各 <=120s (spec D3)。
-        spec = {"evidence_dir": dirs["evidence"], "image": image, "verifier_dir": verifier_mount}
+        spec = {"evidence_dir": dirs["evidence"], "image": image, "verifier_dir": verifier_mount,
+                "verifier_sha256": verifier["sha256"]}
         empty_eval = evaluate_calibration(spec, None, dirs["evidence"] / "calibration-empty",
                                           row["fail_to_pass"], row["pass_to_pass"],
                                           CALIBRATION_TIMEOUT_S)
