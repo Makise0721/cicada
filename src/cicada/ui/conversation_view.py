@@ -71,6 +71,7 @@ from cicada.application import (
     ConfigurationChanged,
     ContextCompacted,
     HistoryCleared,
+    RewindRestoreCompleted,
     ModelChanged,
     LoginCompleted,
     OperationBusy,
@@ -403,6 +404,18 @@ class ConversationView:
                 f"seq {update.first_request_seq}..{update.last_request_seq}，"
                 f"{update.message_count} 条消息），原始记录保留可回看。"
             )
+        elif isinstance(update, RewindRestoreCompleted):
+            result = update.result
+            lines = [f"还原点 {result.point_id} · {len(result.files)} 个路径",
+                     f"还原备份点：{result.backup_point_id or '未生成'}"]
+            for item in result.files:
+                lines.append(f"{item.relative_path}: {item.state}"
+                             + (f" · winerror={item.winerror}" if item.winerror is not None else "")
+                             + (f" · {item.notice}" if item.notice else ""))
+            if result.notice:
+                lines.append(result.notice)
+            lines.append("既有检查回执已过期；交付前请重新检查。")
+            self.transcript.append_system("\n".join(lines))
         elif isinstance(update, HistoryCleared):
             # /clear 只清模型历史: 显示文档保留, 追加系统条目说明
             self.transcript.append_system("已清空模型历史（已显示记录与验证状态保留）。")

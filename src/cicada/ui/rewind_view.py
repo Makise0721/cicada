@@ -1,4 +1,4 @@
-"""/rewind 只读页；输入和写屏仍由主屏 frontend 统一拥有。"""
+"""/rewind 查看、计划与确认页；输入和写屏由主屏 frontend 统一拥有。"""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ class RewindView:
         self.snapshot: RewindListView | None = None
         self.point: RewindPointView | None = None
         self.preview: RewindPreview | None = None
+        self.plan = self.result = None
         self.message = ""
         self._task: asyncio.Task | None = None
         self._started = False
@@ -58,6 +59,7 @@ class RewindView:
         self.active, self.closing = True, False
         self.generation += 1
         self.snapshot = self.point = self.preview = None
+        self.plan = self.result = None
         self._top = self._selected = 0
         self.message = "读取还原点…"
         self._start("open", consume=True)
@@ -84,6 +86,10 @@ class RewindView:
                 value = await self._session.open_rewind()
             elif operation == "point":
                 value = await self._session.read_rewind_point(target)
+            elif operation == "plan":
+                value = await self._session.plan_rewind_restore(target)
+            elif operation == "confirm":
+                value = await self._session.execute_rewind_restore(target)
             else:
                 value = await self._session.read_rewind_preview(self.point.point_id, target)
             if self.closing or generation != self.generation:
@@ -96,6 +102,30 @@ class RewindView:
             elif operation == "point":
                 self.point = value
                 self.message = "选择文件查看 before → after" if value.entries else "该点无可还原条目"
+            elif operation in ("plan", "confirm"):
+                if operation == "plan":
+                    self.plan = value
+                    lines = ["确认后将覆盖以下路径："]
+                    lines.extend(f"{p.relative_path}: {p.op} · {_RELATION[p.current_relation]}"
+                                 for p in value.paths)
+                    lines.append("将删除：")
+                    lines.extend(value.deletions or ("无",))
+                    lines.append("后继影响：")
+                    lines.extend(value.successor_impacts or ("无",))
+                    self.message = "核对路径、删除与后继影响后，选择确认还原"
+                else:
+                    self.plan = None
+                    self.result = value
+                    lines = [f"还原备份点：{value.backup_point_id or '未生成'}"]
+                    lines.extend(f"{p.relative_path}: {p.state}"
+                                 + (f" · winerror={p.winerror}" if p.winerror is not None else "")
+                                 + (f" · {p.notice}" if p.notice else "") for p in value.files)
+                    lines.append(value.notice or "既有检查回执已过期；交付前请重新检查。")
+                    self.message = "还原已结束；逐文件结果如下"
+                self._body = DocumentLayout(tuple(sanitize_display(line) for line in lines), (),
+                                            (None,) * len(lines))
+                self._viewport = DocumentViewport()
+                self._viewport.follow = False
             else:
                 self.preview = value
                 lines = tuple(sanitize_display(line) for line in value.text.splitlines())
@@ -107,6 +137,7 @@ class RewindView:
             if self.closing:
                 return
             self.message = str(exc)
+            self.plan = None
             if consume or not self._session.rewind_active:
                 self.closing = True
                 self._session.cancel_rewind()
@@ -162,10 +193,15 @@ class RewindView:
             return False
         if operation == "file" and not (self.point and any(e.entry_id == target for e in self.point.entries)):
             return False
-        if operation not in ("refresh", "list", "point", "file"):
+        if operation == "plan" and not (self.point and target == self.point.point_id):
+            return False
+        if operation == "confirm" and not (self.plan and target == self.plan.plan_id):
+            return False
+        if operation not in ("refresh", "list", "point", "file", "plan", "confirm"):
             return False
         self.generation += 1
         self.preview = None
+        self.plan = self.result = None
         self._body = DocumentLayout((), (), ())
         self._top = self._selected = 0
         if operation in ("refresh", "list"):
@@ -209,7 +245,7 @@ class RewindView:
 
     def wheel(self, notches: int) -> None:
         if not self.closing:
-            if self.preview:
+            if self.preview or self.plan or self.result:
                 self._viewport.wheel_scroll(notches)
             else:
                 self._top = max(0, self._top - notches * 3)
@@ -221,8 +257,14 @@ class RewindView:
         nav = [("返回", self._action("back")), ("刷新", self._action("refresh"))]
         if self.point:
             nav.append(("还原点列表", self._action("list")))
+            if self.plan:
+                nav.append(("确认还原", self._action("confirm", self.plan.plan_id)))
+            elif not self.result and self.point.availability != "expired" and self.point.entries:
+                nav.append(("计划还原此点", self._action("plan", self.point.point_id)))
         items = []
-        if self.point:
+        if self.plan or self.result:
+            pass
+        elif self.point:
             for entry in self.point.entries:
                 relation = _RELATION[entry.current_relation]
                 if entry.current_relation == "later_request":
@@ -268,6 +310,9 @@ class RewindView:
             if self.preview:
                 add("before → after · " + self.preview.state + " · " + self.preview.observed_at, color=theme.MD_LINK)
                 lines.extend(ReviewView._diff_line(line, width) for line in self._viewport.frame(self._body, rows - len(lines)))
+            elif self.plan or self.result:
+                lines.extend(truncate_to_width(line, width)
+                             for line in self._viewport.frame(self._body, rows - len(lines)))
         self._visible_actions = tuple(hit.action for hit in hits)
         return DocumentLayout(tuple(lines), tuple(hits), (None,) * len(lines))
 

@@ -57,7 +57,7 @@ _ROW_KEYS = (
     "version", "row", "point_id", "kind", "request_id", "seq", "epoch_id",
     "session_id", "created_at", "source", "commit_state", "entries", "links",
 )
-_SETTLE_KEYS = _ROW_KEYS + ("winerror", "availability")
+_SETTLE_KEYS = _ROW_KEYS + ("winerror", "availability", "restore_results")
 _ENTRY_KEYS = ("path", "op", "before_sha256", "after_sha256", "size_bytes")
 
 
@@ -100,8 +100,8 @@ class StoredPoint:
 class _RequestContext:
     """一个请求内的捕获上下文 (应用在 begin 成功后建立, 请求收尾后清除)."""
 
-    request_id: str
-    epoch_id: str
+    request_id: str | None
+    epoch_id: str | None
     session_id: str
     point_id: str | None = None
     noted_seq: int | None = None
@@ -390,6 +390,45 @@ class RestoreStore:
             context.noted_seq = int(seq)
 
     # ---- 读取 (存储事实; 中立 DTO 由查看票投影) ----
+
+    def backup_restore(self, session_id: str, epoch_id: str | None,
+                       source_point: str,
+                       paths: tuple[tuple[str, bytes | None, bytes | None], ...]) -> str:
+        """完整备份先于工作区发布；before=None 是可还原的缺失 tombstone。"""
+        with self._lock:
+            if self._context is not None:
+                raise RestoreStoreError("request capture is still active")
+            context = _RequestContext(None, epoch_id, _checked_session_id(session_id))
+            point_id = _new_point_id()
+            entries = tuple(StoredEntry(
+                path, OP_CREATE if current is None else OP_MODIFY,
+                self._store_blob(current) if current is not None else None,
+                self._store_blob(desired) if desired is not None else None,
+                len(desired) if desired is not None else 0,
+            ) for path, current, desired in paths)
+            blobs = {sha for e in entries for sha in (e.before_sha256, e.after_sha256) if sha}
+            if sum(self._blob_size(sha) or 0 for sha in blobs) > BLOB_TOTAL_LIMIT_BYTES:
+                raise RestoreStoreError("restore backup exceeds blob quota")
+            row = _index_row(context, row=ROW_ENTRY, point_id=point_id,
+                             kind=KIND_PRE_RESTORE, commit_state="unknown", source="committed",
+                             entries=entries, seq=None, winerror=None)
+            row["links"] = [source_point]
+            self._append_row(row)
+            self._maintain_retention(protected=point_id)
+            return point_id
+
+    def finish_restore(self, session_id: str, backup_point_id: str, results: tuple) -> None:
+        """追加执行事实；不把备份的候选 after 冒称为已经全部发布。"""
+        with self._lock:
+            context = _RequestContext(None, None, _checked_session_id(session_id))
+            row = _index_row(context, row=ROW_SETTLE, point_id=backup_point_id,
+                             kind=KIND_PRE_RESTORE, commit_state="unknown", source="committed",
+                             entries=(), seq=None, winerror=None)
+            row["restore_results"] = [
+                {"path": r.relative_path, "state": r.state, "winerror": r.winerror}
+                for r in results]
+            self._append_row(row)
+            self._maintain_retention(protected=backup_point_id)
 
     def read_points(self, session_id: str) -> tuple[StoredPoint, ...]:
         """本会话全部还原点, 新→旧; availability 按 blob 核验与条目上限如实标注."""

@@ -117,8 +117,10 @@ from cicada.review import (
 from cicada.plugins.coding.process import process_plugin
 from cicada.restore_points import (
     REWIND_TIMEOUT_S, RewindError, RewindListView, RewindPointView, RewindPreview,
+    RewindRestorePlan, RewindRestoreResult,
 )
 from cicada.plugins.coding.rewind_reader import RewindReader
+from cicada.plugins.coding.rewind_restore import RewindRestorer
 from cicada.plugins.coding.restore_store import (
     RESTORE_CAPABILITY,
     RestoreStore, RestoreStoreError,
@@ -458,6 +460,11 @@ class ContextCompacted:
 
 
 @dataclass(frozen=True)
+class RewindRestoreCompleted:
+    result: RewindRestoreResult
+
+
+@dataclass(frozen=True)
 class ApplicationClosed:
     """关闭完成或明确清理失败; error 非空不代表所有资源均已成功释放."""
 
@@ -469,6 +476,7 @@ ApplicationUpdate = (
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
     | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
     | SessionNameChanged | SessionChanged
+    | RewindRestoreCompleted
 )
 
 
@@ -620,6 +628,7 @@ class ApplicationSession:
         self._file_queries: dict[asyncio.Task, CancelToken] = {}
         self._rewind_active = False
         self._rewind_reader: RewindReader | None = None
+        self._rewind_restorer: RewindRestorer | None = None
         self._rewind_task: asyncio.Task | None = None
         self._rewind_token: CancelToken | None = None
         self._review_active = False
@@ -754,6 +763,7 @@ class ApplicationSession:
         reader = RewindReader(store, workspace, self._store.session_id, self._epoch_id)
         self._rewind_active = True
         self._rewind_reader = reader
+        self._rewind_restorer = RewindRestorer(reader)
         try:
             return await self._rewind_io(reader.capture)
         except BaseException:
@@ -768,6 +778,29 @@ class ApplicationSession:
         reader = self._require_rewind()
         return await self._rewind_io(lambda token: reader.preview(point_id, entry_id, token))
 
+    def _admit_rewind_write(self) -> RewindRestorer:
+        self._require_rewind()
+        if (self._process_uncertain or self._storage_failed or self._view_only_reason
+                or self._session_cleanup_failed):
+            raise RewindError("blocked", "会话处于写入阻断状态，只能查看还原点。")
+        if self._rewind_restorer is None:
+            raise RewindError("invalid_target", "请重新打开还原点页面。")
+        return self._rewind_restorer
+
+    async def plan_rewind_restore(self, point_id: str) -> RewindRestorePlan:
+        restorer = self._admit_rewind_write()
+        return await self._rewind_io(lambda token: restorer.prepare(point_id, token))
+
+    async def execute_rewind_restore(self, plan_id: str) -> RewindRestoreResult:
+        restorer = self._admit_rewind_write()
+        return await self._rewind_io(lambda token: restorer.execute(plan_id, token),
+                                     completed=self._rewind_restore_completed)
+
+    def _rewind_restore_completed(self, result: RewindRestoreResult) -> None:
+        workspace = self._app.runtime.capability("coding.workspace")
+        workspace.files.invalidate_read_basis(r.relative_path for r in result.files)
+        self._notify(RewindRestoreCompleted(result))
+
     def _require_rewind(self) -> RewindReader:
         if not self.rewind_active or self._rewind_reader is None or self._closing:
             raise RewindError("invalid_target", "还原点页面已关闭。")
@@ -775,11 +808,16 @@ class ApplicationSession:
             raise RewindError("busy", "还原点读取尚未结束。")
         return self._rewind_reader
 
-    async def _rewind_io(self, operation):
+    async def _rewind_io(self, operation, *, completed=None):
         reader = self._rewind_reader
         token = CancelToken()
         task = asyncio.create_task(asyncio.to_thread(operation, token))
         self._rewind_task, self._rewind_token = task, token
+        if completed is not None:
+            def publish(done):
+                if not done.cancelled() and done.exception() is None:
+                    completed(done.result())
+            task.add_done_callback(publish)
         task.add_done_callback(self._rewind_io_settled)
         try:
             result = await asyncio.wait_for(asyncio.shield(task), REWIND_TIMEOUT_S)
@@ -805,6 +843,7 @@ class ApplicationSession:
 
     def cancel_rewind(self) -> None:
         self._rewind_reader = None
+        self._rewind_restorer = None
         if self._rewind_token is not None:
             self._rewind_token.cancel()
         if self._rewind_task is None or self._rewind_task.done():

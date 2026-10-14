@@ -68,3 +68,38 @@ class RewindPreview:
     text: str
     notice: str | None
     observed_at: str
+
+
+@dataclass(frozen=True)
+class RewindRestorePath:
+    relative_path: str
+    op: str
+    current_sha256: str | None
+    current_relation: str
+    later_seq: int | None
+
+
+@dataclass(frozen=True)
+class RewindRestorePlan:
+    plan_id: str
+    point_id: str
+    observed_at: str
+    paths: tuple[RewindRestorePath, ...]
+    deletions: tuple[str, ...]
+    successor_impacts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RewindRestoreFileResult:
+    relative_path: str
+    state: str
+    winerror: int | None = None
+    notice: str | None = None
+
+
+@dataclass(frozen=True)
+class RewindRestoreResult:
+    point_id: str
+    backup_point_id: str | None
+    files: tuple[RewindRestoreFileResult, ...]
+    notice: str | None = None
