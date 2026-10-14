@@ -14,6 +14,7 @@ dependencies = [
 cicada = "cicada.__main__:console_main"
 
 [project.optional-dependencies]
+benchmark = ["pyarrow==26.0.0"]
 # TUI 第一版 (探针裁决的发布版本): 仅交互终端入口需要, 无 UI 模式不导入
 tui = [
     "prompt_toolkit>=3.0.53",
