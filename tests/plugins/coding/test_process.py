@@ -202,9 +202,17 @@ async def test_continuous_output_does_not_reset_deadline(tmp_path):
     assert elapsed < 8
 
 
-async def test_cancel_token_is_bounded_and_marks_incomplete(tmp_path):
+async def test_cancel_token_is_bounded_and_marks_incomplete(tmp_path, monkeypatch):
     ws = make(tmp_path)
     cancel = CancelToken()
+    captured: list[_OutputCollector] = []
+
+    class Capturing(_OutputCollector):
+        def __init__(self, output_dir):
+            super().__init__(output_dir)
+            captured.append(self)
+
+    monkeypatch.setattr(process_module, "_OutputCollector", Capturing)
     task = asyncio.create_task(
         run_runner(
             PowerShellRunner(),
@@ -214,7 +222,13 @@ async def test_cancel_token_is_bounded_and_marks_incomplete(tmp_path):
             timeout=60.0,
         )
     )
-    await asyncio.sleep(1.5)
+    try:
+        assert await wait_until(lambda: bool(captured) and captured[-1]._artifact_bytes > 0), \
+            "pwsh did not produce collectable output in time"
+    except BaseException:
+        cancel.cancel()
+        await task
+        raise
     t0 = time.monotonic()
     cancel.cancel()
     result = await task
@@ -226,9 +240,17 @@ async def test_cancel_token_is_bounded_and_marks_incomplete(tmp_path):
     assert "started" in result.output.text
 
 
-async def test_task_cancel_without_token_cleans_up_and_next_run_is_clean(tmp_path):
+async def test_task_cancel_without_token_cleans_up_and_next_run_is_clean(tmp_path, monkeypatch):
     ws = make(tmp_path)
     runner = PowerShellRunner()
+    captured: list[_OutputCollector] = []
+
+    class Capturing(_OutputCollector):
+        def __init__(self, output_dir):
+            super().__init__(output_dir)
+            captured.append(self)
+
+    monkeypatch.setattr(process_module, "_OutputCollector", Capturing)
     task = asyncio.create_task(
         run_runner(
             runner,
@@ -237,7 +259,13 @@ async def test_task_cancel_without_token_cleans_up_and_next_run_is_clean(tmp_pat
             timeout=60.0,
         )
     )
-    await asyncio.sleep(0.5)  # 等 pwsh 真正启动
+    try:
+        assert await wait_until(lambda: bool(captured) and captured[-1]._artifact_bytes > 0), \
+            "pwsh did not produce collectable output in time"
+    except BaseException:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
     t0 = time.monotonic()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
