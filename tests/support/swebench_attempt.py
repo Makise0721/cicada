@@ -5,6 +5,8 @@ import copy
 import asyncio
 import hashlib
 import json
+import importlib.metadata
+import platform
 import os
 import time
 from datetime import datetime, timezone
@@ -38,6 +40,12 @@ def runtime_identity():
             "swebench_bridge.py", "swebench_cost.py", "swebench_owner.py", "swebench_run.py", "swebench_attempt.py"))]
     return {p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sorted(paths) if p.is_file()}
+
+
+def environment_identity():
+    return {"python": platform.python_version(), "platform": platform.platform(),
+            "packages": dict(sorted((d.metadata["Name"], d.version)
+                                     for d in importlib.metadata.distributions()))}
 
 
 def verify_live_pricing(prepared):
@@ -78,8 +86,18 @@ def prepare_attempt(prepared, root, *, live):
         admission = h.load_json(prepared / "offline-admission.json")
         if (admission.get("outcome") != "admitted" or admission.get("review_status") != "passed"
                 or admission.get("runtime_sha256") != runtime_identity()
-                or admission.get("lock_sha256") != h.sha256_file(prepared / h.LOCK_FILENAME)):
+                or admission.get("lock_sha256") != h.sha256_file(prepared / h.LOCK_FILENAME)
+                or admission.get("environment") != environment_identity()):
             raise ValueError("offline admission is absent or stale")
+        offline_root = Path(admission["attempt_root"])
+        if (not offline_root.is_relative_to(h.PROJECT)
+                or h.sha256_file(offline_root / "result.json") != admission.get("result_sha256")
+                or len(admission.get("reviews", {})) < 2):
+            raise ValueError("offline result or independent review evidence is absent or changed")
+        for path, digest in admission["reviews"].items():
+            review = Path(path)
+            if not review.is_relative_to(h.PROJECT) or h.sha256_file(review) != digest:
+                raise ValueError("independent review evidence changed")
         pricing = verify_live_pricing(prepared)
     root.mkdir(parents=True, exist_ok=False)
     for name in ("public", "private", "evidence", "temp"):
@@ -159,6 +177,7 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
     identity_problems = []
     transport = CostTransport(inner, ledger)
     initial_runtime = runtime_identity()
+    initial_environment = environment_identity()
     grade_evidence = {}
     final_patch = {}
     try:
@@ -179,6 +198,8 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
             current_snapshot = qualification["snapshot_ref"]
             h.write_json(root / "evidence/final-qualification.json", qualification)
             identity_problems = h.verify_frozen_identity(lock, root / "evidence")
+            if environment_identity() != initial_environment:
+                identity_problems.append("runtime environment changed during attempt")
             if runtime_identity() != initial_runtime:
                 identity_problems.append("harness source changed during attempt")
         cleanup = "confirmed"
@@ -210,7 +231,8 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
         "account_actual": "unavailable",
         "fee_bound_holds": budget.get("seal_reason") not in ("prompt-over-server-bound", "completion-over-cap")
             and Decimal(budget.get("total_upper", "0")) <= Decimal("4.50"),
-        "runtime_sha256": initial_runtime, "runtime_artifacts": str(root / "workspace/.cicada"),
+        "runtime_sha256": initial_runtime, "environment": initial_environment, "runtime_artifacts": str(root / "workspace/.cicada"),
         "evidence_index": [p.relative_to(root).as_posix() for p in sorted((root / "evidence").rglob("*")) if p.is_file()]}
+    result["evidence_sha256"] = {relative: h.sha256_file(root / relative) for relative in result["evidence_index"]}
     h.write_json(root / "result.json", result)
     return result

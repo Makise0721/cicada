@@ -1035,6 +1035,28 @@ def cmd_run(args) -> int:
         return 2
 
 
+def cmd_dry_run(args) -> int:
+    from tests.support.swebench_offline import dry_run
+    try:
+        admission = dry_run(Path(args.run_root).resolve())
+        print(json.dumps(admission, ensure_ascii=False))
+        return 0 if admission["outcome"] == "offline-passed-review-pending" else 1
+    except (BridgeError, OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({"outcome": "offline-failed", "reason": str(exc)[:300]}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
+def cmd_report(args) -> int:
+    from tests.support.swebench_offline import report
+    try:
+        summary = report(Path(args.run_root).resolve())
+        print(json.dumps(summary, ensure_ascii=False))
+        return 0 if summary["outcome"] == "passed" else 1
+    except (BridgeError, OSError, ValueError, RuntimeError) as exc:
+        print(json.dumps({"outcome": "inconclusive-evidence", "reason": str(exc)[:300]}, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="swebench_runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1046,12 +1068,14 @@ def main() -> int:
     grade = sub.add_parser("grade", help="重新导出最终补丁并在全新容器复评")
     grade.add_argument("--run-root", required=True)
     grade.add_argument("--workspace", default=None)
-    sub.add_parser("dry-run", help="票 03: 全路径离线演练")
+    dry = sub.add_parser("dry-run", help="同一固定题目全路径离线演练，不调用真实模型")
+    dry.add_argument("--run-root", required=True)
     run = sub.add_parser("run", help="生产 CLI 单题运行；仅另获本次付费授权后使用")
     run.add_argument("--live", action="store_true")
     run.add_argument("--run-root", required=True)
     run.add_argument("--prepared-root", required=True)
-    sub.add_parser("report", help="票 03: 结果汇编")
+    report = sub.add_parser("report", help="结果汇编与源码/工件漂移核对")
+    report.add_argument("--run-root", required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         return cmd_prepare(args)
@@ -1061,7 +1085,10 @@ def main() -> int:
         return cmd_grade(args)
     if args.command == "run":
         return cmd_run(args)
-    print("this subcommand is delivered by a later ticket of the plan", file=sys.stderr)
+    if args.command == "dry-run":
+        return cmd_dry_run(args)
+    if args.command == "report":
+        return cmd_report(args)
     return 2
 
 
