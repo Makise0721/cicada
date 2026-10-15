@@ -511,3 +511,30 @@ class TestWin32PointerDecode:
         items = list(r._get_keys(DWORD(2), records))
         assert len(items) == 1
         assert (items[0].kind, items[0].x, items[0].y) == ("cancel", -1, -1)
+
+    def test_focus_loss_resets_buttons_so_next_click_works(self):
+        """F1: 失焦时按钮仍按住、焦点外松开无记录 → 回窗首次按下仍产 down。
+
+        不重置快照时按钮位与失焦前相同, 第二次 press 会被吞掉, 与随后的 up
+        一起丢失一次点击 (少配)。
+        """
+        from ctypes.wintypes import DWORD
+
+        from prompt_toolkit.win32_types import FOCUS_EVENT_RECORD, INPUT_RECORD
+
+        r = self.make_reader()
+        assert r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0)).kind == "down"
+
+        def focus_record(focus):
+            ir = INPUT_RECORD()
+            ir.EventType = 16
+            ir.Event.FocusEvent = FOCUS_EVENT_RECORD()
+            ir.Event.FocusEvent.SetFocus = focus
+            return ir
+
+        records = (INPUT_RECORD * 1)()
+        records[0] = focus_record(0)
+        assert [e.kind for e in r._get_keys(DWORD(1), records)] == ["cancel"]
+        # 回窗后单击: 按下必须仍产 down, 松开才产 up (可配对)
+        assert r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0)).kind == "down"
+        assert r._decode_pointer(self.mouse(4, 2, 0, 0, 0)).kind == "up"

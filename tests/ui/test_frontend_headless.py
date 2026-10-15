@@ -171,10 +171,13 @@ async def test_alt_enter_cross_batch_within_window_newline():
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_escape_prefix_flushes_before_functional_key():
-    """D2: Escape 前缀窗口内的功能键先派发 Escape 再执行该键。"""
-    h = Harness(escape_timeout=1.0)
+    """D2: Escape 前缀窗口内的功能键先派发 Escape 再执行该键。
+
+    超时设为 0.2s 并在派发后等过窗口: 若冲刷只派发却漏了取消定时器, 迟到
+    Escape 会让 order 变成 [escape, shift_tab, escape]。
+    """
+    h = Harness(escape_timeout=0.2)
     order: list[str] = []
     h.frontend._on_shift_tab = lambda: order.append("shift_tab")
     h.frontend._on_escape = lambda: (order.append("escape"),
@@ -183,6 +186,9 @@ async def test_escape_prefix_flushes_before_functional_key():
         await h.start()
         h.terminal.emit([ESCAPE, BACKTAB])  # Alt+Shift+Tab
         await h.settle()
+        assert order == ["escape", "shift_tab"]
+        assert h.escape_count == 1
+        await asyncio.sleep(0.35)  # 越过前缀窗口: 不得有迟到 Escape
         assert order == ["escape", "shift_tab"]
         assert h.escape_count == 1
     finally:

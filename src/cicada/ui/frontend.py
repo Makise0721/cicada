@@ -498,9 +498,6 @@ class MainScreenFrontend:
             return
         self._sync_command_menu()
         data = key.data
-        # 原生鼠标 KeyPress (上游文本解析产物): 安全消费, 不写入编辑器 (C4)
-        if key.key is Keys.WindowsMouseEvent:
-            return
         # Escape 前缀窗口内到达任何非 Enter/Escape 键 (输入处理 v1 D2): Escape
         # 先行派发再按原逻辑处理该键; 否则 Alt+功能键会先执行功能键、10 ms 后才
         # 派发 Escape, 顺序颠倒。Enter 保留 Alt+Enter 换行、Escape 自身保留连按
@@ -513,6 +510,10 @@ class MainScreenFrontend:
         ):
             self._disarm_escape_prefix()
             self._dispatch_escape()
+        # 原生鼠标 KeyPress (上游文本解析产物): 安全消费, 不写入编辑器 (C4)。
+        # 置于冲刷之后, 使 Alt+鼠标键同样先派发 Escape (D2 无例外)。
+        if key.key is Keys.WindowsMouseEvent:
+            return
         # Ctrl+C / Ctrl+D: 直接派发 (Escape 前缀已在上方先行派发)
         if key.key in (Keys.ControlC,) or data == "\x03":
             if self._on_ctrl_c is not None:

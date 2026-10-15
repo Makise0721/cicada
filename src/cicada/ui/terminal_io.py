@@ -191,7 +191,7 @@ if sys.platform == "win32":
             # 几何提供者由 PromptToolkitTerminal 注入; 读取失败退原点 (0,0),
             # 事件几何与呈现几何不一致时前端忽略, 不会误触发。
             self.geometry_provider: Callable[[], TerminalGeometry] = TerminalGeometry
-            # 上一次非滚轮记录的 ButtonState 快照 (D1); 失焦不重置, 靠绝对快照自愈
+            # 上一次非滚轮记录的 ButtonState 快照 (D1); 失焦时重置 (见 _get_keys)
             self._last_buttons = 0
 
         def _event_to_key_presses(self, ev) -> list[KeyPress]:
@@ -220,6 +220,10 @@ if sys.platform == "win32":
                     if event is not None:
                         yield event
                 elif EventTypes[ir.EventType] == "FocusEvent" and not ev.SetFocus:
+                    # 失焦: 焦点外的按下/松开不会投递到本窗口, 按钮状态已不可信。
+                    # 重置快照, 使回窗后的第一次按下无论按钮位是否变化都能产 down
+                    # (D1 双向自愈); 前端 cancel 已清除未完成配对 (C4)。
+                    self._last_buttons = 0
                     yield PointerEvent("cancel", -1, -1, self._capture_geometry())
 
         def _capture_geometry(self) -> TerminalGeometry:
@@ -234,8 +238,8 @@ if sys.platform == "win32":
             ButtonState 是绝对快照, 与上一非滚轮记录差分: 新增位 = 按下, 归零 =
             松开。因此弦按(按下时仍有其他按钮)不再把第二个按钮解成可配对的左键
             down, 也不会被随后的 up 配成一次点击; 同时带 MOUSE_MOVED 的记录不再
-            吞掉其中的按下。漏记录(失焦/启动时已按住)由下一条记录自愈, 失焦不重置
-            状态; 滚轮记录不参与也不更新按钮状态。
+            吞掉其中的按下。失焦时重置快照(焦点外记录不投递), 回窗后第一次按下
+            必产 down, 使自愈双向成立; 滚轮记录不参与也不更新按钮状态。
             """
             flags = ev.EventFlags
             if flags & _MOUSE_HWHEELED:
