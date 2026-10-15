@@ -7,7 +7,9 @@
 import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -535,8 +537,11 @@ async def test_finalize_reports_added_modified_deleted_with_hashes(repo):
     (repo / "sample.py").write_text("VALUE = 7\n", encoding="utf-8")
     (repo / "brand-new.txt").write_text("fresh\n", encoding="utf-8")
     (repo / "test_sample.py").unlink()
-    evidence = await verifier.finalize(CancelToken())
+    finalized = await verifier.finalize_current(CancelToken())
+    evidence = finalized.evidence
     assert evidence.complete is True, evidence.error
+    assert finalized.view.snapshot_ref == evidence.snapshot_ref
+    assert finalized.view.scope_id == evidence.scope_id
     assert evidence.baseline_snapshot_ref == verifier.baseline_snapshot_ref
     assert evidence.snapshot_ref != evidence.baseline_snapshot_ref
     by_path = {change.relative_path: change for change in evidence.changes}
@@ -553,6 +558,92 @@ async def test_finalize_reports_added_modified_deleted_with_hashes(repo):
     assert "-VALUE = 1" in body and "+VALUE = 7" in body
     assert evidence.artifact_sha256 == hashlib.sha256(
         evidence.artifact_path.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "path", "mode"])
+async def test_final_materialization_changes_never_publish_candidate_authority(repo, mutation):
+    verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    await verifier.run_check("check-1", CancelToken())
+    original = verifier._write_diff
+
+    def mutate(*args):
+        artifact = original(*args)
+        if mutation == "bytes":
+            (repo / "sample.py").write_text("VALUE = 2\n", encoding="utf-8")
+        elif mutation == "path":
+            (repo / "new.txt").write_text("new\n", encoding="utf-8")
+        else:
+            git(repo, "update-index", "--chmod=+x", "sample.py")
+        return artifact
+
+    verifier._write_diff = mutate
+    finalized = await verifier.finalize_current(CancelToken())
+    assert not finalized.evidence.complete
+    assert finalized.evidence.snapshot_ref is None
+    assert finalized.evidence.artifact_sha256 is None
+    assert finalized.view.checks[0].freshness == "unknown"
+    assert finalized.view.blocking_reasons
+
+
+async def test_synchronous_materialization_over_deadline_cannot_complete(repo, monkeypatch):
+    import cicada.plugins.coding.snapshot as snapshot_module
+    import cicada.plugins.coding.verification as verification_module
+
+    verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    offset = [0.0]
+    clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0])
+    monkeypatch.setattr(snapshot_module, "time", clock)
+    monkeypatch.setattr(verification_module, "time", clock)
+    original = verifier._write_diff
+
+    def exceed(*args):
+        artifact = original(*args)
+        offset[0] = 11.0  # 同步物化结束时已经超过原10秒；不依赖event loop抢占。
+        return artifact
+
+    verifier._write_diff = exceed
+    finalized = await verifier.finalize_current(CancelToken())
+    assert offset[0] == 11.0
+    assert not finalized.evidence.complete
+    assert finalized.evidence.failure_kind == "snapshot_unavailable"
+    assert "timeout" in finalized.evidence.error
+    assert finalized.view.checks[0].freshness == "unknown"
+
+
+@pytest.mark.parametrize("stage", ["materialize", "second_scan"])
+async def test_finalization_cancellation_does_not_publish_facts(repo, stage):
+    verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    token = CancelToken()
+    entered = asyncio.Event()
+    if stage == "materialize":
+        original = verifier._write_diff
+
+        def cancel(*args):
+            artifact = original(*args)
+            token.cancel()
+            entered.set()
+            return artifact
+
+        verifier._write_diff = cancel
+    else:
+        original_scan = verifier.snapshotter._scan
+        scans = 0
+
+        async def second_scan(cancel, deadline):
+            nonlocal scans
+            scans += 1
+            if scans == 2:
+                entered.set()
+                await asyncio.Future()
+            return await original_scan(cancel, deadline)
+
+        verifier.snapshotter._scan = second_scan
+    task = asyncio.create_task(verifier.finalize_current(token))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    if stage == "second_scan":
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_corrupted_baseline_artifact_blocks_evidence(repo):

@@ -36,6 +36,7 @@ from cicada.plugins.coding.verification_contracts import (
     Snapshot,
     SnapshotCapture,
     SnapshotEntry,
+    VerificationFinalization,
     VerificationPlan,
     VerificationStatus,
     VerificationView,
@@ -97,10 +98,12 @@ def _sha256_text(text: str) -> str:
     return _sha256_bytes(text.encode("utf-8"))
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, checkpoint: Callable[[], None] | None = None) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         while chunk := handle.read(READ_CHUNK_BYTES):
+            if checkpoint is not None:
+                checkpoint()
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -331,103 +334,125 @@ class Verifier:
         self._latch(reason)
 
     async def finalize(self, cancel: CancelToken) -> ChangeEvidence:
+        """兼容证据单独出口；仍由同一完整双扫描确认."""
+        return (await self.finalize_current(cancel)).evidence
+
+    async def finalize_current(self, cancel: CancelToken) -> VerificationFinalization:
         baseline = self._baseline
         if baseline is None:
-            return ChangeEvidence(
-                baseline_snapshot_ref=None, snapshot_ref=None, scope_id=None, changes=(),
-                artifact_path=None, artifact_sha256=None, complete=False,
-                failure_kind="no_baseline",
-                error="initialize() did not establish a usable baseline snapshot",
+            return VerificationFinalization(
+                self._view(SnapshotCapture(None, "no_baseline", self.baseline_failure())),
+                ChangeEvidence(
+                    baseline_snapshot_ref=None, snapshot_ref=None, scope_id=None, changes=(),
+                    artifact_path=None, artifact_sha256=None, complete=False,
+                    failure_kind="no_baseline",
+                    error="initialize() did not establish a usable baseline snapshot",
+                ),
             )
-        final = await self.snapshotter.capture(cancel)
-        if not final.available:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref, snapshot_ref=None,
-                scope_id=baseline.scope_id, changes=(), artifact_path=None,
-                artifact_sha256=None, complete=False, failure_kind="snapshot_unavailable",
-                error=f"final snapshot unavailable ({final.failure_kind}): {final.error}",
+        # 首轮只是内部候选；capture 不可用时绝不发布其 snapshot_ref/freshness。
+        candidate_evidence: ChangeEvidence | None = None
+        capture_deadline = 0.0
+
+        def materialize(candidate: Snapshot, deadline: float) -> None:
+            nonlocal candidate_evidence, capture_deadline
+            capture_deadline = deadline
+
+            def checkpoint() -> None:
+                self._finalization_checkpoint(cancel, deadline)
+
+            checkpoint()
+            try:
+                verified = self._verify_baseline_artifact(baseline, checkpoint)
+            except TimeoutError:
+                raise
+            except (OSError, ValueError) as exc:
+                candidate_evidence = ChangeEvidence(
+                    baseline_snapshot_ref=baseline.snapshot_ref,
+                    snapshot_ref=candidate.snapshot_ref, scope_id=candidate.scope_id,
+                    changes=(), artifact_path=baseline.path, artifact_sha256=None,
+                    complete=False, failure_kind="baseline_corrupt",
+                    error=f"the preserved baseline bytes no longer match: {exc}",
+                )
+                return
+            checkpoint()
+            try:
+                final_bytes = self._load_final_bytes(candidate, verified, cancel, checkpoint)
+                changes = _changes(verified.files, candidate, final_bytes)
+                checkpoint()
+                path, digest = self._write_diff(
+                    verified, candidate, changes, final_bytes, checkpoint)
+            except TimeoutError:
+                raise
+            except (OSError, ValueError) as exc:
+                candidate_evidence = ChangeEvidence(
+                    baseline_snapshot_ref=baseline.snapshot_ref,
+                    snapshot_ref=candidate.snapshot_ref, scope_id=candidate.scope_id,
+                    changes=(), artifact_path=None, artifact_sha256=None,
+                    complete=False, failure_kind="evidence_incomplete",
+                    error=f"cannot produce complete change evidence: {exc}",
+                )
+                return
+            checkpoint()
+            candidate_evidence = ChangeEvidence(
+                baseline_snapshot_ref=baseline.snapshot_ref,
+                snapshot_ref=candidate.snapshot_ref, scope_id=candidate.scope_id,
+                changes=changes, artifact_path=path, artifact_sha256=digest,
+                complete=False,
             )
+
+        capture = await self.snapshotter._capture_materialized(cancel, materialize)
+        if not capture.available:
+            return VerificationFinalization(
+                self._view(capture),
+                ChangeEvidence(
+                    baseline_snapshot_ref=baseline.snapshot_ref, snapshot_ref=None,
+                    scope_id=None, changes=(),
+                    artifact_path=(candidate_evidence.artifact_path if candidate_evidence else None),
+                    artifact_sha256=None, complete=False, failure_kind="snapshot_unavailable",
+                    error=f"final snapshot unavailable ({capture.failure_kind}): {capture.error}",
+                ),
+            )
+        assert candidate_evidence is not None
+        evidence = candidate_evidence
         try:
-            verified = self._verify_baseline_artifact(baseline)
-        except (OSError, ValueError) as exc:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=(), artifact_path=baseline.path, artifact_sha256=None, complete=False,
-                failure_kind="baseline_corrupt",
-                error=f"the preserved baseline bytes no longer match: {exc}",
-            )
-        try:
-            final_bytes = self._load_final_bytes(final.snapshot, verified, cancel)
-            changes = _changes(verified.files, final.snapshot, final_bytes)
-            artifact_path, artifact_sha256 = self._write_diff(
-                verified, final.snapshot, changes, final_bytes)
-        except (OSError, ValueError) as exc:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=(), artifact_path=None, artifact_sha256=None, complete=False,
-                failure_kind="evidence_incomplete",
-                error=f"cannot produce complete change evidence: {exc}",
-            )
-        # 工件生成后再次刷新快照, 并重验工件 hash: 只有两者都成立才是完整证据。
-        if cancel.cancelled:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
-                complete=False, failure_kind="snapshot_unavailable",
-                error="the run was cancelled before the change artifact could be re-verified",
-            )
-        recheck = await self.snapshotter.capture(cancel)
-        if not recheck.available:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
-                complete=False, failure_kind="snapshot_unavailable",
-                error=(
-                    "the code changed while the change artifact was being produced "
-                    f"({recheck.failure_kind}): {recheck.error}"),
-            )
-        if recheck.snapshot.snapshot_ref != final.snapshot.snapshot_ref:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=recheck.snapshot.snapshot_ref, scope_id=recheck.snapshot.scope_id,
-                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
-                complete=False, failure_kind="snapshot_changed",
-                error="the code changed while the change artifact was being produced",
-            )
-        try:
-            observed_sha256 = _sha256_file(artifact_path)
-        except OSError as exc:
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
-                complete=False, failure_kind="artifact_corrupt",
-                error=f"the change artifact could not be re-read: {exc}",
-            )
-        if observed_sha256 != artifact_sha256:
-            # 保留生成时身份: 重读不一致说明工件被改写, 不能重认领新 hash 当作完整证据。
-            return ChangeEvidence(
-                baseline_snapshot_ref=baseline.snapshot_ref,
-                snapshot_ref=final.snapshot.snapshot_ref, scope_id=final.snapshot.scope_id,
-                changes=changes, artifact_path=artifact_path, artifact_sha256=None,
-                complete=False, failure_kind="artifact_corrupt",
-                error=(
-                    "the change artifact no longer matches the hash recorded when it was "
-                    f"written: recorded {artifact_sha256}, observed {observed_sha256}"),
-            )
-        return ChangeEvidence(
-            baseline_snapshot_ref=baseline.snapshot_ref,
-            snapshot_ref=final.snapshot.snapshot_ref,
-            scope_id=final.snapshot.scope_id,
-            changes=changes,
-            artifact_path=artifact_path,
-            artifact_sha256=artifact_sha256,
-            complete=True,
-        )
+            def checkpoint() -> None:
+                self._finalization_checkpoint(cancel, capture_deadline)
+
+            checkpoint()
+            if evidence.failure_kind is None:
+                assert evidence.artifact_path is not None and evidence.artifact_sha256 is not None
+                try:
+                    observed = _sha256_file(evidence.artifact_path, checkpoint)
+                except TimeoutError:
+                    raise
+                except OSError as exc:
+                    evidence = replace(
+                        evidence, artifact_sha256=None, failure_kind="artifact_corrupt",
+                        error=f"the change artifact could not be re-read: {exc}")
+                else:
+                    if observed != evidence.artifact_sha256:
+                        evidence = replace(
+                            evidence, artifact_sha256=None, failure_kind="artifact_corrupt",
+                            error=("the change artifact no longer matches the hash recorded when it was "
+                                   f"written: recorded {evidence.artifact_sha256}, observed {observed}"))
+                    else:
+                        evidence = replace(evidence, complete=True)
+            checkpoint()
+            view = self._view(capture)
+            checkpoint()
+        except TimeoutError:
+            unavailable = SnapshotCapture(None, "timeout", "snapshot capture deadline exceeded")
+            return VerificationFinalization(
+                self._view(unavailable), replace(
+                    evidence, snapshot_ref=None, scope_id=None, artifact_sha256=None,
+                    complete=False, failure_kind="snapshot_unavailable", error=unavailable.error))
+        return VerificationFinalization(view, evidence)
+
+    @staticmethod
+    def _finalization_checkpoint(cancel: CancelToken, deadline: float) -> None:
+        cancel.throw_if_cancelled()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("snapshot capture deadline exceeded")
 
     # --- check 工具的投影: 服务提供 content 拼装材料, 不自造第二份接口 ---
 
@@ -826,14 +851,18 @@ class Verifier:
         return _Baseline(snapshot.snapshot_ref, snapshot.scope_id, path,
                          _sha256_file(path), files)
 
-    def _verify_baseline_artifact(self, baseline: _Baseline) -> _Baseline:
+    def _verify_baseline_artifact(
+        self, baseline: _Baseline, checkpoint: Callable[[], None] | None = None,
+    ) -> _Baseline:
         """重新读回工件: 工件 hash 与逐文件内容都必须仍匹配初始值."""
-        if _sha256_file(baseline.path) != baseline.artifact_sha256:
+        if _sha256_file(baseline.path, checkpoint) != baseline.artifact_sha256:
             raise ValueError("the baseline artifact hash no longer matches")
         header: dict | None = None
         seen: set[str] = set()
         with open(baseline.path, "r", encoding="utf-8") as handle:
             for index, line in enumerate(handle):
+                if checkpoint is not None:
+                    checkpoint()
                 record = json.loads(line)
                 if index == 0:
                     header = record
@@ -856,7 +885,8 @@ class Verifier:
         return baseline
 
     def _load_final_bytes(
-        self, final: Snapshot, baseline: _Baseline, cancel: CancelToken
+        self, final: Snapshot, baseline: _Baseline, cancel: CancelToken,
+        checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, bytes]:
         """从最终快照重新装载字节并按已捕获 hash 校验; 不采信未校验的文件内容."""
         candidates = {
@@ -868,6 +898,8 @@ class Verifier:
         loaded: dict[str, bytes] = {}
         for relative_path in sorted(candidates, key=lambda p: (p.casefold(), p)):
             cancel.throw_if_cancelled()
+            if checkpoint is not None:
+                checkpoint()
             loaded[relative_path] = _load_entry_bytes(final, relative_path)
         return loaded
 
@@ -877,6 +909,7 @@ class Verifier:
         final: Snapshot,
         changes: tuple[FileChange, ...],
         final_bytes: dict[str, bytes],
+        checkpoint: Callable[[], None] | None = None,
     ) -> tuple[Path, str]:
         path = self._artifact_path("changes")
         written = 0
@@ -892,6 +925,8 @@ class Verifier:
             handle.write(header)
             written += len(header.encode("utf-8"))
             for change in changes:
+                if checkpoint is not None:
+                    checkpoint()
                 block = _diff_block(change, baseline.files, final_bytes)
                 size = len(block.encode("utf-8"))
                 if written + size > DIFF_MAX_BYTES:
@@ -899,7 +934,7 @@ class Verifier:
                         f"the complete change artifact would exceed {DIFF_MAX_BYTES} bytes")
                 handle.write(block)
                 written += size
-        return path, _sha256_file(path)
+        return path, _sha256_file(path, checkpoint)
 
     # --- content 拼装 ---
 

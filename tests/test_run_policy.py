@@ -103,6 +103,9 @@ class FakeVerificationService:
     async def finalize(self, cancel: CancelToken):
         raise AssertionError("投影不生成交付证据")
 
+    async def finalize_current(self, cancel: CancelToken):
+        raise AssertionError("投影不生成交付证据")
+
 
 def make_receipt(
     receipt_id: str,

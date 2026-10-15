@@ -162,6 +162,10 @@ class SlowRefreshService:
     async def finalize(self, cancel: CancelToken):
         return await self._inner.finalize(cancel)
 
+    async def finalize_current(self, cancel):
+        await asyncio.sleep(self._delay)
+        return await self._inner.finalize_current(cancel)
+
 
 class IgnoreCancelTool:
     """吞掉取消令牌并持续运行的工具: 关闭监督到点路径的可控资源."""

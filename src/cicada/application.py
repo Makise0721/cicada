@@ -2151,8 +2151,8 @@ class ApplicationSession:
         async def work() -> tuple[VerificationView, ChangeEvidence, DeliveryDecision]:
             # 末次工具结果 (含最后一轮 check/powershell 错误) 先锁存, 再取最终视图与证据
             policy._scan_terminal_facts(result.messages)
-            view = await service.refresh(token)
-            evidence = await service.finalize(token)
+            finalized = await service.finalize_current(token)
+            view, evidence = finalized.view, finalized.evidence
             decision = decide_delivery(result, view, evidence, verify_receipt_artifacts(view))
             return view, evidence, decision
 

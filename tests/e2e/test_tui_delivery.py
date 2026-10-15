@@ -295,6 +295,10 @@ class SlowService:
     async def finalize(self, cancel):
         return await self._inner.finalize(cancel)
 
+    async def finalize_current(self, cancel):
+        await asyncio.sleep(self._delay)
+        return await self._inner.finalize_current(cancel)
+
 
 async def test_t07_finalizing_submit_silent(tmp_path):
     from cicada.plugins.coding.verification import generate_verification_run_id

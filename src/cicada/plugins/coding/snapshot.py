@@ -20,6 +20,7 @@ import json
 import os
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,21 +124,36 @@ class Snapshotter:
 
     async def capture(self, cancel: CancelToken) -> SnapshotCapture:
         """两次扫描合计在同一 deadline 内; 协作取消与 Task.cancel 都传播."""
+        return await self._capture_materialized(cancel, None)
+
+    async def _capture_materialized(
+        self, cancel: CancelToken,
+        materialize: Callable[[Snapshot, float], None] | None,
+    ) -> SnapshotCapture:
+        """验证实现内部使用：候选只供物化，复核成功前不产生可用捕获."""
         try:
             async with asyncio.timeout(self.deadline_s):
-                return await self._capture(cancel)
+                return await self._capture(cancel, materialize)
         except TimeoutError:
             return _unavailable("timeout", "snapshot capture deadline exceeded")
 
-    async def _capture(self, cancel: CancelToken) -> SnapshotCapture:
+    async def _capture(
+        self, cancel: CancelToken,
+        materialize: Callable[[Snapshot, float], None] | None = None,
+    ) -> SnapshotCapture:
         cancel.throw_if_cancelled()
         deadline = time.monotonic() + self.deadline_s
         try:
             first = await self._scan(cancel, deadline)
+            if materialize is not None:
+                self._checkpoint(cancel, deadline)
+                materialize(self._snapshot(first), deadline)
+                self._checkpoint(cancel, deadline)
         except _CaptureError as exc:
             return _unavailable(exc.kind, exc.message)
         try:
             second = await self._scan(cancel, deadline)
+            self._checkpoint(cancel, deadline)
         except _CaptureError as exc:
             return _unavailable(exc.kind, exc.message)
         if first.root != second.root:
@@ -157,24 +173,23 @@ class Snapshotter:
                     "unstable",
                     "the two full scans disagree on the existence, length or content "
                     f"of {path}")
+        snapshot = self._snapshot(second)
+        self._checkpoint(cancel, deadline)
+        return SnapshotCapture(snapshot=snapshot)
+
+    def _snapshot(self, scan: _LedgerScan) -> Snapshot:
         entries = tuple(
-            first.observations[path]
-            for path in sorted(first.observations, key=lambda path: (path.casefold(), path))
+            scan.observations[path]
+            for path in sorted(scan.observations, key=lambda path: (path.casefold(), path))
         )
-        return SnapshotCapture(
-            snapshot=Snapshot(
-                snapshot_ref=snapshot_ref(
-                    entries,
-                    policy_id=self.ledger.policy_id,
-                    exclusions=self.ledger.exclusions,
-                    scope_id=self.ledger.scope_id,
-                ),
-                scope_id=self.ledger.scope_id,
-                root=first.root,
-                entries=entries,
-                policy_id=self.ledger.policy_id,
-                exclusions=self.ledger.exclusions,
-            )
+        scope_id = self.ledger.scope_id
+        return Snapshot(
+            snapshot_ref=snapshot_ref(
+                entries, policy_id=self.ledger.policy_id,
+                exclusions=self.ledger.exclusions, scope_id=scope_id,
+            ),
+            scope_id=scope_id, root=scan.root, entries=entries,
+            policy_id=self.ledger.policy_id, exclusions=self.ledger.exclusions,
         )
 
     async def _scan(self, cancel: CancelToken, deadline: float) -> _LedgerScan:

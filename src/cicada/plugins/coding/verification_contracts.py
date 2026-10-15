@@ -167,6 +167,14 @@ class ChangeEvidence:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class VerificationFinalization:
+    """同一次最终捕获派生的当前视图与变更证据；交付仍由应用判定."""
+
+    view: VerificationView
+    evidence: ChangeEvidence
+
+
 class VerificationService(Protocol):
     @property
     def plan(self) -> VerificationPlan: ...
@@ -189,4 +197,8 @@ class VerificationService(Protocol):
 
     async def finalize(self, cancel: CancelToken) -> ChangeEvidence:
         """返回已校验的变更证据或完整性故障；不判定模型 stop."""
+        ...
+
+    async def finalize_current(self, cancel: CancelToken) -> VerificationFinalization:
+        """以同一组完整双扫描确认最终视图与证据；失败不提升候选权威."""
         ...
