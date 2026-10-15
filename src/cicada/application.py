@@ -60,6 +60,7 @@ from cicada.core.messages import (
 )
 from cicada.core.ports import ModelRequest, ToolSpec
 from cicada.costs import CostControlPort, CostLedger, CostSnapshot
+from cicada.diagnostic_export import ReportError, build_report, write_report
 from cicada.models import (
     CacheDiagnosticsPort, CacheRequestObservation, ConfigurationRequest, ModelBinding,
     ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ReasoningEffortPort,
@@ -644,6 +645,7 @@ class ApplicationSession:
         # 02 (C8): 最近本进程 outcome 的隔离只读引用与登记目标; 恢复不建立,
         # clear 不清除。页面不持久化, 旧工件不因此获得当前交付权威。
         self._last_outcome: RequestOutcome | None = None
+        self._last_request_model: str | None = None
         self._review_targets: dict[str, _ReviewTarget] = {}
         # 04 (C6): 最新接受的配置准备源; 发布时按结构能力更新, 不从启动缓存准备
         self._model_configuration: ModelConfigurationPort | None = None
@@ -1349,6 +1351,7 @@ class ApplicationSession:
             self._request_store = None
             self._request_epoch = None
             self._last_outcome = None
+            self._last_request_model = None
             self._review_targets.clear()
             self._user_name = snapshot.user_name
             if self._projection is not None:
@@ -1470,6 +1473,28 @@ class ApplicationSession:
     def cost(self) -> CostSnapshot | None:
         """本进程费用事实；切换会话或配置不重置，也不从存档恢复。"""
         return self._config.cost_control.snapshot if self._config.cost_control is not None else None
+
+    def diagnostics_report(self) -> dict:
+        """隔离的只读报告；完成时事实不会因导出变成当前检查权威。"""
+        return build_report(config=self._config, persistence=self.persistence,
+            generation=self.session_generation, outcome=self._last_outcome,
+            request_model=self._last_request_model,
+            model_identity=self._model_route.binding.identity if self._model_route is not None else None,
+            ordinary_calls=self.process_model_calls,
+            summary_calls=self.process_summary_calls, cost=self.cost, restored_receipts=self.restored_receipts)
+
+    def export_diagnostics(self, path: Path) -> Path:
+        """空闲或可靠关闭后同步写一次有界元数据，不建后台生产者。"""
+        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
+                     self._login_task, self._login_save_task, *self._undead_tasks)
+        if (self._state not in ('idle', 'closed') or self._begin_in_flight or self._session_in_flight
+                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
+                or self.review_active or self.rewind_active or self.catalog_active
+                or any(task is not None and not task.done() for task in producers)):
+            raise ReportError('diagnostic export requires a settled session')
+        destination = self._config.workspace / path.expanduser()
+        write_report(destination, self.diagnostics_report())
+        return destination
 
     @property
     def summary_records(self) -> tuple[SummaryRecord, ...]:
@@ -1982,6 +2007,7 @@ class ApplicationSession:
         # C8: 在既有发布位置保存最近本进程 outcome 的隔离只读引用 (02);
         # 不从 CheckProjection/_last_completed 反取权威, 也不从 restored_requests 恢复
         self._last_outcome = _isolate_outcome(outcome)
+        self._last_request_model = self._config.model_label
         self._notify(RequestCompleted(outcome))
         # 请求拥有持久提交、seq补记和捕获收尾的真实IO；内核结束不释放此信号。
         if self._active_done is not None and not self._active_done.done():

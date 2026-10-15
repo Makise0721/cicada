@@ -23,7 +23,7 @@ class SlashCommand:
 SLASH_COMMANDS = (
     SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
-    SlashCommand("/cost", "显示本进程费用与调用限额"),
+    SlashCommand("/export", "导出诊断报告：/export <路径.md或.json>"),
     SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill"),
     SlashCommand("/diff", "审阅工作区差异"),
     SlashCommand("/rewind", "查看并还原各请求的文件改动"),
@@ -31,6 +31,7 @@ SLASH_COMMANDS = (
     SlashCommand("/login", "保存登录配置（可在空闲 DeepSeek 会话保存并应用）"),
     SlashCommand("/compact", "摘要较早对话以释放上下文（需持久会话）"),
     SlashCommand("/clear", "清空模型历史（已显示记录保留）"),
+    SlashCommand("/cost", "显示本进程费用与调用限额"),
     SlashCommand("/name", "会话名称：/name <名称> · --clear 清除"),
     SlashCommand("/resume", "搜索并恢复本工作区会话"),
     SlashCommand("/new", "新建保存会话，验证状态保留"),

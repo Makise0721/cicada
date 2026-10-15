@@ -91,6 +91,7 @@ from cicada.core.events import (
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
 from cicada.costs import CostError
+from cicada.diagnostic_export import ReportError, validate_report_path
 from cicada.persistence.contracts import (
     LIST_SESSIONS_PAGE_SIZE,
     LaunchIdentity,
@@ -382,7 +383,11 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         return 2
     try:
         cost_control = prepare_cost_control(args, workspace.expanduser().resolve())
-    except CostError as exc:
+        if getattr(args, 'export_report', None) is not None:
+            if args.tui:
+                raise ReportError('--export-report is for single requests; use /export in the TUI')
+            validate_report_path(workspace / Path(args.export_report).expanduser())
+    except (CostError, ReportError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     # 指令文件错误先于 preflight/bootstrap (P3 §4.2); Skills 目录错误同为启动输入
@@ -703,6 +708,13 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if session.cost is not None:
         from cicada.costs import cost_lines
         print('\n'.join(cost_lines(session.cost)))
+    if getattr(args, 'export_report', None) is not None:
+        try:
+            destination = session.export_diagnostics(Path(args.export_report))
+            print(f'[report exported: {destination}]')
+        except ReportError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     return outcome.exit_code
 
 
@@ -827,6 +839,7 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
     parser.add_argument('--cost-limit-cny', help='本次进程费用上界（元），须配 --cost-profile；重启新建额度')
     parser.add_argument('--cost-profile', help='本地价格 JSON（相对 workspace），记录来源、核对日期和模型单价')
     parser.add_argument('--max-model-calls', type=int, help='本次进程真实模型发送次数上限；普通与摘要共用')
+    parser.add_argument('--export-report', metavar='PATH', help='单次请求结束后导出 .md/.json 诊断报告；拒绝覆盖已有文件；TUI 用 /export <路径>')
     parser.add_argument(
         "--num-ctx", type=int, help="本地窗口上限 (默认 131072)"
     )

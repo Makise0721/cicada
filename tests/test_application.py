@@ -100,6 +100,40 @@ def _plan(root: Path, command: str = CHECK_COMMAND) -> VerificationPlan:
     )
 
 
+async def test_diagnostic_export_preserves_recorded_receipts_without_revalidation(tmp_path):
+    import json
+    from cicada.diagnostic_export import ReportError
+
+    root = _repo(tmp_path)
+    session = await open_application(_config(root, plan=_plan(root), script=_script(
+        {'tool_calls': [{'id': 'w', 'name': 'write', 'arguments': {'path': 'result.txt', 'content': 'private tool body'}}]},
+        {'tool_calls': [{'id': 'c', 'name': 'check', 'arguments': {'action': 'run', 'check_id': 'check-1'}}]},
+        {'text': 'private answer', 'stop': True})))
+    try:
+        outcome = await session.execute('private user prompt')
+        assert outcome.decision.can_deliver
+        before = (session.history, len(session.process_model_calls))
+        (root / 'result.txt').write_text('changed after completion', encoding='utf-8')
+        destination = session.export_diagnostics(Path('report.json'))
+        original = destination.read_bytes()
+        report = json.loads(original)
+        assert report['latest_request']['snapshot_at_completion'] == outcome.view.snapshot_ref
+        assert report['latest_request']['checks_at_completion'][0]['freshness_at_completion'] == 'current'
+        assert 'not revalidated' in report['observation']
+        assert 'private user prompt' not in original.decode() and 'private tool body' not in original.decode()
+        assert 'private answer' not in original.decode()
+        assert (session.history, len(session.process_model_calls)) == before
+        with pytest.raises(ReportError, match='already exists'):
+            session.export_diagnostics(Path('report.json'))
+        assert destination.read_bytes() == original
+        report['latest_request']['checks_at_completion'].clear()
+        assert session.diagnostics_report()['latest_request']['checks_at_completion']
+    finally:
+        await session.aclose()
+    session.export_diagnostics(Path('closed-report.md'))
+    assert '导出未重新检查工作区' in (root / 'closed-report.md').read_text(encoding='utf-8')
+
+
 class Collector:
     """订阅 ApplicationUpdate; 记录顺序并支持等待."""
 

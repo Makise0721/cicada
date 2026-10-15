@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from pathlib import Path
 from typing import Callable
 
 from cicada.application import (
@@ -85,6 +86,7 @@ from cicada.application import (
 )
 from cicada.persistence.contracts import validate_session_name
 from cicada.costs import cost_lines
+from cicada.diagnostic_export import ReportError
 from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
@@ -841,6 +843,17 @@ class ConversationView:
             self.transcript.append_information('费用控制', [('',
                 [*cost_lines(cost), '范围：本次进程；重启新建额度', f'账本：{cost.ledger_path}']
                 if cost is not None else ['未启用；启动时用 --cost-limit-cny/--max-model-calls 设置'])])
+            return True
+        if command == '/export' or command.startswith('/export '):
+            path = command[len('/export'):].strip()
+            if not path:
+                self.transcript.append_system('用法：/export <路径.md或.json>（不覆盖已有文件）')
+                return True
+            try:
+                destination = self._session.export_diagnostics(Path(path))
+                self.transcript.append_system(f'诊断已导出：{destination}')
+            except ReportError as exc:
+                self.transcript.append_error(str(exc))
             return True
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)

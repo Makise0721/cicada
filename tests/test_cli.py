@@ -41,6 +41,21 @@ def test_cost_flags_refuse_missing_profile_and_fake_before_execution(tmp_path):
     assert not (tmp_path / '.cicada').exists()
 
 
+def test_cli_diagnostic_export_uses_settled_outcome_and_refuses_overwrite(tmp_path):
+    script = tmp_path / 'script.json'
+    script.write_text(json.dumps([{'text': 'private answer', 'stop': True}]), encoding='utf-8')
+    result = run_cli('--workspace', str(tmp_path), '--script', str(script), '--export-report', 'result.json', 'private prompt')
+    assert result.returncode == 0
+    report = json.loads((tmp_path / 'result.json').read_text(encoding='utf-8'))
+    assert report['latest_request']['stop_reason'] == 'stop'
+    assert report['latest_request']['model_at_request'] == 'fake'
+    assert 'private prompt' not in json.dumps(report) and 'private answer' not in json.dumps(report)
+    original = (tmp_path / 'result.json').read_bytes()
+    result = run_cli('--workspace', str(tmp_path), '--script', str(script), '--export-report', 'result.json', 'second')
+    assert result.returncode == 2 and 'already exists' in result.stderr
+    assert (tmp_path / 'result.json').read_bytes() == original
+
+
 def test_cost_profile_and_actual_cli_model_share_persisted_allowance(tmp_path, monkeypatch):
     profile = tmp_path / 'prices.json'
     profile.write_text(json.dumps({'schema_version': 1, 'source': 'https://example.invalid/prices',
