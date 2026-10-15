@@ -83,7 +83,7 @@ def report(root):
         problems.append("workspace differs from the independently graded source")
     summary = {key: result.get(key) for key in (
         "outcome", "attempt", "design", "mode", "live", "cleanup", "http_handoffs", "summary_handoffs",
-        "usage_coverage", "known_pricing_estimate", "account_actual", "fee_bound_holds", "stop_reason")}
+        "usage_coverage", "known_pricing_estimate", "cache_aware_pricing_estimate", "account_actual", "fee_bound_holds", "stop_reason")}
     summary["historical_outcome"] = result["outcome"]
     summary["report_problems"] = problems
     if problems:

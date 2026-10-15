@@ -63,6 +63,11 @@ def verify_live_pricing(prepared):
     source = prepared / "live-pricing-source.html"
     if hashlib.sha256(source.read_bytes()).hexdigest() != proof.get("source_sha256"):
         raise ValueError("live pricing source snapshot differs")
+    rate = proof.get("cache_hit_input_cny_per_million")
+    if rate is not None:
+        amount = Decimal(str(rate))
+        if not amount.is_finite() or not 0 <= amount <= Decimal("2"):
+            raise ValueError("cache pricing contradicts the uncached upper bound")
     return proof
 
 
@@ -98,6 +103,9 @@ def prepare_attempt(prepared, root, *, live):
             review = Path(path)
             if not review.is_relative_to(h.PROJECT) or h.sha256_file(review) != digest:
                 raise ValueError("independent review evidence changed")
+        from tests.support.swebench_offline import report
+        if report(offline_root)["outcome"] != "passed":
+            raise ValueError("offline raw evidence is absent, changed, or no longer current")
         pricing = verify_live_pricing(prepared)
     root.mkdir(parents=True, exist_ok=False)
     for name in ("public", "private", "evidence", "temp"):
@@ -145,6 +153,38 @@ def classify_result(production, transport, grade, cleanup, current_snapshot, ide
                 (c.get("receipt") or {}).get("verification_status") != "passed" for c in checks)):
         return "failed-delivery"
     return "passed"
+
+
+def pricing_estimates(calls, cache_hit_rate=None):
+    uncached = Decimal("0")
+    cached = Decimal("0")
+    complete = True
+    hit_total = miss_total = covered = 0
+    rate = Decimal(str(cache_hit_rate)) if cache_hit_rate is not None else None
+    for call in calls:
+        usage = call.get("usage")
+        if call["state"] != "settled" or usage is None:
+            complete = False
+            continue
+        prompt, output = usage["prompt_tokens"], usage["completion_tokens"]
+        uncached += (Decimal(prompt) * 2 + Decimal(output) * 8) / Decimal(1_000_000)
+        hit, miss = usage.get("cache_hit_input_tokens"), usage.get("cache_miss_input_tokens")
+        if hit is None or miss is None or hit + miss != prompt:
+            complete = False
+            continue
+        hit_total += hit
+        miss_total += miss
+        if hit and rate is None:
+            complete = False
+            continue
+        cached += (Decimal(hit) * (rate or Decimal("0")) + Decimal(miss) * 2 + Decimal(output) * 8) / Decimal(1_000_000)
+        covered += 1
+    return str(uncached), {"status": "available" if complete else "unavailable",
+        "cny": str(cached) if complete else None, "known_part_cny": str(cached),
+        "cache_hit_input_cny_per_million": str(rate) if rate is not None else None,
+        "cache_hit_tokens_known": hit_total, "cache_miss_tokens_known": miss_total,
+        "covered_calls": covered, "total_calls": len(calls),
+        "reason": None if complete else "cache usage or frozen cache price is incomplete"}
 
 
 def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600):
@@ -217,9 +257,8 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
         ledger.release_lock()
     outcome = classify_result(production, transport, grade, cleanup, current_snapshot, identity_problems)
     budget = ledger.budget
-    estimate = sum((Decimal(c["usage"]["prompt_tokens"]) * Decimal("2") +
-                    Decimal(c["usage"]["completion_tokens"]) * Decimal("8")) / Decimal(1_000_000)
-                   for c in ledger.calls if c["state"] == "settled")
+    pricing_proof = h.load_json(root / "evidence/provenance.json").get("live_pricing") or {}
+    estimate, cache_estimate = pricing_estimates(ledger.calls, pricing_proof.get("cache_hit_input_cny_per_million"))
     result = {"outcome": outcome, "attempt": root.name, "design": lock["design"],
         "mode": "offline-mock" if offline else "live", "live": "not-run" if offline else "run-once",
         "started": started, "ended": time.time(), "production": production, "grade": grade,
@@ -227,7 +266,9 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
         "current_snapshot_ref": current_snapshot, "cleanup": cleanup, "identity_problems": identity_problems,
         "http_handoffs": transport.handoffs, "summary_handoffs": sum(c["kind"] == "summary" and c.get("handed_off", False) for c in ledger.calls),
         "usage_coverage": sum(c["state"] == "settled" for c in ledger.calls), "budget": budget,
-        "stop_reason": transport.stop_reason, "known_pricing_estimate": str(estimate),
+        "stop_reason": transport.stop_reason, "known_pricing_estimate": estimate,
+        "known_pricing_estimate_basis": "uncached equivalent of known settled calls; unrounded",
+        "cache_aware_pricing_estimate": cache_estimate,
         "account_actual": "unavailable",
         "fee_bound_holds": budget.get("seal_reason") not in ("prompt-over-server-bound", "completion-over-cap")
             and Decimal(budget.get("total_upper", "0")) <= Decimal("4.50"),
