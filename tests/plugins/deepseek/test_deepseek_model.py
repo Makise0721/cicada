@@ -125,6 +125,72 @@ class BytesStream(httpx.AsyncByteStream):
             raise RuntimeError(KEY)
 
 
+async def test_cost_reservation_boundary_and_summary_share_call_limit(tmp_path):
+    from decimal import Decimal
+    from cicada.costs import CostLedger, CostProfile, ModelPrice
+
+    profile = CostProfile('https://example.invalid/prices', '2026-10-15', 'a' * 64,
+                          (ModelPrice('deepseek-flash', Decimal('1'), Decimal('1')),))
+    sent = []
+    def handle(request):
+        sent.append(request)
+        return httpx.Response(200, stream=BytesStream(frame({'content': 'answer'}, finish='stop',
+            usage={'prompt_tokens': 10, 'completion_tokens': 2}) + DONE))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        config = DeepSeekConfig(think=False, max_tokens=2048)
+        refused = CostLedger(tmp_path / 'cost', limit=Decimal('1.10'), profile=profile)
+        model = DeepSeekModel(client, config, KEY, cost_control=refused)
+        events = [e async for e in model.stream(REQUEST, CancelToken())]
+        assert events[-1].stop_reason == 'error' and sent == [] and refused.snapshot.calls == 0
+        equal = CostLedger(tmp_path / 'cost', limit=Decimal('1.11'), profile=profile)
+        model = DeepSeekModel(client, config, KEY, cost_control=equal)
+        events = [e async for e in model.stream(REQUEST, CancelToken())]
+        assert events[-1].stop_reason == 'stop' and len(sent) == 1
+        assert equal.snapshot.settled_upper_cny == '0.01' and equal.snapshot.pending_upper_cny == '0.00'
+        calls = CostLedger(tmp_path / 'cost', max_calls=2)
+        model = DeepSeekModel(client, config, KEY, cost_control=calls)
+        for channel in (model.initial_binding.summary_model, model.prepare_model('deepseek-v4-pro').model, model):
+            events = [e async for e in channel.stream(REQUEST, CancelToken())]
+        assert events[-1].stop_reason == 'error' and len(sent) == 3 and calls.snapshot.calls == 2
+
+
+@pytest.mark.parametrize('failure', ['usage-missing', 'length', 'close', 'over-cap'])
+async def test_cost_incomplete_call_keeps_reserve_and_blocks_next_http(tmp_path, failure):
+    from decimal import Decimal
+    from cicada.costs import CostLedger, CostProfile, ModelPrice
+
+    profile = CostProfile('https://example.invalid/prices', '2026-10-15', 'a' * 64,
+                          (ModelPrice('deepseek-flash', Decimal('1'), Decimal('1')),))
+    ledger = CostLedger(tmp_path / 'cost', limit=Decimal('10'), profile=profile)
+    sent = []
+    usage = None if failure == 'usage-missing' else {'prompt_tokens': 10, 'completion_tokens': 2049 if failure == 'over-cap' else 2}
+    def handle(request):
+        sent.append(request)
+        return httpx.Response(200, stream=BytesStream(frame({'content': 'answer'},
+            finish='length' if failure == 'length' else 'stop', usage=usage) + DONE,
+            fail_close=failure == 'close'))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(think=False, max_tokens=2048), KEY, cost_control=ledger)
+        for _ in range(2):
+            events = [e async for e in model.stream(REQUEST, CancelToken())]
+            assert events[-1].stop_reason in ('error', 'length')
+    assert len(sent) == 1 and ledger.snapshot.sealed_reason
+    assert ledger.snapshot.settled_upper_cny == '0.00' and ledger.snapshot.pending_upper_cny == '1.11'
+
+
+async def test_cost_ledger_write_failure_prevents_http(tmp_path, monkeypatch):
+    from cicada import costs
+    sent = []
+    ledger = costs.CostLedger(tmp_path / 'cost', max_calls=1)
+    def fail(*args):
+        raise OSError('injected write failure')
+    monkeypatch.setattr(costs.os, 'replace', fail)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: sent.append(request))) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(), KEY, cost_control=ledger)
+        events = [e async for e in model.stream(REQUEST, CancelToken())]
+    assert sent == [] and events[-1].stop_reason == 'error' and ledger.snapshot.sealed_reason
+
+
 async def collect(data, *, config=None, status=200, fail_close=False, request=REQUEST):
     stream = BytesStream(data, fail_close=fail_close)
     requests = []
@@ -325,7 +391,12 @@ async def test_request_context_maps_to_trailing_user_and_requires_tools():
 
 
 @pytest.mark.parametrize("phase", ["send", "read", "task"])
-async def test_cancellation_interrupts_blocked_io_and_closes_response(phase):
+async def test_cancellation_interrupts_blocked_io_and_closes_response(phase, tmp_path):
+    from decimal import Decimal
+    from cicada.costs import CostLedger, CostProfile, ModelPrice
+    profile = CostProfile('https://example.invalid/prices', '2026-10-15', 'a' * 64,
+                          (ModelPrice('deepseek-flash', Decimal('1'), Decimal('1')),))
+    ledger = CostLedger(tmp_path / 'cost', limit=Decimal('10'), profile=profile)
     entered = asyncio.Event()
     class Blocked(BytesStream):
         async def __aiter__(self):
@@ -342,7 +413,7 @@ async def test_cancellation_interrupts_blocked_io_and_closes_response(phase):
         token = CancelToken()
         events = []
         async def run():
-            async for event in DeepSeekModel(client, DeepSeekConfig(), KEY).stream(REQUEST, token):
+            async for event in DeepSeekModel(client, DeepSeekConfig(), KEY, cost_control=ledger).stream(REQUEST, token):
                 events.append(event)
         task = asyncio.create_task(run())
         await asyncio.wait_for(entered.wait(), 2)
@@ -353,6 +424,8 @@ async def test_cancellation_interrupts_blocked_io_and_closes_response(phase):
         await asyncio.gather(task, return_exceptions=True)
     assert events[-1].stop_reason == "aborted"
     assert phase == "send" or stream.closed
+    assert ledger.snapshot.sealed_reason and ledger.snapshot.pending_upper_cny == '1.14'
+    assert ledger.snapshot.settled_upper_cny == '0.00'
 
 
 async def test_total_deadline_interrupts_send(monkeypatch):

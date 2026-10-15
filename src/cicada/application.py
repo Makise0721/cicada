@@ -59,6 +59,7 @@ from cicada.core.messages import (
     isolate_tool_result,
 )
 from cicada.core.ports import ModelRequest, ToolSpec
+from cicada.costs import CostControlPort, CostLedger, CostSnapshot
 from cicada.models import (
     CacheDiagnosticsPort, CacheRequestObservation, ConfigurationRequest, ModelBinding,
     ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ReasoningEffortPort,
@@ -266,6 +267,7 @@ class ApplicationConfig:
     # 请求级快照与撤回 01 (C2): restore_capture 默认开启; 关闭时不安装捕获汇,
     # 编辑照常工作且不产生还原点 (受限环境出口)
     restore_capture: bool = True
+    cost_control: CostLedger | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -278,6 +280,8 @@ class ApplicationConfig:
             raise ValueError("plan must be a VerificationPlan or None")
         if not isinstance(self.restore_capture, bool):
             raise ValueError("restore_capture must be a bool")
+        if self.cost_control is not None and not isinstance(self.cost_control, CostLedger):
+            raise ValueError('cost_control must be a CostLedger or None')
         if self.persistence is not None:
             if not isinstance(self.persistence, PersistenceConfig):
                 raise ValueError("persistence must be a PersistenceConfig or None")
@@ -1461,6 +1465,11 @@ class ApplicationSession:
         if self._budget_policy is None:
             return None
         return self._budget_policy.snapshot()
+
+    @property
+    def cost(self) -> CostSnapshot | None:
+        """本进程费用事实；切换会话或配置不重置，也不从存档恢复。"""
+        return self._config.cost_control.snapshot if self._config.cost_control is not None else None
 
     @property
     def summary_records(self) -> tuple[SummaryRecord, ...]:
@@ -3437,6 +3446,10 @@ async def open_application(
 
     def _model_policy(model, runtime):
         nonlocal config, budget_config, context_projection
+        if config.cost_control is not None:
+            if not isinstance(model, CostControlPort):
+                raise ValueError('selected model does not support cost control')
+            model.set_cost_control(config.cost_control)
         binding = model.initial_binding if isinstance(model, ModelSelectionPort) else None
         if binding is not None:
             policy_state["model_selection"] = model

@@ -33,6 +33,29 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_cost_flags_refuse_missing_profile_and_fake_before_execution(tmp_path):
+    result = run_cli('--workspace', str(tmp_path), '--cost-limit-cny', '1', 'task')
+    assert result.returncode == 2 and '--cost-profile' in result.stderr
+    result = run_cli('--workspace', str(tmp_path), '--script', 'missing.json', '--max-model-calls', '2', 'task')
+    assert result.returncode == 2 and 'cost controls' in result.stderr
+    assert not (tmp_path / '.cicada').exists()
+
+
+def test_cost_profile_and_actual_cli_model_share_persisted_allowance(tmp_path, monkeypatch):
+    profile = tmp_path / 'prices.json'
+    profile.write_text(json.dumps({'schema_version': 1, 'source': 'https://example.invalid/prices',
+        'checked_at': '2026-10-15', 'models': {'deepseek-flash': {
+            'input_cny_per_million': '1', 'output_cny_per_million': '1'}}}), encoding='utf-8')
+    api = _ApiMock(monkeypatch)
+    result = api.run('--workspace', str(tmp_path), '--cost-limit-cny', '2', '--cost-profile', 'prices.json',
+                     '--max-model-calls', '1', 'task')
+    assert result.returncode == 0 and len(api.requests) == 1
+    ledger = json.loads(next((tmp_path / '.cicada' / 'cost').glob('*.json')).read_text(encoding='utf-8'))
+    assert ledger['calls'] == 1 and ledger['settled_upper_cny'] == '0.01' and ledger['pending_upper_cny'] == '0.00'
+    assert ledger['checked_at'] == '2026-10-15' and 'cli-mock-key' not in json.dumps(ledger)
+    assert 'example.invalid/prices' in result.stdout
+
+
 class _ApiMock:
     """通过 MockTransport 运行实际 API 插件，不启动服务。"""
 

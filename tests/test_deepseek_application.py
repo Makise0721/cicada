@@ -40,6 +40,39 @@ def config(root, transport, session_id=None, model_config=None):
         persistence=PersistenceConfig(identity=identity, session_id=session_id), max_turns=8)
 
 
+async def test_process_cost_control_is_shared_across_compaction_clear_and_session_switch(tmp_path):
+    from cicada.costs import CostLedger
+
+    root = _repo(tmp_path)
+    bodies = []
+    def handle(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        return httpx.Response(200, content=response('thought' if body['thinking']['type'] == 'enabled' else None))
+    ledger = CostLedger(root / '.cicada' / 'cost', max_calls=5)
+    session = await open_application(replace(config(root, httpx.MockTransport(handle)), cost_control=ledger))
+    try:
+        original = session.persistence.session_id
+        await session.execute('first')
+        await session.execute('second')
+        await session.compact_context()
+        assert bodies[-1]['thinking']['type'] == 'disabled' and session.cost.calls == 3
+        await session.clear_context()
+        await session.execute('after clear')
+        await session.select_model('deepseek-v4-pro')
+        await session.set_reasoning_effort('low')
+        await session.submit_new_session().wait()
+        assert session.cost.calls == 4
+        await session.execute('new session')
+        await session.submit_resume_session(original, adopt_current_config=True).wait()
+        outcome = await session.execute('limit must survive')
+        assert outcome.exit_code == 1 and 'call limit' in outcome.result.error
+        assert len(bodies) == 5 and session.cost.calls == 5
+    finally:
+        await session.aclose()
+    assert 'offline-test-key' not in ledger.path.read_text(encoding='utf-8')
+
+
 async def test_tools_new_user_restart_and_nonthinking_summary_use_real_bindings(tmp_path):
     root = _repo(tmp_path)
     bodies = []

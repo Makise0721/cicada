@@ -12,6 +12,7 @@ import httpx
 from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelRequest, StreamDone, StreamEvent
+from cicada.costs import CostError, CostLedger
 from cicada.models import (
     CacheRequestObservation, ConfigurationRequest, ModelBinding, ModelOption, SafeModelIdentity,
 )
@@ -100,12 +101,14 @@ async def _close_response(response: httpx.Response, deadline: float) -> bool:
 
 
 class DeepSeekModel:
-    def __init__(self, client: httpx.AsyncClient, config: DeepSeekConfig, api_key: str) -> None:
+    def __init__(self, client: httpx.AsyncClient, config: DeepSeekConfig, api_key: str, *,
+                 cost_control: CostLedger | None = None) -> None:
         if not isinstance(api_key, str) or not api_key.strip() or any(c in api_key for c in "\r\n"):
             raise ValueError("DEEPSEEK_API_KEY is missing or invalid")
         self.client = client
         self.config = config
         self._api_key = api_key
+        self._cost_control = cost_control
         # 缓存 03 (契约 C7): 每实例一份比较基线与最新观察; 换模型/强度/配置
         # 准备出的新实例从空开始, 不持久、不跨进程恢复。
         self._observation: CacheRequestObservation | None = None
@@ -124,10 +127,16 @@ class DeepSeekModel:
     def options(self) -> tuple[ModelOption, ...]:
         return tuple(ModelOption(model, model) for model in MODEL_IDS)
 
+    def set_cost_control(self, ledger: CostLedger) -> None:
+        """装配时绑定本进程唯一账本，后继配置不能换额度。"""
+        if self._cost_control is not None and self._cost_control is not ledger:
+            raise CostError('model already has a different cost allowance')
+        self._cost_control = ledger
+
     @property
     def initial_binding(self) -> ModelBinding:
         summary_config = replace(self.config, think=False, max_tokens=2048)
-        summary = DeepSeekModel(self.client, summary_config, self._api_key)
+        summary = DeepSeekModel(self.client, summary_config, self._api_key, cost_control=self._cost_control)
         return ModelBinding(self, summary, self.config.identity, summary_config.identity,
                             BudgetConfig(self.config.num_ctx, self.config.max_tokens),
                             BudgetConfig(summary_config.num_ctx, summary_config.max_tokens),
@@ -135,7 +144,7 @@ class DeepSeekModel:
 
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
-        return DeepSeekModel(self.client, config, self._api_key).initial_binding
+        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control).initial_binding
 
     @property
     def reasoning_efforts(self) -> tuple[str, ...]:
@@ -150,7 +159,7 @@ class DeepSeekModel:
         if effort not in REASONING_EFFORTS:
             raise ValueError(f"unknown reasoning effort: {effort!r}")
         config = replace(self.config, think=True, reasoning_effort=effort)
-        return DeepSeekModel(self.client, config, self._api_key).initial_binding
+        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control).initial_binding
 
     def prepare_configuration(self, request: ConfigurationRequest) -> ModelBinding:
         """登录应用准备: 复用既有 client, 零网络/文件 I/O, 旧对象保持不可变。"""
@@ -168,7 +177,7 @@ class DeepSeekModel:
             max_request_bytes=identity.max_request_bytes or REQUEST_LIMIT,
         )
         key = self._api_key if request.credential_action == "keep" else request.credential.reveal()
-        return DeepSeekModel(self.client, config, key).initial_binding
+        return DeepSeekModel(self.client, config, key, cost_control=self._cost_control).initial_binding
 
     def _record_observation(self, request: ModelRequest, body: dict) -> None:
         """缓存 03 (契约 C7): client.send 实际启动的同步接缝调用一次。
@@ -224,6 +233,7 @@ class DeepSeekModel:
         terminal = StreamDone("error", "deepseek request failed")
         calls = []
         task_cancelled = False
+        reservation = None
         deadline = time.monotonic() + CALL_DEADLINE_S
         try:
             body = build_request(request, self.config)
@@ -233,6 +243,10 @@ class DeepSeekModel:
                 timeout=DEFAULT_TIMEOUT)
             if len(built.content) > self.config.max_request_bytes:
                 raise ProtocolError("request exceeds byte limit; not sent")
+            if cancel.cancelled:
+                raise asyncio.CancelledError
+            if self._cost_control is not None:
+                reservation = self._cost_control.reserve(self.config.model, self.config.max_tokens)
             # 缓存 03 (契约 C7): 观察只在通过本地验证与字节守卫且 send 实际启动
             # 的同步接缝更新一次, 不能提前到 build_request; 发送后失败仍保留。
             self._record_observation(request, body)
@@ -271,6 +285,9 @@ class DeepSeekModel:
         except ProtocolError as exc:
             terminal = StreamDone("error", f"deepseek protocol error: {exc}", completion.metrics)
             calls = []
+        except CostError as exc:
+            terminal = StreamDone('error', str(exc), completion.metrics)
+            calls = []
         except Exception:
             # 连接、URL、构造或未知异常均不回显 exc/request/Authorization。
             terminal = StreamDone("error", "deepseek request or stream failed", completion.metrics)
@@ -290,6 +307,15 @@ class DeepSeekModel:
                     await chunks.aclose()
                 except Exception:
                     terminal = StreamDone("error", "deepseek stream close failed", completion.metrics)
+                    calls = []
+            if reservation is not None:
+                try:
+                    self._cost_control.finish(reservation, terminal.metrics, complete=(
+                        terminal.stop_reason in ('stop', 'tool_use') and terminal.error is None
+                        and completion.done and not cancel.cancelled and not task_cancelled))
+                except CostError as exc:
+                    reason = 'error' if terminal.stop_reason in ('stop', 'tool_use') else terminal.stop_reason
+                    terminal = StreamDone(reason, terminal.error or str(exc), completion.metrics)
                     calls = []
         if cancel.cancelled:
             terminal = StreamDone("aborted", metrics=completion.metrics)

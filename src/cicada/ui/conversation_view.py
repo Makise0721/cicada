@@ -84,6 +84,7 @@ from cicada.application import (
     SessionChanged,
 )
 from cicada.persistence.contracts import validate_session_name
+from cicada.costs import cost_lines
 from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
@@ -835,6 +836,12 @@ class ConversationView:
         if command == "/status":
             self.transcript.append_information("会话信息", self._status_sections())
             return True
+        if command == '/cost':
+            cost = self._session.cost
+            self.transcript.append_information('费用控制', [('',
+                [*cost_lines(cost), '范围：本次进程；重启新建额度', f'账本：{cost.ledger_path}']
+                if cost is not None else ['未启用；启动时用 --cost-limit-cny/--max-model-calls 设置'])])
+            return True
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)
         if command == "/resume":
@@ -1206,8 +1213,10 @@ class ConversationView:
         # CLI 诊断重复提供相同模型事实时只展示一次，保留任何不同的诊断值。
         diagnostics = [line for line in diagnostics if line != session_lines[1]]
         budget = self._session.budget
+        cost = self._session.cost
         sections = [
             ("会话", session_lines),
+            *([('费用', [f'本进程调用 {cost.calls} · 已结算上界 {cost.settled_upper_cny or "不可得"} 元 · 详见 /cost'])] if cost is not None else []),
             *budget_sections(
                 budget, self._session.summary_records, persistent=persistence is not None,
             ),

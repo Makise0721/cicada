@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+
+from cicada.costs import CostError, CostLedger, CostProfile, positive_amount
 
 from cicada.persistence.contracts import LaunchIdentity, PersistenceError, StoredIdentity
 from cicada.plugins.deepseek import DeepSeekConfig
@@ -107,6 +110,24 @@ def validate_model_args(
     if checks and args.num_ctx is not None and args.num_ctx < CHECK_MODE_MIN_NUM_CTX:
         return (), f"检查模式要求 --num-ctx >= {CHECK_MODE_MIN_NUM_CTX}, 收到 {args.num_ctx}"
     return checks, None
+
+
+def prepare_cost_control(args: argparse.Namespace, workspace: Path) -> CostLedger | None:
+    """显式进程限额；金额上限与价格输入不从旧会话或用户默认值继承。"""
+    amount = getattr(args, 'cost_limit_cny', None)
+    calls = getattr(args, 'max_model_calls', None)
+    profile_path = getattr(args, 'cost_profile', None)
+    if amount is None and calls is None and profile_path is None:
+        return None
+    if args.script is not None:
+        raise CostError('cost controls require a real model; --script is incompatible')
+    if profile_path is not None and amount is None:
+        raise CostError('--cost-profile requires --cost-limit-cny')
+    if amount is not None and profile_path is None:
+        raise CostError('--cost-limit-cny requires an explicit --cost-profile')
+    profile = CostProfile.load(workspace / profile_path) if profile_path is not None else None
+    return CostLedger(workspace / '.cicada' / 'cost', limit=positive_amount(amount) if amount is not None else None,
+                      max_calls=calls, profile=profile)
 
 
 def prepare_restored_launch(

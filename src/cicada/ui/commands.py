@@ -23,6 +23,7 @@ class SlashCommand:
 SLASH_COMMANDS = (
     SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
+    SlashCommand("/cost", "显示本进程费用与调用限额"),
     SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill"),
     SlashCommand("/diff", "审阅工作区差异"),
     SlashCommand("/rewind", "查看并还原各请求的文件改动"),

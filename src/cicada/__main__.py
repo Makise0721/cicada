@@ -74,6 +74,7 @@ from cicada.cli_startup import (
     NORMAL_MODE_MAX_TURNS,
     _RESUME_PICK,
     parse_check_commands,
+    prepare_cost_control,
     prepare_restored_launch,
     resolve_deepseek_config,
     validate_model_args,
@@ -89,6 +90,7 @@ from cicada.core.events import (
     TurnStarted,
 )
 from cicada.core.ports import StreamDone, StreamEvent, TextDelta, ToolCallEvent
+from cicada.costs import CostError
 from cicada.persistence.contracts import (
     LIST_SESSIONS_PAGE_SIZE,
     LaunchIdentity,
@@ -198,6 +200,8 @@ def _run_list_sessions(args: argparse.Namespace) -> int:
     if (
         args.save_session or args.resume is not None or args.resume_with_current_config
         or args.tui or args.skill is not None
+        or any(getattr(args, field, None) is not None for field in
+               ('cost_limit_cny', 'cost_profile', 'max_model_calls', 'export_report'))
     ):
         print(
             "--list-sessions 是只读列表入口, 不能与 --save-session/--resume/--tui/--skill 组合",
@@ -375,6 +379,11 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     workspace = Path(args.workspace)
     if not workspace.expanduser().is_dir():
         print('workspace 必须为存在的目录', file=sys.stderr)
+        return 2
+    try:
+        cost_control = prepare_cost_control(args, workspace.expanduser().resolve())
+    except CostError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     # 指令文件错误先于 preflight/bootstrap (P3 §4.2); Skills 目录错误同为启动输入
     # 错误, 在存档身份预读与 provider 探测之前 (D8)
@@ -629,6 +638,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         budget=budget_config,
         skills=skills_snapshot,
         restore_capture=not args.no_restore_capture,
+        cost_control=cost_control,
     )
     if args.tui:
         assert run_tui_session_fn is not None
@@ -690,6 +700,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             print(f"[session saved request_id={facts.request_id} seq={facts.seq}]")
         else:
             print(f"[session save failed: {facts.error}]", file=sys.stderr)
+    if session.cost is not None:
+        from cicada.costs import cost_lines
+        print('\n'.join(cost_lines(session.cost)))
     return outcome.exit_code
 
 
@@ -791,7 +804,17 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
 还原只改变文件，不回滚对话或检查记录；交付需重新检查。捕获失败拒绝本次编辑。
 数据在工作区 .cicada/restore/；保留每会话最近 100 点、工作区 blob 512 MiB，
 启动机会式清理 30 天前点；已清理点不可还原。--no-restore-capture 关闭新捕获，
-已有点仍可查看；非持久会话不捕获，单次 CLI 无还原入口。''',
+已有点仍可查看；非持久会话不捕获，单次 CLI 无还原入口。
+
+费用控制默认关闭。--max-model-calls 单独限制本进程发送次数；金额上限须同时给
+--cost-limit-cny 与 --cost-profile。普通/摘要共用额度，clear/new/resume/model/login
+不重置，重启新建额度。发送前按1,100,000输入tokens和本次输出cap预留，超限零发送；
+完整成功计量及响应关闭后结算，缺计量/错误/取消保留预留并封口。/cost 查看详情。
+价格文件为UTF-8 JSON（≤64KiB），结构示例（1.00仅示例，不是当前报价）：
+{"schema_version":1,"source":"https://example.invalid/pricing","checked_at":"2026-10-15",
+ "models":{"deepseek-flash":{"input_cny_per_million":"1.00","output_cny_per_million":"1.00"}}}
+按需增加deepseek-v4-pro。价格应覆盖所用模型/时段的上界；配置单价及输入上界冻结，
+不是实时价格或账户账单。账本在.cicada/cost/，不从旧存档恢复消费额度。''',
     )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
@@ -801,6 +824,9 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
                         help="开启/关闭思考 (默认开启; 思考可在 TUI 展开查看)")
     parser.add_argument("--reasoning-effort", choices=("low", "high", "max"), help="DeepSeek 思考强度 (默认 high)")
     parser.add_argument("--max-output-tokens", type=int, help="DeepSeek 思考+答案总输出上限 (默认 32768)")
+    parser.add_argument('--cost-limit-cny', help='本次进程费用上界（元），须配 --cost-profile；重启新建额度')
+    parser.add_argument('--cost-profile', help='本地价格 JSON（相对 workspace），记录来源、核对日期和模型单价')
+    parser.add_argument('--max-model-calls', type=int, help='本次进程真实模型发送次数上限；普通与摘要共用')
     parser.add_argument(
         "--num-ctx", type=int, help="本地窗口上限 (默认 131072)"
     )
