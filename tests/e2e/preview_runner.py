@@ -175,8 +175,8 @@ def evaluate_calibration(spec: TaskSpec, image: dict, verifier_dir: Path,
     return result
 
 
-def calibration_problems(empty: bridge.EvaluationResult,
-                         gold: bridge.EvaluationResult, timeout_s: float) -> list[str]:
+def calibration_problems(empty: bridge.EvaluationResult, gold: bridge.EvaluationResult,
+                         timeout_s: float, f2p: list[str]) -> list[str]:
     """空补丁必失败、参考补丁必通过的联合判定; 返回全部不足, 不早退掩盖。"""
     problems: list[str] = []
     for name, result in (("empty", empty), ("gold", gold)):
@@ -198,16 +198,21 @@ def calibration_problems(empty: bridge.EvaluationResult,
         problems.append("empty: reward must be 0")
     if empty_grade.get("grader_pass"):
         problems.append("empty: empty patch must not be reported as passing")
-    # 空补丁门槛严格照授权包口径: "空补丁 reward=0 且退出失败"。官方 exit/reward 是权威,
-    # 不额外要求 required_observed == required_total 或 f2p_failed: 当题目的 test_patch
-    # 新增测试文件时 (new-multifile 的 test_locale.py 是 new file), 空补丁下该文件导入
-    # 失败会让整轮 pytest 会话中止, 连基础已存在的 P2P 也观测不到。旧单题流程那条更严的
-    # 断言只适用于 F2P 用例在基础版本即已存在的题目。
-    #
-    # 代价: 对这类题目, "空补丁失败"的强度较弱 (仅证明官方判定为未通过, 不证明 F2P 逐项
-    # 失败)。该差异逐题记入 receipt 的 empty_reversal_strength, 不在此处静默升级为强结论。
     if empty_grade.get("parse_failed"):
         problems.append("empty: official output.json unparsable")
+    # 空补丁门槛 (主 Agent 2026-10-15 裁决的细化标准):
+    #   (a) 官方 exit!=0 且 reward==0;
+    #   (b) 基线已存在的 P2P 必须被观测且通过 —— 证明"失败来自缺少实现",
+    #       而不是环境/收集被搞坏;
+    #   (c) 被观测到的 F2P 必须失败 (部分观测即可, 见下)。
+    # 不要求 required_observed == required_total: 当题目 test_patch 新增整个测试文件时
+    # (new-multifile 的 test_locale.py 是 new file), 空补丁下该文件导入失败会让整轮
+    # pytest 会话中止, 那部分 F2P 根本无法被收集。逐题强度记入 empty_reversal_strength。
+    if not empty_grade.get("p2p_passed"):
+        problems.append("empty: pre-existing P2P tests must be observed and pass")
+    f2p_observed_failed, f2p_total = empty_f2p_failures(empty, f2p)
+    if f2p_observed_failed == 0:
+        problems.append("empty: no F2P test was observed failing")
 
     gold_grade = gold.output_json or {}
     if not gold_grade.get("grader_pass"):
@@ -222,22 +227,60 @@ def calibration_problems(empty: bridge.EvaluationResult,
     return problems
 
 
-def empty_reversal_strength(empty: bridge.EvaluationResult) -> dict:
+def test_statuses(result: bridge.EvaluationResult) -> dict[str, str]:
+    """从官方 output.json 工件解析逐用例状态; 解析失败返回空表 (判定仍以 exit/reward 为准)。"""
+    raw = (result.artifacts or {}).get("output.json")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    statuses: dict[str, str] = {}
+    for entry in payload.get("tests", []):
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            statuses[entry["name"]] = str(entry.get("status", ""))
+    return statuses
+
+
+def empty_f2p_failures(empty: bridge.EvaluationResult,
+                       f2p: list[str]) -> tuple[int, int]:
+    """空补丁下被观测且失败的 F2P 数量, 与 F2P 总数。"""
+    statuses = test_statuses(empty)
+    failed = [name for name in f2p if statuses.get(name) == "FAILED"]
+    return len(failed), len(f2p)
+
+
+def empty_reversal_strength(empty: bridge.EvaluationResult,
+                            f2p: list[str]) -> dict:
     """记录空补丁反证的实际强度, 避免把弱反证当强结论。"""
     grade = empty.output_json or {}
     observed = grade.get("required_observed")
     total = empty.required_total
-    strong = bool(grade.get("f2p_failed")) and observed == total
-    if strong:
-        detail = "every required test observed and F2P individually failed"
+    failed_count, f2p_total = empty_f2p_failures(empty, f2p)
+    p2p_passed = bool(grade.get("p2p_passed"))
+    all_f2p_failed = f2p_total > 0 and failed_count == f2p_total
+    if p2p_passed and all_f2p_failed and observed == total:
+        strength = "strong"
+        detail = "every required test observed and all F2P individually failed"
+    elif p2p_passed and failed_count:
+        strength = "partial-f2p-observed"
+        detail = (f"{failed_count}/{f2p_total} F2P tests observed failing while "
+                  f"pre-existing P2P stayed green; the unobserved rest could not be "
+                  f"collected under the empty patch ({observed}/{total} observed)")
+    elif p2p_passed:
+        strength = "p2p-intact-only"
+        detail = ("no F2P test was observed failing; reversal rests on the official "
+                  "exit code and reward=0 with pre-existing P2P intact")
     else:
+        strength = "exit-and-reward-only"
         detail = ("required tests were not all collected under the empty patch "
                   f"({observed}/{total} observed); reversal rests on the official "
                   "exit code and reward=0 only")
-    return {"strength": "strong" if strong else "exit-and-reward-only",
-            "required_observed": observed, "required_total": total,
-            "f2p_failed": bool(grade.get("f2p_failed")),
-            "p2p_passed": bool(grade.get("p2p_passed")), "detail": detail}
+    return {"strength": strength, "required_observed": observed,
+            "required_total": total, "f2p_observed_failed": failed_count,
+            "f2p_total": f2p_total, "f2p_failed": bool(grade.get("f2p_failed")),
+            "p2p_passed": p2p_passed, "detail": detail}
 
 
 # --- prepare ---
@@ -353,9 +396,11 @@ def cmd_prepare(args) -> int:
             row["pass_to_pass"], timeout_s)
         receipt["calibration_gold"] = gold_eval.to_json()
 
-        problems = calibration_problems(empty_eval, gold_eval, timeout_s)
+        problems = calibration_problems(empty_eval, gold_eval, timeout_s,
+                                         row["fail_to_pass"])
         receipt["calibration_problems"] = problems
-        receipt["empty_reversal_strength"] = empty_reversal_strength(empty_eval)
+        receipt["empty_reversal_strength"] = empty_reversal_strength(
+            empty_eval, row["fail_to_pass"])
         if problems:
             raise PrepareFailed("calibration failed: " + "; ".join(problems[:6]))
 
