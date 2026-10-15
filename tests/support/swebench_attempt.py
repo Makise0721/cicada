@@ -23,7 +23,8 @@ from tests.support.swebench_run import run_cli
 DISCIPLINE = ("上述 /app 指本次 Windows 工作区，源码与官方基础版本一致。请自行读取与定位问题，"
     "只修改 lib/ansible/utils/vars.py 和 lib/ansible/vars/manager.py。先用 check-1 确认初始未通过，"
     "修改后用 check-1 重检；检查在固定 Linux 容器运行。不得改测试、样本、依赖或项目指令，"
-    "不查找参考修复，不联网、不提交。普通环境是 Windows/PowerShell。最后如实说明修改及指定检查结果；"
+    "不查找参考修复，不联网、不提交。不要在宿主机对工作区执行 python 或导入其代码，验证只用 check-1。"
+    "普通环境是 Windows/PowerShell。最后如实说明修改及指定检查结果；"
     "未解决就报告未完成。")
 
 
@@ -187,7 +188,7 @@ def pricing_estimates(calls, cache_hit_rate=None):
         "reason": None if complete else "cache usage or frozen cache price is incomplete"}
 
 
-def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600):
+def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=900):
     from tests.e2e import swebench_runner as h
 
     started = time.time()
@@ -198,7 +199,7 @@ def execute_attempt(prepared, root, *, inner=None, offline=False, timeout_s=600)
                 raise ValueError("offline mode requires a local transport")
             key = "offline-benchmark-key"
         else:
-            if inner is not None or timeout_s != 600:
+            if inner is not None or timeout_s != 900:
                 raise ValueError("live transport and runtime overrides are forbidden")
             from cicada.plugins.user_config import FileUserConfigStore
             credential = FileUserConfigStore(Path.home() / ".cicada").load(os.environ.get("DEEPSEEK_API_KEY")).credential

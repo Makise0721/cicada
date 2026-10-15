@@ -31,7 +31,9 @@ SERVER_INPUT_TOKEN_BOUND = 1_100_000
 # 冻结的请求 cap (spec D3): 普通 8192; 意外摘要 2048。
 NORMAL_OUTPUT_CAP = 8192
 SUMMARY_OUTPUT_CAP = 2048
-MAX_HTTP_CALLS = 12
+# 修订 2026-10-15 (amendment-proposal-20261015 提案A): 12 -> 24;
+# 费用硬闸 S+U+R<=4.50 与次数无关，次数仅作 usage 谎报的纵深防御。
+MAX_HTTP_CALLS = 24
 
 PRICING_IDENTITY = {
     "currency": "CNY",

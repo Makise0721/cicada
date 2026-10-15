@@ -58,6 +58,18 @@ def test_outside_scope_including_ignored_file_is_rejected(tmp_path):
         export_patch(root, base, ("source.txt",), tmp_path, git)
 
 
+def test_python_bytecode_caches_are_exempted_and_recorded(tmp_path):
+    root, git, base = repository(tmp_path)
+    cache = root / "pkg/__pycache__"
+    cache.mkdir(parents=True)
+    (cache / "mod.cpython-312.pyc").write_bytes(b"\x00")
+    (root / "source.txt").write_text("changed\n", encoding="utf-8")
+    exported = export_patch(root, base, ("source.txt",), tmp_path, git)
+    assert exported.exempted_paths == ["pkg/__pycache__/mod.cpython-312.pyc"]
+    assert exported.to_json()["exempted_paths"] == exported.exempted_paths
+    assert b"__pycache__" not in exported.patch_bytes
+
+
 def test_official_reward_cannot_replace_required_coverage():
     output = json.dumps({"tests": [{"name": "regression", "status": "PASSED"}]}).encode()
     assert not grade_from_artifacts(0, b"1", output, ["required"], ["regression"])["grader_pass"]
@@ -212,16 +224,16 @@ async def test_cost_unresolved_keeps_reserve_and_seals(tmp_path, mode):
         ledger.release_lock()
 
 
-@pytest.mark.parametrize("kind", ["equal", "over", "thirteen", "persist"])
+@pytest.mark.parametrize("kind", ["equal", "over", "limit", "persist"])
 async def test_cost_send_gates_before_handoff(tmp_path, monkeypatch, kind):
     import httpx
-    from tests.support.swebench_cost import CostTransport, LedgerError
+    from tests.support.swebench_cost import CostTransport, LedgerError, MAX_HTTP_CALLS
     ledger = ledger_at(tmp_path)
     if kind in ("equal", "over"):
         ledger.budget["settled_upper"] = "2.23" if kind == "equal" else "2.24"
         ledger._persist()
-    elif kind == "thirteen":
-        ledger.budget["calls"] = 12
+    elif kind == "limit":
+        ledger.budget["calls"] = MAX_HTTP_CALLS
     else:
         def fail():
             raise OSError("offline disk failure")

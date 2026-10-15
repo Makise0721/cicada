@@ -37,7 +37,7 @@ def cli_arguments(run_root, prompt):
             "--check-command", command, "--check-timeout", "300", prompt]
 
 
-def run_cli(run_root, transport, key, prompt, *, timeout_s=600):
+def run_cli(run_root, transport, key, prompt, *, timeout_s=900):
     import cicada.__main__ as cli
     from cicada.plugins.deepseek.model import DeepSeekModel
 

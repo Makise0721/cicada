@@ -650,7 +650,7 @@ def build_lock(run_root: Path, row: dict, verifier: dict, image: dict, receipt: 
         "created": time.time(),
         "profile": {"model": "deepseek-flash", "num_ctx": 262144,
                     "max_tokens": 8192, "thinking": "enabled", "reasoning_effort": "low",
-                    "http_limit": 12, "run_timeout": 600, "check_timeout": 300,
+                    "http_limit": 24, "run_timeout": 900, "check_timeout": 300,
                     "grader_timeout": 240, "budget_cny": "4.50"},
         "pending_fields": [],
     }
@@ -900,7 +900,8 @@ def evaluate_workspace_patch(run_root: Path, workspace: Path, lock: dict,
                                 ALLOWED_PATHS, temp_dir, git)
     except PatchScopeError as exc:
         (evidence_dir / "scope-violation.json").write_text(
-            json.dumps({"offending": exc.offending}, ensure_ascii=False, indent=1),
+            json.dumps({"offending": exc.offending, "exempted": exc.exempted},
+                       ensure_ascii=False, indent=1),
             encoding="utf-8")
         summary = {"result": "anomaly", "reason": "changes outside allowlist",
                    "offending_count": len(exc.offending)}

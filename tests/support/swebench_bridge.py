@@ -85,8 +85,9 @@ class BridgeError(RuntimeError):
 class PatchScopeError(BridgeError):
     """工作区改动超出冻结 allowlist; 拒绝导出而非静默过滤。"""
 
-    def __init__(self, offending: list[str]):
+    def __init__(self, offending: list[str], exempted: list[str] | None = None):
         self.offending = offending
+        self.exempted = exempted or []
         super().__init__(f"workspace changes outside allowlist: {len(offending)} path(s)")
 
 
@@ -602,8 +603,10 @@ def porcelain_paths(status: str) -> list[str]:
 
 
 def runtime_artifact(path: str) -> bool:
-    """生产 policy 固定排除的根 .cicada 工件；不扩大其他业务路径范围。"""
-    return path == ".cicada/" or path.startswith(".cicada/")
+    """固定排除的运行副产物：根 .cicada 工件与 Python 字节码缓存 (__pycache__/*.pyc)；
+    不扩大其他业务路径范围。豁免路径由 export_patch 记入证据，非静默过滤。"""
+    return (path == ".cicada/" or path.startswith(".cicada/")
+            or path.endswith(".pyc") or "/__pycache__/" in "/" + path)
 
 
 def workspace_manifest(workspace: Path, git: GitCLI) -> WorkspaceManifest:
@@ -644,12 +647,14 @@ class PatchExport:
     index_unchanged: bool
     empty: bool
     source_manifest: dict
+    exempted_paths: list[str]
 
     def to_json(self) -> dict:
         return {
             "sha256": self.sha256, "changed_paths": self.changed_paths,
             "index_unchanged": self.index_unchanged, "empty": self.empty,
             "bytes": len(self.patch_bytes), "source_manifest": self.source_manifest,
+            "exempted_paths": self.exempted_paths,
         }
 
 
@@ -668,15 +673,17 @@ def export_patch(workspace: Path, base_commit: str, allowed: tuple[str, ...],
     status = git.run("status", "--porcelain", "-z", "--untracked-files=all", "--ignored").stdout
     changed: list[str] = []
     offending: list[str] = []
+    exempted: list[str] = []
     for path in porcelain_paths(status):
         if runtime_artifact(path):
+            exempted.append(path)
             continue
         if path not in allowed:
             offending.append(path)
         else:
             changed.append(path)
     if offending:
-        raise PatchScopeError(sorted(offending))
+        raise PatchScopeError(sorted(offending), sorted(exempted))
 
     index_before = git.run("ls-files", "-s").stdout
     index_file = temp_dir.resolve() / f"index-{uuid.uuid4().hex}"
@@ -696,7 +703,8 @@ def export_patch(workspace: Path, base_commit: str, allowed: tuple[str, ...],
     return PatchExport(
         patch_bytes=patch, sha256=hashlib.sha256(patch).hexdigest(),
         changed_paths=sorted(changed), index_unchanged=index_before == index_after,
-        empty=not patch.strip(), source_manifest=after.to_json())
+        empty=not patch.strip(), source_manifest=after.to_json(),
+        exempted_paths=sorted(exempted))
 
 
 def capture_container_manifest(image: str, supervisor: ContainerSupervisor,
