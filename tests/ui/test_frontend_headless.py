@@ -25,6 +25,7 @@ ESCAPE = KeyPress(Keys.Escape, "\x1b")
 CTRL_C = KeyPress(Keys.ControlC, "\x03")
 CTRL_D = KeyPress(Keys.ControlD, "\x04")
 BACKSPACE = KeyPress(Keys.Backspace, "\x7f")
+BACKTAB = KeyPress(Keys.BackTab, "\x1b[Z")
 
 
 def text_keys(text: str) -> list[KeyPress]:
@@ -165,6 +166,25 @@ async def test_alt_enter_cross_batch_within_window_newline():
         assert h.submitted == []
         assert h.editor.get_text() == "跨批\n"
         assert h.escape_count == 0  # 未被拆成取消
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_escape_prefix_flushes_before_functional_key():
+    """D2: Escape 前缀窗口内的功能键先派发 Escape 再执行该键。"""
+    h = Harness(escape_timeout=1.0)
+    order: list[str] = []
+    h.frontend._on_shift_tab = lambda: order.append("shift_tab")
+    h.frontend._on_escape = lambda: (order.append("escape"),
+                                     setattr(h, "escape_count", h.escape_count + 1))
+    try:
+        await h.start()
+        h.terminal.emit([ESCAPE, BACKTAB])  # Alt+Shift+Tab
+        await h.settle()
+        assert order == ["escape", "shift_tab"]
+        assert h.escape_count == 1
     finally:
         await h.stop()
 
