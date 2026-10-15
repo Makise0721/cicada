@@ -1,0 +1,197 @@
+"""PV01 两题身份/允许路径隔离与旧题缺省兼容的最小关键回归。
+
+不调用 Docker、不发模型请求。身份负向用例只依赖仓库内冻结的 selection.json 与
+公开输入副本; 当本地公开输入缺失时按 skip 处理 (该目录按交付规则不入库)。
+"""
+import json
+from pathlib import Path
+
+import pytest
+
+from tests.support import swebench_tasks as tasks
+
+PUBLIC_INPUTS = tasks.PUBLIC_VALIDATION / "inputs"
+
+
+def _manifest(task_key: str) -> dict:
+    path = tasks.manifest_path_for(task_key)
+    if not path.is_file():
+        pytest.skip(f"manifest not present: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _require_inputs(task_key: str) -> None:
+    """公开输入副本不在库内; 缺失时跳过而不是失败。"""
+    doc = _manifest(task_key)
+    for entry in doc["public_inputs"].values():
+        if not (tasks.PUBLIC_VALIDATION / entry["path"]).is_file():
+            pytest.skip("public input copies are not committed")
+
+
+def test_both_frozen_tasks_load_with_expected_identity():
+    """两题都能从 manifest 载入, 且身份与冻结 selection.json 一致。"""
+    _require_inputs("repeat-lifecycle")
+    _require_inputs("new-multifile")
+    selection = tasks.load_selection()
+    for task_key, scenario in (("repeat-lifecycle", "restore-compact-continue"),
+                               ("new-multifile", "coding")):
+        spec = tasks.spec_from_manifest(tasks.manifest_path_for(task_key))
+        frozen = selection["tasks"][task_key]["metadata"]
+        assert spec.task_key == task_key
+        assert spec.scenario == scenario
+        assert spec.instance_id == frozen["instance_id"]
+        assert spec.repo == frozen["repo"]
+        assert spec.base_commit == frozen["base_commit"]
+        assert spec.image_tag.endswith(frozen["instance_id"])
+        # 两题允许路径互不相同, 且与冻结授权契约一致。
+        assert set(spec.allowed_paths) == set(tasks.FROZEN_ALLOWED_PATHS[task_key])
+
+
+def test_allowlist_cannot_be_widened_by_manifest(tmp_path):
+    """manifest 不得自行放宽允许路径 (例如加入 README 或测试文件)。"""
+    _require_inputs("repeat-lifecycle")
+    doc = _manifest("repeat-lifecycle")
+    doc["allowed_paths"] = [*doc["allowed_paths"], "README.md"]
+    path = tmp_path / "widened.json"
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(tasks.ManifestError):
+        tasks.spec_from_manifest(path)
+
+
+def test_unknown_task_key_is_rejected(tmp_path):
+    """只接受本包冻结的两题; 其他题号一律拒绝。"""
+    _require_inputs("repeat-lifecycle")
+    doc = _manifest("repeat-lifecycle")
+    doc["task_key"] = "not-a-frozen-task"
+    path = tmp_path / "unknown.json"
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(tasks.ManifestError):
+        tasks.spec_from_manifest(path)
+
+
+def test_scenario_binding_cannot_be_swapped(tmp_path):
+    """生命周期题不能改成 coding 场景运行。"""
+    _require_inputs("repeat-lifecycle")
+    doc = _manifest("repeat-lifecycle")
+    doc["scenario"] = "coding"
+    path = tmp_path / "swapped.json"
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(tasks.ManifestError):
+        tasks.spec_from_manifest(path)
+
+
+def test_base_commit_tamper_is_rejected(tmp_path):
+    _require_inputs("repeat-lifecycle")
+    doc = _manifest("repeat-lifecycle")
+    doc["base_commit"] = "0" * 40
+    path = tmp_path / "tampered.json"
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(tasks.ManifestError):
+        tasks.spec_from_manifest(path)
+
+
+def test_legacy_runner_default_identity_is_unchanged():
+    """旧单题 runner 缺省身份未被两题接缝改写。
+
+    旧固定题就是"重复题"(repeat-lifecycle)的同一 instance, 因此它与该题 instance_id
+    相同、允许路径相同; 新题 new-multifile 则必须是另一个 instance。这同时证明新接缝
+    没有反向改写旧 runner 的缺省题。
+    """
+    from tests.e2e import swebench_runner as legacy
+
+    assert legacy.INSTANCE_ID == tasks.bridge.INSTANCE_ID
+    assert legacy.ALLOWED_PATHS == tasks.bridge.ALLOWED_PATHS
+    assert legacy.DESIGN_ID == "live-coding-under-5-rmb-20261014-r2"
+
+    repeat = _manifest("repeat-lifecycle")
+    new = _manifest("new-multifile")
+    assert legacy.INSTANCE_ID == repeat["instance_id"]
+    assert set(legacy.ALLOWED_PATHS) == set(repeat["allowed_paths"])
+    assert legacy.INSTANCE_ID != new["instance_id"]
+    assert set(legacy.ALLOWED_PATHS) != set(new["allowed_paths"])
+
+
+def test_run_subcommand_refuses_without_authorization(tmp_path):
+    """run 在无 --live 时必须拒绝, 且不发真实请求。"""
+    from tests.e2e import preview_runner as runner
+    from types import SimpleNamespace
+
+    manifest = tasks.manifest_path_for("repeat-lifecycle")
+    if not manifest.is_file():
+        pytest.skip("manifest not present")
+    args = SimpleNamespace(live=False, manifest=str(manifest),
+                           run_root=str(tmp_path), prepared_root=str(tmp_path))
+    assert runner.cmd_run(args) == 2
+
+
+def test_prepare_does_not_overwrite_existing_attempt_receipt(tmp_path):
+    """prepare 拒绝非空 run root 时, 不得覆盖既有 attempt 的回执 (spec: 不覆盖)。"""
+    from tests.e2e import preview_runner as runner
+    from types import SimpleNamespace
+
+    manifest = tasks.manifest_path_for("repeat-lifecycle")
+    if not manifest.is_file():
+        pytest.skip("manifest not present")
+
+    run_root = tmp_path / "attempt"
+    run_root.mkdir()
+    existing = {"task": {"task_key": "repeat-lifecycle"}, "outcome": "prepared",
+                "calibration_empty": {"reward": 0}, "calibration_gold": {"reward": 1}}
+    receipt_path = run_root / runner.RECEIPT_FILENAME
+    receipt_path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+
+    args = SimpleNamespace(manifest=str(manifest), run_root=str(run_root))
+    assert runner.cmd_prepare(args) == 2
+    # 既有成功回执必须原样保留, 不被失败回执覆盖。
+    assert json.loads(receipt_path.read_text(encoding="utf-8")) == existing
+
+
+def _report_args(manifest: Path, run_root: Path):
+    from types import SimpleNamespace
+    return SimpleNamespace(manifest=str(manifest), run_root=str(run_root))
+
+
+def test_report_refuses_pass_without_calibration_evidence(tmp_path):
+    """缺少校准/身份证据时 report 不得报 passed (spec: 缺必须证据不得 overall passed)。"""
+    from tests.e2e import preview_runner as runner
+
+    manifest = tasks.manifest_path_for("repeat-lifecycle")
+    if not manifest.is_file():
+        pytest.skip("manifest not present")
+    root = tmp_path / "bare"
+    (root / "evidence").mkdir(parents=True)
+    (root / "workspace").mkdir()
+    (root / runner.RECEIPT_FILENAME).write_text(
+        json.dumps({"outcome": "prepared"}), encoding="utf-8")
+    (root / runner.LOCK_FILENAME).write_text(json.dumps({}), encoding="utf-8")
+    # 只有一个裸 grade 文件, 没有校准与身份证据。
+    (root / "evidence" / "grade-last.json").write_text(
+        json.dumps({"result": "passed"}), encoding="utf-8")
+    assert runner.cmd_report(_report_args(manifest, root)) != 0
+
+
+def test_report_requires_graded_manifest_to_claim_pass(tmp_path, monkeypatch):
+    """final grade 未携带被评分工作区指纹时, report 不得据此报 passed。"""
+    from tests.e2e import preview_runner as runner
+    from tests.support import swebench_bridge as bridge
+
+    manifest = tasks.manifest_path_for("repeat-lifecycle")
+    if not manifest.is_file():
+        pytest.skip("manifest not present")
+    root = tmp_path / "attempt"
+    (root / "evidence" / "checks").mkdir(parents=True)
+    (root / "workspace").mkdir()
+    (root / runner.RECEIPT_FILENAME).write_text(
+        json.dumps({"outcome": "prepared", "calibration_empty": {"reward": 0},
+                    "calibration_gold": {"reward": 1}}), encoding="utf-8")
+    (root / runner.LOCK_FILENAME).write_text(json.dumps({"verifier": {}}), encoding="utf-8")
+    (root / "evidence" / "checks" / "c1").mkdir()
+    # grade 声称 passed, 但没有 source_manifest。
+    (root / "evidence" / "grade-last.json").write_text(
+        json.dumps({"result": "passed", "required_passed": 16, "required_total": 16}),
+        encoding="utf-8")
+    # 隔离外部依赖, 只考察"缺 graded manifest"这一条。
+    monkeypatch.setattr(runner, "verify_frozen_identity", lambda *a, **k: [])
+    monkeypatch.setattr(bridge, "workspace_manifest",
+                        lambda *a, **k: type("M", (), {"to_json": staticmethod(lambda: {})})())
+    assert runner.cmd_report(_report_args(manifest, root)) != 0
