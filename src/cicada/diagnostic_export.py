@@ -45,6 +45,9 @@ def build_report(*, config, persistence, generation: int, outcome, request_model
                 'check_id': state.check_id, 'status': state.status,
                 'freshness_at_completion': state.freshness,
                 'receipt_id': state.receipt.receipt_id if state.receipt else None,
+                'verification_run_id': state.receipt.verification_run_id if state.receipt else None,
+                'snapshot_before': state.receipt.snapshot_before if state.receipt else None,
+                'snapshot_after': state.receipt.snapshot_after if state.receipt else None,
                 'execution_status': state.receipt.execution_status if state.receipt else None,
                 'exit_code': state.receipt.exit_code if state.receipt else None,
             } for state in view.checks] if view is not None else [],
@@ -58,7 +61,7 @@ def build_report(*, config, persistence, generation: int, outcome, request_model
         'schema_version': 1,
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'observation': 'recorded facts; not revalidated at export; no current delivery authority',
-        'workspace': str(config.workspace),
+        'workspace': str(config.workspace.expanduser().resolve()),
         'session_id': persistence.session_id if persistence is not None else None,
         'session_generation': generation,
         'current_configuration': {
@@ -73,6 +76,14 @@ def build_report(*, config, persistence, generation: int, outcome, request_model
         'current_process_metrics': {'ordinary': _metrics(ordinary_calls), 'summary': _metrics(summary_calls)},
         'cost': asdict(cost) if cost is not None else None,
         'historical_receipt_count': len(restored_receipts),
+        'historical_receipts': [{
+            'request_id': receipt.request_id, 'epoch_id': receipt.epoch_id,
+            'verification_run_id': receipt.verification_run_id, 'receipt_id': receipt.receipt_id,
+            'definition_fingerprint': receipt.definition_fingerprint,
+            'execution_status': receipt.execution_status, 'exit_code': receipt.exit_code,
+            'timed_out': receipt.timed_out, 'cancelled': receipt.cancelled,
+            'output_complete': receipt.output_complete,
+        } for receipt in restored_receipts],
         'historical_receipts_have_current_authority': False,
         'content_policy': 'no prompts, conversation, reasoning, tool bodies, raw errors or credentials',
     }

@@ -386,7 +386,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         if getattr(args, 'export_report', None) is not None:
             if args.tui:
                 raise ReportError('--export-report is for single requests; use /export in the TUI')
-            validate_report_path(workspace / Path(args.export_report).expanduser())
+            validate_report_path(workspace.expanduser().resolve() / Path(args.export_report).expanduser())
     except (CostError, ReportError) as exc:
         print(str(exc), file=sys.stderr)
         return 2

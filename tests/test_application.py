@@ -119,6 +119,8 @@ async def test_diagnostic_export_preserves_recorded_receipts_without_revalidatio
         report = json.loads(original)
         assert report['latest_request']['snapshot_at_completion'] == outcome.view.snapshot_ref
         assert report['latest_request']['checks_at_completion'][0]['freshness_at_completion'] == 'current'
+        assert report['latest_request']['checks_at_completion'][0]['snapshot_before'] == outcome.view.checks[0].receipt.snapshot_before
+        assert report['latest_request']['checks_at_completion'][0]['snapshot_after'] == outcome.view.checks[0].receipt.snapshot_after
         assert 'not revalidated' in report['observation']
         assert 'private user prompt' not in original.decode() and 'private tool body' not in original.decode()
         assert 'private answer' not in original.decode()
@@ -128,10 +130,37 @@ async def test_diagnostic_export_preserves_recorded_receipts_without_revalidatio
         assert destination.read_bytes() == original
         report['latest_request']['checks_at_completion'].clear()
         assert session.diagnostics_report()['latest_request']['checks_at_completion']
+        closing = asyncio.create_task(session.aclose())
+        await asyncio.sleep(0)
+        with pytest.raises(ReportError, match='settled'):
+            session.export_diagnostics(Path('closing-report.json'))
+        await closing
     finally:
         await session.aclose()
     session.export_diagnostics(Path('closed-report.md'))
     assert '导出未重新检查工作区' in (root / 'closed-report.md').read_text(encoding='utf-8')
+
+
+async def test_diagnostic_export_expands_workspace_and_preserves_historical_provenance(tmp_path, monkeypatch):
+    import json
+    from cicada.persistence.contracts import StoredReceipt
+
+    root = _repo(tmp_path)
+    monkeypatch.setenv('USERPROFILE', str(root))
+    session = await open_application(_config(Path('~'), script=_script({'text': 'done', 'stop': True})))
+    try:
+        await session.execute('task')
+        source = StoredReceipt('old-run', 'old-receipt', 'old-epoch', 'old-request', 'a' * 64,
+                               'exited', 0, False, False, True, None)
+        session._restored_receipts = (source,)
+        destination = session.export_diagnostics(Path('report.json'))
+        assert destination == root / 'report.json'
+        report = json.loads(destination.read_text(encoding='utf-8'))
+        assert report['historical_receipts'][0]['request_id'] == 'old-request'
+        assert report['historical_receipts'][0]['verification_run_id'] == 'old-run'
+        assert report['historical_receipts_have_current_authority'] is False
+    finally:
+        await session.aclose()
 
 
 class Collector:

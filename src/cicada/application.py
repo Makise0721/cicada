@@ -1487,12 +1487,13 @@ class ApplicationSession:
         """空闲或可靠关闭后同步写一次有界元数据，不建后台生产者。"""
         producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
                      self._login_task, self._login_save_task, *self._undead_tasks)
-        if (self._state not in ('idle', 'closed') or self._begin_in_flight or self._session_in_flight
+        if (self._state not in ('idle', 'closed') or (self._closing and not self._closed)
+                or self._begin_in_flight or self._session_in_flight
                 or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
                 or self.review_active or self.rewind_active or self.catalog_active
                 or any(task is not None and not task.done() for task in producers)):
             raise ReportError('diagnostic export requires a settled session')
-        destination = self._config.workspace / path.expanduser()
+        destination = self._config.workspace.expanduser().resolve() / path.expanduser()
         write_report(destination, self.diagnostics_report())
         return destination
 
