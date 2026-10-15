@@ -63,6 +63,22 @@ from cicada.application import (
     verification_checks_signature,
 )
 from cicada.budget import BudgetConfig
+from cicada.cli_startup import (
+    CHECK_COMMAND_MAX_BYTES,
+    CHECK_MODE_MAX_TURNS,
+    CHECK_MODE_MIN_NUM_CTX,
+    CHECK_TIMEOUT_DEFAULT_S,
+    CHECK_TIMEOUT_MAX_S,
+    CHECK_TIMEOUT_MIN_S,
+    MAX_CHECK_COMMANDS,
+    NORMAL_MODE_MAX_TURNS,
+    _RESUME_PICK,
+    parse_check_commands,
+    prepare_restored_launch,
+    resolve_deepseek_config,
+    validate_model_args,
+    validate_session_args,
+)
 from cicada.core.events import (
     AssistantCompleted,
     Event,
@@ -83,14 +99,11 @@ from cicada.persistence.contracts import (
 )
 from cicada.plugins.coding.verification import generate_verification_run_id
 from cicada.plugins.coding.verification_contracts import (
-    CheckDefinition,
     VerificationPlan,
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
-from cicada.plugins.deepseek import DeepSeekConfig, deepseek_plugin
-from cicada.plugins.deepseek.protocol import BASE_URL as DEEPSEEK_BASE_URL, REQUEST_LIMIT
+from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import list_sessions, read_session_identity
-from cicada.plugins.session_store.store import validate_session_id
 from cicada.plugins.skills import load_skill_catalog
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.user_config import (
@@ -107,26 +120,11 @@ from cicada.prompting import (
 )
 from cicada.reporting import build_delivery_section, build_run_summary
 from cicada.skills import (
-    SKILLS_PROMPT_VERSION,
     SkillCatalogError,
     SkillsError,
     build_skill_request,
     find_skill,
 )
-
-# P4 §5/§8 检查模式的固定 profile 与输入边界
-MAX_CHECK_COMMANDS = 8
-CHECK_COMMAND_MAX_BYTES = 4096
-CHECK_TIMEOUT_DEFAULT_S = 120.0
-CHECK_TIMEOUT_MIN_S = 0.0
-CHECK_TIMEOUT_MAX_S = 300.0
-CHECK_MODE_MIN_NUM_CTX = 32768
-CHECK_MODE_MAX_TURNS = 25
-NORMAL_MODE_MAX_TURNS = 50
-
-# 05: --tui --resume 不带 ID = 启动选择器 (哨兵; 单次模式明确拒绝)
-_RESUME_PICK = object()
-
 
 async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdentity | None:
     """恢复前的存档身份预读; 失败返回 None (错误消息已打印, 调用方退出码 2).
@@ -262,41 +260,6 @@ def parse_script(raw: str) -> list[list[StreamEvent]]:
     return script
 
 
-def parse_check_commands(
-    commands: list[str] | None, timeout: float | None
-) -> tuple[tuple[CheckDefinition, ...], str | None]:
-    """解析 --check-command/--check-timeout; 返回 (检查定义, 错误消息).
-
-    全部输入边界在此给出明确错误: 条数、空命令、命令字节上限、timeout 范围、
-    无检查时使用 --check-timeout。
-    """
-    commands = list(commands or [])
-    if not commands and timeout is not None:
-        return (), "--check-timeout 只能与 --check-command 一起使用"
-    if not commands:
-        return (), None
-    if len(commands) > MAX_CHECK_COMMANDS:
-        return (), f"--check-command 最多 {MAX_CHECK_COMMANDS} 条, 收到 {len(commands)} 条"
-    timeout_s = timeout if timeout is not None else CHECK_TIMEOUT_DEFAULT_S
-    if not CHECK_TIMEOUT_MIN_S < timeout_s <= CHECK_TIMEOUT_MAX_S:
-        return (), (
-            f"--check-timeout 必须在 ({CHECK_TIMEOUT_MIN_S:g}, {CHECK_TIMEOUT_MAX_S:g}] 秒内, "
-            f"收到 {timeout_s:g}"
-        )
-    definitions: list[CheckDefinition] = []
-    for index, command in enumerate(commands, start=1):
-        if not command or not command.strip():
-            return (), f"--check-command 第 {index} 条为空命令"
-        size = len(command.encode("utf-8"))
-        if size > CHECK_COMMAND_MAX_BYTES:
-            return (), (
-                f"--check-command 第 {index} 条超过 {CHECK_COMMAND_MAX_BYTES} UTF-8 bytes "
-                f"(收到 {size} bytes)"
-            )
-        definitions.append(CheckDefinition(check_id=f"check-{index}", command=command, timeout_s=timeout_s))
-    return tuple(definitions), None
-
-
 def print_event(event: Event) -> None:
     """旧 CLI 的内核事件打印; 新增事件类型 (文本增量等) 自然静默."""
     if isinstance(event, RunStarted):
@@ -384,38 +347,9 @@ async def _launch_first_run(
 async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore | None = None) -> int:
     if args.list_sessions:
         return _run_list_sessions(args)
-    if args.list_cursor is not None:
-        # 审查 05-F6: 游标只属于列表入口; 误用时拒绝而非静默忽略并执行请求
-        print("--list-cursor 只能与 --list-sessions 一起使用", file=sys.stderr)
-        return 2
-    if args.save_session and args.resume is not None:
-        print("--save-session 与 --resume 互斥: 保存新会话与恢复已有会话只能二选一", file=sys.stderr)
-        return 2
-    if args.resume_with_current_config and args.resume is None:
-        print(
-            "--resume-with-current-config 只能与 --resume 一起使用: "
-            "显式采用当前配置仅对恢复有意义",
-            file=sys.stderr,
-        )
-        return 2
-    if args.resume is _RESUME_PICK and not args.tui:
-        print(
-            "--resume 不带会话 ID 仅在 --tui 下可用 (启动选择器); "
-            "单次模式请给出精确的会话 ID",
-            file=sys.stderr,
-        )
-        return 2
-    if isinstance(args.resume, str):
-        # nargs="?" 会把紧随其后的词当 ID: 提前按 UUIDv4 校验, 错误不延迟到开库
-        try:
-            validate_session_id(args.resume)
-        except PersistenceError as exc:
-            print(f"{exc}", file=sys.stderr)
-            return 2
-    # 05: --tui 默认持久保存; --save-session 允许组合但不改变行为 (契约 §6)
-    # 03: --skill 使位置 prompt 成为可选任务 (省略时用固定指令)
-    if not args.tui and args.prompt is None and args.skill is None:
-        print("缺少 prompt: 单次模式需要位置参数 prompt (交互入口用 --tui)", file=sys.stderr)
+    argument_error = validate_session_args(args)
+    if argument_error is not None:
+        print(argument_error, file=sys.stderr)
         return 2
     run_tui_session_fn = None
     if args.tui:
@@ -434,31 +368,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 file=sys.stderr,
             )
             return 2
-    if args.script is not None and (
-        args.model is not None
-        or args.think is not None
-        or args.num_ctx is not None
-        or args.provider is not None
-        or args.max_output_tokens is not None
-        or args.reasoning_effort is not None
-    ):
-        print(
-            "--script 与真实模型旗标互斥, 请只选一种模型来源",
-            file=sys.stderr,
-        )
-        return 2
-    if args.num_ctx is not None and args.num_ctx <= 0:
-        print(f"--num-ctx 必须是正整数, 收到 {args.num_ctx}", file=sys.stderr)
-        return 2
-    checks, check_error = parse_check_commands(args.check_command, args.check_timeout)
-    if check_error is not None:
-        print(check_error, file=sys.stderr)
-        return 2
-    if checks and args.num_ctx is not None and args.num_ctx < CHECK_MODE_MIN_NUM_CTX:
-        print(
-            f"检查模式要求 --num-ctx >= {CHECK_MODE_MIN_NUM_CTX}, 收到 {args.num_ctx}",
-            file=sys.stderr,
-        )
+    checks, argument_error = validate_model_args(args)
+    if argument_error is not None:
+        print(argument_error, file=sys.stderr)
         return 2
     workspace = Path(args.workspace)
     if not workspace.expanduser().is_dir():
@@ -566,40 +478,11 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         saved_stored = await _read_saved_identity(workspace, args.resume)
         if saved_stored is None:
             return 2
-        if saved_stored.launch.checks_signature is not None and not checks:
-            print(
-                "--resume: 存档为检查模式会话, 检查定义不保存在存档中, 无法省略继承; "
-                "请显式给出与保存时相同的 --check-command, "
-                "或用 --resume-with-current-config 以当前配置恢复",
-                file=sys.stderr,
-            )
+        try:
+            saved_launch = prepare_restored_launch(saved_stored, args, checks)
+        except ValueError as exc:
+            print(f"--resume: {exc}", file=sys.stderr)
             return 2
-        if saved_stored.launch.prompt_version == SKILLS_PROMPT_VERSION and args.skills_dir is None:
-            print(
-                "--resume: 存档为 Skills 会话, --skills-dir 不从存档继承; "
-                "请重传与保存时相同的 --skills-dir, "
-                "或用 --resume-with-current-config 以当前配置恢复",
-                file=sys.stderr,
-            )
-            return 2
-        if saved_stored.launch.provider not in ("deepseek", "fake"):
-            print("--resume: 存档 provider 已不受支持; 使用 --resume-with-current-config 显式采用当前配置", file=sys.stderr)
-            return 2
-        if saved_stored.launch.provider == "deepseek":
-            saved_launch = saved_stored.launch
-            options = saved_launch.options
-            try:
-                if set(options) != {"num_ctx", "max_tokens", "reasoning_effort"}:
-                    raise ValueError("存档 DeepSeek options 白名单不匹配")
-                if saved_launch.base_url != DEEPSEEK_BASE_URL:
-                    raise ValueError("存档 DeepSeek endpoint 必须为官方 origin")
-                DeepSeekConfig(model=saved_launch.model, think=saved_launch.think,
-                    num_ctx=options["num_ctx"], max_tokens=options["max_tokens"],
-                    reasoning_effort=options["reasoning_effort"],
-                    max_request_bytes=saved_launch.max_request_bytes)
-            except ValueError as exc:
-                print(f"--resume: {exc}", file=sys.stderr)
-                return 2
     # API 路径启用预算; fake 默认不安装预算层。
     budget_config: BudgetConfig | None = None
     defaults_saved = False
@@ -653,16 +536,10 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         try:
             store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
             snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
-            resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
-            defaults = resolved.defaults
-            sources = dict(resolved.sources)
-            # 会话options沿用既有max_tokens命名；用户文件采用max_output_tokens。
-            sources['max_tokens'] = sources.pop('max_output_tokens')
-            config = DeepSeekConfig(
-                model=defaults.model, think=defaults.think, num_ctx=defaults.num_ctx,
-                max_tokens=defaults.max_output_tokens, reasoning_effort=defaults.reasoning_effort,
-                max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT,
+            resolved, config, sources = resolve_deepseek_config(
+                snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
             )
+            defaults = resolved.defaults
         except UserConfigError as exc:
             print(str(exc), file=sys.stderr)
             return 2
@@ -700,14 +577,10 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                           'login failed: ' + (result.error_code or 'save-failed'), file=sys.stderr)
                     return 2
                 snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
-                resolved = resolve_launch_config(snapshot, explicit=explicit, archive=archive)
+                resolved, config, sources = resolve_deepseek_config(
+                    snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
+                )
                 defaults = resolved.defaults
-                config = DeepSeekConfig(model=defaults.model, think=defaults.think,
-                    reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
-                    max_tokens=defaults.max_output_tokens,
-                    max_request_bytes=saved_launch.max_request_bytes if saved_launch else REQUEST_LIMIT)
-                sources = dict(resolved.sources)
-                sources['max_tokens'] = sources.pop('max_output_tokens')
                 if resolved.credential is None:
                     raise UserConfigError('credential', 'missing-credential')
             except UserConfigError as exc:
