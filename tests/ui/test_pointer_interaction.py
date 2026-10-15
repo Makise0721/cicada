@@ -512,11 +512,12 @@ class TestWin32PointerDecode:
         assert len(items) == 1
         assert (items[0].kind, items[0].x, items[0].y) == ("cancel", -1, -1)
 
-    def test_focus_loss_resets_buttons_so_next_click_works(self):
-        """F1: 失焦时按钮仍按住、焦点外松开无记录 → 回窗首次按下仍产 down。
+    def test_focus_loss_while_held_never_ghost_clicks(self):
+        """失焦不重置按钮快照 (N1): 续拖跨格松开不得产可配对点击。
 
-        不重置快照时按钮位与失焦前相同, 第二次 press 会被吞掉, 与随后的 up
-        一起丢失一次点击 (少配)。
+        失焦前按住左键、焦点外移动、在别处松开: 回窗首条记录仍是「已按住」,
+        只产 move, 与随后的 up 不配对。若失焦时重置快照, 该移动会被误判为新
+        按下, 与其后同格松开配出用户没打算做的点击。
         """
         from ctypes.wintypes import DWORD
 
@@ -535,6 +536,30 @@ class TestWin32PointerDecode:
         records = (INPUT_RECORD * 1)()
         records[0] = focus_record(0)
         assert [e.kind for e in r._get_keys(DWORD(1), records)] == ["cancel"]
-        # 回窗后单击: 按下必须仍产 down, 松开才产 up (可配对)
-        assert r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0)).kind == "down"
-        assert r._decode_pointer(self.mouse(4, 2, 0, 0, 0)).kind == "up"
+        # 焦点外移动 (仍按住) → move, 不是新的 down
+        moved = r._decode_pointer(self.mouse(7, 2, 0x0001, 0, 0x0001))
+        assert (moved.kind, moved.button) == ("move", "left")
+        assert r._decode_pointer(self.mouse(7, 2, 0, 0, 0)).kind == "up"
+
+    def test_refocus_click_still_works_when_nothing_held(self):
+        """常规失焦 (未按住) 后回窗单击仍可配对 (D1 可观察要求)。"""
+        from ctypes.wintypes import DWORD
+
+        from prompt_toolkit.win32_types import FOCUS_EVENT_RECORD, INPUT_RECORD
+
+        r = self.make_reader()
+        r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0))
+        r._decode_pointer(self.mouse(4, 2, 0, 0, 0))  # 一次完整点击, 无残留
+
+        def focus_record(focus):
+            ir = INPUT_RECORD()
+            ir.EventType = 16
+            ir.Event.FocusEvent = FOCUS_EVENT_RECORD()
+            ir.Event.FocusEvent.SetFocus = focus
+            return ir
+
+        records = (INPUT_RECORD * 1)()
+        records[0] = focus_record(0)
+        r._get_keys(DWORD(1), records)
+        assert r._decode_pointer(self.mouse(9, 2, 0x0001, 0, 0)).kind == "down"
+        assert r._decode_pointer(self.mouse(9, 2, 0, 0, 0)).kind == "up"

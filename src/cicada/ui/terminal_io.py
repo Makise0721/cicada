@@ -220,10 +220,12 @@ if sys.platform == "win32":
                     if event is not None:
                         yield event
                 elif EventTypes[ir.EventType] == "FocusEvent" and not ev.SetFocus:
-                    # 失焦: 焦点外的按下/松开不会投递到本窗口, 按钮状态已不可信。
-                    # 重置快照, 使回窗后的第一次按下无论按钮位是否变化都能产 down
-                    # (D1 双向自愈); 前端 cancel 已清除未完成配对 (C4)。
-                    self._last_buttons = 0
+                    # 失焦: 焦点外的按下/松开不投递到本窗口。此处**不**重置按钮
+                    # 快照: 回窗首条记录无法区分「失焦前一直按住(续拖)」与「刚按下」
+                    # —— 重置会把续拖的移动记录当成新按下, 与随后的同格松开配出用户
+                    # 没打算做的点击(幽灵点击)。保留旧快照时两个方向都安全: 续拖只产
+                    # move, 而「失焦前按住、窗外松开、回窗再按」会丢一次点击(少配,
+                    # 失败方向安全)。前端 cancel 已清除未完成配对 (C4)。
                     yield PointerEvent("cancel", -1, -1, self._capture_geometry())
 
         def _capture_geometry(self) -> TerminalGeometry:
@@ -238,8 +240,9 @@ if sys.platform == "win32":
             ButtonState 是绝对快照, 与上一非滚轮记录差分: 新增位 = 按下, 归零 =
             松开。因此弦按(按下时仍有其他按钮)不再把第二个按钮解成可配对的左键
             down, 也不会被随后的 up 配成一次点击; 同时带 MOUSE_MOVED 的记录不再
-            吞掉其中的按下。失焦时重置快照(焦点外记录不投递), 回窗后第一次按下
-            必产 down, 使自愈双向成立; 滚轮记录不参与也不更新按钮状态。
+            吞掉其中的按下。失焦**不**重置快照: 焦点外记录不投递, 而回窗首条记录
+            无法区分续拖与刚按下, 重置会把续拖误判成点击(见 _get_keys); 滚轮记录
+            不参与也不更新按钮状态。
             """
             flags = ev.EventFlags
             if flags & _MOUSE_HWHEELED:
