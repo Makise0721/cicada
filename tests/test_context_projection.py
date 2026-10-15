@@ -127,7 +127,7 @@ def test_canonical_prefix_sha256_pins_fingerprint_recipe():
 
 
 def test_summary_prompt_is_versioned_and_stable():
-    assert SUMMARY_PROMPT_VERSION == "2"  # v2: 请求末尾追加固定 user 指令 (05 收口修正)
+    assert SUMMARY_PROMPT_VERSION == "3"  # v3: 含思考的完整 quoted-record 输入
     assert len(SUMMARY_PROMPT_SHA256) == 64
     assert summary_prompt_text() == summary_prompt_text()
 

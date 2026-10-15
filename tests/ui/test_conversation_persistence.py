@@ -112,6 +112,7 @@ async def test_new_prepare_rejection_preserves_full_draft_and_old_session(tmp_pa
 
 
 async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
+    from cicada.core.cancel import CancelToken
     from prompt_toolkit.key_binding.key_processor import KeyPress
     from prompt_toolkit.keys import Keys
     from cicada.__main__ import render_session_page
@@ -119,7 +120,7 @@ async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
     from cicada.ui.commands import SlashCommandMenu
     from cicada.ui.frontend import MainScreenFrontend
     from cicada.ui.terminal_io import FakeTerminal
-    from cicada.ui.selector import _entry_line
+    from cicada.ui.session_selector import SessionSelectorState
 
     root = _repo(tmp_path)
     session = await open_application(_persistence_config(root, _script(), session_id=None))
@@ -145,7 +146,9 @@ async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
         directory = root / '.cicada' / 'sessions'
         page = list_sessions(directory=directory)
         assert '中文 空档' in '\n'.join(render_session_page(page))
-        assert '中文 空档' in _entry_line(page.entries[0], 80)
+        selector = SessionSelectorState()
+        selector.accept_observation(await session.observe_session_catalog(CancelToken()))
+        assert '中文 空档' in '\n'.join(selector.render_lines(80))
         assert harness.submit('/name --clear extra')
         await view._name_task
         assert session.persistence.user_name == '--clear extra', '保留参数只精确匹配'
@@ -313,10 +316,16 @@ async def test_save_failure_shown_and_followups_refused(tmp_path, monkeypatch):
         assert await _wait_until(
             lambda: "[session save failed:" in chr(10).join(harness.lines(80))
         ), "保存失败如实显示"
+        await harness.wait_request_done()
+        before = (session.history, session.persistence.saved_request_count,
+                  len(session.process_model_calls))
         assert harness.submit("第二问")
+        await harness.wait_request_done()
         assert await _wait_until(
             lambda: "storage_failed" in chr(10).join(harness.lines(80))
         ), "锁存拒绝后继编码"
+        assert (session.history, session.persistence.saved_request_count,
+                len(session.process_model_calls)) == before, "拒绝不新增模型或保存事实"
     finally:
         await session.aclose()
         harness.close()
