@@ -191,6 +191,8 @@ if sys.platform == "win32":
             # 几何提供者由 PromptToolkitTerminal 注入; 读取失败退原点 (0,0),
             # 事件几何与呈现几何不一致时前端忽略, 不会误触发。
             self.geometry_provider: Callable[[], TerminalGeometry] = TerminalGeometry
+            # 上一次非滚轮记录的 ButtonState 快照 (D1); 失焦不重置, 靠绝对快照自愈
+            self._last_buttons = 0
 
         def _event_to_key_presses(self, ev) -> list[KeyPress]:
             keys = list(super()._event_to_key_presses(ev))
@@ -227,6 +229,14 @@ if sys.platform == "win32":
                 return TerminalGeometry(0, 0)
 
         def _decode_pointer(self, ev: MOUSE_EVENT_RECORD) -> PointerEvent | None:
+            """按按钮位差分解码 (输入处理 v1 D1)。
+
+            ButtonState 是绝对快照, 与上一非滚轮记录差分: 新增位 = 按下, 归零 =
+            松开。因此弦按(按下时仍有其他按钮)不再把第二个按钮解成可配对的左键
+            down, 也不会被随后的 up 配成一次点击; 同时带 MOUSE_MOVED 的记录不再
+            吞掉其中的按下。漏记录(失焦/启动时已按住)由下一条记录自愈, 失焦不重置
+            状态; 滚轮记录不参与也不更新按钮状态。
+            """
             flags = ev.EventFlags
             if flags & _MOUSE_HWHEELED:
                 return None  # 水平滚轮: 安全消费, 不产事件 (C4)
@@ -240,17 +250,27 @@ if sys.platform == "win32":
                 return PointerEvent("wheel", x, y, geometry, "none",
                                     wheel_delta=int(delta), modifiers=modifiers)
             button_state = ev.ButtonState
-            if flags & _MOUSE_MOVED:
-                return PointerEvent("move", x, y, geometry, _button_of(button_state),
-                                    modifiers=modifiers)
+            previous = self._last_buttons
+            self._last_buttons = button_state
             if flags & _DOUBLE_CLICK_FLAG:
                 # 原生双击的第二次按下: 交前端清除配对并消费 (C4)
                 return PointerEvent("down", x, y, geometry, _button_of(button_state),
                                     modifiers=modifiers, double_click=True)
-            if button_state == 0:
+            if button_state & ~previous:
+                # 按下: 仅"此前无按钮持有且本记录只按下一个按钮"才可与后续 up
+                # 配对; 弦按(已有按钮持有, 或同一记录多键齐按) 报 "other"。
+                pairable = not previous and button_state & (button_state - 1) == 0
+                return PointerEvent("down", x, y, geometry,
+                                    _button_of(button_state) if pairable else "other",
+                                    modifiers=modifiers)
+            if previous & ~button_state:
+                if button_state:
+                    return None  # 部分松开: 仍有按钮持有, 不产 up 配对
                 return PointerEvent("up", x, y, geometry, "none", modifiers=modifiers)
-            return PointerEvent("down", x, y, geometry, _button_of(button_state),
-                                modifiers=modifiers)
+            if flags & _MOUSE_MOVED:
+                return PointerEvent("move", x, y, geometry, _button_of(button_state),
+                                    modifiers=modifiers)
+            return None  # 无按钮位变化且非移动: 不产事件
 
         # --- 按键后处理: 容忍批次内 PointerEvent (保持记录顺序) ---------------
 

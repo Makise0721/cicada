@@ -434,9 +434,14 @@ class TestWin32PointerDecode:
         # NUMLOCK|CAPSLOCK|SCROLLLOCK|ENHANCED 不计入修饰符 (C4)
         pe = r._decode_pointer(self.mouse(3, 2, 0x0001, 0x01E0, 0))
         assert (pe.kind, pe.button, pe.modifiers) == ("down", "left", ())
-        assert r._decode_pointer(self.mouse(1, 1, 0x0002, 0, 0)).button == "right"
-        assert r._decode_pointer(self.mouse(1, 1, 0x0004, 0, 0)).button == "middle"
-        assert r._decode_pointer(self.mouse(1, 1, 0, 0, 0)).kind == "up"
+        # 已持有左键时的第二次按下不再解成可配对 down (D1 弦按)
+        assert r._decode_pointer(self.mouse(1, 1, 0x0002, 0, 0)).button == "other"
+        r2 = self.make_reader()
+        assert r2._decode_pointer(self.mouse(1, 1, 0x0002, 0, 0)).button == "right"
+        assert r2._decode_pointer(self.mouse(1, 1, 0x0004, 0, 0)).button == "other"
+        r3 = self.make_reader()
+        assert r3._decode_pointer(self.mouse(1, 1, 0x0004, 0, 0)).button == "middle"
+        assert r3._decode_pointer(self.mouse(1, 1, 0, 0, 0)).kind == "up"
 
     def test_double_click_flag_and_horizontal_consumed(self):
         r = self.make_reader()
@@ -446,5 +451,63 @@ class TestWin32PointerDecode:
 
     def test_move_carries_state_and_modifiers(self):
         r = self.make_reader()
+        # 先按下, 随后的移动记录仍产 move 并如实携带按钮与修饰符 (D1)
+        assert r._decode_pointer(self.mouse(4, 2, 0x0001, 0x0010, 0)).kind == "down"
         pe = r._decode_pointer(self.mouse(4, 2, 0x0001, 0x0010, 0x0001))
         assert (pe.kind, pe.button, pe.modifiers) == ("move", "left", ("shift",))
+
+    def test_chord_press_never_pairs_a_click(self):
+        """弦按两向 (D1): 第二个按钮不产可配对的左键 down。"""
+        # 左先右后: down left → down other → (部分松开不产) → up
+        r = self.make_reader()
+        left_first = [
+            r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0)),
+            r._decode_pointer(self.mouse(4, 2, 0x0003, 0, 0)),
+            r._decode_pointer(self.mouse(4, 2, 0x0002, 0, 0)),  # 部分松开
+            r._decode_pointer(self.mouse(4, 2, 0, 0, 0)),
+        ]
+        assert [(e.kind, e.button) for e in left_first if e] == [
+            ("down", "left"), ("down", "other"), ("up", "none"),
+        ]
+        # 右先左后: 没有左键 down, up 无配对对象
+        r = self.make_reader()
+        right_first = [
+            r._decode_pointer(self.mouse(4, 2, 0x0002, 0, 0)),
+            r._decode_pointer(self.mouse(4, 2, 0x0003, 0, 0)),
+            r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0)),
+            r._decode_pointer(self.mouse(4, 2, 0, 0, 0)),
+        ]
+        assert [(e.kind, e.button) for e in right_first if e] == [
+            ("down", "right"), ("down", "other"), ("up", "none"),
+        ]
+        assert all(e.button != "left" for e in right_first if e and e.kind == "down")
+
+    def test_move_record_with_press_is_not_swallowed(self):
+        """同一记录既有位移又有按下 (D1): 产 down 而非 move。"""
+        r = self.make_reader()
+        pe = r._decode_pointer(self.mouse(4, 2, 0x0001, 0, 0x0001))
+        assert (pe.kind, pe.button) == ("down", "left")
+        # 纯移动仍产 move (拖动中); 无按钮位变化且非移动不产事件
+        assert r._decode_pointer(self.mouse(5, 3, 0x0001, 0, 0x0001)).kind == "move"
+        assert r._decode_pointer(self.mouse(5, 3, 0x0001, 0, 0)) is None
+
+    def test_focus_loss_decodes_cancel(self):
+        """失焦 → cancel 解码级断言 (D3); 获得焦点不产事件。"""
+        from ctypes.wintypes import DWORD
+
+        from prompt_toolkit.win32_types import FOCUS_EVENT_RECORD, INPUT_RECORD
+
+        def record(focus):
+            ir = INPUT_RECORD()
+            ir.EventType = 16  # EventTypes[16] == "FocusEvent"
+            ir.Event.FocusEvent = FOCUS_EVENT_RECORD()
+            ir.Event.FocusEvent.SetFocus = focus
+            return ir
+
+        r = self.make_reader()
+        records = (INPUT_RECORD * 2)()
+        records[0] = record(1)  # 获得焦点: 不产事件
+        records[1] = record(0)  # 失焦: cancel
+        items = list(r._get_keys(DWORD(2), records))
+        assert len(items) == 1
+        assert (items[0].kind, items[0].x, items[0].y) == ("cancel", -1, -1)
