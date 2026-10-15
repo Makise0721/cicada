@@ -171,7 +171,7 @@ def test_report_refuses_pass_without_calibration_evidence(tmp_path):
 
 
 def test_report_requires_graded_manifest_to_claim_pass(tmp_path, monkeypatch):
-    """final grade 未携带被评分工作区指纹时, report 不得据此报 passed。"""
+    """存在最终 grade 但未携带被评分工作区指纹时, report 不得据此报 passed。"""
     from tests.e2e import preview_runner as runner
     from tests.support import swebench_bridge as bridge
 
@@ -194,4 +194,22 @@ def test_report_requires_graded_manifest_to_claim_pass(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "verify_frozen_identity", lambda *a, **k: [])
     monkeypatch.setattr(bridge, "workspace_manifest",
                         lambda *a, **k: type("M", (), {"to_json": staticmethod(lambda: {})})())
+    assert runner.cmd_report(_report_args(manifest, root)) != 0
+
+
+def test_report_without_any_grade_reports_missing_grade_not_drift(tmp_path, monkeypatch):
+    """没有最终 grade 时, 只应表达 grade 缺失, 不得伪报 grade 溯源缺陷。"""
+    from tests.e2e import preview_runner as runner
+
+    manifest = tasks.manifest_path_for("repeat-lifecycle")
+    if not manifest.is_file():
+        pytest.skip("manifest not present")
+    root = tmp_path / "nograde"
+    (root / "evidence" / "checks").mkdir(parents=True)
+    (root / "workspace").mkdir()
+    (root / runner.RECEIPT_FILENAME).write_text(
+        json.dumps({"outcome": "prepared", "calibration_empty": {"reward": 0},
+                    "calibration_gold": {"reward": 1}}), encoding="utf-8")
+    (root / runner.LOCK_FILENAME).write_text(json.dumps({"verifier": {}}), encoding="utf-8")
+    monkeypatch.setattr(runner, "verify_frozen_identity", lambda *a, **k: [])
     assert runner.cmd_report(_report_args(manifest, root)) != 0

@@ -730,19 +730,22 @@ def cmd_report(args) -> int:
         # (spec: 缺少任何必须证据时不得 overall passed)。
         identity_problems = verify_frozen_identity(spec, lock, run_root)
         workspace = run_root / WORKSPACE_DIRNAME
-        if not workspace.is_dir():
-            identity_problems.append("graded workspace is missing")
-        else:
-            current = bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json()
-            # 与"被评分的那份内容"比较, 而非 prepare 时的原始基线: 解答题工作区本就
-            # 不同于基线, 用基线比较会让任何合法解答都被误判为漂移。
-            graded = (grade or {}).get("source_manifest")
-            if graded is None:
-                identity_problems.append(
-                    "final grade carries no graded source manifest; cannot prove "
-                    "the workspace still equals what was scored")
-            elif current != graded:
-                identity_problems.append("workspace differs from the graded source manifest")
+        # 只在确实存在最终 grade 时才谈"与所评内容是否一致": 没有 grade 时由
+        # coverage.final_grade 表达缺失, 不应伪报成 grade 的溯源缺陷。
+        if grade is not None:
+            if not workspace.is_dir():
+                identity_problems.append("graded workspace is missing")
+            else:
+                current = bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json()
+                # 与"被评分的那份内容"比较, 而非 prepare 时的原始基线: 解答题工作区本就
+                # 不同于基线, 用基线比较会让任何合法解答都被误判为漂移。
+                graded = grade.get("source_manifest")
+                if graded is None:
+                    identity_problems.append(
+                        "final grade carries no graded source manifest; cannot prove "
+                        "the workspace still equals what was scored")
+                elif current != graded:
+                    identity_problems.append("workspace differs from the graded source manifest")
 
         overall = bool(
             coverage["prepare"]
