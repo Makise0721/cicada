@@ -820,15 +820,31 @@ def verify_frozen_identity(lock: dict, evidence_dir: Path) -> list[str]:
     problems: list[str] = []
     if lock.get("design") != DESIGN_ID:
         problems.append("design differs from frozen contract")
-    for relative, digest in lock.get("cicada", {}).get("source_sha256", {}).items():
-        path = PROJECT / relative
-        if not path.is_file() or sha256_file(path) != digest:
-            problems.append("production source differs from lock")
-            break
+    actual_sources = {p.relative_to(PROJECT).as_posix(): sha256_file(p)
+                      for p in sorted((PROJECT / "src").rglob("*.py"))}
+    if lock.get("cicada", {}).get("source_sha256") != actual_sources:
+        problems.append("production source manifest differs from lock")
+    if lock.get("dataset") != {"id": DATASET_ID, "config": DATASET_CONFIG, "split": DATASET_SPLIT,
+            "revision": DATASET_REVISION, "version": DATASET_VERSION, "parquet_sha256": DATASET_PARQUET_LFS_SHA256}:
+        problems.append("dataset identity differs from frozen selection")
+    if any(lock.get("upstream", {}).get(key) != expected for key, expected in (
+            ("repo", UPSTREAM_REPO), ("revision", UPSTREAM_REVISION), ("tree", UPSTREAM_TREE))):
+        problems.append("upstream identity differs from frozen selection")
+    if (lock.get("instance", {}).get("instance_id") != INSTANCE_ID
+            or lock.get("instance", {}).get("repo") != INSTANCE_REPO
+            or lock.get("image", {}).get("tag") != IMAGE_TAG
+            or lock.get("image", {}).get("architecture") != "amd64"
+            or lock.get("image", {}).get("os") != "linux"):
+        problems.append("task/image identity differs from frozen selection")
     try:
         materials = verify_downloaded_materials()
     except PrepareFailed as exc:
         return [f"materials: {exc}"]
+    row = dataset_row()
+    for key in ("base_commit", "fail_to_pass", "pass_to_pass", "selected_test_files"):
+        if lock["instance"].get(key) != row[key]:
+            problems.append("required task identity differs from pinned dataset row")
+            break
     if materials["tests/test.sh"]["sha256"] != lock["verifier"]["test.sh"] \
             or materials["tests/config.json"]["sha256"] != lock["verifier"]["config.json"] \
             or materials["tests/parser.py"]["sha256"] != lock["verifier"]["parser.py"] \
@@ -989,6 +1005,36 @@ def cmd_grade(args) -> int:
         return 2
 
 
+def cmd_run(args) -> int:
+    if not args.live:
+        print("run requires --live and prior explicit user authorization", file=sys.stderr)
+        return 2
+    from tests.support.swebench_attempt import execute_attempt, PreflightRejected
+    try:
+        result = execute_attempt(Path(args.prepared_root).resolve(), Path(args.run_root).resolve())
+        print(json.dumps({"outcome": result["outcome"], "run_root": args.run_root}, ensure_ascii=False))
+        return 0 if result["outcome"] == "passed" else 1
+    except (BridgeError, OSError, ValueError, RuntimeError) as exc:
+        preflight = isinstance(exc, PreflightRejected)
+        rejection = {"outcome": "prepare-failed" if preflight else "inconclusive-evidence",
+            "reason": str(exc)[:300], "exception_type": type(exc).__name__,
+            "http_handoffs": 0 if preflight else "unknown", "requested_run_root": args.run_root,
+            "prepared_root": args.prepared_root, "timestamp": time.time()}
+        failure_dir = PROJECT / ".scratch/live-coding-under-5-rmb/runs/preflight-rejections"
+        failure_dir.mkdir(parents=True, exist_ok=True)
+        failure_path = failure_dir / (uuid.uuid4().hex + ".json")
+        try:
+            with failure_path.open("x", encoding="utf-8") as handle:
+                json.dump(rejection, handle, ensure_ascii=False, indent=1)
+                handle.flush()
+                os.fsync(handle.fileno())
+            rejection["receipt"] = str(failure_path)
+        except OSError:
+            rejection["receipt_error"] = "failure receipt could not be persisted"
+        print(json.dumps(rejection, ensure_ascii=False), file=sys.stderr)
+        return 2
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="swebench_runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1001,7 +1047,10 @@ def main() -> int:
     grade.add_argument("--run-root", required=True)
     grade.add_argument("--workspace", default=None)
     sub.add_parser("dry-run", help="票 03: 全路径离线演练")
-    sub.add_parser("run", help="票 02: 生产 CLI 单题运行")
+    run = sub.add_parser("run", help="生产 CLI 单题运行；仅另获本次付费授权后使用")
+    run.add_argument("--live", action="store_true")
+    run.add_argument("--run-root", required=True)
+    run.add_argument("--prepared-root", required=True)
     sub.add_parser("report", help="票 03: 结果汇编")
     args = parser.parse_args()
     if args.command == "prepare":
@@ -1010,6 +1059,8 @@ def main() -> int:
         return cmd_check(args)
     if args.command == "grade":
         return cmd_grade(args)
+    if args.command == "run":
+        return cmd_run(args)
     print("this subcommand is delivered by a later ticket of the plan", file=sys.stderr)
     return 2
 
