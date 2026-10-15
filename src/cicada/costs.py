@@ -8,7 +8,7 @@ import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date
-from decimal import Decimal, InvalidOperation, ROUND_CEILING
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
@@ -16,6 +16,11 @@ from urllib.parse import urlsplit
 from cicada.core.ports import ModelMetrics
 
 SERVER_INPUT_BOUND = 1_100_000
+
+
+def _valid_amount(amount: Decimal) -> bool:
+    return (isinstance(amount, Decimal) and amount.is_finite() and amount > 0
+            and amount <= Decimal('1000000000') and amount.as_tuple().exponent >= -8)
 
 
 class CostError(ValueError):
@@ -27,11 +32,11 @@ def positive_amount(value: str) -> Decimal:
         if not isinstance(value, str) or len(value) > 32:
             raise ValueError
         amount = Decimal(value)
-        if not amount.is_finite() or amount <= 0 or amount > Decimal('1000000000'):
+        if not _valid_amount(amount):
             raise ValueError
         return amount
     except (ValueError, InvalidOperation):
-        raise CostError('cost amount must be a finite positive decimal') from None
+        raise CostError('cost amount must be positive, <= 1000000000, with at most 8 decimal places') from None
 
 
 def _strict_pairs(pairs):
@@ -49,9 +54,18 @@ class ModelPrice:
     input_rate: Decimal
     output_rate: Decimal
 
+    def __post_init__(self) -> None:
+        if not _valid_amount(self.input_rate) or not _valid_amount(self.output_rate):
+            raise CostError('model prices require positive amounts with at most 8 decimal places')
+
     def upper(self, inputs: int, outputs: int) -> Decimal:
-        return ((inputs * self.input_rate + outputs * self.output_rate) / 1_000_000).quantize(
-            Decimal('0.01'), rounding=ROUND_CEILING)
+        # 整数有理数计算后取分的上整，避免 Decimal context 在取整前丢正尾数。
+        input_num, input_den = self.input_rate.as_integer_ratio()
+        output_num, output_den = self.output_rate.as_integer_ratio()
+        numerator = inputs * input_num * output_den + outputs * output_num * input_den
+        denominator = input_den * output_den * 1_000_000
+        cents = (100 * numerator + denominator - 1) // denominator
+        return Decimal(cents).scaleb(-2)
 
 
 @dataclass(frozen=True)
@@ -129,7 +143,7 @@ class CostLedger:
                  max_calls: int | None = None, profile: CostProfile | None = None):
         if limit is None and max_calls is None:
             raise CostError('cost control requires an amount or call limit')
-        if limit is not None and (not isinstance(limit, Decimal) or not limit.is_finite() or limit <= 0 or profile is None):
+        if limit is not None and (not _valid_amount(limit) or profile is None):
             raise CostError('cost limit requires a positive amount and an explicit price profile')
         if max_calls is not None and (type(max_calls) is not int or max_calls <= 0):
             raise CostError('max-model-calls must be a positive integer')

@@ -127,7 +127,14 @@ class BytesStream(httpx.AsyncByteStream):
 
 async def test_cost_reservation_boundary_and_summary_share_call_limit(tmp_path):
     from decimal import Decimal
-    from cicada.costs import CostLedger, CostProfile, ModelPrice
+    from cicada.costs import CostError, CostLedger, CostProfile, ModelPrice, positive_amount
+
+    for invalid in ('1e-999999999', '0.9090909090909090909090909091', 'NaN'):
+        with pytest.raises(CostError):
+            positive_amount(invalid)
+    with pytest.raises(CostError):
+        ModelPrice('deepseek-flash', Decimal('1e-999999999'), Decimal('1'))
+    assert ModelPrice('deepseek-flash', Decimal('0.90909091'), Decimal('0.00000001')).upper(1_100_000, 2048) == Decimal('1.01')
 
     profile = CostProfile('https://example.invalid/prices', '2026-10-15', 'a' * 64,
                           (ModelPrice('deepseek-flash', Decimal('1'), Decimal('1')),))

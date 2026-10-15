@@ -810,7 +810,7 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
 --cost-limit-cny 与 --cost-profile。普通/摘要共用额度，clear/new/resume/model/login
 不重置，重启新建额度。发送前按1,100,000输入tokens和本次输出cap预留，超限零发送；
 完整成功计量及响应关闭后结算，缺计量/错误/取消保留预留并封口。/cost 查看详情。
-价格文件为UTF-8 JSON（≤64KiB），结构示例（1.00仅示例，不是当前报价）：
+金额与单价最大10亿元、最多8位小数。价格文件为UTF-8 JSON（≤64KiB），示例（非现价）：
 {"schema_version":1,"source":"https://example.invalid/pricing","checked_at":"2026-10-15",
  "models":{"deepseek-flash":{"input_cny_per_million":"1.00","output_cny_per_million":"1.00"}}}
 按需增加deepseek-v4-pro。价格应覆盖所用模型/时段的上界；配置单价及输入上界冻结，
