@@ -16,6 +16,7 @@ from tests.support.swebench_live import (
     Broker,
     RemoteGate,
     _supervise_child,
+    check_gate,
     watch_parent,
 )
 
@@ -241,6 +242,24 @@ def test_watch_tolerates_transient_state_failures_and_obeys_stop(tmp_path):
             await broker.close()
             gate.budget.release()
     asyncio.run(run())
+
+
+def test_check_gate_separates_offline_ordering_from_live_outcome():
+    """离线要求首次检查是空补丁失败(我们的契约); live 只要求存在通过检查(模型行为自由)。"""
+    edited_first = {"code": 0, "result": "passed", "patch_empty": False,
+                    "required_passed": 11, "required_total": 11}
+    empty_failure = {"code": 1, "result": "failed", "patch_empty": True,
+                     "required_passed": 0, "required_total": 11}
+    assert check_gate([empty_failure], offline=True) is None
+    assert check_gate([empty_failure], offline=False) is not None      # 没有通过检查
+    assert check_gate([], offline=True) is not None
+    # live 首题实测形态: 模型先改后检, 唯一一次检查是 11/11 通过 -> 必须放行
+    assert check_gate([edited_first], offline=False) is None
+    # 离线同样的序列必须拒绝(证明检查落在未修改的工作区上)
+    assert "empty failing patch" in check_gate([edited_first], offline=True)
+    # 部分通过(未达全覆盖)不算达标
+    partial = {**edited_first, "required_passed": 9}
+    assert check_gate([partial], offline=False) is not None
 
 
 def test_broker_audit_trail_records_route_decisions(tmp_path):

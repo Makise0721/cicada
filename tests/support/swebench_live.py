@@ -455,6 +455,27 @@ def _diagnosis(child_facts: dict, broker, budget) -> str:
     return "; ".join(parts)
 
 
+def check_gate(checks: list[dict], *, offline: bool) -> str | None:
+    """检查准入: 返回拒绝原因, None 表示通过。
+
+    离线演练由 fixture 保证"先 read+check、再编辑"的顺序, 所以**离线**要求第一次观察到的
+    检查必须是空补丁失败 —— 那是我们自己的契约, 也证明检查确实落在未修改的工作区上。
+    **live** 下模型有行为自由(本题 prompt 要求先检后改, 但模型可以先改后检): 那次检查会落在
+    已修改的工作区上, `patch_empty=false` 却是真实的 11/11 通过。因此 live 只要求
+    "存在一次覆盖达标的通过检查", 而把"首次是否为空的失败检查"作为**事实**记录下来
+    (见 facts["initial_check"]), 不再当作门禁 —— 门禁不应该把"做对了题"判成失败。
+    """
+    if offline:
+        if not checks or checks[0].get("code") != 1 or checks[0].get("patch_empty") is not True:
+            return "initial check did not observe an empty failing patch"
+        return None
+    if not any(check.get("code") == 0 and check.get("result") == "passed"
+               and check.get("required_passed") == check.get("required_total")
+               for check in checks):
+        return "no passing check with full required coverage was observed"
+    return None
+
+
 async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_raw, credential=None,
                admission=None, offline=True):
     from tests.e2e import preview_runner as runner
@@ -540,8 +561,17 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         if p1["os_exit_code"] != 0 or p1["timed_out"] or broker.stopped or p1.get("closed_ok") is not True:
             raise AttemptBudgetError("first child did not complete normally: " + _diagnosis(
                 p1, broker, budget))
-        if not broker.checks or broker.checks[0]["code"] != 1 or broker.checks[0].get("patch_empty") is not True:
-            raise AttemptBudgetError("initial check did not observe an empty failing patch")
+        # 首次检查的形态是**事实**而不是门禁: live 下模型可以先改后检 (见 check_gate 说明)。
+        first_check = broker.checks[0] if broker.checks else None
+        facts["initial_check"] = None if first_check is None else {
+            key: first_check.get(key) for key in
+            ("code", "result", "patch_empty", "required_passed", "required_total")}
+        facts["initial_check_was_empty_failure"] = bool(
+            first_check is not None and first_check.get("code") == 1
+            and first_check.get("patch_empty") is True)
+        gate_problem = check_gate(broker.checks, offline=offline)
+        if gate_problem is not None:
+            raise AttemptBudgetError(gate_problem + ": " + _diagnosis(p1, broker, budget))
         if spec.scenario == "restore-compact-continue":
             requests = p1.get("requests") or []
             if len(requests) != 2 or p1.get("manifest_unchanged") is not True or any(
