@@ -36,6 +36,7 @@ from cicada.application import (
     PersistenceConfig,
     RequestCompleted,
     open_application,
+    verification_checks_signature,
 )
 from cicada.budget import BudgetConfig
 from cicada.core.ports import ModelMetrics
@@ -402,7 +403,8 @@ def launch_identity(spec: LifecycleSpec, prompt_info: PromptInfo,
         max_turns=spec.max_turns, prompt_version=prompt_info.version,
         prompt_sha256=prompt_info.prompt_sha256,
         instructions_sha256=prompt_info.instructions_sha256,
-        checks_signature=None, sources={"harness": "pv02"})
+        checks_signature=verification_checks_signature(spec.checks) if spec.checks else None,
+        sources={"harness": "pv02"})
 
 
 def _plan(spec: LifecycleSpec) -> VerificationPlan | None:
@@ -536,6 +538,10 @@ async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *
                 "reason": compacted.reason}
             facts["context_compacted_events"] = len(log.compacted)
             facts["projection_blocks"] = len(session._context_projection.blocks)
+            if compacted is None or not log.compacted or transport.network_sealed_reason:
+                raise AttemptBudgetError("summary did not commit; refusing R3")
+            if facts["restored_requests"] != 2 or session.view_only_reason:
+                raise AttemptBudgetError("restore did not admit two committed requests")
             outcome = await session.execute(prompts["R3"])
         facts["requests"] = [_request_facts("R3", outcome)]
         facts["completed_events"] = log.completed
@@ -772,6 +778,8 @@ def runtime_identity() -> dict:
         project / "tests" / "support" / "swebench_bridge.py",
         project / "tests" / "support" / "swebench_cost.py",
     ]
+    tracked.extend(sorted((project / "tests" / "support").glob("swebench_live*.py")))
+    tracked.extend(sorted((project / "tests" / "support").glob("swebench_authorization.py")))
     identity = {p.relative_to(project).as_posix(): source_sha256(p)
                 for p in tracked if p.is_file()}
     identity.update({p.relative_to(project).as_posix(): source_sha256(p)
@@ -793,7 +801,8 @@ def rehearsal_plan(prepared_root: Path, manifest_path: Path) -> dict:
         "allowed_paths": tuple(lock["instance"]["allowed_paths"]),
         "base_commit": lock["instance"]["base_commit"],
         "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
-        "prompt_sha256": prompts["sha256"],
+        "prompt_sha256": {**prompts["sha256"], "coding": hashlib.sha256(
+            build_coding_prompt(instruction).encode("utf-8")).hexdigest()},
         "model_doc": manifest["model"],
         "check_timeout_s": float(manifest["limits"].get("check_timeout_s", 300)),
         "runner_command": _runner_command(

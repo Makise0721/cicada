@@ -1,0 +1,524 @@
+"""PV02 评估方监督 + 受限模型子进程。默认只允许离线演练。
+
+真实凭据、总账、官方检查与墙钟均由 Medium 父进程拥有。Low 子进程只经过
+本地代理发送生产模型请求、上报生产终局、触发固定 check-1；不能读私料或凭据。
+代理不接受 URL、命令、路径或模型选择。离线与 live 复用同一代理和真实子进程。
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from dataclasses import asdict
+from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import httpx
+
+from cicada.core.ports import ModelMetrics, StreamDone
+from cicada.costs import CostLedger, CostProfile
+from cicada.plugins.coding.verification_contracts import CheckDefinition
+from cicada.prompting import CheckPrompt, DEFAULT_TOOLS, compose_system_prompt
+from tests.support import swebench_bridge as bridge
+from tests.support import swebench_isolation as isolation
+from tests.support import swebench_lifecycle as lifecycle
+from tests.support.swebench_budget import AttemptBudget, AttemptBudgetError, PROCESS_1, PROCESS_2
+from tests.support.swebench_tasks import load_json, sha256_file, spec_from_manifest, write_json
+
+PROJECT = Path(__file__).resolve().parents[2]
+WIRE_LIMIT = 2 * 1024 * 1024
+
+
+def archive_manifest(workspace: Path) -> dict:
+    """已关闭存档的内容身份, 在第二个 OS 进程启动前重核。"""
+    root = workspace / ".cicada" / "sessions"
+    return {path.relative_to(root).as_posix(): sha256_file(path)
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def _public_check(summary: dict) -> dict:
+    return {key: summary.get(key) for key in (
+        "result", "required_passed", "required_total", "patch_empty", "grade_id", "cleanup")}
+
+
+class Broker:
+    """固定权限的本地代理; 所有账本操作在父进程同一个 asyncio loop 串行执行。"""
+
+    def __init__(self, *, gate, check, deadline, credential=None, admission=None):
+        self.gate, self.check = gate, check
+        self.deadline, self.credential, self.admission = deadline, credential, admission
+        self.token = uuid.uuid4().hex
+        self.stopped = False
+        self.checks = []
+        self.inflight = None
+        self.checking = False
+        self.server = None
+
+    async def dispatch(self, route: str, body: bytes) -> tuple[int, dict, bytes]:
+        if route == "/state":
+            return 200, {}, json.dumps({"stopped": self.stopped}).encode()
+        if self.stopped or time.monotonic() >= self.deadline:
+            self.stop("run-timeout-or-stopped")
+            raise AttemptBudgetError("production deadline reached")
+        if route == "/model":
+            if self.checking:
+                raise AttemptBudgetError("model send overlaps a check")
+            if self.admission:
+                self.admission()
+            if any(not item.resolved for item in self.gate.observations.values()):
+                self.stop("unconfirmed-previous-send")
+                raise AttemptBudgetError("previous send lacks production confirmation")
+            self.inflight = asyncio.current_task()
+            response = None
+            try:
+                request = httpx.Request("POST", "https://api.deepseek.com/chat/completions",
+                    content=body, headers={"Content-Type": "application/json",
+                    "Authorization": "Bearer " + (self.credential or lifecycle.OFFLINE_CREDENTIAL)})
+                response = await self.gate.handle_async_request(request)
+                content = bytearray()
+                async for chunk in response.aiter_raw():
+                    content.extend(chunk)
+                    if len(content) > WIRE_LIMIT:
+                        raise AttemptBudgetError("response exceeds frozen wire cap")
+                call_id = next(reversed(self.gate.observations))
+                return response.status_code, {"X-Call-Id": call_id}, bytes(content)
+            except BaseException:
+                self.stop("model-transport-failed")
+                raise
+            finally:
+                if response is not None:
+                    await response.aclose()
+                self.inflight = None
+        if route == "/confirm":
+            data = json.loads(body)
+            metrics = data.get("metrics")
+            terminal = None if data.get("stop_reason") is None else StreamDone(
+                data["stop_reason"], error="production-error" if data.get("error") else None,
+                metrics=ModelMetrics(**metrics) if metrics else None)
+            if data.get("call_id") not in self.gate.observations:
+                self.stop("unknown-production-confirmation")
+                raise AttemptBudgetError("unknown production confirmation")
+            self.gate.confirm(data["call_id"], terminal)
+            return 200, {}, b"{}"
+        if route == "/seal":
+            self.stop("child-sealed")
+            return 200, {}, b"{}"
+        if route == "/check":
+            if self.checking or self.gate.active_call_id is not None:
+                raise AttemptBudgetError("overlapping check refused")
+            self.checking = True
+            try:
+                code, summary = await asyncio.to_thread(self.check)
+                self.checks.append({"code": code, **summary})
+                if code == 2:
+                    self.stop("evaluation-anomaly")
+                return 200, {}, json.dumps({"code": code, "summary": _public_check(summary)}).encode()
+            finally:
+                self.checking = False
+        raise AttemptBudgetError("unknown broker operation")
+
+    def stop(self, reason):
+        self.stopped = True
+        self.gate.seal_network(reason)
+        self.gate.budget.seal(reason)
+
+    def start(self):
+        loop = asyncio.get_running_loop()
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                if self.headers.get("X-PV-Token") != owner.token:
+                    self.send_error(403)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 <= length <= WIRE_LIMIT:
+                        raise ValueError
+                    body = self.rfile.read(length)
+                    future = asyncio.run_coroutine_threadsafe(owner.dispatch(self.path, body), loop)
+                    code, headers, result = future.result()
+                except BaseException:
+                    code, headers, result = 503, {}, b'{"error":"broker refused"}'
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Length", str(len(result)))
+                    for key, value in headers.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    self.wfile.write(result)
+                except OSError:
+                    loop.call_soon_threadsafe(owner.stop, "child-disconnected")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return f"http://127.0.0.1:{self.server.server_port}"
+
+    async def close(self):
+        if self.inflight is not None:
+            self.inflight.cancel()
+            await asyncio.gather(self.inflight, return_exceptions=True)
+        if self.server:
+            await asyncio.to_thread(self.server.shutdown)
+            self.server.server_close()
+            self.thread.join(timeout=2)
+
+
+class RemoteGate(httpx.AsyncBaseTransport):
+    """Low 子进程的传输适配器; 真实 key 不进入此进程。"""
+
+    def __init__(self, endpoint, token):
+        self.endpoint, self.token = endpoint, token
+        self.inner = httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+        self.observations = {}
+        self.network_sealed_reason = None
+        self.budget = self
+
+    def _post(self, route, data):
+        with httpx.Client(trust_env=False, timeout=30) as client:
+            response = client.post(self.endpoint + route,
+                                  headers={"X-PV-Token": self.token}, json=data)
+            response.raise_for_status()
+            return response.json()
+
+    def seal_network(self, reason):
+        self.network_sealed_reason = reason
+
+    def seal(self, reason):
+        self.seal_network(reason)
+        self._post("/seal", {})
+
+    def confirm(self, call_id, terminal):
+        self._post("/confirm", {"call_id": call_id,
+            "stop_reason": terminal.stop_reason if terminal else None,
+            "error": bool(terminal.error) if terminal else True,
+            "metrics": asdict(terminal.metrics) if terminal and terminal.metrics else None})
+
+    async def handle_async_request(self, request):
+        body = await request.aread()
+        local = httpx.Request("POST", self.endpoint + "/model", content=body,
+                              headers={"X-PV-Token": self.token})
+        response = await self.inner.handle_async_request(local)
+        call_id = response.headers.get("X-Call-Id")
+        if call_id:
+            self.observations[call_id] = True
+        return response
+
+    async def aclose(self):
+        await self.inner.aclose()
+
+
+async def _child(config_path: Path) -> dict:
+    config = load_json(config_path)
+    workspace = Path(config["workspace"])
+    gate = RemoteGate(config["endpoint"], config["token"])
+    check_command = config["check_command"]
+    timeout = config["check_timeout_s"]
+    prompt, info = compose_system_prompt(workspace, None, tools=DEFAULT_TOOLS + ("check",),
+        checks=(CheckPrompt("check-1", check_command, timeout),))
+    profile = CostProfile.load(Path(config["profile"]))
+    ledger = CostLedger(Path(config["child_root"]) / "cost" / config["phase"],
+                       limit=Decimal("4.50"), max_calls=24, profile=profile)
+    spec = lifecycle.LifecycleSpec(workspace=workspace, instruction=config["instruction"],
+        model_doc=config["model"], checks=(CheckDefinition("check-1", check_command, timeout),),
+        cost_control=ledger)
+    # 只通过生产 close 发协作取消; 父进程先封发送, 等待退出后才核对存档。
+    task = asyncio.create_task(
+        lifecycle.run_process_coding(spec, gate, system_prompt=prompt, prompt_info=info)
+        if config["scenario"] == "coding" else
+        lifecycle.run_process_1(spec, gate, system_prompt=prompt, prompt_info=info)
+        if config["phase"] == PROCESS_1 else
+        lifecycle.run_process_2(spec, gate, None, session_id=config["session_id"],
+                                system_prompt=prompt, prompt_info=info))
+
+    async def watch():
+        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+            while not task.done():
+                try:
+                    response = await client.post(config["endpoint"] + "/state",
+                                                headers={"X-PV-Token": config["token"]})
+                    if response.json()["stopped"]:
+                        task.cancel()
+                        return
+                except (httpx.HTTPError, ValueError):
+                    task.cancel()
+                    return
+                await asyncio.sleep(0.1)
+    watcher = asyncio.create_task(watch())
+    try:
+        result = await task
+        result["process_ledger"] = lifecycle._ledger_facts(ledger)
+        result["pid"] = os.getpid()
+        return result
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        await gate.aclose()
+
+
+def _child_env(child_root: Path) -> dict:
+    env = {key: value for key, value in os.environ.items() if key.upper() in {
+        "SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"}}
+    env.update({"PYTHONPATH": str(PROJECT / "src") + os.pathsep + str(PROJECT),
+        "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
+        "TMP": str(child_root / "temp"), "TEMP": str(child_root / "temp"),
+        "UV_CACHE_DIR": str(child_root / "uv-cache"),
+        "XDG_CACHE_HOME": str(child_root / "cache"),
+        "APPDATA": str(child_root / "appdata"), "LOCALAPPDATA": str(child_root / "localappdata")})
+    return env
+
+
+async def _supervise_child(config, config_path, broker, deadline):
+    write_json(config_path, config)
+    child = isolation.LowProcess([sys.executable, "-m", "tests.support.swebench_live",
+        "child", "--config", str(config_path)], PROJECT, _child_env(Path(config["child_root"])))
+    timeout = False
+    try:
+        while child.poll() is None:
+            if time.monotonic() >= deadline or broker.stopped:
+                timeout = time.monotonic() >= deadline
+                broker.stop("run-timeout" if timeout else "attempt-stopped")
+                if broker.inflight:
+                    broker.inflight.cancel()
+                grace = time.monotonic() + 10
+                while child.poll() is None and time.monotonic() < grace:
+                    await asyncio.sleep(0.05)
+                if child.poll() is None:
+                    child.terminate_tree()
+                break
+            await asyncio.sleep(0.05)
+        code = child.poll()
+        if code is None:
+            raise AttemptBudgetError("child termination is unconfirmed")
+        facts_path = Path(config["child_root"]) / (config["phase"] + "-facts.json")
+        facts = load_json(facts_path) if facts_path.is_file() else {}
+        facts.update({"pid": child.pid, "os_exit_code": code,
+                      "os_exit_confirmed": True, "timed_out": timeout})
+        return facts
+    finally:
+        if child.poll() is None:
+            broker.stop("supervisor-exit")
+            child.terminate_tree()
+        child.close()
+
+
+def _make_budget(root, manifest_path, prepared, profile, manifest):
+    return AttemptBudget(root, attempt_id="pv02-" + manifest["task_key"],
+        manifest_hash=sha256_file(manifest_path), prepared_lock_hash=sha256_file(prepared / "lock.json"),
+        profile=profile, model_identity={"provider": "deepseek", "model": manifest["model"]["normal"]["model"]})
+
+
+async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_raw, credential=None,
+               admission=None, offline=True):
+    from tests.e2e import preview_runner as runner
+
+    prepared, manifest_path, attempt_root = map(Path, (prepared_root, manifest_path, attempt_root))
+    spec = spec_from_manifest(manifest_path)
+    manifest, lock = load_json(manifest_path), runner.load_lock(prepared)
+    problems = runner.verify_frozen_identity(spec, lock, prepared)
+    if problems:
+        raise AttemptBudgetError("frozen identity does not match: " + "; ".join(problems))
+    workspace = prepared / "workspace"
+    if bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json() != lock["workspace"]["manifest"]:
+        raise AttemptBudgetError("workspace differs from prepared baseline; refusing reset")
+    if attempt_root.exists() and any(attempt_root.iterdir()):
+        raise AttemptBudgetError("attempt root is not empty; refusing to overwrite evidence")
+    child_root, private = attempt_root / "child", attempt_root / "private"
+    private.mkdir(parents=True)
+    protection = isolation.seal_private(private)
+    # 评分原始材料也保存在 private 下, Low 模型只收到批准的公共摘要。
+    for directory in (workspace, child_root, *(child_root / name for name in (
+            "temp", "cache", "uv-cache", "appdata", "localappdata"))):
+        isolation.allow_low_write(directory)
+    if isolation.isolation_problems(private, protection):
+        raise AttemptBudgetError("controller private materials are reachable")
+    # 旧 prepare 原始日志含评分私料, 与新父进程账本一样封印, 内容不改写。
+    evidence_protection = isolation.seal_private(prepared / "evidence")
+    if isolation.isolation_problems(prepared / "evidence", evidence_protection):
+        raise AttemptBudgetError("prepared evaluator logs are reachable")
+    profile_path = child_root / "profile.json"
+    # 用原 profile 原始字节, 避免重编码产生另一份价格身份。
+    # 调用者传入路径只用于复制, 不把真实凭据放到模型进程。
+    profile_path.write_bytes(profile_raw)
+    edits = lifecycle.learned_edits(workspace, spec.base_commit,
+        prepared / "private" / "gold_patch.diff", spec.allowed_paths) if offline else None
+    started = time.monotonic()
+    deadline = started + manifest["limits"]["run_timeout_s"]
+    budget_root = private / "budget"
+    budget = _make_budget(budget_root, manifest_path, prepared, profile, manifest)
+    budget.acquire(PROCESS_1)
+    fixture = lifecycle.offline_fixture(edits=edits, allowed_paths=spec.allowed_paths,
+        sequence=lifecycle._CODING_SEQUENCE if spec.scenario == "coding" else lifecycle._FIXTURE_SEQUENCE
+        ) if offline else httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+    gate = lifecycle.AttemptGateTransport(fixture, budget, phase=PROCESS_1, deadline_monotonic=deadline)
+
+    def check():
+        with contextlib.redirect_stdout(io.StringIO()):
+            return runner.evaluate_workspace_patch(spec, prepared, workspace, lock, private / "checks")
+
+    broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential, admission=admission)
+    endpoint = broker.start()
+    # 端口在整个 attempt 内不变, 因而恢复前后的 checks_signature 相同。
+    config = {"workspace": str(workspace), "endpoint": endpoint, "token": broker.token,
+        "check_command": f"& '{sys.executable}' -m tests.support.swebench_live check "
+                         f"--endpoint '{endpoint}' --token '{broker.token}'",
+        "check_timeout_s": manifest["limits"]["check_timeout_s"],
+        "profile": str(profile_path), "child_root": str(child_root),
+        "phase": PROCESS_1, "scenario": spec.scenario, "model": manifest["model"],
+        "instruction": (prepared / "public" / "instruction.md").read_text(encoding="utf-8")}
+    facts = {"task_key": spec.task_key, "scenario": spec.scenario, "live": "not-run" if offline else "run",
+        "prompt_sha256": lock["prompt_sha256"], "runtime_sha256": lifecycle.runtime_identity(),
+        "manifest_sha256": sha256_file(manifest_path), "profile_sha256": profile.sha256,
+        "prepared_lock_sha256": sha256_file(prepared / "lock.json"),
+        "process_ledgers": {}, "writable_directories": [str(workspace), str(child_root)],
+        "problems": [], "model_requests": 0 if offline else None}
+    try:
+        p1 = await _supervise_child(config, child_root / "config.json", broker, deadline)
+        facts["process_1"] = p1
+        facts["process_ledgers"][PROCESS_1] = p1.get("process_ledger")
+        if p1["os_exit_code"] != 0 or p1["timed_out"] or broker.stopped:
+            raise AttemptBudgetError("first child did not complete normally")
+        if not broker.checks or broker.checks[0]["code"] != 1 or broker.checks[0].get("patch_empty") is not True:
+            raise AttemptBudgetError("initial check did not observe an empty failing patch")
+        if spec.scenario == "restore-compact-continue":
+            requests = p1.get("requests") or []
+            if len(requests) != 2 or p1.get("manifest_unchanged") is not True or any(
+                    not r.get("saved") or r.get("save_error") or r.get("stop_reason") != "stop" for r in requests):
+                raise AttemptBudgetError("R1/R2 did not both commit without edits")
+            checkpoint = budget.close_checkpoint(process_identity={
+                "pid": p1["pid"], "os_exit_confirmed": True, "session_id": p1["session_id"],
+                "request_ids": [r["request_id"] for r in requests],
+                "workspace_manifest": bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json(),
+                "archive_manifest": archive_manifest(workspace),
+                "elapsed_s": time.monotonic() - started})
+            facts["checkpoint_after_process_1"] = checkpoint
+            budget.release()
+            second = _make_budget(budget_root, manifest_path, prepared, profile, manifest)
+            second.acquire(PROCESS_2)
+            continuation = second.verify_continuation(expect_phase=PROCESS_1)
+            saved = continuation["checkpoint"]["process_identity"]
+            if (saved["archive_manifest"] != archive_manifest(workspace)
+                    or saved["workspace_manifest"] != bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json()
+                    or saved["session_id"] != p1["session_id"]
+                    or saved["elapsed_s"] >= manifest["limits"]["run_timeout_s"]):
+                raise AttemptBudgetError("continuation archive/workspace/time identity differs")
+            budget = second
+            gate = lifecycle.AttemptGateTransport(fixture, second, phase=PROCESS_2,
+                session=p1["session_id"], deadline_monotonic=deadline)
+            broker.gate = gate
+            config.update(phase=PROCESS_2, session_id=saved["session_id"])
+            p2 = await _supervise_child(config, child_root / "config.json", broker, deadline)
+            facts["process_2"] = p2
+            facts["process_ledgers"][PROCESS_2] = p2.get("process_ledger")
+            if p2["os_exit_code"] != 0 or p2["timed_out"] or p2.get("restored_requests") != 2:
+                raise AttemptBudgetError("second child did not restore and complete")
+            if p2.get("restored_request_ids") != saved["request_ids"]:
+                raise AttemptBudgetError("restored request identities differ")
+            if p2.get("context_compacted_events") != 1 or not p2.get("compacted"):
+                raise AttemptBudgetError("summary was not committed")
+            if not any(call["kind"] == "summary" and call["state"] == "settled" for call in budget.recorded_calls()):
+                raise AttemptBudgetError("summary send did not settle")
+            final_process = p2
+        else:
+            final_process = p1
+        if not final_process.get("requests") or final_process["requests"][-1].get("exit_code") != 0:
+            raise AttemptBudgetError("final request has no current passing check")
+        if broker.stopped or gate.network_sealed_reason or budget.sealed_reason or budget.totals()["pending_cent"]:
+            raise AttemptBudgetError("attempt sealed or has a pending reservation")
+        for ledger in facts["process_ledgers"].values():
+            if not ledger or ledger["sealed_reason"] or Decimal(ledger["pending_upper_cny"] or "0"):
+                raise AttemptBudgetError("production process ledger is not settled")
+        facts["production_elapsed_s"] = time.monotonic() - started
+        # 独立最终评分在模型进程退出后另起干净容器, 单独记时。
+        grade_started = time.monotonic()
+        code, grade = await asyncio.to_thread(check)
+        facts["grading_elapsed_s"] = time.monotonic() - grade_started
+        facts["final_grade"] = grade
+        if code != 0:
+            raise AttemptBudgetError("independent final grade did not pass")
+        facts["outcome"] = "offline-passed-review-pending" if offline else "live-passed"
+    except BaseException as exc:
+        broker.stop("attempt-failed")
+        facts["outcome"] = "offline-failed" if offline else "live-failed"
+        facts["problems"].append(type(exc).__name__ + ": " + str(exc)[:200]
+                                 if isinstance(exc, AttemptBudgetError) else type(exc).__name__)
+    finally:
+        facts.setdefault("production_elapsed_s", time.monotonic() - started)
+        facts["checks"] = broker.checks
+        facts["attempt_ledger"] = budget.totals()
+        facts["attempt_calls"] = budget.recorded_calls()
+        if not offline:
+            facts["model_requests"] = sum(c["event"] == "reserve" for c in budget.events())
+        facts["sealed_reason"] = budget.sealed_reason
+        budget.release()
+        await broker.close()
+        await fixture.aclose()
+        write_json(attempt_root / ("offline-admission.json" if offline else "live-result.json"), facts)
+    return facts
+
+
+def run_supervised(*, prepared_root, manifest_path, attempt_root, profile_path,
+                   authorization_path=None, offline=True):
+    from tests.support.swebench_authorization import candidate_binding, validate_authorization
+
+    profile = CostProfile.load(Path(profile_path))
+    # frozen dataclass: 原始 bytes 单独传给内部, 不修改生产 profile 对象。
+    expected = candidate_binding(manifest_path=Path(manifest_path), prepared_root=Path(prepared_root),
+                                 attempt_root=Path(attempt_root), profile=profile)
+    credential = None
+    admission = None
+    if not offline:
+        admission = lambda: validate_authorization(authorization_path, expected)
+        admission()
+        credential = os.environ.get("DEEPSEEK_API_KEY")
+        if not credential:
+            raise AttemptBudgetError("DEEPSEEK_API_KEY is missing from evaluator environment")
+    return asyncio.run(_run(prepared_root=Path(prepared_root).resolve(),
+        manifest_path=Path(manifest_path).resolve(), attempt_root=Path(attempt_root).resolve(),
+        profile=profile, profile_raw=Path(profile_path).read_bytes(),
+        credential=credential, admission=admission, offline=offline))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+    child = sub.add_parser("child")
+    child.add_argument("--config", type=Path, required=True)
+    check = sub.add_parser("check")
+    check.add_argument("--endpoint", required=True)
+    check.add_argument("--token", required=True)
+    args = parser.parse_args()
+    if args.action == "check":
+        with httpx.Client(trust_env=False, timeout=300) as client:
+            result = client.post(args.endpoint + "/check", headers={"X-PV-Token": args.token})
+            result.raise_for_status()
+            data = result.json()
+            print(json.dumps(data["summary"], ensure_ascii=False))
+            return data["code"]
+    config = load_json(args.config)
+    try:
+        facts = asyncio.run(_child(args.config))
+        code = 0
+    except BaseException as exc:
+        facts, code = {"error_type": type(exc).__name__}, 2
+    write_json(Path(config["child_root"]) / (config["phase"] + "-facts.json"), facts)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

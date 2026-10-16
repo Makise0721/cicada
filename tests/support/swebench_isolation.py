@@ -217,6 +217,53 @@ def _icacls(*args: str) -> subprocess.CompletedProcess:
     return record
 
 
+class LowProcess:
+    """评估方保有真实进程句柄, 可轮询退出并在协作取消失败后终止整棵树。"""
+
+    def __init__(self, argv: list[str], cwd: Path, env: dict[str, str]):
+        token = _low_token()
+        startup = _STARTUPINFOW()
+        startup.cb = ctypes.sizeof(startup)
+        info = _PROCESS_INFORMATION()
+        environment = ctypes.create_unicode_buffer(
+            "\0".join(f"{key}={value}" for key, value in sorted(env.items())) + "\0\0")
+        command = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+        try:
+            if not _advapi32.CreateProcessAsUserW(
+                    token, str(argv[0]), command, None, None, False,
+                    0x00000400 | 0x08000000, environment, str(cwd),
+                    ctypes.byref(startup), ctypes.byref(info)):
+                raise IsolationError(f"low process launch failed: {ctypes.get_last_error()}")
+            self.handle, self.pid = info.hProcess, int(info.dwProcessId)
+            _kernel32.CloseHandle(info.hThread)
+        finally:
+            _kernel32.CloseHandle(token)
+
+    def poll(self) -> int | None:
+        if _kernel32.WaitForSingleObject(self.handle, 0) == 0x102:
+            return None
+        code = _wt.DWORD()
+        if not _kernel32.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            raise IsolationError("cannot confirm child exit")
+        return int(code.value)
+
+    def terminate_tree(self) -> None:
+        subprocess.run(["taskkill", "/PID", str(self.pid), "/T", "/F"],
+                       capture_output=True, timeout=20)
+
+    def close(self) -> None:
+        _kernel32.CloseHandle(self.handle)
+
+
+def allow_low_write(directory: Path) -> None:
+    """只在显式列出的模型工作目录给 Low 子进程读写权限。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    for args in ((str(directory), "/grant", f"*{EVERYONE_SID}:(OI)(CI)M"),
+                 (str(directory), "/setintegritylevel", "(OI)(CI)L", "/T")):
+        if _icacls(*args).returncode:
+            raise IsolationError("cannot authorize low writable directory")
+
+
 def _acl_text(path: Path) -> str:
     record = _icacls(str(path))
     return (record.stdout or "") + (record.stderr or "")

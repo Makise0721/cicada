@@ -471,6 +471,11 @@ def build_lock(spec: TaskSpec, row: dict, verifier: dict, image: dict,
         "image": image,
         "instruction_sha256": spec.instruction_sha256,
         "task_toml_sha256": spec.task_toml_sha256,
+        "prompt_sha256": {**lifecycle.build_prompts(
+            (run_root / "public" / "instruction.md").read_text(encoding="utf-8"))["sha256"],
+            "coding": tasks.sha256_bytes(lifecycle.build_coding_prompt(
+                (run_root / "public" / "instruction.md").read_text(encoding="utf-8"))
+                .encode("utf-8"))},
         "verifier": verifier["sha256"],
         "verifier_config_sha256": verifier["config_bytes_sha256"],
         # P1: 封印配方与其 SID 随 lock 冻结; 每次准入按此重跑负向验收。
@@ -524,6 +529,9 @@ def verify_frozen_identity(spec: TaskSpec, lock: dict, run_root: Path) -> list[s
         problems.append("lock task identity differs from manifest")
     if lock.get("manifest_sha256") != sha256_file(Path(spec_manifest_path(spec))):
         problems.append("manifest changed since prepare")
+    if lock.get("prompt_sha256") != lifecycle.rehearsal_plan(
+            run_root, Path(spec_manifest_path(spec)))["prompt_sha256"]:
+        problems.append("prompt identity differs from prepare")
     if lock.get("dataset") != {
             "id": bridge.DATASET_ID, "config": bridge.DATASET_CONFIG,
             "split": bridge.DATASET_SPLIT, "revision": bridge.DATASET_REVISION,
@@ -651,7 +659,9 @@ def evaluate_workspace_patch(spec: TaskSpec, run_root: Path, workspace: Path, lo
         not result.timed_out and not result.apply_failed and result.cleanup == "confirmed"
         and result.verifier_exit_code is not None and grade.get("reward") == 0
         and grade.get("artifacts_complete") and not identity_after
-        and grade.get("required_observed") == result.required_total
+        and (grade.get("required_observed") == result.required_total
+             or (exported.empty and grade.get("p2p_passed")
+                 and empty_f2p_failures(result, lock["instance"]["fail_to_pass"])[0] > 0))
         and not grade.get("parse_failed") and not grade.get("required_empty"))
     write_json(check_dir / "patch.json", exported.to_json())
     write_json(check_dir / "evaluation.json", result.to_json())
@@ -812,35 +822,34 @@ def cmd_run(args) -> int:
             print(json.dumps({"outcome": "refused", "model_requests": 0,
                               "reason": str(exc)}, ensure_ascii=False), file=sys.stderr)
             return 2
-        if args.live:
-            # live 是**单独一次**明确授权动作: 本构建不携带授权记录, 因此零请求拒绝,
-            # 不把 harness 的存在当成授权。
-            print(json.dumps({
-                "outcome": "refused", "model_requests": 0,
-                "reason": "live authorization is a separate explicit step and no "
-                          "authorization record is present; refusing to send"},
-                ensure_ascii=False), file=sys.stderr)
+        if args.live and not getattr(args, "authorization", None):
+            print(json.dumps({"outcome": "refused", "model_requests": 0,
+                              "reason": "live authorization required"}), file=sys.stderr)
             return 2
+        from tests.support.swebench_live import run_supervised
 
-        facts = lifecycle.run_rehearsal(
-            prepared_root=prepared, manifest_path=manifest,
-            attempt_root=run_root / "attempt", profile=profile)
+        facts = run_supervised(prepared_root=prepared, manifest_path=manifest,
+            attempt_root=run_root, profile_path=Path(args.cost_profile),
+            authorization_path=Path(args.authorization) if args.live else None,
+            offline=not args.live)
         # 只写 attempt root: prepared root 是冻结输入, 覆盖它等于改动已签名材料
         # (审查 P1-C)。report 需要时用 --admission 显式指路, 不做隐式副本。
-        write_json(run_root / "offline-admission.json", facts)
+        result_path = run_root / ("live-result.json" if args.live else "offline-admission.json")
+        write_json(result_path, facts)
         summary = {
             "outcome": facts["outcome"], "task_key": spec.task_key,
-            "live": facts["live"], "model_requests": 0,
+            "live": facts["live"], "model_requests": facts["model_requests"],
             "prompt_sha256": facts["prompt_sha256"],
             "attempt_ledger": facts.get("attempt_ledger"),
             "problems": facts.get("problems", []),
-            "admission": str(run_root / "offline-admission.json")}
+            "admission": str(result_path)}
         print(json.dumps(summary, ensure_ascii=False))
-        return 0 if facts["outcome"] == "offline-passed-review-pending" else 1
+        return 0 if facts["outcome"] in ("offline-passed-review-pending", "live-passed") else 1
     except (ManifestError, PrepareFailed, bridge.BridgeError, bridge.PatchScopeError,
             isolation.IsolationError, lifecycle.AttemptBudgetError, OSError, ValueError,
             RuntimeError, KeyError) as exc:
-        print(json.dumps({"outcome": "inconclusive-evidence", "model_requests": 0,
+        print(json.dumps({"outcome": "inconclusive-evidence",
+                          "model_requests": None if args.live else 0,
                           "reason": str(exc)[:300]}, ensure_ascii=False))
         return 2
 
@@ -969,6 +978,7 @@ def main() -> int:
                 "--cost-profile",
                 help="本地价格 JSON; attempt 总额度闸需要显式 profile, 缺它一律零发送")
             sub_parser.add_argument("--live", action="store_true")
+            sub_parser.add_argument("--authorization", help="本次候选与 attempt 的明确授权记录 JSON")
     args = parser.parse_args()
     handlers = {"prepare": cmd_prepare, "dry-run": cmd_dry_run, "check": cmd_check,
                 "grade": cmd_grade, "run": cmd_run, "report": cmd_report}
