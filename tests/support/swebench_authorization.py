@@ -85,6 +85,33 @@ def _utc_timestamp(value):
     return parsed
 
 
+def execution_binding(*, manifest_path: Path, prepared_root: Path, attempt_root: Path,
+                      profile: CostProfile, admission_path: Path, review_path: Path) -> dict:
+    """live 还必须绑定当前代码的全路径演练和通过的独立两轴审查。"""
+    binding = candidate_binding(manifest_path=manifest_path, prepared_root=prepared_root,
+                                attempt_root=attempt_root, profile=profile)
+    try:
+        admission = json.loads(Path(admission_path).read_text(encoding="utf-8"))
+        review = json.loads(Path(review_path).read_text(encoding="utf-8"))
+        if (admission["outcome"] != "offline-passed-review-pending"
+                or admission["task_key"] != binding["task_key"]
+                or admission["runtime_sha256"] != binding["runtime_sha256"]
+                or admission["prepared_lock_sha256"] != binding["prepared_lock_sha256"]
+                or admission["profile_sha256"] != binding["profile_sha256"]
+                or review["candidate_head"] != binding["git_head"]
+                or review["candidate_tree"] != binding["git_tree"]
+                or review["runtime_sha256"] != binding["runtime_sha256"]
+                or review["standards"] != "passed" or review["spec"] != "passed"):
+            raise ValueError
+        digest = hashlib.sha256(Path(admission_path).read_bytes()).hexdigest()
+        if review["offline_admissions"][binding["task_key"]] != digest:
+            raise ValueError
+        return {**binding, "offline_admission_sha256": digest,
+                "review_sha256": hashlib.sha256(Path(review_path).read_bytes()).hexdigest()}
+    except (OSError, ValueError, KeyError, TypeError):
+        raise AttemptBudgetError("offline admission or independent review does not match candidate") from None
+
+
 def validate_authorization(path: Path | None, expected: dict) -> dict:
     """严格匹配一次显式授权及有效价格核对；任何失败均零发送拒绝。"""
     if path is None:

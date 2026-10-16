@@ -32,6 +32,7 @@ import httpx
 
 from cicada.application import (
     ApplicationConfig,
+    ApplicationClosed,
     ContextCompacted,
     PersistenceConfig,
     RequestCompleted,
@@ -420,6 +421,8 @@ class _EventLog:
     completed: int = 0
     compacted: list = field(default_factory=list)
     events: list = field(default_factory=list)
+    closed_events: int = 0
+    close_problem: str | None = None
 
     def __call__(self, update) -> None:
         self.events.append(update)
@@ -427,6 +430,15 @@ class _EventLog:
             self.completed += 1
         elif isinstance(update, ContextCompacted):
             self.compacted.append(update)
+        elif isinstance(update, ApplicationClosed):
+            self.closed_events += 1
+            self.close_problem = "runtime stop failed or close incomplete" if update.error else None
+
+
+async def close_process(session, log: _EventLog, facts: dict) -> None:
+    await session.aclose()
+    facts["closed_ok"] = log.closed_events == 1 and log.close_problem is None
+    facts["close_problem"] = log.close_problem
 
 
 async def open_process(spec: LifecycleSpec, transport, *, session_id: str | None,
@@ -495,9 +507,8 @@ async def run_process_1(spec: LifecycleSpec, transport, *, system_prompt: str,
                 facts["manifest_unchanged"] = True
         facts["completed_events"] = log.completed
         facts["state"] = session.persistence.mode
-        facts["closed_ok"] = True
     finally:
-        await session.aclose()
+        await close_process(session, log, facts)
     return facts
 
 
@@ -545,9 +556,8 @@ async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *
             outcome = await session.execute(prompts["R3"])
         facts["requests"] = [_request_facts("R3", outcome)]
         facts["completed_events"] = log.completed
-        facts["closed_ok"] = True
     finally:
-        await session.aclose()
+        await close_process(session, log, facts)
     return facts
 
 # --- 离线 fixture (MockTransport) ---
@@ -1038,7 +1048,7 @@ async def run_process_coding(spec: LifecycleSpec, transport, *, system_prompt: s
         facts["requests"].append(_request_facts("coding", outcome))
         facts["completed_events"] = log.completed
     finally:
-        await session.aclose()
+        await close_process(session, log, facts)
     return facts
 
 

@@ -340,6 +340,7 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         raise AttemptBudgetError("attempt root is not empty; refusing to overwrite evidence")
     child_root, private = attempt_root / "child", attempt_root / "private"
     private.mkdir(parents=True)
+    write_json(private / "controller.json", {"task_key": spec.task_key, "supervisor_pid": os.getpid()})
     protection = isolation.seal_private(private)
     # 评分原始材料也保存在 private 下, Low 模型只收到批准的公共摘要。
     for directory in (workspace, child_root, *(child_root / name for name in (
@@ -391,7 +392,7 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         p1 = await _supervise_child(config, child_root / "config.json", broker, deadline)
         facts["process_1"] = p1
         facts["process_ledgers"][PROCESS_1] = p1.get("process_ledger")
-        if p1["os_exit_code"] != 0 or p1["timed_out"] or broker.stopped:
+        if p1["os_exit_code"] != 0 or p1["timed_out"] or broker.stopped or p1.get("closed_ok") is not True:
             raise AttemptBudgetError("first child did not complete normally")
         if not broker.checks or broker.checks[0]["code"] != 1 or broker.checks[0].get("patch_empty") is not True:
             raise AttemptBudgetError("initial check did not observe an empty failing patch")
@@ -422,10 +423,13 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
                 session=p1["session_id"], deadline_monotonic=deadline)
             broker.gate = gate
             config.update(phase=PROCESS_2, session_id=saved["session_id"])
+            if admission:
+                admission()
             p2 = await _supervise_child(config, child_root / "config.json", broker, deadline)
             facts["process_2"] = p2
             facts["process_ledgers"][PROCESS_2] = p2.get("process_ledger")
-            if p2["os_exit_code"] != 0 or p2["timed_out"] or p2.get("restored_requests") != 2:
+            if (p2["os_exit_code"] != 0 or p2["timed_out"] or p2.get("restored_requests") != 2
+                    or p2.get("closed_ok") is not True):
                 raise AttemptBudgetError("second child did not restore and complete")
             if p2.get("restored_request_ids") != saved["request_ids"]:
                 raise AttemptBudgetError("restored request identities differ")
@@ -473,17 +477,27 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
 
 
 def run_supervised(*, prepared_root, manifest_path, attempt_root, profile_path,
-                   authorization_path=None, offline=True):
-    from tests.support.swebench_authorization import candidate_binding, validate_authorization
+                   authorization_path=None, admission_path=None, review_path=None, offline=True):
+    from tests.support.swebench_authorization import candidate_binding, execution_binding, validate_authorization
 
     profile = CostProfile.load(Path(profile_path))
     # frozen dataclass: 原始 bytes 单独传给内部, 不修改生产 profile 对象。
-    expected = candidate_binding(manifest_path=Path(manifest_path), prepared_root=Path(prepared_root),
-                                 attempt_root=Path(attempt_root), profile=profile)
+    def binding(current_profile):
+        args = dict(manifest_path=Path(manifest_path), prepared_root=Path(prepared_root),
+                    attempt_root=Path(attempt_root), profile=current_profile)
+        return (candidate_binding(**args) if offline else execution_binding(**args,
+                admission_path=admission_path, review_path=review_path))
+
+    expected = binding(profile)
     credential = None
     admission = None
     if not offline:
-        admission = lambda: validate_authorization(authorization_path, expected)
+        def admission():
+            current_profile = CostProfile.load(Path(profile_path))
+            current = binding(current_profile)
+            if current != expected:
+                raise AttemptBudgetError("candidate identity changed during execution")
+            return validate_authorization(authorization_path, current)
         admission()
         credential = os.environ.get("DEEPSEEK_API_KEY")
         if not credential:
@@ -515,7 +529,7 @@ def main():
         facts = asyncio.run(_child(args.config))
         code = 0
     except BaseException as exc:
-        facts, code = {"error_type": type(exc).__name__}, 2
+        facts, code = {"error_type": type(exc).__name__, "error_detail": str(exc)[:300]}, 2
     write_json(Path(config["child_root"]) / (config["phase"] + "-facts.json"), facts)
     return code
 

@@ -122,3 +122,26 @@ def test_supervisor_seals_before_cancel_and_confirms_os_exit(tmp_path, monkeypat
         finally:
             gate.budget.release()
     asyncio.run(run())
+
+
+def test_close_records_production_runtime_failure_even_when_aclose_returns(tmp_path, monkeypatch):
+    """真实 ApplicationClosed 诊断不能被正常 aclose 返回/OS exit 掩盖。"""
+    from cicada.prompting import compose_system_prompt
+
+    async def run():
+        spec = lifecycle.LifecycleSpec(workspace=tmp_path, instruction="fixture",
+            model_doc={"normal": {"model": "deepseek-flash", "thinking": "enabled",
+                "reasoning_effort": "low", "num_ctx": 262144, "max_tokens": 8192}})
+        prompt, info = compose_system_prompt(tmp_path, None)
+        session, log = await lifecycle.open_process(spec, httpx.MockTransport(lambda r: None),
+            session_id=None, system_prompt=prompt, prompt_info=info)
+        stop = session._app.runtime.stop
+        async def failed_stop():
+            await stop()
+            raise RuntimeError("injected stop failure")
+        monkeypatch.setattr(session._app.runtime, "stop", failed_stop)
+        facts = {}
+        await lifecycle.close_process(session, log, facts)
+        assert facts["closed_ok"] is False
+        assert "runtime stop failed" in facts["close_problem"]
+    asyncio.run(run())

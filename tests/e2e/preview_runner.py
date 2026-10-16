@@ -424,8 +424,7 @@ def cmd_prepare(args) -> int:
                           "f2p_count": len(row["fail_to_pass"]),
                           "p2p_count": len(row["pass_to_pass"])}, ensure_ascii=False))
         return 0
-    except (ManifestError, PrepareFailed, bridge.BridgeError, bridge.PatchScopeError,
-            OSError, ValueError, RuntimeError) as exc:
+    except Exception as exc:
         receipt["outcome"] = "prepare-failed"
         receipt["failures"].append({"type": type(exc).__name__, "message": str(exc)[:500]})
         if dirs:
@@ -441,6 +440,7 @@ def build_lock(spec: TaskSpec, row: dict, verifier: dict, image: dict,
 
     from cicada.plugins.coding.process import resolve_pwsh
 
+    run_root = Path(receipt["workspace"]["path"]).parent
     git = bridge.GitCLI(receipt["workspace"]["path"])
     manifest = bridge.workspace_manifest(Path(receipt["workspace"]["path"]), git)
     uv_record = subprocess.run(["uv", "--version"], capture_output=True, text=True, timeout=60)
@@ -831,6 +831,8 @@ def cmd_run(args) -> int:
         facts = run_supervised(prepared_root=prepared, manifest_path=manifest,
             attempt_root=run_root, profile_path=Path(args.cost_profile),
             authorization_path=Path(args.authorization) if args.live else None,
+            admission_path=getattr(args, "offline_admission", None),
+            review_path=getattr(args, "review_receipt", None),
             offline=not args.live)
         # 只写 attempt root: prepared root 是冻结输入, 覆盖它等于改动已签名材料
         # (审查 P1-C)。report 需要时用 --admission 显式指路, 不做隐式副本。
@@ -979,6 +981,8 @@ def main() -> int:
                 help="本地价格 JSON; attempt 总额度闸需要显式 profile, 缺它一律零发送")
             sub_parser.add_argument("--live", action="store_true")
             sub_parser.add_argument("--authorization", help="本次候选与 attempt 的明确授权记录 JSON")
+            sub_parser.add_argument("--offline-admission", help="当前候选的全路径离线演练回执")
+            sub_parser.add_argument("--review-receipt", help="当前候选的独立两轴审查 JSON")
     args = parser.parse_args()
     handlers = {"prepare": cmd_prepare, "dry-run": cmd_dry_run, "check": cmd_check,
                 "grade": cmd_grade, "run": cmd_run, "report": cmd_report}
