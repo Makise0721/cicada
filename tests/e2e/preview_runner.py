@@ -109,14 +109,20 @@ def extract_base_git(docker: bridge.DockerCLI, supervisor: bridge.ContainerSuper
 
 
 def build_workspace(base_git: Path, base_commit: str, workspace_dir: Path,
-                    command_log: list) -> None:
+                    command_log: list, *, local_clone: bool = False) -> None:
     if workspace_dir.exists():
         raise PrepareFailed("workspace directory already exists")
+    source = str(base_git) if local_clone else base_git.as_uri()
+    clone_command = ["git", "clone", "--no-checkout", "--quiet"]
+    if local_clone:
+        # 复用本地对象时仍复制文件, 模型工作区不能经硬链接改坏冻结基线对象。
+        clone_command.append("--no-hardlinks")
+    clone_command.extend((source, str(workspace_dir)))
     clone = subprocess.run(
-        ["git", "clone", "--no-checkout", "--quiet", base_git.as_uri(), str(workspace_dir)],
+        clone_command,
         capture_output=True, timeout=3600)
     command_log.append(bridge.CommandRecord(
-        command=["git", "clone", "--no-checkout", base_git.as_uri(), str(workspace_dir)],
+        command=clone_command,
         exit_code=clone.returncode,
         stdout=clone.stdout.decode("utf-8", errors="replace")[-2000:],
         stderr=clone.stderr.decode("utf-8", errors="replace")[-2000:],

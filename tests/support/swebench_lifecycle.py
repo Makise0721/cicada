@@ -611,10 +611,9 @@ def learned_solution(workspace: Path, base_commit: str, gold_patch: Path,
     scratch = Path(tempfile.mkdtemp(prefix="pv02-fixture-", dir=gold_patch.parent))
     try:
         clone = scratch / "clone"
-        subprocess.run(["git", "clone", "--no-checkout", "--quiet",
-                        str(workspace), str(clone)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(clone), "checkout", "--quiet", base_commit],
-                       check=True, capture_output=True)
+        from tests.e2e.preview_runner import build_workspace
+
+        build_workspace(workspace / ".git", base_commit, clone, [], local_clone=True)
         subprocess.run(["git", "-C", str(clone), "apply", str(Path(gold_patch).resolve())],
                        check=True, capture_output=True)
         return {name: (clone / name).read_text(encoding="utf-8")
@@ -631,10 +630,9 @@ def base_solution(workspace: Path, base_commit: str, allowed_paths) -> dict:
     scratch = Path(tempfile.mkdtemp(prefix="pv02-base-", dir=workspace.parent))
     try:
         clone = scratch / "clone"
-        subprocess.run(["git", "clone", "--no-checkout", "--quiet",
-                        str(workspace), str(clone)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(clone), "checkout", "--quiet", base_commit],
-                       check=True, capture_output=True)
+        from tests.e2e.preview_runner import build_workspace
+
+        build_workspace(workspace / ".git", base_commit, clone, [], local_clone=True)
         return {name: (clone / name).read_text(encoding="utf-8")
                 for name in allowed_paths if (clone / name).is_file()}
     finally:

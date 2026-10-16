@@ -353,7 +353,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
     workspace = child_root / "workspace"
     child_root.mkdir(parents=True)
     clone_log = []
-    runner.build_workspace(prepared_workspace / ".git", spec.base_commit, workspace, clone_log)
+    runner.build_workspace(prepared_workspace / ".git", spec.base_commit, workspace, clone_log,
+                           local_clone=True)
     owned_baseline = bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json()
     write_json(private / "workspace-clone.json", {"workspace": str(workspace),
         "baseline": owned_baseline, "commands": [record.to_json() for record in clone_log]})
