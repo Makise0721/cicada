@@ -439,6 +439,9 @@ async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *
 _FIXTURE_SEQUENCE = ("read-check", "text", "text", "summary", "read",
                      "write-check", "text")
 
+# coding 场景 (new-multifile): 单进程, 无恢复/压缩; 先读定位, 再写并检查, 最后收尾。
+_CODING_SEQUENCE = ("read-check", "write-check", "text")
+
 
 def _sse(frames: list[dict]) -> httpx.Response:
     """把若干帧编成 SSE; 末帧带 usage, 并补 [DONE] (闸要求 DONE+EOF+usage 齐备)。"""
@@ -470,7 +473,7 @@ def learned_solution(workspace: Path, base_commit: str, gold_patch: Path,
                      allowed_paths) -> dict:
     """从参考修复学到"正确内容": 在临时 clone 上应用 gold patch 后读取业务文件。
 
-    这样 fixture 写出的补丁是**真的能让 check-1 通过**的解, 而不是自说自话的文本。
+    这样 fixture 写出的修改是**真的能让 check-1 通过**的解, 而不是自说自话的文本。
     """
     scratch = Path(tempfile.mkdtemp(prefix="pv02-fixture-"))
     try:
@@ -479,7 +482,7 @@ def learned_solution(workspace: Path, base_commit: str, gold_patch: Path,
                         str(workspace), str(clone)], check=True, capture_output=True)
         subprocess.run(["git", "-C", str(clone), "checkout", "--quiet", base_commit],
                        check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(clone), "apply", str(gold_patch)],
+        subprocess.run(["git", "-C", str(clone), "apply", str(Path(gold_patch).resolve())],
                        check=True, capture_output=True)
         return {name: (clone / name).read_text(encoding="utf-8")
                 for name in allowed_paths}
@@ -487,15 +490,99 @@ def learned_solution(workspace: Path, base_commit: str, gold_patch: Path,
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def offline_fixture(*, replacements: dict, allowed_paths, check_id: str = "check-1",
+def base_solution(workspace: Path, base_commit: str, allowed_paths) -> dict:
+    """基线上**已存在**的业务文件内容; 基线里没有的路径不出现在结果里。
+
+    不存在的路径意味着参考解要新建该文件, 只能用 write (edit 要求先存在)。
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="pv02-base-"))
+    try:
+        clone = scratch / "clone"
+        subprocess.run(["git", "clone", "--no-checkout", "--quiet",
+                        str(workspace), str(clone)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(clone), "checkout", "--quiet", base_commit],
+                       check=True, capture_output=True)
+        return {name: (clone / name).read_text(encoding="utf-8")
+                for name in allowed_paths if (clone / name).is_file()}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def unique_edits(base_text: str, fixed_text: str, *, min_context: int = 3,
+                 max_context: int = 4000) -> list[dict]:
+    """把 base→fixed 拆成 ``edit`` 工具能接受的 old_text/new_text 对。
+
+    为什么不用 ``write`` 全量覆盖: write 的 content 上限是 50 KiB, 而 new-multifile
+    的 basic.py 是 86 KiB —— 全量写会被工具直接拒绝 (实测踩过)。真实模型也是用
+    edit 改局部, 这里保持一致。
+
+    old_text 必须**唯一**匹配 (edit 工具的硬要求), 故按需扩大上下文, 直到唯一或
+    覆盖整文件。
+    """
+    import difflib
+
+    base_lines = base_text.splitlines(keepends=True)
+    fixed_lines = fixed_text.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(None, base_lines, fixed_lines, autojunk=False)
+    edits: list[dict] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        context = min_context
+        while True:
+            lo = max(0, i1 - context)
+            hi = min(len(base_lines), i2 + context)
+            old = "".join(base_lines[lo:hi])
+            new = ("".join(base_lines[lo:i1]) + "".join(fixed_lines[j1:j2])
+                   + "".join(base_lines[i2:hi]))
+            covers_all = lo == 0 and hi == len(base_lines)
+            if covers_all or base_text.count(old) == 1 or context >= max_context:
+                break
+            context *= 2
+        edits.append({"old_text": old, "new_text": new})
+    # 自检: 这些编辑必须真的把 base 变成 fixed, 否则 fixture 会写出错误的解。
+    for edit in edits:
+        if base_text.count(edit["old_text"]) != 1:
+            raise ValueError("fixture edit is not uniquely applicable")
+    produced = base_text
+    for edit in edits:
+        produced = produced.replace(edit["old_text"], edit["new_text"])
+    if produced != fixed_text:
+        raise ValueError("fixture edits do not reproduce the reference solution")
+    return edits
+
+
+def learned_edits(workspace: Path, base_commit: str, gold_patch: Path,
+                  allowed_paths) -> dict:
+    """{路径: 工具调用规格}; 已自检"应用后等于参考解"。
+
+    每个路径按基线里是否已存在来选择工具:
+      - 基线不存在 (参考解新建它, 如 new-multifile 的 locale.py) → ``write``;
+      - 已存在 → ``edit`` 最小替换 (write 的 50 KiB 上限容不下 basic.py 的 86 KiB)。
+    """
+    fixed = learned_solution(workspace, base_commit, gold_patch, allowed_paths)
+    existing = base_solution(workspace, base_commit, allowed_paths)
+    plan: dict = {}
+    for name in allowed_paths:
+        if name not in existing:
+            plan[name] = {"tool": "write", "content": fixed[name]}
+        else:
+            plan[name] = {"tool": "edit",
+                          "edits": unique_edits(existing[name], fixed[name])}
+    return plan
+
+
+def offline_fixture(*, edits: dict, allowed_paths, check_id: str = "check-1",
                     sequence=_FIXTURE_SEQUENCE, start: int = 0) -> httpx.MockTransport:
-    """离线响应: 读+检查 → 说明 → 摘要 → 写+检查 → 收尾。
+    """离线响应: 读+检查 → 说明 → 摘要 → 重读 → 编辑+检查 → 收尾。
 
-    只读纪律由编排体现: R1 只发 read/check, R2 与摘要不发工具, 写入只出现在 R3。
+    只读纪律由编排体现: R1 只发 read/check, R2 与摘要不发工具, 修改只出现在实施轮。
 
-    ``start`` 是**跨进程**的序列起点: 第一进程与第二进程是两个真实进程, 各自的
-    计数器独立, 但整条剧本是一条连续流 —— 第二进程必须从第一进程消耗处继续,
-    否则摘要会拿到给 R1 的响应 (实测踩过这个坑)。
+    ``edits`` 是 {路径: [edit, ...]}; 用 ``edit`` 而非 ``write``, 因为 write 的
+    content 上限 50 KiB 而 basic.py 有 86 KiB (实测), 且真实模型也是改局部。
+
+    ``start`` 是**跨进程**的序列起点: 两个进程各自计数器独立但剧本连续, 第二进程
+    必须从第一进程消耗处继续, 否则摘要会拿到给 R1 的响应 (实测踩过)。
     """
     counter = {"n": start}
 
@@ -513,8 +600,13 @@ def offline_fixture(*, replacements: dict, allowed_paths, check_id: str = "check
             calls = [("read", {"path": name}) for name in allowed_paths]
             return _sse([_call_frame(index, calls, finish="tool_calls")])
         if step == "write-check":
-            calls = [("write", {"path": name, "content": replacements[name]})
-                     for name in allowed_paths]
+            calls = []
+            for name in allowed_paths:
+                plan = edits[name]
+                if plan["tool"] == "write":
+                    calls.append(("write", {"path": name, "content": plan["content"]}))
+                else:
+                    calls.append(("edit", {"path": name, "edits": plan["edits"]}))
             calls.append(("check", {"action": "run", "check_id": check_id}))
             return _sse([_call_frame(index, calls, finish="tool_calls")])
         if step == "summary":
@@ -566,7 +658,6 @@ def rehearsal_plan(prepared_root: Path, manifest_path: Path) -> dict:
 
 
 def _ledger_facts(ledger) -> dict | None:
-    """生产进程账本的只读事实; 未安装进程级费用控制时为 None。"""
     if ledger is None:
         return None
     snapshot = ledger.snapshot
@@ -581,7 +672,11 @@ def _ledger_facts(ledger) -> dict | None:
 def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Path,
                   profile: CostProfile, limit_cent: int = 450,
                   max_calls: int = 24) -> dict:
-    """完整离线演练: 两进程生命周期 + 跨进程总闸 + 双账本; 零真实网络请求。
+    """完整离线演练 + 跨进程总闸 + 双账本; 零真实网络请求。
+
+    按 manifest 的 scenario 分派:
+      - ``restore-compact-continue``: 两进程生命周期 (R1/R2 → 关闭 → 恢复 → 摘要 → R3);
+      - ``coding``: 单进程编码路径 (读定位 → 写并检查 → 收尾), 不做恢复/压缩。
 
     返回可用于准入判定的全部事实。任何一步不成立都如实记录, 不粉饰。
     """
@@ -602,8 +697,8 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
                    capture_output=True)
     subprocess.run(["git", "-C", str(workspace), "clean", "-qfd"], capture_output=True)
 
-    replacements = learned_solution(workspace, plan["base_commit"],
-                                    prepared_root / "private" / "gold_patch.diff", allowed)
+    edits = learned_edits(workspace, plan["base_commit"],
+                               prepared_root / "private" / "gold_patch.diff", allowed)
     check_command = plan["runner_command"]
     from cicada.plugins.coding.verification_contracts import CheckDefinition
 
@@ -647,14 +742,26 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
 
     deadline = time.monotonic() + float(manifest["limits"].get("run_timeout_s", 1500))
     facts: dict = {"task_key": manifest["task_key"],
+                   "scenario": manifest["scenario"],
                    "prompt_sha256": plan["prompt_sha256"],
                    "instruction_sha256": plan["instruction_sha256"],
                    "allowed_paths": list(allowed),
                    "live": "not-run"}
 
+    if manifest["scenario"] == "coding":
+        return _run_coding(spec=spec, facts=facts, budget=budget, allowed=allowed,
+                           edits=edits, deadline=deadline,
+                           prompt_info=prompt_info, system_prompt=system_prompt,
+                           process_ledgers=process_ledgers, attempt_root=attempt_root,
+                           manifest=manifest)
+    if manifest["scenario"] != "restore-compact-continue":
+        facts["outcome"] = "offline-failed"
+        facts["problems"] = [f"unsupported scenario {manifest['scenario']!r}"]
+        return facts
+
     budget.acquire(PROCESS_1)
     gate1 = AttemptGateTransport(
-        offline_fixture(replacements=replacements, allowed_paths=allowed), budget,
+        offline_fixture(edits=edits, allowed_paths=allowed), budget,
         phase=PROCESS_1, deadline_monotonic=deadline)
     facts["process_1"] = asyncio.run(run_process_1(
         spec, gate1, system_prompt=system_prompt, prompt_info=prompt_info))
@@ -682,7 +789,7 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
     started = facts["process_1"]["gate"]["handoffs"]
     spec2 = replace(spec, cost_control=process_ledger("process-2"))
     gate2 = AttemptGateTransport(
-        offline_fixture(replacements=replacements, allowed_paths=allowed, start=started),
+        offline_fixture(edits=edits, allowed_paths=allowed, start=started),
         second, phase=PROCESS_2, deadline_monotonic=deadline)
     facts["process_2"] = asyncio.run(run_process_2(
         spec2, gate2, second, session_id=facts["process_1"]["session_id"],
@@ -723,4 +830,76 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
         problems.append(f"R3 did not pass its own check (exit={r3.get('exit_code')})")
     facts["problems"] = problems
     facts["outcome"] = "offline-passed-review-pending" if not problems else "offline-failed"
+    return facts
+
+
+def build_coding_prompt(instruction: str) -> str:
+    """coding 场景的单请求 prompt (无恢复/压缩语义)。"""
+    return (f"{instruction}\n{WORKSPACE_NOTE}\n请自行阅读相关源码定位问题, 只修改允许的"
+            "业务路径, 完成后执行一次指定 check-1 并如实报告结果。")
+
+
+async def run_process_coding(spec: LifecycleSpec, transport, *, system_prompt: str,
+                             prompt_info: PromptInfo) -> dict:
+    """coding 场景: 单进程读定位 → 写并检查 → 收尾 (不持久化, 不压缩)。"""
+    config = _deepseek_config(spec)
+    app_config = ApplicationConfig(
+        workspace=spec.workspace, system_prompt=system_prompt, prompt_info=prompt_info,
+        model_plugin=deepseek_plugin(config, api_key=OFFLINE_CREDENTIAL,
+                                     transport=transport),
+        plan=_plan(spec), max_turns=spec.max_turns, model_label=config.model,
+        # coding 场景不需要跨进程延续, 故不建持久会话 (compact_context 也就不可用)。
+        persistence=None,
+        budget=BudgetConfig(config.num_ctx, config.max_tokens),
+        restore_capture=spec.restore_capture, cost_control=spec.cost_control)
+    session = await open_application(app_config)
+    log = _EventLog()
+    session.subscribe(log)
+    facts: dict = {"requests": [], "compacted": 0}
+    try:
+        outcome = await session.execute(build_coding_prompt(spec.instruction))
+        facts["requests"].append(_request_facts("coding", outcome))
+        facts["completed_events"] = log.completed
+    finally:
+        await session.aclose()
+    return facts
+
+
+def _run_coding(*, spec, facts, budget, allowed, edits, deadline, prompt_info,
+                system_prompt, process_ledgers, attempt_root, manifest) -> dict:
+    """coding 场景的离线演练与判定。"""
+    import asyncio
+
+    from tests.support.swebench_budget import PROCESS_1
+
+    budget.acquire(PROCESS_1)
+    gate = AttemptGateTransport(
+        offline_fixture(edits=edits, allowed_paths=allowed,
+                        sequence=_CODING_SEQUENCE),
+        budget, phase=PROCESS_1, deadline_monotonic=deadline)
+    facts["process_1"] = asyncio.run(run_process_coding(
+        spec, gate, system_prompt=system_prompt, prompt_info=prompt_info))
+    facts["process_1"]["gate"] = {"handoffs": gate.handoffs,
+                                  "settled": len(gate.settled_ids),
+                                  "sealed": gate.network_sealed_reason}
+    process_ledgers["process-1"] = _ledger_facts(spec.cost_control)
+    facts["process_ledgers"] = process_ledgers
+    facts["attempt_ledger"] = budget.totals()
+    facts["attempt_calls"] = [{"kind": c["kind"], "state": c["state"],
+                               "reserve_cent": c["reserve_cent"],
+                               "settled_cent": c.get("settled_cent")}
+                              for c in budget.recorded_calls()]
+    budget.release()
+
+    problems: list[str] = []
+    exit_code = (facts["process_1"].get("requests") or [{}])[0].get("exit_code")
+    if exit_code != 0:
+        problems.append(f"coding request did not pass its own check (exit={exit_code})")
+    if facts["process_1"]["gate"]["sealed"] is not None:
+        problems.append("the attempt gate sealed the network")
+    if facts["attempt_ledger"]["pending_cent"] != 0:
+        problems.append("a reservation is still pending")
+    facts["problems"] = problems
+    facts["outcome"] = ("offline-passed-review-pending" if not problems
+                        else "offline-failed")
     return facts
