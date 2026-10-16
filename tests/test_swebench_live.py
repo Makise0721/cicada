@@ -224,6 +224,8 @@ def test_watch_tolerates_transient_state_failures_and_obeys_stop(tmp_path):
             assert task.cancelled()
             assert diagnostics["watch"]["failures"] == WATCH_MAX_FAILURES
             assert diagnostics["watch"]["stop_seen"] is False
+            # 失败形态必须可读 (首题"不知道是超时还是别的 httpx 错误"的盲点)。
+            assert diagnostics["watch"]["last_failure"].startswith("KeyError")
 
             stopped_task = asyncio.create_task(asyncio.sleep(30))
             stopped_diagnostics: dict = {}
@@ -232,7 +234,9 @@ def test_watch_tolerates_transient_state_failures_and_obeys_stop(tmp_path):
                                               stopped_diagnostics), return_exceptions=True)
             await asyncio.gather(stopped_task, return_exceptions=True)
             assert stopped_task.cancelled()
-            assert stopped_diagnostics["watch"] == {"stop_seen": True, "failures": 0}
+            # 新的 watcher 实例从零起算: total_failures 不跨实例累计。
+            assert stopped_diagnostics["watch"] == {"stop_seen": True, "failures": 0,
+                                                    "total_failures": 0}
         finally:
             await broker.close()
             gate.budget.release()
@@ -255,6 +259,16 @@ def test_broker_audit_trail_records_route_decisions(tmp_path):
             await broker.dispatch("/seal", b"{}")
             with pytest.raises(AttemptBudgetError, match="deadline"):
                 await broker.dispatch("/model", _body())
+            # 只经真实 HTTP 才会走到 handler 两级拒绝: 这一行是"为什么没成"的唯一落痕。
+            endpoint = broker.start()
+            # 必须用 async client: 同步 post 会阻塞 loop, 而 Handler 线程正等 loop 跑 dispatch。
+            async with httpx.AsyncClient(trust_env=False, timeout=5) as client:
+                rejected = await client.post(endpoint + "/model",
+                                             headers={"X-PV-Token": "wrong"})
+                assert rejected.status_code == 403
+                refused = await client.post(endpoint + "/model",
+                                            headers={"X-PV-Token": broker.token})
+                assert refused.status_code == 503
         finally:
             gate.budget.release()
         raw = audit.read_text(encoding="utf-8")
@@ -262,6 +276,11 @@ def test_broker_audit_trail_records_route_decisions(tmp_path):
         events = [record["event"] for record in records]
         assert "model-ok" in events and "check-ok" in events
         assert "seal" in events and "stop" in events
+        assert "handler-rejected" in events and "handler-refused" in events
+        # 首个封口原因只记一次, 后续 stop 不再重复写行 (首因优先)。
+        assert events.count("stop") == 1
+        refused_record = next(r for r in records if r["event"] == "handler-refused")
+        assert refused_record["path"] == "/model" and "detail" in refused_record
         model_ok = next(record for record in records if record["event"] == "model-ok")
         assert model_ok["status"] == 200 and model_ok["call_id"] == headers["X-Call-Id"]
         stop = next(record for record in records if record["event"] == "stop")
