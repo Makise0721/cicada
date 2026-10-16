@@ -607,7 +607,7 @@ def learned_solution(workspace: Path, base_commit: str, gold_patch: Path,
 
     这样 fixture 写出的修改是**真的能让 check-1 通过**的解, 而不是自说自话的文本。
     """
-    scratch = Path(tempfile.mkdtemp(prefix="pv02-fixture-"))
+    scratch = Path(tempfile.mkdtemp(prefix="pv02-fixture-", dir=workspace.parent))
     try:
         clone = scratch / "clone"
         subprocess.run(["git", "clone", "--no-checkout", "--quiet",
@@ -627,7 +627,7 @@ def base_solution(workspace: Path, base_commit: str, allowed_paths) -> dict:
 
     不存在的路径意味着参考解要新建该文件, 只能用 write (edit 要求先存在)。
     """
-    scratch = Path(tempfile.mkdtemp(prefix="pv02-base-"))
+    scratch = Path(tempfile.mkdtemp(prefix="pv02-base-", dir=workspace.parent))
     try:
         clone = scratch / "clone"
         subprocess.run(["git", "clone", "--no-checkout", "--quiet",

@@ -122,6 +122,9 @@ class Broker:
                 if code == 2:
                     self.stop("evaluation-anomaly")
                 return 200, {}, json.dumps({"code": code, "summary": _public_check(summary)}).encode()
+            except BaseException:
+                self.stop("evaluation-error")
+                raise
             finally:
                 self.checking = False
         raise AttemptBudgetError("unknown broker operation")
@@ -160,7 +163,8 @@ class Broker:
                     self.end_headers()
                     self.wfile.write(result)
                 except OSError:
-                    loop.call_soon_threadsafe(owner.stop, "child-disconnected")
+                    if self.path in ("/model", "/confirm", "/check"):
+                        loop.call_soon_threadsafe(owner.stop, "child-disconnected")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -172,6 +176,9 @@ class Broker:
         if self.inflight is not None:
             self.inflight.cancel()
             await asyncio.gather(self.inflight, return_exceptions=True)
+        # Docker 评估 worker 有自己的截止与清理; 取消 asyncio 等待不证明线程已退出。
+        while self.checking:
+            await asyncio.sleep(0.05)
         if self.server:
             await asyncio.to_thread(self.server.shutdown)
             self.server.server_close()
@@ -333,8 +340,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
     problems = runner.verify_frozen_identity(spec, lock, prepared)
     if problems:
         raise AttemptBudgetError("frozen identity does not match: " + "; ".join(problems))
-    workspace = prepared / "workspace"
-    if bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json() != lock["workspace"]["manifest"]:
+    prepared_workspace = prepared / "workspace"
+    if bridge.workspace_manifest(prepared_workspace, bridge.GitCLI(prepared_workspace)).to_json() != lock["workspace"]["manifest"]:
         raise AttemptBudgetError("workspace differs from prepared baseline; refusing reset")
     if attempt_root.exists() and any(attempt_root.iterdir()):
         raise AttemptBudgetError("attempt root is not empty; refusing to overwrite evidence")
@@ -342,6 +349,16 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
     private.mkdir(parents=True)
     write_json(private / "controller.json", {"task_key": spec.task_key, "supervisor_pid": os.getpid()})
     protection = isolation.seal_private(private)
+    # 每个 attempt 都从只读基线创建独立工作区, 不重置演练补丁或复用旧存档。
+    workspace = child_root / "workspace"
+    child_root.mkdir(parents=True)
+    clone_log = []
+    runner.build_workspace(prepared_workspace / ".git", spec.base_commit, workspace, clone_log)
+    owned_baseline = bridge.workspace_manifest(workspace, bridge.GitCLI(workspace)).to_json()
+    write_json(private / "workspace-clone.json", {"workspace": str(workspace),
+        "baseline": owned_baseline, "commands": [record.to_json() for record in clone_log]})
+    if owned_baseline != lock["workspace"]["manifest"]:
+        raise AttemptBudgetError("attempt clone differs from frozen baseline")
     # 评分原始材料也保存在 private 下, Low 模型只收到批准的公共摘要。
     for directory in (workspace, child_root, *(child_root / name for name in (
             "temp", "cache", "uv-cache", "appdata", "localappdata"))):
@@ -386,6 +403,7 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         "prompt_sha256": lock["prompt_sha256"], "runtime_sha256": lifecycle.runtime_identity(),
         "manifest_sha256": sha256_file(manifest_path), "profile_sha256": profile.sha256,
         "prepared_lock_sha256": sha256_file(prepared / "lock.json"),
+        "workspace": str(workspace), "baseline_manifest": owned_baseline,
         "process_ledgers": {}, "writable_directories": [str(workspace), str(child_root)],
         "problems": [], "model_requests": 0 if offline else None}
     try:
@@ -408,6 +426,7 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
                 "archive_manifest": archive_manifest(workspace),
                 "elapsed_s": time.monotonic() - started})
             facts["checkpoint_after_process_1"] = checkpoint
+            write_json(private / "process-1-checkpoint.json", checkpoint)
             budget.release()
             second = _make_budget(budget_root, manifest_path, prepared, profile, manifest)
             second.acquire(PROCESS_2)
@@ -453,7 +472,7 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         code, grade = await asyncio.to_thread(check)
         facts["grading_elapsed_s"] = time.monotonic() - grade_started
         facts["final_grade"] = grade
-        if code != 0:
+        if code != 0 or broker.stopped:
             raise AttemptBudgetError("independent final grade did not pass")
         facts["outcome"] = "offline-passed-review-pending" if offline else "live-passed"
     except BaseException as exc:
@@ -463,15 +482,25 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
                                  if isinstance(exc, AttemptBudgetError) else type(exc).__name__)
     finally:
         facts.setdefault("production_elapsed_s", time.monotonic() - started)
+        cleanup_started = time.monotonic()
+        await broker.close()
+        try:
+            await fixture.aclose()
+        except BaseException:
+            broker.stop("parent-transport-close-failed")
+            facts["problems"].append("parent transport close failed")
+            facts["outcome"] = "offline-failed" if offline else "live-failed"
+        facts["cleanup_elapsed_s"] = time.monotonic() - cleanup_started
         facts["checks"] = broker.checks
         facts["attempt_ledger"] = budget.totals()
         facts["attempt_calls"] = budget.recorded_calls()
         if not offline:
             facts["model_requests"] = sum(c["event"] == "reserve" for c in budget.events())
         facts["sealed_reason"] = budget.sealed_reason
+        if (broker.stopped or budget.sealed_reason) and facts["outcome"].endswith(("pending", "passed")):
+            facts["outcome"] = "offline-failed" if offline else "live-failed"
+            facts["problems"].append("attempt stopped before cleanup completed")
         budget.release()
-        await broker.close()
-        await fixture.aclose()
         write_json(attempt_root / ("offline-admission.json" if offline else "live-result.json"), facts)
     return facts
 

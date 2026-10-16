@@ -2,6 +2,7 @@
 import asyncio
 import json
 import time
+import threading
 from pathlib import Path
 
 import httpx
@@ -144,4 +145,29 @@ def test_close_records_production_runtime_failure_even_when_aclose_returns(tmp_p
         await lifecycle.close_process(session, log, facts)
         assert facts["closed_ok"] is False
         assert "runtime stop failed" in facts["close_problem"]
+    asyncio.run(run())
+
+
+def test_broker_close_waits_for_evaluator_thread_to_finish(tmp_path):
+    async def run():
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        def check():
+            loop.call_soon_threadsafe(entered.set)
+            release.wait(5)
+            return 1, {"result": "failed"}
+        gate = _gate(tmp_path, httpx.MockTransport(lambda req: None))
+        broker = Broker(gate=gate, check=check, deadline=time.monotonic() + 10)
+        checking = asyncio.create_task(broker.dispatch("/check", b"{}"))
+        await entered.wait()
+        closing = asyncio.create_task(broker.close())
+        await asyncio.sleep(0)
+        try:
+            assert not closing.done()
+        finally:
+            release.set()
+            await asyncio.gather(checking, closing)
+            gate.budget.release()
+        assert not broker.checking and len(broker.checks) == 1
     asyncio.run(run())
