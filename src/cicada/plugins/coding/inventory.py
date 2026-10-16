@@ -23,6 +23,8 @@ DEFAULT_EXCLUSIONS = (
 MAX_GIT_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_PATHS = 10_000
 QUERY_TIMEOUT_S = 10.0
+# 清单逐条路径都要逐段 lstat: 让出控制权的时间间隔 (单次连续占用 ≈ 它 + 一条路径)。
+YIELD_AFTER_S = 0.01
 
 
 class InventoryError(WorkspaceError):
@@ -165,9 +167,13 @@ class GitInventory:
                     raise InventoryError("path_limit", f"Git inventory exceeds {self.max_paths} paths")
         entries: list[InventoryEntry] = []
         excluded = 0
-        for index, path in enumerate(sorted(modes, key=lambda p: (p.casefold(), p))):
-            if index % 128 == 0:
+        yielded_at = time.monotonic()
+        for path in sorted(modes, key=lambda p: (p.casefold(), p)):
+            if time.monotonic() - yielded_at >= YIELD_AFTER_S:
+                # 每条路径都要逐段 lstat, 单条开销随文件系统/杀毒扫描而变; 按**时间**让出,
+                # 单次连续占用 ≈ YIELD_AFTER_S + 一条路径, 不随机器快慢漂移。
                 await asyncio.sleep(0)
+                yielded_at = time.monotonic()
             self._checkpoint(cancel, deadline)
             parts = path.split("/")
             if any(p.casefold() in DEFAULT_EXCLUSIONS for p in parts[:-1]):
