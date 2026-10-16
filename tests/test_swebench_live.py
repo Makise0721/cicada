@@ -251,11 +251,15 @@ def test_check_gate_separates_offline_ordering_from_live_outcome():
     empty_failure = {"code": 1, "result": "failed", "patch_empty": True,
                      "required_passed": 0, "required_total": 11}
     assert check_gate([empty_failure], offline=True) is None
-    assert check_gate([empty_failure], offline=False) is not None      # 没有通过检查
+    assert check_gate([empty_failure], offline=False) is not None      # 还没有通过检查
     assert check_gate([], offline=True) is not None
     # live 首题实测形态: 模型先改后检, 唯一一次检查是 11/11 通过 -> 必须放行
     assert check_gate([edited_first], offline=False) is None
-    # 离线同样的序列必须拒绝(证明检查落在未修改的工作区上)
+    # 生命周期题实测形态: 首次是空补丁失败(p1), 通过检查出现在 p2 的 R3 -> 必须放行
+    # (这一条正是审查抓到的 P1: live 判若放在 p1 之后, 这个序列会被误拒)
+    assert check_gate([empty_failure, edited_first], offline=False) is None
+    assert check_gate([empty_failure, edited_first], offline=True) is None
+    # 离线同样的"先改后检"序列必须拒绝(证明检查落在未修改的工作区上)
     assert "empty failing patch" in check_gate([edited_first], offline=True)
     # 部分通过(未达全覆盖)不算达标
     partial = {**edited_first, "required_passed": 9}

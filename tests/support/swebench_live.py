@@ -464,6 +464,9 @@ def check_gate(checks: list[dict], *, offline: bool) -> str | None:
     已修改的工作区上, `patch_empty=false` 却是真实的 11/11 通过。因此 live 只要求
     "存在一次覆盖达标的通过检查", 而把"首次是否为空的失败检查"作为**事实**记录下来
     (见 facts["initial_check"]), 不再当作门禁 —— 门禁不应该把"做对了题"判成失败。
+
+    调用点位置同样是契约的一部分(见 `_run`): live 判必须在**两个进程都跑完**之后执行,
+    因为 restore-compact-continue 的通过检查出现在第二个进程的 R3。
     """
     if offline:
         if not checks or checks[0].get("code") != 1 or checks[0].get("patch_empty") is not True:
@@ -569,9 +572,11 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         facts["initial_check_was_empty_failure"] = bool(
             first_check is not None and first_check.get("code") == 1
             and first_check.get("patch_empty") is True)
-        gate_problem = check_gate(broker.checks, offline=offline)
-        if gate_problem is not None:
-            raise AttemptBudgetError(gate_problem + ": " + _diagnosis(p1, broker, budget))
+        if offline:
+            # 离线严格判就留在 p1 之后: 首检不是空补丁失败立刻失败, 不先跑 p2 (与既有离线证据语义一致)。
+            gate_problem = check_gate(broker.checks, offline=True)
+            if gate_problem is not None:
+                raise AttemptBudgetError(gate_problem + ": " + _diagnosis(p1, broker, budget))
         if spec.scenario == "restore-compact-continue":
             requests = p1.get("requests") or []
             if len(requests) != 2 or p1.get("manifest_unchanged") is not True or any(
@@ -618,6 +623,14 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
             final_process = p2
         else:
             final_process = p1
+        if not offline:
+            # live 判必须在 p2 之后: restore-compact-continue 的**通过检查发生在 p2 的 R3**
+            # (R1 只读且只跑一次空补丁检查), 在 p1 处判会必然误拒生命周期题 —— 这与首题
+            # "只在 live 暴露" 同型, 离线分支(严格顺序)覆盖不到, 所以不要把这段前移。
+            gate_problem = check_gate(broker.checks, offline=False)
+            if gate_problem is not None:
+                raise AttemptBudgetError(gate_problem + ": " + _diagnosis(
+                    final_process, broker, budget))
         if not final_process.get("requests") or final_process["requests"][-1].get("exit_code") != 0:
             raise AttemptBudgetError("final request has no current passing check: " + _diagnosis(
                 final_process, broker, budget))
