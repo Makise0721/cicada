@@ -37,6 +37,13 @@ from tests.support.swebench_tasks import load_json, sha256_file, spec_from_manif
 PROJECT = Path(__file__).resolve().parents[2]
 WIRE_LIMIT = 2 * 1024 * 1024
 
+# watcher 是**存活检查**, 不是命令通道: 子进程自己的长时同步工作 (逐轮工作区快照扫描)
+# 会让在途轮询超时, 而父进程只要还活着就一定会立刻回 stopped。首题 live 实测:
+# 单次轮询失败就把整轮请求取消, 生产账本因此留下未决预留而根因不可见。
+WATCH_TIMEOUT_S = 30.0
+WATCH_INTERVAL_S = 0.1
+WATCH_MAX_FAILURES = 5
+
 
 def archive_manifest(workspace: Path) -> dict:
     """已关闭存档的内容身份, 在第二个 OS 进程启动前重核。"""
@@ -51,17 +58,35 @@ def _public_check(summary: dict) -> dict:
 
 
 class Broker:
-    """固定权限的本地代理; 所有账本操作在父进程同一个 asyncio loop 串行执行。"""
+    """固定权限的本地代理; 所有账本操作在父进程同一个 asyncio loop 串行执行。
 
-    def __init__(self, *, gate, check, deadline, credential=None, admission=None):
+    ``audit`` 给出审计文件路径时, 逐路由记一行 (决策/原因/状态), 只记事实不记正文;
+    审计失败不得影响请求本身 (live 首题就是因为没有这份轨迹而无法判定根因)。
+    """
+
+    def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None):
         self.gate, self.check = gate, check
         self.deadline, self.credential, self.admission = deadline, credential, admission
         self.token = uuid.uuid4().hex
         self.stopped = False
+        self.stop_reason = None
+        self.audit = Path(audit) if audit is not None else None
         self.checks = []
         self.inflight = None
         self.checking = False
         self.server = None
+
+    def record(self, event: str, **fields) -> None:
+        """审计一行; 任何写失败都吞掉 —— 审计不得成为新的失败面。"""
+        if self.audit is None:
+            return
+        try:
+            self.audit.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps({"at": time.time(), "event": event, **fields},
+                                        ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            pass
 
     async def dispatch(self, route: str, body: bytes) -> tuple[int, dict, bytes]:
         if route == "/state":
@@ -71,9 +96,15 @@ class Broker:
             raise AttemptBudgetError("production deadline reached")
         if route == "/model":
             if self.checking:
+                self.record("model-refused", reason="check-in-flight")
                 raise AttemptBudgetError("model send overlaps a check")
             if self.admission:
-                self.admission()
+                try:
+                    self.admission()
+                except BaseException as exc:
+                    self.record("model-refused", reason="admission",
+                                detail=type(exc).__name__ + ": " + str(exc)[:200])
+                    raise
             if any(not item.resolved for item in self.gate.observations.values()):
                 self.stop("unconfirmed-previous-send")
                 raise AttemptBudgetError("previous send lacks production confirmation")
@@ -90,8 +121,13 @@ class Broker:
                     if len(content) > WIRE_LIMIT:
                         raise AttemptBudgetError("response exceeds frozen wire cap")
                 call_id = next(reversed(self.gate.observations))
+                self.record("model-ok", status=response.status_code, call_id=call_id,
+                            request_bytes=len(body), response_bytes=len(content),
+                            handoffs=self.gate.handoffs)
                 return response.status_code, {"X-Call-Id": call_id}, bytes(content)
-            except BaseException:
+            except BaseException as exc:
+                self.record("model-failed", detail=type(exc).__name__ + ": " + str(exc)[:200],
+                            gate_sealed=self.gate.network_sealed_reason)
                 self.stop("model-transport-failed")
                 raise
             finally:
@@ -108,21 +144,27 @@ class Broker:
                 self.stop("unknown-production-confirmation")
                 raise AttemptBudgetError("unknown production confirmation")
             self.gate.confirm(data["call_id"], terminal)
+            self.record("confirm", call_id=data.get("call_id"),
+                        stop_reason=data.get("stop_reason"), error=bool(data.get("error")))
             return 200, {}, b"{}"
         if route == "/seal":
+            self.record("seal")
             self.stop("child-sealed")
             return 200, {}, b"{}"
         if route == "/check":
             if self.checking or self.gate.active_call_id is not None:
+                self.record("check-refused", reason="overlapping")
                 raise AttemptBudgetError("overlapping check refused")
             self.checking = True
             try:
                 code, summary = await asyncio.to_thread(self.check)
                 self.checks.append({"code": code, **summary})
+                self.record("check-ok", code=code)
                 if code == 2:
                     self.stop("evaluation-anomaly")
                 return 200, {}, json.dumps({"code": code, "summary": _public_check(summary)}).encode()
-            except BaseException:
+            except BaseException as exc:
+                self.record("check-failed", detail=type(exc).__name__ + ": " + str(exc)[:200])
                 self.stop("evaluation-error")
                 raise
             finally:
@@ -130,7 +172,9 @@ class Broker:
         raise AttemptBudgetError("unknown broker operation")
 
     def stop(self, reason):
+        self.stop_reason = self.stop_reason or reason
         self.stopped = True
+        self.record("stop", reason=reason)
         self.gate.seal_network(reason)
         self.gate.budget.seal(reason)
 
@@ -144,16 +188,20 @@ class Broker:
 
             def do_POST(self):
                 if self.headers.get("X-PV-Token") != owner.token:
+                    owner.record("handler-rejected", path=self.path, reason="token")
                     self.send_error(403)
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     if not 0 <= length <= WIRE_LIMIT:
-                        raise ValueError
+                        raise ValueError("bad content length")
                     body = self.rfile.read(length)
                     future = asyncio.run_coroutine_threadsafe(owner.dispatch(self.path, body), loop)
                     code, headers, result = future.result()
-                except BaseException:
+                except BaseException as exc:
+                    # 这里的 detail 是"为什么没成"的唯一落痕: 首题 live 缺的就是这一行。
+                    owner.record("handler-refused", path=self.path,
+                                 detail=type(exc).__name__ + ": " + str(exc)[:200])
                     code, headers, result = 503, {}, b'{"error":"broker refused"}'
                 try:
                     self.send_response(code)
@@ -229,6 +277,37 @@ class RemoteGate(httpx.AsyncBaseTransport):
         await self.inner.aclose()
 
 
+async def watch_parent(endpoint: str, token: str, task, diagnostics: dict | None = None) -> None:
+    """轮询父进程停止信号; **单次失败不取消**整轮请求。
+
+    为什么: 轮询是存活检查, 而子进程自己的长时同步工作 (逐轮工作区快照扫描) 会让在途
+    轮询超时。首题 live 因此在第 5 次发送前被取消, 生产账本留下未决预留, 父进程却只
+    看得到 "child-sealed"。只有明确的 ``stopped`` 或连续失败 ``WATCH_MAX_FAILURES``
+    次才取消; 失败计数进诊断事实。
+    """
+    failures = 0
+    async with httpx.AsyncClient(trust_env=False, timeout=WATCH_TIMEOUT_S) as client:
+        while not task.done():
+            try:
+                response = await client.post(endpoint + "/state",
+                                             headers={"X-PV-Token": token})
+                if response.json()["stopped"]:
+                    if diagnostics is not None:
+                        diagnostics["watch"] = {"stop_seen": True, "failures": failures}
+                    task.cancel()
+                    return
+                failures = 0
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                failures += 1
+                if diagnostics is not None:
+                    diagnostics["watch"] = {"stop_seen": False, "failures": failures,
+                                            "last_failure": "poll failed"}
+                if failures >= WATCH_MAX_FAILURES:
+                    task.cancel()
+                    return
+            await asyncio.sleep(WATCH_INTERVAL_S)
+
+
 async def _child(config_path: Path) -> dict:
     config = load_json(config_path)
     workspace = Path(config["workspace"])
@@ -240,36 +319,28 @@ async def _child(config_path: Path) -> dict:
     profile = CostProfile.load(Path(config["profile"]))
     ledger = CostLedger(Path(config["child_root"]) / "cost" / config["phase"],
                        limit=Decimal("4.50"), max_calls=24, profile=profile)
+    diagnostics: dict = {"watch": {"stop_seen": False, "failures": 0}, "streams": []}
     spec = lifecycle.LifecycleSpec(workspace=workspace, instruction=config["instruction"],
         model_doc=config["model"], checks=(CheckDefinition("check-1", check_command, timeout),),
         cost_control=ledger)
     # 只通过生产 close 发协作取消; 父进程先封发送, 等待退出后才核对存档。
     task = asyncio.create_task(
-        lifecycle.run_process_coding(spec, gate, system_prompt=prompt, prompt_info=info)
+        lifecycle.run_process_coding(spec, gate, system_prompt=prompt, prompt_info=info,
+                                     diagnostics=diagnostics)
         if config["scenario"] == "coding" else
-        lifecycle.run_process_1(spec, gate, system_prompt=prompt, prompt_info=info)
+        lifecycle.run_process_1(spec, gate, system_prompt=prompt, prompt_info=info,
+                                diagnostics=diagnostics)
         if config["phase"] == PROCESS_1 else
         lifecycle.run_process_2(spec, gate, None, session_id=config["session_id"],
-                                system_prompt=prompt, prompt_info=info))
-
-    async def watch():
-        async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
-            while not task.done():
-                try:
-                    response = await client.post(config["endpoint"] + "/state",
-                                                headers={"X-PV-Token": config["token"]})
-                    if response.json()["stopped"]:
-                        task.cancel()
-                        return
-                except (httpx.HTTPError, ValueError):
-                    task.cancel()
-                    return
-                await asyncio.sleep(0.1)
-    watcher = asyncio.create_task(watch())
+                                system_prompt=prompt, prompt_info=info,
+                                diagnostics=diagnostics))
+    watcher = asyncio.create_task(watch_parent(config["endpoint"], config["token"], task,
+                                               diagnostics))
     try:
         result = await task
         result["process_ledger"] = lifecycle._ledger_facts(ledger)
         result["pid"] = os.getpid()
+        result["diagnostics"] = diagnostics
         return result
     finally:
         watcher.cancel()
@@ -328,6 +399,30 @@ def _make_budget(root, manifest_path, prepared, profile, manifest):
     return AttemptBudget(root, attempt_id="pv02-" + manifest["task_key"],
         manifest_hash=sha256_file(manifest_path), prepared_lock_hash=sha256_file(prepared / "lock.json"),
         profile=profile, model_identity={"provider": "deepseek", "model": manifest["model"]["normal"]["model"]})
+
+
+def _diagnosis(child_facts: dict, broker, budget, facts: dict) -> str:
+    """把"为什么没成"从事实里抽出来, 附在父进程的失败报错上。
+
+    首题 live 的教训: 父进程只报一句 "first child did not complete normally",
+    真正的原因 (子进程被谁取消、哪次发送没相关上、账本是否封口) 全在事实里没被带出来。
+    """
+    diagnostics = (child_facts or {}).get("diagnostics") or {}
+    streams = diagnostics.get("streams") or []
+    production = (child_facts or {}).get("process_ledger") or {}
+    parts = [
+        f"broker={broker.stop_reason or 'running'}",
+        f"gate_sealed={getattr(broker.gate, 'network_sealed_reason', None)}",
+        f"attempt_sealed={budget.sealed_reason}",
+        f"os_exit={child_facts.get('os_exit_code')}",
+        f"timed_out={child_facts.get('timed_out')}",
+        f"closed_ok={child_facts.get('closed_ok')}",
+        f"watch={diagnostics.get('watch')}",
+        f"streams={streams[-3:]}",
+        "production=" + str({key: production.get(key) for key in (
+            "calls", "settled_upper_cny", "pending_upper_cny", "sealed_reason")}),
+    ]
+    return "; ".join(parts)
 
 
 async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_raw, credential=None,
@@ -390,7 +485,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         with contextlib.redirect_stdout(io.StringIO()):
             return runner.evaluate_workspace_patch(spec, prepared, workspace, lock, private / "checks")
 
-    broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential, admission=admission)
+    broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential,
+                    admission=admission, audit=private / "broker-audit.jsonl")
     endpoint = broker.start()
     # 端口在整个 attempt 内不变, 因而恢复前后的 checks_signature 相同。
     config = {"workspace": str(workspace), "endpoint": endpoint, "token": broker.token,
@@ -412,7 +508,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         facts["process_1"] = p1
         facts["process_ledgers"][PROCESS_1] = p1.get("process_ledger")
         if p1["os_exit_code"] != 0 or p1["timed_out"] or broker.stopped or p1.get("closed_ok") is not True:
-            raise AttemptBudgetError("first child did not complete normally")
+            raise AttemptBudgetError("first child did not complete normally: " + _diagnosis(
+                p1, broker, budget, facts))
         if not broker.checks or broker.checks[0]["code"] != 1 or broker.checks[0].get("patch_empty") is not True:
             raise AttemptBudgetError("initial check did not observe an empty failing patch")
         if spec.scenario == "restore-compact-continue":
@@ -450,7 +547,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
             facts["process_ledgers"][PROCESS_2] = p2.get("process_ledger")
             if (p2["os_exit_code"] != 0 or p2["timed_out"] or p2.get("restored_requests") != 2
                     or p2.get("closed_ok") is not True):
-                raise AttemptBudgetError("second child did not restore and complete")
+                raise AttemptBudgetError("second child did not restore and complete: " + _diagnosis(
+                    p2, broker, budget, facts))
             if p2.get("restored_request_ids") != saved["request_ids"]:
                 raise AttemptBudgetError("restored request identities differ")
             if p2.get("context_compacted_events") != 1 or not p2.get("compacted"):
@@ -461,9 +559,11 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
         else:
             final_process = p1
         if not final_process.get("requests") or final_process["requests"][-1].get("exit_code") != 0:
-            raise AttemptBudgetError("final request has no current passing check")
+            raise AttemptBudgetError("final request has no current passing check: " + _diagnosis(
+                final_process, broker, budget, facts))
         if broker.stopped or gate.network_sealed_reason or budget.sealed_reason or budget.totals()["pending_cent"]:
-            raise AttemptBudgetError("attempt sealed or has a pending reservation")
+            raise AttemptBudgetError("attempt sealed or has a pending reservation: " + _diagnosis(
+                final_process, broker, budget, facts))
         for ledger in facts["process_ledgers"].values():
             if not ledger or ledger["sealed_reason"] or Decimal(ledger["pending_upper_cny"] or "0"):
                 raise AttemptBudgetError("production process ledger is not settled")
@@ -493,6 +593,8 @@ async def _run(*, prepared_root, manifest_path, attempt_root, profile, profile_r
             facts["outcome"] = "offline-failed" if offline else "live-failed"
         facts["cleanup_elapsed_s"] = time.monotonic() - cleanup_started
         facts["checks"] = broker.checks
+        facts["broker_stop_reason"] = broker.stop_reason
+        facts["broker_audit"] = str(broker.audit) if broker.audit is not None else None
         facts["attempt_ledger"] = budget.totals()
         facts["attempt_calls"] = budget.recorded_calls()
         if not offline:
@@ -555,12 +657,21 @@ def main():
             print(json.dumps(data["summary"], ensure_ascii=False))
             return data["code"]
     config = load_json(args.config)
-    try:
-        facts = asyncio.run(_child(args.config))
-        code = 0
-    except BaseException as exc:
-        facts, code = {"error_type": type(exc).__name__, "error_detail": str(exc)[:300]}, 2
-    write_json(Path(config["child_root"]) / (config["phase"] + "-facts.json"), facts)
+    child_root = Path(config["child_root"])
+    # Low 子进程没有 std 句柄管道 (继承被父进程关闭): 自身落盘才能留下 traceback 与
+    # 库里的杂散输出。事实文件只记分类, 这里记原文。
+    with (child_root / (config["phase"] + "-child.log")).open(
+            "w", encoding="utf-8", newline="\n") as handle, \
+            contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle):
+        print(f"pid={os.getpid()} phase={config['phase']} scenario={config['scenario']}",
+              flush=True)
+        try:
+            facts = asyncio.run(_child(args.config))
+            code = 0
+        except BaseException as exc:
+            facts, code = {"error_type": type(exc).__name__, "error_detail": str(exc)[:300]}, 2
+            print(f"{type(exc).__name__}: {exc}", flush=True)
+    write_json(child_root / (config["phase"] + "-facts.json"), facts)
     return code
 
 

@@ -324,11 +324,14 @@ class _ObservedStream(httpx.AsyncByteStream):
 # --- 生产确认: 包装模型 stream 取得终结事实 ---
 
 
-def observe_model_stream(original, gate):
+def observe_model_stream(original, gate, diagnostics: dict | None = None):
     """包装 ``DeepSeekModel.stream``, 把模型自己的终结事件交给闸做生产确认。
 
     与旧栈同一接缝: 一次 stream 期间新出现的预订必须恰好一条, 否则视为归因不明
     并封口 (宁可停在未结算, 也不把别人的 usage 记到这笔上)。事件与请求内容不变。
+
+    每次 stream 的"新预订数/终局/错误分类"都写进 ``diagnostics``: 封口语义本身不改,
+    但必须留下**为什么**封口的证据 (首次 live 就是缺这一条而无法判定根因)。
     """
     from cicada.core.ports import StreamDone
 
@@ -350,6 +353,17 @@ def observe_model_stream(original, gate):
                 gate.budget.seal("ambiguous call correlation")
             else:
                 gate.confirm(new_ids[0], terminal if completed else None)
+            if diagnostics is not None:
+                # 决策之后落痕: 这样"为什么封口"与新预订数一起可读 (首题 live 缺的就是它)。
+                diagnostics.setdefault("streams", []).append({
+                    "new_correlations": len(new_ids),
+                    "terminal": None if terminal is None else terminal.stop_reason,
+                    "terminal_error": None if terminal is None else terminal.error,
+                    "completed": completed,
+                    "network_sealed": gate.network_sealed_reason,
+                    "attempt_sealed": getattr(getattr(gate, "budget", None),
+                                              "sealed_reason", None),
+                })
         if terminal is not None:
             yield terminal
 
@@ -357,12 +371,12 @@ def observe_model_stream(original, gate):
 
 
 @contextlib.contextmanager
-def production_confirmation(gate):
+def production_confirmation(gate, diagnostics: dict | None = None):
     """在会话使用期间把生产确认接到 ``DeepSeekModel.stream`` 上, 退出时严格还原。"""
     from cicada.plugins.deepseek.model import DeepSeekModel
 
     original = DeepSeekModel.stream
-    DeepSeekModel.stream = observe_model_stream(original, gate)
+    DeepSeekModel.stream = observe_model_stream(original, gate, diagnostics)
     try:
         yield
     finally:
@@ -478,7 +492,7 @@ def _request_facts(name: str, outcome) -> dict:
 
 
 async def run_process_1(spec: LifecycleSpec, transport, *, system_prompt: str,
-                        prompt_info: PromptInfo) -> dict:
+                        prompt_info: PromptInfo, diagnostics: dict | None = None) -> dict:
     """R1 + R2 两个只读请求, 逐一自然终局后关闭; 返回可核对事实。"""
     session, log = await open_process(spec, transport, session_id=None,
                                       system_prompt=system_prompt,
@@ -493,7 +507,7 @@ async def run_process_1(spec: LifecycleSpec, transport, *, system_prompt: str,
     try:
         facts["session_id"] = session.persistence.session_id
         # 生产确认必须在场: 每次发送的结算要求模型自己的终结事件与观察到的 usage 一致。
-        with production_confirmation(transport):
+        with production_confirmation(transport, diagnostics):
             for name in ("R1", "R2"):
                 outcome = await session.execute(prompts[name])
                 facts["requests"].append(_request_facts(name, outcome))
@@ -513,7 +527,8 @@ async def run_process_1(spec: LifecycleSpec, transport, *, system_prompt: str,
 
 
 async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *,
-                        session_id: str, system_prompt: str, prompt_info: PromptInfo) -> dict:
+                        session_id: str, system_prompt: str, prompt_info: PromptInfo,
+                        diagnostics: dict | None = None) -> dict:
     """真实恢复同一 session → ``compact_context`` 摘要 → R3。"""
     session, log = await open_process(spec, transport, session_id=session_id,
                                       system_prompt=system_prompt,
@@ -529,7 +544,7 @@ async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *
         # 恢复出的旧回执只是历史: 记录其只读暴露, 不作为当前权威。
         facts["historical_receipts_have_current_authority"] = False
         # 摘要与 R3 的发送同样需要生产确认在场才结算。
-        with production_confirmation(transport):
+        with production_confirmation(transport, diagnostics):
             try:
                 compacted = await session.compact_context()
             except RuntimeError as exc:
@@ -1025,7 +1040,8 @@ def build_coding_prompt(instruction: str) -> str:
 
 
 async def run_process_coding(spec: LifecycleSpec, transport, *, system_prompt: str,
-                             prompt_info: PromptInfo) -> dict:
+                             prompt_info: PromptInfo,
+                             diagnostics: dict | None = None) -> dict:
     """coding 场景: 单进程读定位 → 写并检查 → 收尾 (不持久化, 不压缩)。"""
     config = _deepseek_config(spec)
     app_config = ApplicationConfig(
@@ -1042,7 +1058,7 @@ async def run_process_coding(spec: LifecycleSpec, transport, *, system_prompt: s
     session.subscribe(log)
     facts: dict = {"requests": [], "compacted": 0}
     try:
-        with production_confirmation(transport):
+        with production_confirmation(transport, diagnostics):
             outcome = await session.execute(build_coding_prompt(spec.instruction))
         facts["requests"].append(_request_facts("coding", outcome))
         facts["completed_events"] = log.completed

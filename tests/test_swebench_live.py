@@ -11,7 +11,13 @@ import pytest
 from cicada.costs import CostProfile
 from tests.support import swebench_lifecycle as lifecycle
 from tests.support.swebench_budget import AttemptBudget, AttemptBudgetError, PROCESS_1
-from tests.support.swebench_live import Broker, RemoteGate, _supervise_child
+from tests.support.swebench_live import (
+    WATCH_MAX_FAILURES,
+    Broker,
+    RemoteGate,
+    _supervise_child,
+    watch_parent,
+)
 
 
 def _gate(tmp_path, inner):
@@ -171,3 +177,137 @@ def test_broker_close_waits_for_evaluator_thread_to_finish(tmp_path):
             gate.budget.release()
         assert not broker.checking and len(broker.checks) == 1
     asyncio.run(run())
+
+
+async def _until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+def test_watch_tolerates_transient_state_failures_and_obeys_stop(tmp_path):
+    """子进程轮询失败是存活抖动, 不是父进程失联。
+
+    首次 live 就是因为**单次**轮询失败即 task.cancel() 而整轮中止, 生产账本留下未决
+    预留, 父进程只看到 "child-sealed"。这里锁定: 连续失败到阈值才取消, 明确 stopped
+    立刻取消。
+    """
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(lambda request: None))
+        broker = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 30)
+        endpoint = broker.start()
+        original = broker.dispatch
+        state = {"fail": 0}
+
+        async def dispatch(route, body):
+            if route == "/state" and state["fail"]:
+                state["fail"] -= 1
+                raise AttemptBudgetError("injected transient state failure")
+            return await original(route, body)
+
+        broker.dispatch = dispatch  # type: ignore[method-assign]
+        try:
+            task = asyncio.create_task(asyncio.sleep(30))
+            diagnostics: dict = {}
+            state["fail"] = WATCH_MAX_FAILURES - 1
+            watcher = asyncio.create_task(
+                watch_parent(endpoint, broker.token, task, diagnostics))
+            assert await _until(
+                lambda: diagnostics.get("watch", {}).get("failures") == WATCH_MAX_FAILURES - 1)
+            assert not task.cancelled() and not task.done()
+            state["fail"] = 1
+            assert await _until(lambda: task.cancelled() or task.done(), timeout=5)
+            await asyncio.gather(watcher, task, return_exceptions=True)
+            assert task.cancelled()
+            assert diagnostics["watch"]["failures"] == WATCH_MAX_FAILURES
+            assert diagnostics["watch"]["stop_seen"] is False
+
+            stopped_task = asyncio.create_task(asyncio.sleep(30))
+            stopped_diagnostics: dict = {}
+            broker.stopped = True
+            await asyncio.gather(watch_parent(endpoint, broker.token, stopped_task,
+                                              stopped_diagnostics), return_exceptions=True)
+            await asyncio.gather(stopped_task, return_exceptions=True)
+            assert stopped_task.cancelled()
+            assert stopped_diagnostics["watch"] == {"stop_seen": True, "failures": 0}
+        finally:
+            await broker.close()
+            gate.budget.release()
+    asyncio.run(run())
+
+
+def test_broker_audit_trail_records_route_decisions(tmp_path):
+    """每个路由的决策与原因必须落盘: 首题 live 没有这份轨迹, 根因无法判定。"""
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(
+            lambda request: lifecycle._sse([lifecycle._text_frame(0, "fixture")])))
+        audit = tmp_path / "broker-audit.jsonl"
+        broker = Broker(gate=gate, check=lambda: (1, {"result": "failed"}),
+                        deadline=time.monotonic() + 10, credential="parent-only-secret",
+                        audit=audit)
+        try:
+            code, headers, _body_bytes = await broker.dispatch("/model", _body())
+            assert code == 200 and headers["X-Call-Id"]
+            await broker.dispatch("/check", b"{}")
+            await broker.dispatch("/seal", b"{}")
+            with pytest.raises(AttemptBudgetError, match="deadline"):
+                await broker.dispatch("/model", _body())
+        finally:
+            gate.budget.release()
+        raw = audit.read_text(encoding="utf-8")
+        records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        events = [record["event"] for record in records]
+        assert "model-ok" in events and "check-ok" in events
+        assert "seal" in events and "stop" in events
+        model_ok = next(record for record in records if record["event"] == "model-ok")
+        assert model_ok["status"] == 200 and model_ok["call_id"] == headers["X-Call-Id"]
+        stop = next(record for record in records if record["event"] == "stop")
+        assert stop["reason"] == "child-sealed"
+        # 审计只记事实, 不把父进程凭据写进去。
+        assert "parent-only-secret" not in raw
+    asyncio.run(run())
+
+
+def test_ambiguous_correlation_seal_is_recorded_in_diagnostics():
+    """封口语义不变, 但"为什么封口"必须留痕 (新预订数/终局/错误分类)。"""
+    class FakeBudget:
+        sealed_reason = None
+
+        def seal(self, reason):
+            self.sealed_reason = self.sealed_reason or reason
+
+    class FakeGate:
+        def __init__(self):
+            self.observations = {}
+            self.network_sealed_reason = None
+            self.budget = FakeBudget()
+
+        def seal_network(self, reason):
+            self.network_sealed_reason = self.network_sealed_reason or reason
+
+        def confirm(self, call_id, terminal):
+            raise AssertionError("no correlation must never be confirmed")
+
+    from cicada.core.ports import StreamDone
+
+    gate = FakeGate()
+    diagnostics: dict = {}
+
+    async def original(model, request, cancel):
+        yield StreamDone("stop")
+
+    async def run():
+        observed = lifecycle.observe_model_stream(original, gate, diagnostics)
+        events = [event async for event in observed(None, None, None)]
+        assert [event.stop_reason for event in events] == ["stop"]
+
+    asyncio.run(run())
+    assert gate.network_sealed_reason == "ambiguous-call-correlation"
+    assert gate.budget.sealed_reason == "ambiguous call correlation"
+    assert diagnostics["streams"] == [{
+        "new_correlations": 0, "terminal": "stop", "terminal_error": None,
+        "completed": True, "network_sealed": "ambiguous-call-correlation",
+        "attempt_sealed": "ambiguous call correlation"}]
