@@ -4,6 +4,8 @@
 公开输入副本; 当本地公开输入缺失时按 skip 处理 (该目录按交付规则不入库)。
 """
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -213,3 +215,76 @@ def test_report_without_any_grade_reports_missing_grade_not_drift(tmp_path, monk
     (root / runner.LOCK_FILENAME).write_text(json.dumps({"verifier": {}}), encoding="utf-8")
     monkeypatch.setattr(runner, "verify_frozen_identity", lambda *a, **k: [])
     assert runner.cmd_report(_report_args(manifest, root)) != 0
+
+
+# --- P1 私有材料隔离 ---
+#
+# 这些用例会真实改写临时目录的 ACL 并启动低完整性子进程 (不碰 Docker、不发模型请求)。
+# 保留它们的理由: 隔离是安全边界, 且底层依赖的内核规则被 DSH 文档自标 unconfirmed ——
+# 一旦形状或屏障失效, "封印成功"会变成静默放行, 属"已确认的关键风险"。
+
+
+def test_package_sid_shape_guard_rejects_sids_that_do_not_trip_the_rule():
+    """短值/通配/异族 SID 必须被拒: 它们不会触发内核规则, 用了等于没封印。"""
+    from tests.support import swebench_isolation as iso
+
+    for bad in ("S-1-15-2-1", "S-1-15-2-2", "S-1-15-2-99", "S-1-15-2-12345",
+                "S-1-15-2-1-2", "S-1-5-21-1-2-3", "S-1-15-3-1-2-3", "Everyone"):
+        with pytest.raises(iso.IsolationError):
+            iso.validate_package_sid(bad)
+    # 生产常量必须是多子授权形式, 否则封印静默失效。
+    assert iso.package_sid_subauthorities(iso.PROTECTED_PACKAGE_SID) >= 3
+    iso.validate_package_sid(iso.PROTECTED_PACKAGE_SID)
+
+
+def _sealed_private(tmp_path: Path):
+    from tests.support import swebench_isolation as iso
+
+    if not sys.platform == "win32":
+        pytest.skip("Windows ACL isolation is Windows-only")
+    private = tmp_path / "private"
+    (private / "verifier").mkdir(parents=True)
+    (private / "gold_patch.diff").write_bytes(b"GOLD_SECRET_PAYLOAD\n")
+    (private / "verifier" / "config.json").write_bytes(b'{"ok":true}\n')
+    return iso, private
+
+
+def test_sealed_private_passes_the_negative_gate(tmp_path):
+    """正常封印后负向验收应为空: 子进程读不到私料, 但评估方读得到。"""
+    iso, private = _sealed_private(tmp_path)
+    record = iso.seal_private(private)
+    assert iso.isolation_problems(private, record) == []
+
+
+def test_gate_detects_a_removed_package_sid_ace(tmp_path):
+    """撤掉包 SID ACE 后, 负向验收必须报出"子进程读到了受保护材料"。"""
+    iso, private = _sealed_private(tmp_path)
+    record = iso.seal_private(private)
+    for path in sorted(private.rglob("*")):
+        if path.is_file():
+            subprocess.run(["icacls", str(path), "/remove:g",
+                            f"*{iso.PROTECTED_PACKAGE_SID}"],
+                           capture_output=True, text=True)
+    subprocess.run(["icacls", str(private), "/remove:g",
+                    f"*{iso.PROTECTED_PACKAGE_SID}"], capture_output=True, text=True)
+    problems = iso.isolation_problems(private, record)
+    assert any("READ protected material" in item for item in problems)
+
+
+def test_gate_detects_both_delete_barriers_being_removed(tmp_path):
+    """两条删除屏障 (目录包 SID ACE 与 DC deny) 同时撤掉时, 必须报出破坏性访问。
+
+    只撤其中一条不该被误判为"已被破坏": 矩阵实测二者任一即可挡住删除。
+    """
+    iso, private = _sealed_private(tmp_path)
+    record = iso.seal_private(private)
+    subprocess.run(["icacls", str(private), "/remove:d", f"*{iso.EVERYONE_SID}"],
+                   capture_output=True, text=True)
+    problems = iso.isolation_problems(private, record)
+    # 目录 ACE 仍在 => 删除仍被挡; 但 DC 屏障已少一层, 必须显式报告。
+    assert any("FILE_DELETE_CHILD" in item for item in problems)
+    assert not any("DELETED protected material" in item for item in problems)
+    subprocess.run(["icacls", str(private), "/remove:g",
+                    f"*{iso.PROTECTED_PACKAGE_SID}"], capture_output=True, text=True)
+    problems = iso.isolation_problems(private, record)
+    assert any("DELETED protected material" in item for item in problems)

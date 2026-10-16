@@ -33,6 +33,7 @@ PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
 
 from tests.support import swebench_bridge as bridge  # noqa: E402
+from tests.support import swebench_isolation as isolation  # noqa: E402
 from tests.support import swebench_tasks as tasks  # noqa: E402
 from tests.support.swebench_tasks import (  # noqa: E402
     ManifestError,
@@ -375,6 +376,15 @@ def cmd_prepare(args) -> int:
         gold_patch = tasks.gold_patch_bytes(spec)
         (dirs["private"] / "gold_patch.diff").write_bytes(gold_patch)
 
+        # P1 私有材料隔离: 全部私料落盘后封印, 并在准入前做一次负向验收。
+        # 封印失败即 prepare-failed, 不降级放行 (规格: 无法证明不可达就不得完成准入)。
+        protection = isolation.seal_private(dirs["private"])
+        receipt["protection"] = protection
+        gate = isolation.isolation_problems(dirs["private"], protection)
+        receipt["isolation_problems"] = gate
+        if gate:
+            raise PrepareFailed("isolation gate failed: " + "; ".join(gate[:4]))
+
         # 干净工作区必须导出空补丁且真实 index 不变。
         empty_export = bridge.export_patch(
             dirs["workspace"], row["base_commit"], spec.allowed_paths, dirs["temp"], git)
@@ -462,6 +472,8 @@ def build_lock(spec: TaskSpec, row: dict, verifier: dict, image: dict,
         "task_toml_sha256": spec.task_toml_sha256,
         "verifier": verifier["sha256"],
         "verifier_config_sha256": verifier["config_bytes_sha256"],
+        # P1: 封印配方与其 SID 随 lock 冻结; 每次准入按此重跑负向验收。
+        "protection": receipt.get("protection"),
         "workspace": {
             "path_name": WORKSPACE_DIRNAME, "head": row["base_commit"],
             "git_entries_sha256": manifest.entries_sha256,
@@ -542,6 +554,16 @@ def verify_frozen_identity(spec: TaskSpec, lock: dict, run_root: Path) -> list[s
                         for p in sorted((PROJECT / "src").rglob("*.py"))}
     if lock.get("cicada", {}).get("source_sha256") != expected_sources:
         problems.append("production source manifest differs from lock")
+    # P1 隔离: 每次准入重跑负向验收, 不只信 prepare 时的一次结论。
+    # 底层内核规则被 DSH 文档自标 unconfirmed, 故必须每次实测 (读/删/改名/覆写
+    # 必须失败、评估方必须可读), 任一不符即阻断。
+    protection = lock.get("protection")
+    if not isinstance(protection, dict):
+        problems.append("lock carries no private-material protection record")
+    else:
+        problems.extend(f"isolation: {item}"
+                        for item in isolation.isolation_problems(
+                            run_root / PRIVATE_DIRNAME, protection))
     docker = bridge.DockerCLI()
     inspect = docker.run("image", "inspect", spec.image_tag)
     if inspect.exit_code != 0:
