@@ -114,16 +114,23 @@ def test_legacy_runner_default_identity_is_unchanged():
 
 
 def test_run_subcommand_refuses_without_authorization(tmp_path):
-    """run 在无 --live 时必须拒绝, 且不发真实请求。"""
+    """run 的两条零发送闸: 缺价格 profile 拒绝; --live 无授权记录拒绝。
+
+    PV02 后 run 的语义是"缺 --live 跑离线演练, --live 需另获授权"。无论哪条,
+    "没有闸就不发送"与"没有授权就不发送"都必须成立且零请求。
+    """
     from tests.e2e import preview_runner as runner
     from types import SimpleNamespace
 
     manifest = tasks.manifest_path_for("repeat-lifecycle")
     if not manifest.is_file():
         pytest.skip("manifest not present")
-    args = SimpleNamespace(live=False, manifest=str(manifest),
-                           run_root=str(tmp_path), prepared_root=str(tmp_path))
-    assert runner.cmd_run(args) == 2
+    base = dict(manifest=str(manifest), run_root=str(tmp_path),
+                prepared_root=str(tmp_path))
+    # 1) 缺 --cost-profile: 没有 attempt 总额度闸, 一律不发送。
+    assert runner.cmd_run(SimpleNamespace(live=False, cost_profile=None, **base)) == 2
+    # 2) --live 但无授权记录: 拒绝, 零请求。
+    assert runner.cmd_run(SimpleNamespace(live=True, cost_profile=None, **base)) == 2
 
 
 def test_prepare_does_not_overwrite_existing_attempt_receipt(tmp_path):

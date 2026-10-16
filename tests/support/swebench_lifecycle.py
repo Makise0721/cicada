@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -269,6 +269,9 @@ class LifecycleSpec:
     model_doc: dict = field(default_factory=dict)
     max_turns: int = 50
     restore_capture: bool = False
+    # 生产进程账本 (cicada.costs.CostLedger); None = 本次不安装进程级费用控制。
+    # 与 AttemptBudget 是两本账: 前者按产品规则"重启新建额度", 后者是 attempt 级总闸。
+    cost_control: object | None = None
 
 
 def _deepseek_config(spec: LifecycleSpec) -> DeepSeekConfig:
@@ -331,6 +334,7 @@ async def open_process(spec: LifecycleSpec, transport, *, session_id: str | None
             identity=launch_identity(spec, prompt_info, config)),
         budget=BudgetConfig(config.num_ctx, config.max_tokens),
         restore_capture=spec.restore_capture,
+        cost_control=spec.cost_control,
     )
     session = await open_application(app_config)
     log = _EventLog()
@@ -518,3 +522,205 @@ def offline_fixture(*, replacements: dict, allowed_paths, check_id: str = "check
         return _sse([_text_frame(index, "offline rehearsal complete.")])
 
     return httpx.MockTransport(respond)
+
+# --- 离线全路径演练 (preview_runner run 的离线入口) ---
+
+
+def _runner_command(manifest_path: Path, prepared_root: Path, workspace: Path) -> str:
+    """check-1 的生产命令。
+
+    所有路径**必须绝对化**: check 工具以 workspace 为 cwd 运行该命令, 相对路径会
+    落到工作区里 (实测踩过: 报 "manifest missing ...\\workspace\\.scratch\\...")。
+    """
+    import sys as _sys
+
+    runner = (Path(__file__).resolve().parents[1] / "e2e" / "preview_runner.py").resolve()
+    manifest_path = Path(manifest_path).resolve()
+    prepared_root = Path(prepared_root).resolve()
+    workspace = Path(workspace).resolve()
+    return (f"& '{_sys.executable}' '{runner}' check "
+            f"--manifest '{manifest_path}' --run-root '{prepared_root}' "
+            f"--workspace '{workspace}'")
+
+
+def rehearsal_plan(prepared_root: Path, manifest_path: Path) -> dict:
+    """离线演练的静态输入核对与 prompt hash 冻结 (不执行任何模型请求)。"""
+    prepared_root = Path(prepared_root).resolve()
+    manifest_path = Path(manifest_path).resolve()
+    lock = json.loads((prepared_root / "lock.json").read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    instruction = (prepared_root / "public" / "instruction.md").read_text(encoding="utf-8")
+    prompts = build_prompts(instruction)
+    return {
+        "manifest": manifest,
+        "lock": lock,
+        "allowed_paths": tuple(lock["instance"]["allowed_paths"]),
+        "base_commit": lock["instance"]["base_commit"],
+        "instruction_sha256": hashlib.sha256(instruction.encode("utf-8")).hexdigest(),
+        "prompt_sha256": prompts["sha256"],
+        "model_doc": manifest["model"],
+        "check_timeout_s": float(manifest["limits"].get("check_timeout_s", 300)),
+        "runner_command": _runner_command(
+            manifest_path, prepared_root, prepared_root / "workspace"),
+    }
+
+
+def _ledger_facts(ledger) -> dict | None:
+    """生产进程账本的只读事实; 未安装进程级费用控制时为 None。"""
+    if ledger is None:
+        return None
+    snapshot = ledger.snapshot
+    return {"scope": snapshot.scope, "calls": snapshot.calls,
+            "max_calls": snapshot.max_calls, "limit_cny": snapshot.limit_cny,
+            "settled_upper_cny": snapshot.settled_upper_cny,
+            "pending_upper_cny": snapshot.pending_upper_cny,
+            "sealed_reason": snapshot.sealed_reason,
+            "profile_sha256": snapshot.profile_sha256}
+
+
+def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Path,
+                  profile: CostProfile, limit_cent: int = 450,
+                  max_calls: int = 24) -> dict:
+    """完整离线演练: 两进程生命周期 + 跨进程总闸 + 双账本; 零真实网络请求。
+
+    返回可用于准入判定的全部事实。任何一步不成立都如实记录, 不粉饰。
+    """
+    import asyncio
+    import shutil
+    import subprocess
+
+    from cicada.prompting import CheckPrompt, DEFAULT_TOOLS, compose_system_prompt
+    from tests.support.swebench_budget import PROCESS_1, PROCESS_2, AttemptBudget
+
+    plan = rehearsal_plan(prepared_root, manifest_path)
+    workspace = prepared_root / "workspace"
+    allowed = plan["allowed_paths"]
+    manifest = plan["manifest"]
+
+    # 干净工作区: 上一轮残留会让 R3 的写入依据失真。
+    subprocess.run(["git", "-C", str(workspace), "checkout", "--quiet", "--", "."],
+                   capture_output=True)
+    subprocess.run(["git", "-C", str(workspace), "clean", "-qfd"], capture_output=True)
+
+    replacements = learned_solution(workspace, plan["base_commit"],
+                                    prepared_root / "private" / "gold_patch.diff", allowed)
+    check_command = plan["runner_command"]
+    from cicada.plugins.coding.verification_contracts import CheckDefinition
+
+    checks = (CheckDefinition(check_id="check-1", command=check_command,
+                              timeout_s=plan["check_timeout_s"]),)
+    system_prompt, prompt_info = compose_system_prompt(
+        workspace, None, tools=DEFAULT_TOOLS + ("check",),
+        checks=(CheckPrompt("check-1", check_command, plan["check_timeout_s"]),))
+    spec = LifecycleSpec(workspace=workspace,
+                         instruction=(prepared_root / "public" / "instruction.md")
+                         .read_text(encoding="utf-8"),
+                         checks=checks, model_doc=manifest["model"],
+                         max_turns=50, restore_capture=False)
+
+    if attempt_root.exists():
+        shutil.rmtree(attempt_root, ignore_errors=True)
+    attempt_root.mkdir(parents=True)
+    # 生产进程账本: 每个进程各一本 (产品规则"重启新建额度"), 与 attempt 总闸分开记。
+    from decimal import Decimal
+
+    from cicada.costs import CostLedger
+
+    limits = manifest.get("limits", {})
+    execution_limit = Decimal(str(limits.get("budget_cny_execution", "4.50")))
+    call_limit = int(limits.get("http_limit", 24))
+
+    def process_ledger(name: str) -> CostLedger:
+        return CostLedger(attempt_root / "cost" / name, limit=execution_limit,
+                          max_calls=call_limit, profile=profile)
+
+    spec = replace(spec, cost_control=process_ledger("process-1"))
+    process_ledgers: dict = {}
+    identity = {"provider": "deepseek", "model": manifest["model"]["normal"]["model"]}
+    budget = AttemptBudget(
+        attempt_root, attempt_id="pv02-" + manifest["task_key"],
+        manifest_hash=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        prepared_lock_hash=hashlib.sha256(
+            (prepared_root / "lock.json").read_bytes()).hexdigest(),
+        profile=profile, model_identity=identity,
+        limit_cent=limit_cent, max_calls=max_calls)
+
+    deadline = time.monotonic() + float(manifest["limits"].get("run_timeout_s", 1500))
+    facts: dict = {"task_key": manifest["task_key"],
+                   "prompt_sha256": plan["prompt_sha256"],
+                   "instruction_sha256": plan["instruction_sha256"],
+                   "allowed_paths": list(allowed),
+                   "live": "not-run"}
+
+    budget.acquire(PROCESS_1)
+    gate1 = AttemptGateTransport(
+        offline_fixture(replacements=replacements, allowed_paths=allowed), budget,
+        phase=PROCESS_1, deadline_monotonic=deadline)
+    facts["process_1"] = asyncio.run(run_process_1(
+        spec, gate1, system_prompt=system_prompt, prompt_info=prompt_info))
+    facts["process_1"]["gate"] = {"handoffs": gate1.handoffs,
+                                  "settled": len(gate1.settled_ids),
+                                  "sealed": gate1.network_sealed_reason}
+    process_ledgers["process-1"] = _ledger_facts(spec.cost_control)
+    # 第一进程用剩余工作时长记账; checkpoint 只记事实。
+    if facts["process_1"]["manifest_unchanged"] is not True:
+        facts["outcome"] = "offline-failed"
+        facts["reason"] = "R1/R2 changed the workspace or did not both commit"
+        budget.release()
+        return facts
+    checkpoint = budget.close_checkpoint(process_identity={"pid": "process-1"})
+    budget.release()
+
+    second = AttemptBudget(
+        attempt_root, attempt_id=budget.identity["attempt_id"],
+        manifest_hash=budget.identity["manifest_hash"],
+        prepared_lock_hash=budget.identity["prepared_lock_hash"],
+        profile=profile, model_identity=identity,
+        limit_cent=limit_cent, max_calls=max_calls)
+    second.acquire(PROCESS_2)
+    continuation = second.verify_continuation(expect_phase=PROCESS_1)
+    started = facts["process_1"]["gate"]["handoffs"]
+    spec2 = replace(spec, cost_control=process_ledger("process-2"))
+    gate2 = AttemptGateTransport(
+        offline_fixture(replacements=replacements, allowed_paths=allowed, start=started),
+        second, phase=PROCESS_2, deadline_monotonic=deadline)
+    facts["process_2"] = asyncio.run(run_process_2(
+        spec2, gate2, second, session_id=facts["process_1"]["session_id"],
+        system_prompt=system_prompt, prompt_info=prompt_info))
+    facts["process_2"]["gate"] = {"handoffs": gate2.handoffs,
+                                  "settled": len(gate2.settled_ids),
+                                  "sealed": gate2.network_sealed_reason}
+    process_ledgers["process-2"] = _ledger_facts(spec2.cost_control)
+    facts["process_ledgers"] = process_ledgers
+    facts["checkpoint_after_process_1"] = checkpoint
+    facts["continuation_verified"] = continuation["totals"]
+    facts["attempt_ledger"] = second.totals()
+    facts["attempt_calls"] = [{"kind": c["kind"], "state": c["state"],
+                               "reserve_cent": c["reserve_cent"],
+                               "settled_cent": c.get("settled_cent")}
+                              for c in second.recorded_calls()]
+    second.release()
+
+    # 判定: 生命周期成立 + 闸未封口 + 无残留预留 + 官方评分通过。
+    p1, p2 = facts["process_1"], facts["process_2"]
+    problems: list[str] = []
+    if p1.get("completed_events") != 2:
+        problems.append("R1/R2 did not both commit")
+    if p2.get("restored_requests") != 2:
+        problems.append("restore did not bring back exactly two committed requests")
+    if p2.get("view_only_reason"):
+        problems.append(f"restored session is view-only: {p2['view_only_reason']}")
+    if p2.get("compacted") is None:
+        problems.append("no summary was produced")
+    if p2.get("context_compacted_events", 0) < 1:
+        problems.append("ContextCompacted was not published")
+    if p1["gate"]["sealed"] is not None or p2["gate"]["sealed"] is not None:
+        problems.append("the attempt gate sealed the network")
+    if facts["attempt_ledger"]["pending_cent"] != 0:
+        problems.append("a reservation is still pending")
+    r3 = (p2.get("requests") or [{}])[0]
+    if r3.get("exit_code") != 0:
+        problems.append(f"R3 did not pass its own check (exit={r3.get('exit_code')})")
+    facts["problems"] = problems
+    facts["outcome"] = "offline-passed-review-pending" if not problems else "offline-failed"
+    return facts

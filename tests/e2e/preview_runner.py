@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT))
 
 from tests.support import swebench_bridge as bridge  # noqa: E402
 from tests.support import swebench_isolation as isolation  # noqa: E402
+from tests.support import swebench_lifecycle as lifecycle  # noqa: E402
 from tests.support import swebench_tasks as tasks  # noqa: E402
 from tests.support.swebench_tasks import (  # noqa: E402
     ManifestError,
@@ -743,6 +744,15 @@ def cmd_dry_run(args) -> int:
                 problems = verify_frozen_identity(spec, lock, run_root)
                 admission["lock_problems"] = problems
                 admission["prepare_receipt_present"] = has_receipt
+                # 生命周期静态计划: prompt hash 与 check 命令在准入前冻结, 不执行。
+                try:
+                    plan = lifecycle.rehearsal_plan(run_root, Path(args.manifest))
+                    admission["prompt_sha256"] = plan["prompt_sha256"]
+                    admission["instruction_sha256"] = plan["instruction_sha256"]
+                    admission["lifecycle_check_command"] = plan["runner_command"]
+                except (OSError, ValueError, KeyError) as exc:
+                    problems.append(f"lifecycle plan unavailable: {exc}")
+                    admission["lock_problems"] = problems
                 if problems:
                     admission["outcome"] = "offline-static-failed"
                     print(json.dumps(admission, ensure_ascii=False))
@@ -758,17 +768,62 @@ def cmd_dry_run(args) -> int:
 
 
 def cmd_run(args) -> int:
-    """live 入口占位: 不实现 launcher, 不发送真实请求 (PV01 边界)。"""
-    if not args.live:
-        print(json.dumps({
-            "outcome": "refused", "reason": "run requires --live and separate explicit authorization",
-            "model_requests": 0}, ensure_ascii=False), file=sys.stderr)
+    """live 入口: 未授权即零请求拒绝; 离线时跑全路径演练并留准入证据。
+
+    两种模式都必须显式给出 ``--cost-profile`` —— 没有价格 profile 就没有 attempt
+    总额度闸, 规格禁止在没有闸的情况下发送。
+    """
+    run_root = Path(args.run_root).resolve()
+    prepared = Path(args.prepared_root).resolve()
+    manifest = Path(args.manifest)
+    try:
+        spec = spec_from_manifest(manifest)
+        from cicada.costs import CostError, CostProfile
+
+        if args.cost_profile is None:
+            print(json.dumps({
+                "outcome": "refused", "model_requests": 0,
+                "reason": "run requires --cost-profile; no send without an explicit "
+                          "price profile and the attempt budget it enables"},
+                ensure_ascii=False), file=sys.stderr)
+            return 2
+        try:
+            profile = CostProfile.load(Path(args.cost_profile))
+        except CostError as exc:
+            print(json.dumps({"outcome": "refused", "model_requests": 0,
+                              "reason": str(exc)}, ensure_ascii=False), file=sys.stderr)
+            return 2
+        if args.live:
+            # live 是**单独一次**明确授权动作: 本构建不携带授权记录, 因此零请求拒绝,
+            # 不把 harness 的存在当成授权。
+            print(json.dumps({
+                "outcome": "refused", "model_requests": 0,
+                "reason": "live authorization is a separate explicit step and no "
+                          "authorization record is present; refusing to send"},
+                ensure_ascii=False), file=sys.stderr)
+            return 2
+
+        facts = lifecycle.run_rehearsal(
+            prepared_root=prepared, manifest_path=manifest,
+            attempt_root=run_root / "attempt", profile=profile)
+        write_json(run_root / "offline-admission.json", facts)
+        # 同写入 prepared root: report 以 prepared root 为 run-root, 两处都留才能核对。
+        write_json(prepared / "offline-admission.json", facts)
+        summary = {
+            "outcome": facts["outcome"], "task_key": spec.task_key,
+            "live": facts["live"], "model_requests": 0,
+            "prompt_sha256": facts["prompt_sha256"],
+            "attempt_ledger": facts.get("attempt_ledger"),
+            "problems": facts.get("problems", []),
+            "admission": str(run_root / "offline-admission.json")}
+        print(json.dumps(summary, ensure_ascii=False))
+        return 0 if facts["outcome"] == "offline-passed-review-pending" else 1
+    except (ManifestError, PrepareFailed, bridge.BridgeError, bridge.PatchScopeError,
+            isolation.IsolationError, lifecycle.AttemptBudgetError, OSError, ValueError,
+            RuntimeError, KeyError) as exc:
+        print(json.dumps({"outcome": "inconclusive-evidence", "model_requests": 0,
+                          "reason": str(exc)[:300]}, ensure_ascii=False))
         return 2
-    print(json.dumps({
-        "outcome": "not-implemented", "model_requests": 0,
-        "reason": "live launcher (AttemptBudget, cross-process lifecycle) belongs to PV02 and is not built",
-        "prepared_root": args.prepared_root}, ensure_ascii=False), file=sys.stderr)
-    return 2
 
 
 def cmd_report(args) -> int:
@@ -796,6 +851,19 @@ def cmd_report(args) -> int:
         # 私料/verifier/源码/镜像漂移, 或工作区已不同于被评分内容时仍报 passed
         # (spec: 缺少任何必须证据时不得 overall passed)。
         identity_problems = verify_frozen_identity(spec, lock, run_root)
+        # 双账本: 生产进程账本与 attempt 总账**分开**输出, 不用其中一份替代另一份。
+        # 离线演练产物在 prepared root 的 offline-admission.json。
+        admission_path = run_root / "offline-admission.json"
+        admission = load_json(admission_path) if admission_path.is_file() else None
+        process_ledgers = (admission or {}).get("process_ledgers")
+        attempt_ledger = (admission or {}).get("attempt_ledger")
+        if admission is not None:
+            if process_ledgers is None:
+                identity_problems.append(
+                    "offline admission carries no production process ledger")
+            if attempt_ledger is None:
+                identity_problems.append(
+                    "offline admission carries no attempt ledger")
         workspace = run_root / WORKSPACE_DIRNAME
         # 只在确实存在最终 grade 时才谈"与所评内容是否一致": 没有 grade 时由
         # coverage.final_grade 表达缺失, 不应伪报成 grade 的溯源缺陷。
@@ -823,19 +891,31 @@ def cmd_report(args) -> int:
             and (grade or {}).get("result") == "passed"
             and not prepare_failures
             and not calibration_problems
-            and not identity_problems)
+            and not identity_problems
+            # 存在离线演练产物时, 它必须是通过的: 失败的演练不得被 report 洗成 passed。
+            and (admission is None
+                 or admission.get("outcome") == "offline-passed-review-pending"))
         summary = {
             "task_key": spec.task_key, "run_root": str(run_root),
             "coverage": coverage, "prepare_failures": prepare_failures,
             "calibration_problems": calibration_problems,
             "final_grade": grade, "check_ids": checks,
             "identity_problems": identity_problems,
+            "process_ledgers": process_ledgers,
+            "attempt_ledger": attempt_ledger,
+            "lifecycle": None if admission is None else {
+                "outcome": admission.get("outcome"),
+                "prompt_sha256": admission.get("prompt_sha256"),
+                "problems": admission.get("problems"),
+                "process_1": (admission.get("process_1") or {}),
+                "process_2": (admission.get("process_2") or {})},
             "overall_passed": overall,
             "outcome": "passed" if overall else "not-passed",
             "note": "reassembles stored facts only; no requests, no re-scoring"}
         print(json.dumps(summary, ensure_ascii=False))
         return 0 if overall else 1
-    except (ManifestError, bridge.BridgeError, OSError, ValueError, RuntimeError, KeyError) as exc:
+    except (ManifestError, bridge.BridgeError, isolation.IsolationError, OSError,
+            ValueError, RuntimeError, KeyError) as exc:
         print(json.dumps({"outcome": "inconclusive-evidence", "reason": str(exc)[:300]},
                          ensure_ascii=False))
         return 2
@@ -850,7 +930,7 @@ def main() -> int:
             ("check", "导出当前补丁并在新容器官方评测 (0/1/2)"),
             ("grade", "重新导出最终补丁并在全新容器复评"),
             ("report", "只重组已有事实, 不重新评分"),
-            ("run", "live 入口; 需 --live 与另获授权 (PV02 未实现)")):
+            ("run", "生命周期 launcher: 缺 --live 时跑离线全路径演练; --live 需另获授权")):
         sub_parser = sub.add_parser(name, help=help_text)
         sub_parser.add_argument("--manifest", required=True)
         sub_parser.add_argument("--run-root", required=True)
@@ -860,6 +940,9 @@ def main() -> int:
             sub_parser.add_argument("--workspace", default=None)
         if name == "run":
             sub_parser.add_argument("--prepared-root", required=True)
+            sub_parser.add_argument(
+                "--cost-profile",
+                help="本地价格 JSON; attempt 总额度闸需要显式 profile, 缺它一律零发送")
             sub_parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
     handlers = {"prepare": cmd_prepare, "dry-run": cmd_dry_run, "check": cmd_check,
