@@ -10,6 +10,11 @@
 
 这是 checkpoint 一致性检查, 不是操作系统原子快照, 也不能证明检查期间没有发生
 "短暂修改后还原"; 它面向单 Agent、无并发修改的验收工作区。
+
+读取与哈希是同步的 (open/read/hashlib), 所以扫描过程中必须按**路径数**与**已读字节**
+定期让出 event loop: 否则整棵树的内容读取会把宿主协程连同协作取消与 `asyncio.timeout`
+一起卡住 (实测 ansible 工作区单次捕获停顿 2.3-10.2 秒, 足以打穿子进程的存活性轮询,
+冷启动时连 60 秒的捕获 deadline 都无法生效)。让出只影响调度, 不改变任何比较结果。
 """
 
 from __future__ import annotations
@@ -49,6 +54,10 @@ MAX_PATHS = 10_000
 CAPTURE_DEADLINE_S = 60.0  # 两次扫描合计；大工作区在实时扫描/容器 I/O 下 10 秒不足
 READ_CHUNK_BYTES = 256 * 1024
 _CHECKPOINT_EVERY = 128
+# 让出控制权的两个上界: 内容循环按**路径数**(每文件都要 lstat/open/hash, 实测约 1.5ms/文件,
+# 按字节算反而会攒到二百多个文件才让出); 单个大文件在 _read_content 内按**已读字节**让出。
+_YIELD_EVERY = 32
+_YIELD_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -222,7 +231,11 @@ class Snapshotter:
         observed |= set(self.ledger.paths)
         observations: dict[str, SnapshotEntry] = {}
         total_bytes = 0
-        for path in sorted(observed, key=lambda path: (path.casefold(), path)):
+        for index, path in enumerate(sorted(observed, key=lambda path: (path.casefold(), path))):
+            if index % _YIELD_EVERY == 0:
+                # 每个文件都有固定开销 (多次 lstat + open + 哈希), 所以按路径数让出;
+                # 停顿时长 ≈ 一次让出间隔内处理完的文件开销。
+                await asyncio.sleep(0)
             self._checkpoint(cancel, deadline)
             exists, sha256, size = await self._read_content(path, cancel, deadline, total_bytes)
             if size:
@@ -278,6 +291,10 @@ class Snapshotter:
                     if not chunk:
                         break
                     read_bytes += len(chunk)
+                    if read_bytes % _YIELD_BYTES == 0:
+                        # 单个大文件也不能独占 loop: 按已读量让出 (READ_CHUNK_BYTES 整除
+                        # _YIELD_BYTES, 所以每个让出点的读取量相同)。
+                        await asyncio.sleep(0)
                     if read_bytes > self.max_file_bytes:
                         raise _CaptureError(
                             "file_limit",
