@@ -399,10 +399,20 @@ def isolation_problems(private_dir: Path, record: dict | None = None) -> list[st
     # 对照: 子进程必须能读到**未被封印**的普通文件, 否则"读不到私有材料"可能只是
     # 环境整体损坏, 结论不可归因到包 SID ACE。对照放在 private/ 之外 —— 放进去会继承
     # 目录上的包 SID ACE, 就不是对照了。
+    #
+    # 对照目录**自带**显式授权而不依赖继承: 实测对照的可读性一度受 run root 所在父目录的
+    # 继承 ACL 影响而偶发失败 (fail-closed 但把环境问题误报成隔离缺陷)。自带授权后,
+    # 对照只随"受限低权子进程能否读普通文件"这一件事变化。
     control_dir = private_dir.parent / "isolation-control"
+    shutil.rmtree(control_dir, ignore_errors=True)
     control_dir.mkdir(parents=True, exist_ok=True)
     control = control_dir / "readable.txt"
     control.write_bytes(b"CONTROL_READABLE\n")
+    # 自带授权 (评估方全权 + Everyone 只读), 不依赖继承; 必须保留评估方写权限,
+    # 否则下一轮 rmtree 清理对照目录会因缺 DELETE 而失败。
+    _icacls(str(control_dir), "/inheritance:r")
+    _icacls(str(control_dir), "/grant:r", f"{current_user()}:(OI)(CI)F")
+    _icacls(str(control_dir), "/grant", f"*{EVERYONE_SID}:(OI)(CI)R")
     try:
         control_code = low_child_exit_code(
             f'type "{_escape_quotes(str(control))}" >nul 2>&1', private_dir)
