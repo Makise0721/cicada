@@ -751,6 +751,11 @@ def _runner_command(manifest_path: Path, prepared_root: Path, workspace: Path) -
             f"--workspace '{workspace}'")
 
 
+def source_sha256(path: Path) -> str:
+    """Python 源码按 LF 冻结, 兼容 Git 检出时的 CRLF 转换。"""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def runtime_identity() -> dict:
     """产出准入的 harness 与生产源码身份。
 
@@ -767,9 +772,9 @@ def runtime_identity() -> dict:
         project / "tests" / "support" / "swebench_bridge.py",
         project / "tests" / "support" / "swebench_cost.py",
     ]
-    identity = {p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+    identity = {p.relative_to(project).as_posix(): source_sha256(p)
                 for p in tracked if p.is_file()}
-    identity.update({p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+    identity.update({p.relative_to(project).as_posix(): source_sha256(p)
                      for p in sorted((project / "src").rglob("*.py"))})
     return identity
 

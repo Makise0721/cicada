@@ -482,7 +482,7 @@ def build_lock(spec: TaskSpec, row: dict, verifier: dict, image: dict,
             "manifest": manifest.to_json(),
             "ls_files_match_container": receipt.get("workspace_identity", {}).get("ls_files_match")},
         "cicada": {
-            "source_sha256": {str(p.relative_to(PROJECT)).replace("\\", "/"): sha256_file(p)
+            "source_sha256": {p.relative_to(PROJECT).as_posix(): lifecycle.source_sha256(p)
                               for p in sorted((PROJECT / "src").rglob("*.py"))},
             # harness 身份必须一起冻结: attempt 闸与隔离封印都在 tests/ 下, 只冻结
             # src/** 会让"真钱闸可被替换而身份检查全绿" (审查 P1-B)。
@@ -554,7 +554,7 @@ def verify_frozen_identity(spec: TaskSpec, lock: dict, run_root: Path) -> list[s
         if not mounted.is_file() or sha256_file(mounted) != digest:
             problems.append("mounted verifier differs from lock")
             break
-    expected_sources = {p.relative_to(PROJECT).as_posix(): sha256_file(p)
+    expected_sources = {p.relative_to(PROJECT).as_posix(): lifecycle.source_sha256(p)
                         for p in sorted((PROJECT / "src").rglob("*.py"))}
     if lock.get("cicada", {}).get("source_sha256") != expected_sources:
         problems.append("production source manifest differs from lock")

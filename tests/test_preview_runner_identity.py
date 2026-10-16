@@ -15,6 +15,22 @@ from tests.support import swebench_tasks as tasks
 PUBLIC_INPUTS = tasks.PUBLIC_VALIDATION / "inputs"
 
 
+def test_runtime_identity_survives_checkout_line_endings_but_detects_edits(monkeypatch):
+    """准入身份跨 LF/CRLF 检出保持一致, 但不能漏掉实际源码改动。"""
+    from tests.support import swebench_lifecycle as lifecycle
+
+    read_bytes = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes",
+                        lambda path: read_bytes(path).replace(b"\r\n", b"\n"))
+    expected = lifecycle.runtime_identity()
+    monkeypatch.setattr(Path, "read_bytes", lambda path: read_bytes(path)
+                        .replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    assert lifecycle.runtime_identity() == expected
+    monkeypatch.setattr(Path, "read_bytes", lambda path: read_bytes(path) + b"# edit\n")
+    assert all(value != expected[name]
+               for name, value in lifecycle.runtime_identity().items())
+
+
 def _manifest(task_key: str) -> dict:
     path = tasks.manifest_path_for(task_key)
     if not path.is_file():
