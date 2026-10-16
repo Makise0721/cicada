@@ -118,6 +118,9 @@ def test_run_subcommand_refuses_without_authorization(tmp_path):
 
     PV02 后 run 的语义是"缺 --live 跑离线演练, --live 需另获授权"。无论哪条,
     "没有闸就不发送"与"没有授权就不发送"都必须成立且零请求。
+
+    注意: 用**合法 profile** 才能走到 live 分支 —— 传 None 会在缺 profile 处短路,
+    那样测的只是第一条闸 (审查 P2-7)。
     """
     from tests.e2e import preview_runner as runner
     from types import SimpleNamespace
@@ -129,8 +132,17 @@ def test_run_subcommand_refuses_without_authorization(tmp_path):
                 prepared_root=str(tmp_path))
     # 1) 缺 --cost-profile: 没有 attempt 总额度闸, 一律不发送。
     assert runner.cmd_run(SimpleNamespace(live=False, cost_profile=None, **base)) == 2
-    # 2) --live 但无授权记录: 拒绝, 零请求。
-    assert runner.cmd_run(SimpleNamespace(live=True, cost_profile=None, **base)) == 2
+    # 2) 无授权记录时 --live 必须拒绝 (此例真正走到 live 分支)。
+    profile = tmp_path / "profile.json"
+    profile.write_text(json.dumps({
+        "schema_version": 1,
+        "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
+        "checked_at": "2026-10-15",
+        "models": {"deepseek-flash": {"input_cny_per_million": "2",
+                                      "output_cny_per_million": "8"}}},
+        ensure_ascii=False), encoding="utf-8")
+    assert runner.cmd_run(
+        SimpleNamespace(live=True, cost_profile=str(profile), **base)) == 2
 
 
 def test_prepare_does_not_overwrite_existing_attempt_receipt(tmp_path):
@@ -157,7 +169,8 @@ def test_prepare_does_not_overwrite_existing_attempt_receipt(tmp_path):
 
 def _report_args(manifest: Path, run_root: Path):
     from types import SimpleNamespace
-    return SimpleNamespace(manifest=str(manifest), run_root=str(run_root))
+    return SimpleNamespace(manifest=str(manifest), run_root=str(run_root),
+                           admission=None)
 
 
 def test_report_refuses_pass_without_calibration_evidence(tmp_path):

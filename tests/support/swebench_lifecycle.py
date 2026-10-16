@@ -22,6 +22,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import contextlib
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -108,13 +109,21 @@ class GateObservation:
     closed: bool = False
     transport_error: str | None = None
     resolved: bool = False
+    # 结算需要**两侧证据齐备**: transport 侧 (2xx + usage + DONE + EOF + 流已关闭)
+    # 与**生产侧** (模型自己的终结事件, 且其计量与观察到的 usage 逐位一致)。
+    # 规格 §3 要求"完整合法 usage、成功终局、DONE、EOF、响应关闭和生产确认
+    # 全部具备后才结算一次"; 缺生产确认就保留 pending 并封口, 不当作已结算。
+    transport_complete: bool = False
+    production_seen: bool = False
+    production_terminal: str | None = None
+    production_ok: bool = False
 
 
 class AttemptGateTransport(httpx.AsyncBaseTransport):
-    """发送前经 ``AttemptBudget`` 预留; 只有完整 usage + DONE + EOF + 2xx 才结算。
+    """发送前经 ``AttemptBudget`` 预留; 两侧证据齐备才结算。
 
-    结算条件刻意严格: 任何一项缺失都保留 pending 并封口 (不把无法确认的发送
-    写成已结算)。
+    结算条件刻意严格: transport 事实与生产确认缺一不可, 任一缺失都保留 pending
+    并封口 (不把无法确认的发送写成已结算)。
     """
 
     def __init__(self, inner: httpx.AsyncBaseTransport, budget: AttemptBudget, *,
@@ -128,6 +137,7 @@ class AttemptGateTransport(httpx.AsyncBaseTransport):
         self.observations: dict[str, GateObservation] = {}
         self.handoffs = 0
         self.settled_ids: list[str] = []
+        self.resolved_ids: list[str] = []
         self.network_sealed_reason: str | None = None
         self.active_call_id: str | None = None
         self.admitting = False
@@ -180,17 +190,15 @@ class AttemptGateTransport(httpx.AsyncBaseTransport):
         return response
 
     def _finish(self, observation: GateObservation) -> None:
-        """流耗尽后的结算点; 条件不齐即封口且保留 pending。
+        """流耗尽: 记录 transport 侧事实; 不完整即**立刻封口**, 完整则等生产确认。
 
-        幂等: httpx 可能在迭代结束与显式关闭时各调一次 ``aclose``。结算必须
-        只发生一次 —— 第二次进入直接返回, 而不是把"已结算"当矛盾抛出去
-        (那会把正常收尾误报成摘要失败)。
+        幂等: httpx 可能在迭代结束与显式关闭时各调一次 ``aclose``。第二次进入
+        直接返回, 而不是把"已结算"当矛盾抛出去 (那会把正常收尾误报成失败)。
         """
-        if observation.resolved:
+        if observation.transport_complete or observation.resolved:
             return
-        observation.resolved = True
         self.active_call_id = None
-        complete = (
+        observation.transport_complete = (
             observation.transport_error is None
             and isinstance(observation.http_status, int)
             and 200 <= observation.http_status < 300
@@ -198,17 +206,65 @@ class AttemptGateTransport(httpx.AsyncBaseTransport):
             and observation.eof_seen
             and observation.closed
             and isinstance(observation.usage, dict))
+        if not observation.transport_complete:
+            # 规格: 部分异常/usage 缺失/关闭失败一律**保留 pending 并封口**。
+            # 不回退成"留着不封口"—— 那会允许下一笔发送与一条未决预留并存。
+            self._resolve(observation, complete=False)
+            return
+        self._maybe_settle(observation)
+
+    def confirm(self, call_id: str, terminal) -> None:
+        """生产侧确认: 模型自己的终结事件必须成功, 且计量与观察到的 usage 一致。
+
+        由 ``observe_model_stream`` 在模型 stream 耗尽后调用 (与旧栈同一接缝)。
+        """
+        observation = self.observations.get(call_id)
+        if observation is None or observation.resolved:
+            return
+        observation.production_seen = True
+        observation.production_terminal = None if terminal is None else terminal.stop_reason
+        ok = (terminal is not None and terminal.stop_reason in ("stop", "tool_use")
+              and terminal.error is None and terminal.metrics is not None)
+        if ok and isinstance(observation.usage, dict):
+            usage = observation.usage
+            try:
+                ok = (terminal.metrics.input_tokens == int(usage["prompt_tokens"])
+                      and terminal.metrics.output_tokens == int(usage["completion_tokens"]))
+            except (KeyError, TypeError, ValueError):
+                ok = False
+        observation.production_ok = bool(ok)
+        if not observation.production_ok:
+            # 生产确认失败同样是"部分异常": 立刻封口并保留 pending。
+            self._resolve(observation, complete=False)
+            return
+        self._maybe_settle(observation)
+
+    def _maybe_settle(self, observation: GateObservation) -> None:
+        """两侧证据齐备才结算一次; 未齐备则保持未决 (不猜测)。"""
+        if observation.resolved:
+            return
+        if not (observation.transport_complete and observation.production_seen):
+            return
+        self._resolve(observation, complete=observation.production_ok)
+
+    def _resolve(self, observation: GateObservation, *, complete: bool) -> None:
+        observation.resolved = True
         metrics = None
-        if complete:
+        if complete and isinstance(observation.usage, dict):
             usage = observation.usage
             try:
                 metrics = ModelMetrics(input_tokens=int(usage["prompt_tokens"]),
                                        output_tokens=int(usage["completion_tokens"]))
             except (KeyError, TypeError, ValueError):
                 metrics = None
-        self.budget.settle(observation.call_id, metrics, complete=complete,
-                           closed=observation.closed)
-        self.settled_ids.append(observation.call_id)
+        # 结算可能返回 False (封口保留 pending); 分开记"已了结"与"真结算", 否则
+        # 把未结算的也报成 settled 会让人误以为金额已释放 (审查 P3-1)。
+        settled_ok = bool(self.budget.settle(observation.call_id, metrics,
+                                             complete=complete,
+                                             closed=observation.closed))
+        self.resolved_ids.append(observation.call_id)
+        if settled_ok:
+            self.settled_ids.append(observation.call_id)
 
 
 class _ObservedStream(httpx.AsyncByteStream):
@@ -226,7 +282,14 @@ class _ObservedStream(httpx.AsyncByteStream):
             async for chunk in self.inner:
                 self._scan(chunk)
                 yield chunk
-        finally:
+        except BaseException as exc:
+            # 流中途异常必须留痕: 否则"已见 usage/DONE"会把一条失败的流误判为完整
+            # (审查 P1-A 实测: DONE 之后连接重置曾被当作完整结算)。
+            self.observation.transport_error = type(exc).__name__
+            raise
+        else:
+            # 只有**自然耗尽**才算 EOF; 消费者提前 break 时 eof_seen 保持 False
+            # (保守: 未证完整就不结算)。
             self.observation.eof_seen = True
 
     def _scan(self, chunk: bytes) -> None:
@@ -254,6 +317,54 @@ class _ObservedStream(httpx.AsyncByteStream):
         finally:
             self.observation.closed = True
             self.transport._finish(self.observation)
+
+
+# --- 生产确认: 包装模型 stream 取得终结事实 ---
+
+
+def observe_model_stream(original, gate):
+    """包装 ``DeepSeekModel.stream``, 把模型自己的终结事件交给闸做生产确认。
+
+    与旧栈同一接缝: 一次 stream 期间新出现的预订必须恰好一条, 否则视为归因不明
+    并封口 (宁可停在未结算, 也不把别人的 usage 记到这笔上)。事件与请求内容不变。
+    """
+    from cicada.core.ports import StreamDone
+
+    async def observed(model, request, cancel):
+        before = len(gate.observations)
+        terminal = None
+        completed = False
+        try:
+            async for event in original(model, request, cancel):
+                if isinstance(event, StreamDone):
+                    terminal = event
+                else:
+                    yield event
+            completed = True
+        finally:
+            new_ids = list(gate.observations)[before:]
+            if len(new_ids) != 1:
+                gate.seal_network("ambiguous-call-correlation")
+                gate.budget.seal("ambiguous call correlation")
+            else:
+                gate.confirm(new_ids[0], terminal if completed else None)
+        if terminal is not None:
+            yield terminal
+
+    return observed
+
+
+@contextlib.contextmanager
+def production_confirmation(gate):
+    """在会话使用期间把生产确认接到 ``DeepSeekModel.stream`` 上, 退出时严格还原。"""
+    from cicada.plugins.deepseek.model import DeepSeekModel
+
+    original = DeepSeekModel.stream
+    DeepSeekModel.stream = observe_model_stream(original, gate)
+    try:
+        yield
+    finally:
+        DeepSeekModel.stream = original
 
 
 # --- 生产启动配置 ---
@@ -367,17 +478,19 @@ async def run_process_1(spec: LifecycleSpec, transport, *, system_prompt: str,
     prompts = build_prompts(spec.instruction)["prompts"]
     try:
         facts["session_id"] = session.persistence.session_id
-        for name in ("R1", "R2"):
-            outcome = await session.execute(prompts[name])
-            facts["requests"].append(_request_facts(name, outcome))
-            # 每个请求结束都检查业务 manifest 未变 (只读纪律)。
-            manifest_after = bridge.workspace_manifest(spec.workspace, git)
-            if manifest_after.to_json() != manifest_before.to_json():
-                facts["manifest_unchanged"] = False
-                facts["dirty_after"] = name
-                break
-        else:
-            facts["manifest_unchanged"] = True
+        # 生产确认必须在场: 每次发送的结算要求模型自己的终结事件与观察到的 usage 一致。
+        with production_confirmation(transport):
+            for name in ("R1", "R2"):
+                outcome = await session.execute(prompts[name])
+                facts["requests"].append(_request_facts(name, outcome))
+                # 每个请求结束都检查业务 manifest 未变 (只读纪律)。
+                manifest_after = bridge.workspace_manifest(spec.workspace, git)
+                if manifest_after.to_json() != manifest_before.to_json():
+                    facts["manifest_unchanged"] = False
+                    facts["dirty_after"] = name
+                    break
+            else:
+                facts["manifest_unchanged"] = True
         facts["completed_events"] = log.completed
         facts["state"] = session.persistence.mode
         facts["closed_ok"] = True
@@ -402,25 +515,28 @@ async def run_process_2(spec: LifecycleSpec, transport, budget: AttemptBudget, *
         facts["restored_request_ids"] = restored_ids
         # 恢复出的旧回执只是历史: 记录其只读暴露, 不作为当前权威。
         facts["historical_receipts_have_current_authority"] = False
-        try:
-            compacted = await session.compact_context()
-        except RuntimeError as exc:
-            # 摘要失败时把模型侧的 error 终结事实附上, 否则错误只剩一个 "error" 分类。
-            from cicada.core.events import RunFinished
-            errors = [e.event.error for e in log.events
-                      if isinstance(e, RunFinished) and e.event.error]
-            exc.add_note(f"summary terminal errors: {errors[-2:]} "
-                         f"gate={getattr(transport, 'network_sealed_reason', None)}")
-            raise
-        facts["compacted"] = None if compacted is None else {            "summary_id": compacted.summary_id,
-            "first_request_seq": compacted.first_request_seq,
-            "last_request_seq": compacted.last_request_seq,
-            "message_count": compacted.message_count,
-            "end_message_index": compacted.end_message_index,
-            "reason": compacted.reason}
-        facts["context_compacted_events"] = len(log.compacted)
-        facts["projection_blocks"] = len(session._context_projection.blocks)
-        outcome = await session.execute(prompts["R3"])
+        # 摘要与 R3 的发送同样需要生产确认在场才结算。
+        with production_confirmation(transport):
+            try:
+                compacted = await session.compact_context()
+            except RuntimeError as exc:
+                # 摘要失败时附上模型侧的终结事实, 否则错误只剩一个 "error" 分类。
+                from cicada.core.events import RunFinished
+                errors = [e.event.error for e in log.events
+                          if isinstance(e, RunFinished) and e.event.error]
+                exc.add_note(f"summary terminal errors: {errors[-2:]} "
+                             f"gate={getattr(transport, 'network_sealed_reason', None)}")
+                raise
+            facts["compacted"] = None if compacted is None else {
+                "summary_id": compacted.summary_id,
+                "first_request_seq": compacted.first_request_seq,
+                "last_request_seq": compacted.last_request_seq,
+                "message_count": compacted.message_count,
+                "end_message_index": compacted.end_message_index,
+                "reason": compacted.reason}
+            facts["context_compacted_events"] = len(log.compacted)
+            facts["projection_blocks"] = len(session._context_projection.blocks)
+            outcome = await session.execute(prompts["R3"])
         facts["requests"] = [_request_facts("R3", outcome)]
         facts["completed_events"] = log.completed
         facts["closed_ok"] = True
@@ -635,6 +751,29 @@ def _runner_command(manifest_path: Path, prepared_root: Path, workspace: Path) -
             f"--workspace '{workspace}'")
 
 
+def runtime_identity() -> dict:
+    """产出准入的 harness 与生产源码身份。
+
+    为什么要它: admission 若只记题目身份与限额, 换掉 harness 后旧 admission 仍然
+    "看起来有效"。把实际产出它的源码 hash 记进准入, 漂移才能被发现 (旧栈同一做法)。
+    """
+    project = Path(__file__).resolve().parents[2]
+    tracked = [
+        project / "tests" / "e2e" / "preview_runner.py",
+        project / "tests" / "support" / "swebench_budget.py",
+        project / "tests" / "support" / "swebench_lifecycle.py",
+        project / "tests" / "support" / "swebench_isolation.py",
+        project / "tests" / "support" / "swebench_tasks.py",
+        project / "tests" / "support" / "swebench_bridge.py",
+        project / "tests" / "support" / "swebench_cost.py",
+    ]
+    identity = {p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in tracked if p.is_file()}
+    identity.update({p.relative_to(project).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in sorted((project / "src").rglob("*.py"))})
+    return identity
+
+
 def rehearsal_plan(prepared_root: Path, manifest_path: Path) -> dict:
     """离线演练的静态输入核对与 prompt hash 冻结 (不执行任何模型请求)。"""
     prepared_root = Path(prepared_root).resolve()
@@ -713,9 +852,13 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
                          checks=checks, model_doc=manifest["model"],
                          max_turns=50, restore_capture=False)
 
-    if attempt_root.exists():
-        shutil.rmtree(attempt_root, ignore_errors=True)
-    attempt_root.mkdir(parents=True)
+    if attempt_root.exists() and any(attempt_root.iterdir()):
+        # 不覆盖既有 attempt: 先失败后成功时同一路径只留成功那份, 等于掩盖失败
+        # (审查 P1-C 实测过既有 admission 被无声删除)。
+        raise AttemptBudgetError(
+            f"attempt root already exists and is not empty: {attempt_root}; "
+            "refusing to overwrite existing attempt evidence")
+    attempt_root.mkdir(parents=True, exist_ok=True)
     # 生产进程账本: 每个进程各一本 (产品规则"重启新建额度"), 与 attempt 总闸分开记。
     from decimal import Decimal
 
@@ -746,6 +889,12 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
                    "prompt_sha256": plan["prompt_sha256"],
                    "instruction_sha256": plan["instruction_sha256"],
                    "allowed_paths": list(allowed),
+                   "profile_sha256": profile.sha256,
+                   "manifest_sha256": hashlib.sha256(
+                       Path(manifest_path).resolve().read_bytes()).hexdigest(),
+                   "prepared_lock_sha256": hashlib.sha256(
+                       (prepared_root / "lock.json").read_bytes()).hexdigest(),
+                   "runtime_sha256": runtime_identity(),
                    "live": "not-run"}
 
     if manifest["scenario"] == "coding":
@@ -767,12 +916,24 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
         spec, gate1, system_prompt=system_prompt, prompt_info=prompt_info))
     facts["process_1"]["gate"] = {"handoffs": gate1.handoffs,
                                   "settled": len(gate1.settled_ids),
+                                  "resolved": len(gate1.resolved_ids),
                                   "sealed": gate1.network_sealed_reason}
     process_ledgers["process-1"] = _ledger_facts(spec.cost_control)
     # 第一进程用剩余工作时长记账; checkpoint 只记事实。
+    # 前置必须在**起第二进程之前**强制 —— 否则会带着一个未提交的 attempt 继续花真钱
+    # (审查 P2-1)。三个事实都要: 两次请求都提交、无存档错误、模型正常终局。
+    p1_requests = facts["process_1"].get("requests") or []
     if facts["process_1"]["manifest_unchanged"] is not True:
         facts["outcome"] = "offline-failed"
         facts["reason"] = "R1/R2 changed the workspace or did not both commit"
+        budget.release()
+        return facts
+    unmet = [r["name"] for r in p1_requests
+             if not r.get("saved") or r.get("save_error") or r.get("stop_reason") != "stop"]
+    if len(p1_requests) != 2 or unmet:
+        facts["outcome"] = "offline-failed"
+        facts["reason"] = ("process-1 did not finish two cleanly committed requests: "
+                           f"{unmet or 'missing requests'}")
         budget.release()
         return facts
     checkpoint = budget.close_checkpoint(process_identity={"pid": "process-1"})
@@ -796,6 +957,7 @@ def run_rehearsal(*, prepared_root: Path, manifest_path: Path, attempt_root: Pat
         system_prompt=system_prompt, prompt_info=prompt_info))
     facts["process_2"]["gate"] = {"handoffs": gate2.handoffs,
                                   "settled": len(gate2.settled_ids),
+                                  "resolved": len(gate2.resolved_ids),
                                   "sealed": gate2.network_sealed_reason}
     process_ledgers["process-2"] = _ledger_facts(spec2.cost_control)
     facts["process_ledgers"] = process_ledgers
@@ -857,7 +1019,8 @@ async def run_process_coding(spec: LifecycleSpec, transport, *, system_prompt: s
     session.subscribe(log)
     facts: dict = {"requests": [], "compacted": 0}
     try:
-        outcome = await session.execute(build_coding_prompt(spec.instruction))
+        with production_confirmation(transport):
+            outcome = await session.execute(build_coding_prompt(spec.instruction))
         facts["requests"].append(_request_facts("coding", outcome))
         facts["completed_events"] = log.completed
     finally:
@@ -881,6 +1044,7 @@ def _run_coding(*, spec, facts, budget, allowed, edits, deadline, prompt_info,
         spec, gate, system_prompt=system_prompt, prompt_info=prompt_info))
     facts["process_1"]["gate"] = {"handoffs": gate.handoffs,
                                   "settled": len(gate.settled_ids),
+                                  "resolved": len(gate.resolved_ids),
                                   "sealed": gate.network_sealed_reason}
     process_ledgers["process-1"] = _ledger_facts(spec.cost_control)
     facts["process_ledgers"] = process_ledgers

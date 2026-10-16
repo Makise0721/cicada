@@ -484,6 +484,9 @@ def build_lock(spec: TaskSpec, row: dict, verifier: dict, image: dict,
         "cicada": {
             "source_sha256": {str(p.relative_to(PROJECT)).replace("\\", "/"): sha256_file(p)
                               for p in sorted((PROJECT / "src").rglob("*.py"))},
+            # harness 身份必须一起冻结: attempt 闸与隔离封印都在 tests/ 下, 只冻结
+            # src/** 会让"真钱闸可被替换而身份检查全绿" (审查 P1-B)。
+            "harness_sha256": lifecycle.runtime_identity(),
             "git_head": subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT,
                                        capture_output=True, text=True).stdout.strip(),
             "git_tree": subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=PROJECT,
@@ -555,6 +558,22 @@ def verify_frozen_identity(spec: TaskSpec, lock: dict, run_root: Path) -> list[s
                         for p in sorted((PROJECT / "src").rglob("*.py"))}
     if lock.get("cicada", {}).get("source_sha256") != expected_sources:
         problems.append("production source manifest differs from lock")
+    # harness 身份: attempt 闸/隔离封印都在 tests/ 下, 必须与 lock 冻结的一致。
+    if lock.get("cicada", {}).get("harness_sha256") != lifecycle.runtime_identity():
+        problems.append(
+            "harness source manifest differs from lock; the admission gate changed "
+            "since prepare")
+    # 冻结提交必须真的等于当前提交 (此前只记录不校验 —— 审查 P1-B)。
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=PROJECT,
+                          capture_output=True, text=True).stdout.strip()
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], cwd=PROJECT,
+                          capture_output=True, text=True).stdout.strip()
+    if lock.get("cicada", {}).get("git_head") != head:
+        problems.append(
+            f"cicada HEAD differs from lock ({lock.get('cicada', {}).get('git_head')} "
+            f"!= {head}); re-run prepare on the frozen commit")
+    if lock.get("cicada", {}).get("git_tree") != tree:
+        problems.append("cicada tree differs from lock")
     # P1 隔离: 每次准入重跑负向验收, 不只信 prepare 时的一次结论。
     # 底层内核规则被 DSH 文档自标 unconfirmed, 故必须每次实测 (读/删/改名/覆写
     # 必须失败、评估方必须可读), 任一不符即阻断。
@@ -806,9 +825,9 @@ def cmd_run(args) -> int:
         facts = lifecycle.run_rehearsal(
             prepared_root=prepared, manifest_path=manifest,
             attempt_root=run_root / "attempt", profile=profile)
+        # 只写 attempt root: prepared root 是冻结输入, 覆盖它等于改动已签名材料
+        # (审查 P1-C)。report 需要时用 --admission 显式指路, 不做隐式副本。
         write_json(run_root / "offline-admission.json", facts)
-        # 同写入 prepared root: report 以 prepared root 为 run-root, 两处都留才能核对。
-        write_json(prepared / "offline-admission.json", facts)
         summary = {
             "outcome": facts["outcome"], "task_key": spec.task_key,
             "live": facts["live"], "model_requests": 0,
@@ -852,8 +871,10 @@ def cmd_report(args) -> int:
         # (spec: 缺少任何必须证据时不得 overall passed)。
         identity_problems = verify_frozen_identity(spec, lock, run_root)
         # 双账本: 生产进程账本与 attempt 总账**分开**输出, 不用其中一份替代另一份。
-        # 离线演练产物在 prepared root 的 offline-admission.json。
-        admission_path = run_root / "offline-admission.json"
+        # 离线演练产物在 attempt root (由 run 写出); report 的 --run-root 是 prepared
+        # root (lock 在此), 故用 --admission 显式指向 attempt 的产物。
+        admission_path = (Path(args.admission).resolve() if args.admission
+                          else run_root / "offline-admission.json")
         admission = load_json(admission_path) if admission_path.is_file() else None
         process_ledgers = (admission or {}).get("process_ledgers")
         attempt_ledger = (admission or {}).get("attempt_ledger")
@@ -929,7 +950,7 @@ def main() -> int:
             ("dry-run", "静态离线准入核对; 不启动容器、不发请求"),
             ("check", "导出当前补丁并在新容器官方评测 (0/1/2)"),
             ("grade", "重新导出最终补丁并在全新容器复评"),
-            ("report", "只重组已有事实, 不重新评分"),
+            ("report", "只重组已有事实, 不重新评分; --admission 显式指向演练产物"),
             ("run", "生命周期 launcher: 缺 --live 时跑离线全路径演练; --live 需另获授权")):
         sub_parser = sub.add_parser(name, help=help_text)
         sub_parser.add_argument("--manifest", required=True)
@@ -938,6 +959,10 @@ def main() -> int:
             sub_parser.add_argument("--workspace", required=True)
         if name == "grade":
             sub_parser.add_argument("--workspace", default=None)
+        if name == "report":
+            sub_parser.add_argument(
+                "--admission", default=None,
+                help="离线演练产物 offline-admission.json 的路径; 默认取 run-root 下")
         if name == "run":
             sub_parser.add_argument("--prepared-root", required=True)
             sub_parser.add_argument(

@@ -442,7 +442,9 @@ def _process_alive(pid) -> bool:
 
         handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
-            return False
+            # 打不开句柄**不等于进程已死**: 权限不足也会失败。顶替一个可能仍存活
+            # 的持有者会让两个进程同时消费同一 attempt, 故一律保守当作存活。
+            return True
         try:
             code = ctypes.c_ulong()
             ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
