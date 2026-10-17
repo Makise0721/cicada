@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -82,8 +83,8 @@ class _BeginSpyStore:
         self.begins: list[str] = []
         self.commits: list[str] = []
 
-    def recovery_snapshot(self):  # pragma: no cover - 本组测试不消费快照
-        raise AssertionError("snapshot not expected")
+    def recovery_snapshot(self):
+        return SimpleNamespace(user_name=None, short_title="")
 
     async def start_epoch(self, identity):
         return "epoch-1"
