@@ -348,22 +348,31 @@ def observe_model_stream(original, gate, diagnostics: dict | None = None):
             completed = True
         finally:
             new_ids = list(gate.observations)[before:]
-            if len(new_ids) != 1:
-                gate.seal_network("ambiguous-call-correlation")
-                gate.budget.seal("ambiguous call correlation")
-            else:
-                gate.confirm(new_ids[0], terminal if completed else None)
-            if diagnostics is not None:
-                # 决策之后落痕: 这样"为什么封口"与新预订数一起可读 (首题 live 缺的就是它)。
-                diagnostics.setdefault("streams", []).append({
-                    "new_correlations": len(new_ids),
-                    "terminal": None if terminal is None else terminal.stop_reason,
-                    "terminal_error": None if terminal is None else terminal.error,
-                    "completed": completed,
-                    "network_sealed": gate.network_sealed_reason,
-                    "attempt_sealed": getattr(getattr(gate, "budget", None),
-                                              "sealed_reason", None),
-                })
+            decision_error = None
+            try:
+                if len(new_ids) != 1:
+                    gate.seal_network("ambiguous-call-correlation")
+                    gate.budget.seal("ambiguous call correlation")
+                else:
+                    gate.confirm(new_ids[0], terminal if completed else None)
+            except BaseException as exc:
+                decision_error = type(exc).__name__
+                raise
+            finally:
+                if diagnostics is not None:
+                    # 确认/封口本身可能因父进程失联而失败，仍须留痕并传播原异常。
+                    record = {
+                        "new_correlations": len(new_ids),
+                        "terminal": None if terminal is None else terminal.stop_reason,
+                        "terminal_error": None if terminal is None else terminal.error,
+                        "completed": completed,
+                        "network_sealed": gate.network_sealed_reason,
+                        "attempt_sealed": getattr(getattr(gate, "budget", None),
+                                                  "sealed_reason", None),
+                    }
+                    if decision_error is not None:
+                        record["decision_error"] = decision_error
+                    diagnostics.setdefault("streams", []).append(record)
         if terminal is not None:
             yield terminal
 

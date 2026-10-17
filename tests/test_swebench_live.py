@@ -313,13 +313,16 @@ def test_broker_audit_trail_records_route_decisions(tmp_path):
     asyncio.run(run())
 
 
-def test_ambiguous_correlation_seal_is_recorded_in_diagnostics():
+@pytest.mark.parametrize("failure", [None, "confirm", "seal"])
+def test_ambiguous_correlation_seal_is_recorded_in_diagnostics(failure):
     """封口语义不变, 但"为什么封口"必须留痕 (新预订数/终局/错误分类)。"""
     class FakeBudget:
         sealed_reason = None
 
         def seal(self, reason):
             self.sealed_reason = self.sealed_reason or reason
+            if failure == "seal":
+                raise ConnectionError("parent unavailable")
 
     class FakeGate:
         def __init__(self):
@@ -331,7 +334,8 @@ def test_ambiguous_correlation_seal_is_recorded_in_diagnostics():
             self.network_sealed_reason = self.network_sealed_reason or reason
 
         def confirm(self, call_id, terminal):
-            raise AssertionError("no correlation must never be confirmed")
+            assert failure == "confirm"
+            raise ConnectionError("parent unavailable")
 
     from cicada.core.ports import StreamDone
 
@@ -339,17 +343,28 @@ def test_ambiguous_correlation_seal_is_recorded_in_diagnostics():
     diagnostics: dict = {}
 
     async def original(model, request, cancel):
+        if failure == "confirm":
+            gate.observations["call-1"] = True
         yield StreamDone("stop")
 
     async def run():
         observed = lifecycle.observe_model_stream(original, gate, diagnostics)
-        events = [event async for event in observed(None, None, None)]
-        assert [event.stop_reason for event in events] == ["stop"]
+        if failure is None:
+            events = [event async for event in observed(None, None, None)]
+            assert [event.stop_reason for event in events] == ["stop"]
+        else:
+            with pytest.raises(ConnectionError, match="parent unavailable"):
+                _ = [event async for event in observed(None, None, None)]
 
     asyncio.run(run())
-    assert gate.network_sealed_reason == "ambiguous-call-correlation"
-    assert gate.budget.sealed_reason == "ambiguous call correlation"
-    assert diagnostics["streams"] == [{
-        "new_correlations": 0, "terminal": "stop", "terminal_error": None,
-        "completed": True, "network_sealed": "ambiguous-call-correlation",
-        "attempt_sealed": "ambiguous call correlation"}]
+    network_reason = None if failure == "confirm" else "ambiguous-call-correlation"
+    attempt_reason = None if failure == "confirm" else "ambiguous call correlation"
+    assert gate.network_sealed_reason == network_reason
+    assert gate.budget.sealed_reason == attempt_reason
+    expected = {
+        "new_correlations": int(failure == "confirm"), "terminal": "stop", "terminal_error": None,
+        "completed": True, "network_sealed": network_reason,
+        "attempt_sealed": attempt_reason}
+    if failure is not None:
+        expected["decision_error"] = "ConnectionError"
+    assert diagnostics["streams"] == [expected]
