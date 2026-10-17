@@ -590,6 +590,7 @@ async def test_synchronous_materialization_over_deadline_cannot_complete(repo, m
     import cicada.plugins.coding.verification as verification_module
 
     verifier = await initialized(repo, CheckDefinition("check-1", "exit 0"))
+    exceeded = snapshot_module.CAPTURE_DEADLINE_S + 1.0
     offset = [0.0]
     clock = SimpleNamespace(monotonic=lambda: time.monotonic() + offset[0])
     monkeypatch.setattr(snapshot_module, "time", clock)
@@ -598,12 +599,12 @@ async def test_synchronous_materialization_over_deadline_cannot_complete(repo, m
 
     def exceed(*args):
         artifact = original(*args)
-        offset[0] = 11.0  # 同步物化结束时已经超过原10秒；不依赖event loop抢占。
+        offset[0] = exceeded  # 超过当前截止值；不依赖 event loop 抢占。
         return artifact
 
     verifier._write_diff = exceed
     finalized = await verifier.finalize_current(CancelToken())
-    assert offset[0] == 11.0
+    assert offset[0] == exceeded
     assert not finalized.evidence.complete
     assert finalized.evidence.failure_kind == "snapshot_unavailable"
     assert "timeout" in finalized.evidence.error
