@@ -224,10 +224,24 @@ def test_selector_then_wizard_then_main_screen_sequence(monkeypatch, tmp_path, r
     monkeypatch.setattr(terminal, 'stop', wizard_stop)
 
     async def selector(workspace):
+        from cicada.application import make_session_catalog_reader
         from cicada.ui.selector import run_session_selector
-        picker = ScriptTerminal([ENTER])
+        picker = ScriptTerminal([])
+        directory = workspace / '.cicada' / 'sessions'
+        reader = make_session_catalog_reader(directory=directory)
+
+        async def observe(cancel):
+            snapshot = await reader.observe(cancel)
+            asyncio.get_running_loop().call_soon(picker.emit, [ENTER])
+            return snapshot
+
         events.append('selector-start')
-        picked, errors = await run_session_selector(picker, workspace / '.cicada' / 'sessions')
+        try:
+            picked, errors = await asyncio.wait_for(
+                run_session_selector(picker, directory, observe=observe), timeout=10,
+            )
+        finally:
+            await reader.aclose()
         assert errors == [] and picker.stopped and terminal.starts == 0
         events.append('selector-stop')
         return picked
