@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import sys
 from pathlib import Path
 
@@ -33,11 +34,35 @@ from cicada.application import (
 )
 from cicada.persistence.contracts import LaunchIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.plugins.session_store.store import SQLiteSessionStore
 from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
 
 
 async def main() -> int:
-    mode, workspace, session_id, script_path = sys.argv[1:5]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('mode', choices=('run', 'resume'))
+    parser.add_argument('workspace')
+    parser.add_argument('session_id')
+    parser.add_argument('script_path')
+    parser.add_argument('--before-commit-ready', type=Path)
+    args = parser.parse_args()
+    mode, workspace, session_id, script_path = (
+        args.mode, args.workspace, args.session_id, args.script_path,
+    )
+    if args.before_commit_ready is not None:
+        assert mode == 'run', '提交前屏障仅用于 run 子进程'
+        original_commit = SQLiteSessionStore.commit_request
+        commit_calls = 0
+
+        async def held_commit(store, *commit_args, **commit_kwargs):
+            nonlocal commit_calls
+            commit_calls += 1
+            if commit_calls == 2:
+                args.before_commit_ready.write_text('ready', encoding='utf-8')
+                await asyncio.Event().wait()
+            return await original_commit(store, *commit_args, **commit_kwargs)
+
+        SQLiteSessionStore.commit_request = held_commit
     script = parse_script(Path(script_path).read_text(encoding="utf-8"))
     prompt, info = compose_system_prompt(Path(workspace), None, tools=DEFAULT_TOOLS, checks=())
     identity = LaunchIdentity(

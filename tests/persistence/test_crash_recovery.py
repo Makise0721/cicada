@@ -8,7 +8,7 @@ kill 点 (script 四幕: 答复 -> powershell A(gateA) -> powershell B(gateB) ->
 - after-begin:       请求开始后立即 kill (首活动登记与否按存档实况分支断言)
 - activity-open:     活动已登记、进程被 gate 挂住 (状态可持有, 确定性)
 - activity-terminal: A 已证终结、B 仍开放 (状态可持有, 确定性)
-- before-commit:     全部终结已登记、完整提交未落 (窄窗口, 失败换会话重试)
+- before-commit:     全部终结已登记、第二次提交在测试子进程屏障处等待
 - mid-commit:        提交事务 journal 在盘时 kill (窄窗口, 失败换会话重试)
 """
 
@@ -31,14 +31,18 @@ POLL_TIMEOUT_S = 30.0
 ATTEMPTS = 6
 
 
-def _spawn(mode: str, workspace: Path, session_id: str, script: Path) -> subprocess.Popen:
+def _spawn(mode: str, workspace: Path, session_id: str, script: Path,
+           *, before_commit_ready: Path | None = None) -> subprocess.Popen:
     env = {
         **os.environ,
         "PYTHONPATH": str(SRC),
         "PYTHONIOENCODING": "utf-8",
     }
+    command = [sys.executable, str(HARNESS), mode, str(workspace), session_id, str(script)]
+    if before_commit_ready is not None:
+        command.extend(['--before-commit-ready', str(before_commit_ready)])
     return subprocess.Popen(
-        [sys.executable, str(HARNESS), mode, str(workspace), session_id, str(script)],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -122,7 +126,7 @@ def _build_workspace(tmp_path: Path, gates: tuple[Path, Path]) -> tuple[Path, Pa
 
     script = tmp_path / "script.json"
     # 6 MiB 尾轮文本拉长完整提交事务的窗口 (编码在调用方线程、事务写盘在 worker),
-    # 让 before-commit/mid-commit 的窄窗口轮询可命中; 载荷仍低于 8 MiB v1 限额
+    # 让 mid-commit 的窄窗口轮询可命中; 载荷仍低于 8 MiB v1 限额
     script.write_text(json.dumps([
         {"text": "第一问回答", "stop": True},
         {"tool_calls": [{"id": "a1", "name": "powershell",
@@ -195,7 +199,7 @@ _KILL_POINTS = (
 def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
     gate_a = tmp_path / "gateA.txt"
     gate_b = tmp_path / "gateB.txt"
-    attempts = 1 if kill_point in ("after-begin", "activity-open", "activity-terminal") else ATTEMPTS
+    attempts = ATTEMPTS if kill_point == "mid-commit" else 1
     last_error: Exception | None = None
     for attempt in range(attempts):
         scope = tmp_path / f"attempt-{attempt}"
@@ -204,7 +208,8 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
         for gate in (gate_a, gate_b):
             if gate.exists():
                 gate.unlink()
-        child = _spawn("run", work, "new", script)
+        ready = scope / 'before-commit.ready' if kill_point == 'before-commit' else None
+        child = _spawn("run", work, "new", script, before_commit_ready=ready)
         try:
             _wait_line(child, "[request1 committed]")
             db = _session_dir(work)
@@ -228,7 +233,7 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                     "SELECT (SELECT COUNT(*) FROM process_activity WHERE end_json IS NOT NULL),"
                     " (SELECT COUNT(*) FROM process_activity WHERE end_json IS NULL)"
                 ), lambda rows: int(rows[0][0]) >= 1 and int(rows[0][1]) >= 1)
-            else:  # before-commit / mid-commit: 窄窗口
+            else:  # 两个活动均结束后，等待提交前屏障或事务 journal。
                 _poll(session_file,
                       "SELECT COUNT(*) FROM process_activity WHERE end_json IS NULL",
                       lambda rows: int(rows[0][0]) >= 1)
@@ -237,10 +242,19 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                       "SELECT COUNT(*) FROM process_activity WHERE end_json IS NOT NULL",
                       lambda rows: int(rows[0][0]) >= 1)
                 gate_b.write_text("go", encoding="utf-8")
+                if ready is not None:
+                    deadline = time.monotonic() + POLL_TIMEOUT_S
+                    while not ready.exists():
+                        assert child.poll() is None, 'child exited before commit barrier'
+                        assert time.monotonic() < deadline, 'commit barrier timed out'
+                        time.sleep(0.01)
+                    pending, open_acts, ended, committed = _counts(session_file)
+                    assert (pending, open_acts, committed) == (1, 0, 1)
+                    assert ended >= 2
                 journal = session_file.with_name(session_file.name + "-journal")
-                hit = False
+                hit = ready is not None
                 deadline = time.monotonic() + 8.0
-                while time.monotonic() < deadline:
+                while not hit and time.monotonic() < deadline:
                     try:
                         connection = _connect_ro(session_file)
                         try:
@@ -264,9 +278,6 @@ def test_crash_then_resume_yields_committed_prefix(tmp_path, kill_point):
                     # journal 命中必须叠加前置: B 的终结已落库且无开放活动,
                     # 否则 journal 可能属于 end_process 事务而非完整提交
                     if pending == 1 and open_acts == 0 and ended >= 2:
-                        if kill_point == "before-commit":
-                            hit = True
-                            break
                         if journal.exists():
                             hit = True
                             break
