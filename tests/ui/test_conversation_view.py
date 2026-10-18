@@ -354,8 +354,8 @@ async def test_commands_idle_only_with_escape_and_unknown_hint(tmp_path):
     )))
     h = Harness(session)
     try:
-        assert h.submit("/help") is True
-        assert any("/status" in line for line in h.lines())
+        assert h.submit("/help") is False  # 2026-10-18 用户裁决删除 /help: 按未知命令处理
+        assert any("未知命令" in line for line in h.lines())
         assert h.submit("/status") is True
         joined = "\n".join(strip_terminal_sequences(line) for line in h.lines())
         assert "状态: idle" in joined and "模型: fake" in joined

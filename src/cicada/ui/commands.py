@@ -3,6 +3,9 @@
 交互参考 pi-mono@1a584a7a packages/tui/src/components/editor.ts / select-list.ts
 （MIT, Copyright (c) 2025 Mario Zechner）：前缀筛选、上下循环选择、
 Enter 交回原提交路径、Escape 收起。所有输出仍由主屏 renderer 写入。
+
+菜单打开时输入框下方只留 COMMAND_MENU_MAX_ROWS 行候选 (底栏让位), 不显示
+分页计数行 (2026-10-18 用户裁决: 从 3 行候选增到 9 行, 其余信息隐去)。
 """
 
 from __future__ import annotations
@@ -23,8 +26,9 @@ class SlashCommand:
     takes_argument: bool = False
 
 
+COMMAND_MENU_MAX_ROWS = 9  # 菜单一次可见的候选行数 (不含已移除的分页计数行)
+
 SLASH_COMMANDS = (
-    SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
     SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill", takes_argument=True),
     SlashCommand("/diff", "审阅工作区差异"),
@@ -85,8 +89,7 @@ class SlashCommandMenu:
     def render(self, width: int, max_rows: int) -> list[str]:
         if not self._matches or max_rows <= 0:
             return []
-        show_count = len(self._matches) > max_rows and max_rows > 1
-        count = min(len(self._matches), max_rows - int(show_count))
+        count = min(len(self._matches), max_rows)
         start = max(0, min(self._index - count // 2, len(self._matches) - count))
         name_width = max(len(item.command) - 1 for item in SLASH_COMMANDS)
         lines: list[str] = []
@@ -109,8 +112,4 @@ class SlashCommandMenu:
                 )
             else:
                 lines.append(f"  {name}  " + theme.fg(theme.MUTED_GRAY, desc))
-        if show_count:
-            lines.append(theme.fg(theme.FOOTER_DIM, truncate_to_width(
-                f"  ({self._index + 1}/{len(self._matches)})", width
-            )))
         return lines

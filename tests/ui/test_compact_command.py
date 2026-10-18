@@ -18,7 +18,7 @@ from cicada.core.ports import ModelMetrics, StreamDone
 from cicada.persistence.contracts import StoredIdentity
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.session_store import open_session_store
-from cicada.ui.commands import SLASH_COMMANDS
+from cicada.ui.commands import SLASH_COMMANDS, SlashCommandMenu
 from cicada.ui.main_screen import strip_terminal_sequences
 
 from tests.support.app import identity as _identity
@@ -150,21 +150,20 @@ async def test_compact_guidance_for_non_persistent_and_no_budget(tmp_path):
             await store2.aclose()
 
 
-async def test_help_and_menu_list_compact_with_accurate_description(tmp_path):
-    """04: /help 与斜线菜单含 /compact, 描述与实际准入行为一致 (需持久会话)."""
+async def test_menu_lists_compact_with_accurate_description(tmp_path):
+    """04: 斜线菜单含 /compact, 描述与实际准入行为一致 (需持久会话)。
+
+    /help 已于 2026-10-18 删除, 命令发现只经输入 / 的菜单; 这里核对菜单渲染。
+    """
     assert any(
         item.command == "/compact" and "持久会话" in item.description
         for item in SLASH_COMMANDS
     )
-    session, _m, _c, _s = await _manual_session(tmp_path, script=[[StreamDone("stop")]])
-    harness = Harness(session)
-    try:
-        assert harness.submit("/help")
-        rendered = strip_terminal_sequences(chr(10).join(harness.lines(90)))
-        assert "/compact" in rendered
-        assert "摘要较早对话以释放上下文（需持久会话）" in rendered
-    finally:
-        await session.aclose()
+    menu = SlashCommandMenu()
+    menu.sync("/compact", at_end=True)
+    rendered = strip_terminal_sequences(chr(10).join(menu.render(90, 9)))
+    assert "compact" in rendered
+    assert "摘要较早对话以释放上下文（需持久会话）" in rendered
 
 
 async def test_compact_failure_shows_error_and_releases_barrier(tmp_path):

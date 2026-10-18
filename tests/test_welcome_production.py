@@ -30,7 +30,7 @@ PASTE = KeyPress(Keys.BracketedPaste, 'startup-sentinel')
 CTRL_D = KeyPress(Keys.ControlD, '')
 BACKSPACE = KeyPress(Keys.ControlH, '\b')
 _LOGO_CHARS = '█▄▀'
-_WELCOME_LEAKS = ('启动快照', '启动模型', '/help 帮助')
+_WELCOME_LEAKS = ('启动快照', '启动模型', '输入 / 查看命令')
 _BUSY_MARKERS = ('正在输出…', '正在收尾…', '正在取消…',
                  '正在执行…', '等待模型…', '正在思考…')  # 票据 02: 忙态文案全集
 
@@ -219,7 +219,7 @@ def test_new_session_welcome_reaches_real_tui_screen(monkeypatch, tmp_path, requ
     assert events == ['main-start', 'main-stop']
     welcome = main.notes.get('welcome_text')
     assert welcome is not None, '主屏未出现新会话欢迎'
-    for needle in ('新会话 · 启动快照', '[工作区]', '[启动模型]', '[Skills]', '/help 全部命令'):
+    for needle in ('新会话 · 启动快照', '[工作区]', '[启动模型]', '[Skills]', '输入 / 查看命令'):
         assert needle in welcome
     assert not any(mark in welcome for mark in _LOGO_CHARS), 'r2 起全宽度无标志'
     title = main.notes['title_line']
@@ -247,7 +247,7 @@ def test_resumed_session_welcome_has_no_logo_and_replies_again(monkeypatch, tmp_
     assert events == ['main-start', 'main-stop']
     welcome = main.notes.get('welcome_text')
     assert welcome is not None, '主屏未出现恢复欢迎'
-    for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '/help 帮助 · /status 状态'):
+    for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '输入 / 查看命令 · /status 状态'):
         assert needle in welcome
     assert not any(mark in welcome for mark in _LOGO_CHARS), '恢复短欢迎无标志'
     assert main.notes.get('restored_seen'), '恢复投影的旧记录不可见'

@@ -42,7 +42,7 @@ from typing import Callable
 
 from prompt_toolkit.keys import Keys
 
-from cicada.ui.commands import SlashCommand, SlashCommandMenu
+from cicada.ui.commands import COMMAND_MENU_MAX_ROWS, SlashCommand, SlashCommandMenu
 from cicada.ui import theme
 from cicada.ui.document_layout import (
     ACTION_EFFORT_CYCLE,
@@ -189,12 +189,28 @@ class MainScreenFrontend:
         status = self._status_lines(width) if self._status_lines is not None else []
         # 设计 §4: 编辑器正文 1–5 行; 低高度 (8 行) 时 1–3 行, 剩余给对话
         max_rows = min(5, max(3, int(rows * 0.3)))
-        footer = self._footer_lines(width, rows) if self._footer_lines is not None else []
+        menu: list[str] = []
         if self._document_focused():
-            menu: list[str] = []  # 文档焦点期间斜线菜单不同步不渲染 (C3)
+            slash_open = False  # 文档焦点期间斜线菜单不同步不渲染 (C3)
         else:
             self._sync_command_menu()
-            menu_budget = min(4, max(0, rows - len(footer) - 3))
+            # 斜线菜单打开时输入框下方只留候选 (2026-10-18 裁决): 其他信息隐去,
+            # 候选窗放宽到 COMMAND_MENU_MAX_ROWS 行
+            slash_open = (
+                self._command_menu is not None
+                and self._command_menu.selected is not None
+                and not self._model_menu_active()
+                and not (self._file_menu is not None and self._file_menu.visible)
+            )
+        footer = (
+            [] if slash_open
+            else (self._footer_lines(width, rows) if self._footer_lines is not None else [])
+        )
+        if not self._document_focused():
+            menu_budget = min(
+                COMMAND_MENU_MAX_ROWS if slash_open else 4,
+                max(0, rows - len(footer) - 3),
+            )
             if self._model_menu_active():
                 # 模型菜单 (DeepSeek 04) 与斜线菜单共用编辑器下方槽位; 两者不会同时打开
                 menu = self._model_menu.render(width, menu_budget)

@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 from prompt_toolkit.key_binding.key_processor import KeyPress
-from prompt_toolkit.keys import Keys
 
 from cicada.application import ApplicationSession, open_application
 import cicada.ui as ui
@@ -86,11 +85,7 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         assert await wait_until(lambda: any("会话信息" in line for line in doc_lines())), (
             "命令输出进入同源文档 (窗口可能只呈尾部)"
         )
-        stage.emit(text_keys("/help"))
-        stage.emit([ENTER])
-        assert await wait_until(lambda: any("命令帮助" in line for line in doc_lines()))
         compact = "".join("".join(doc_lines()).split())
-        assert "清空模型历史（已显示记录保留）" in compact
         assert "a" * 64 in compact, "窄窗换行保留完整 hash (文档级)"
         assert not re.search(r"\[[0-9;]+m", stage.text()), "不能显示被拆开的 SGR 碎片"
         cursor_row = stage.vt.cursor_row
@@ -98,23 +93,19 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         assert "›" in stage.vt.screen_text()[cursor_row], "硬件光标仍在输入行"
         # 同一文档在宽窗口重新排版，分组顺序与留白是同源文档事实 (视口只呈窗口)。
         stage.set_size(100, 45)
-        assert await wait_until(lambda: stage.contains("命令帮助"))
+        assert await wait_until(lambda: stage.contains("会话信息"))
         lines = doc_lines()
         answer = lines.index(" 回答结束。")
         info = lines.index(" 会话信息")
-        help_title = lines.index(" 命令帮助")
         assert not any(lines[answer + 1:info])
         assert info > answer + 1
         for heading in (" 会话", " 计量", " 检查", " 配置"):
-            assert heading in lines[info:help_title]
+            assert heading in lines[info:]
         assert " 状态: idle" in lines
         assert " 模型: fake" in lines
         assert " prompt 版本: builtin:p4-v1" in lines
         assert " 轮次上限: 50" in lines
-        assert any(line.startswith(" /help") and "显示本帮助" in line for line in lines)
-        assert lines[help_title - 1] == ""
-        last_body = next(i for i, line in enumerate(lines) if "//内容" in line)
-        assert lines[last_body + 1] == "", "命令输出与后续条目之间留白"
+        assert not any(line.startswith(" /help") for line in lines)
         assert len(model_of(session).requests) == 1
         assert len(session.history) == 2, "显示命令不进入模型历史"
         stage.emit(text_keys("/exit"))
@@ -132,13 +123,10 @@ async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
     try:
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("/"))
-        assert await wait_until(lambda: stage.contains("→ help")), "输入斜杠后列出可用命令"
-        assert all(stage.contains(name) for name in ("help", "status", "skill")), (
-            "02 起 /compact、03 起 /skill 加入菜单; 小窗口内可见项以选中位置为中心, "
-            "6 项菜单默认窗不含 compact, 由 /skill 代占该断言位"
+        assert await wait_until(lambda: stage.contains("→ status")), "输入斜杠后列出可用命令"
+        assert all(stage.contains(name) for name in ("status", "skill", "diff")), (
+            "2026-10-18 起 /help 删除、菜单一次可见 9 行, 首屏含 status/skill/diff"
         )
-        stage.emit([KeyPress(Keys.Down, "\x1b[B")])
-        assert await wait_until(lambda: stage.contains("→ status"))
         stage.emit([ENTER])
         assert await wait_until(lambda: stage.contains("状态: idle")), "Enter 执行选中的 /status"
         assert session.history == ()
@@ -173,7 +161,9 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path, m
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("问题") + [ENTER])
         assert await wait_until(lambda: session.state == "executing")
-        stage.emit(text_keys("/") + [KeyPress(Keys.Down, "\x1b[B"), ENTER])
+        # /help 删除后菜单第二项是带参数的 /skill (菜单 Enter 只补齐), 这里用前缀
+        # 直接过滤到唯一候选 /status: 菜单选中的无参数命令 Enter 仍走原准入。
+        stage.emit(text_keys("/st") + [ENTER])
         # 完成渲染是同源文档事实 (40x8 菜单打开时文档窗口 0 行, 屏幕无可呈)
         assert await wait_until(
             lambda: session.state == "idle"
@@ -182,7 +172,7 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path, m
         assert not stage.contains("状态: idle")
         assert len(model_of(session).requests) == 1
         assert "→ status" in "\n".join(stage.vt.screen_text())
-        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /"  # 提示符 + 草稿 (§C)
+        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /st"  # 提示符 + 草稿 (§C)
         stage.emit([ENTER])
         # /status 经菜单 Enter 执行: 40x8 跟随窗口只呈尾部, 首行 "状态: idle"
         # 是同源文档事实 (紧凑交互 01); 有色环境标签带 SGR, 内容事实剥样式后匹配

@@ -48,7 +48,7 @@ cicada
 cicada --max-model-calls 5 '阅读这个项目，说明入口和运行方法，暂不修改文件'
 ```
 
-Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export report.json` 导出，`/help` 查看命令。运行和收尾期间不能提交下一问。
+Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export report.json` 导出，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
 
 ## 检查、费用与恢复
 

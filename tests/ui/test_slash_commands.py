@@ -6,7 +6,7 @@ pytestmark = pytest.mark.usefixtures("color_env")
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
-from cicada.ui.commands import SlashCommandMenu
+from cicada.ui.commands import COMMAND_MENU_MAX_ROWS, SlashCommandMenu
 from cicada.ui.main_screen import strip_terminal_sequences, visible_width
 from tests.ui.test_frontend_headless import BACKSPACE, ENTER, ESCAPE, Harness, text_keys
 
@@ -23,7 +23,7 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
         assert h.find("→ exit")
         h.terminal.emit([DOWN])
         await h.settle()
-        assert h.find("→ help")
+        assert h.find("→ status")
         h.terminal.emit(text_keys("c"))
         await h.settle()
         # 02: /c 前缀现有 compact/clear 两个候选, 选中首个
@@ -88,12 +88,12 @@ async def test_no_argument_command_still_submits_directly_from_menu():
     h = Harness(commands=True)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/he"))
+        h.terminal.emit(text_keys("/st"))
         await h.settle()
-        assert h.find("→ help")
+        assert h.find("→ status")
         h.terminal.emit([ENTER])
         await h.settle()
-        assert h.submitted == ["/help"]
+        assert h.submitted == ["/status"]
         assert h.editor.is_empty()
     finally:
         await h.stop()
@@ -115,21 +115,21 @@ async def test_escape_hides_menu_without_cancelling_or_losing_draft():
         assert not h.find("显示状态与计量")
         h.terminal.emit([BACKSPACE] + text_keys("/"))
         await h.settle()
-        assert h.find("→ help")
+        assert h.find("→ status")
     finally:
         await h.stop()
 
 
-@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /help"])
+@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /status"])
 async def test_non_command_prefix_keeps_original_editing_and_submission(text):
     """非命令形态不打开菜单、原样提交: // 转义、过滤为空、斜杠不在草稿开头
-    ("/help 参数" 的过滤为空分支与 "/unknown" 同型, 不再单列)。"""
+    ("/status 参数" 的过滤为空分支与 "/unknown" 同型, 不再单列)。"""
     h = Harness(commands=True)
     try:
         await h.start()
         h.terminal.emit(text_keys(text))
         await h.settle()
-        assert not h.find("→ help")
+        assert not h.find("→ status")
         h.terminal.emit([ENTER])
         assert h.submitted == [text]
     finally:
@@ -149,14 +149,14 @@ async def test_menu_rejected_enter_keeps_draft_and_selection():
     h = Harness(commands=True, on_submit=admit)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/") + [DOWN, ENTER])
+        h.terminal.emit(text_keys("/") + [UP, ENTER])
         await h.settle()
         assert h.editor.get_text() == "/"
-        assert h.find("→ status")
+        assert h.find("→ exit")
         assert submitted == []
         ready = True
         h.terminal.emit([ENTER])
-        assert submitted == ["/status"]
+        assert submitted == ["/exit"]
         assert h.editor.is_empty()
     finally:
         await h.stop()
@@ -175,7 +175,7 @@ async def test_alt_enter_and_multiline_paste_do_not_confirm_menu():
         h.terminal.emit([KeyPress(Keys.BracketedPaste, "/\n内容")])
         await h.settle()
         assert h.editor.get_text() == "/\n内容"
-        assert not h.find("→ help")
+        assert not h.find("→ status")
         assert h.submitted == []
     finally:
         await h.stop()
@@ -185,11 +185,11 @@ async def test_moving_cursor_out_of_prefix_returns_to_text_editing():
     h = Harness(commands=True)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/h") + [KeyPress(Keys.Home, "\x1b[H")])
+        h.terminal.emit(text_keys("/s") + [KeyPress(Keys.Home, "\x1b[H")])
         await h.settle()
-        assert not h.find("→ help")
+        assert not h.find("→ status")
         h.terminal.emit(text_keys("普通"))
-        assert h.editor.get_text() == "普通/h"
+        assert h.editor.get_text() == "普通/s"
     finally:
         await h.stop()
 
@@ -222,16 +222,28 @@ def test_v2_selected_row_full_width_highlight():
     menu.sync("/", at_end=True)
     lines = menu.render(60, 4)
     selected = lines[0]
-    assert strip_terminal_sequences(selected).startswith("→ help")
+    assert strip_terminal_sequences(selected).startswith("→ status")
     assert selected.startswith(SEL_BG) and selected.endswith("\x1b[0m")
     assert ARROW_FG in selected and NAME_FG in selected and DESC_FG in selected
     assert visible_width(strip_terminal_sequences(selected)) == 60  # 整行背景补齐
     # 选中行内部不出现复位 (内层 \x1b[0m 会清掉整行背景)
     assert selected[:-4].count("\x1b[0m") == 0
+    assert len(lines) == 4  # 只有候选行, 无分页计数行
     for line in lines[1:]:
-        if "(" in strip_terminal_sequences(line):
-            continue  # 分页指示行
         assert not line.startswith(SEL_BG)  # 未选中行无背景
+
+
+def test_menu_shows_nine_rows_without_counter():
+    """2026-10-18 裁决: 输入 / 时输入框下方只留 9 行候选, 无分页计数行。"""
+    menu = SlashCommandMenu()
+    menu.sync("/", at_end=True)
+    lines = menu.render(60, COMMAND_MENU_MAX_ROWS)
+    plain = [strip_terminal_sequences(line) for line in lines]
+    assert len(lines) == COMMAND_MENU_MAX_ROWS == 9
+    assert plain[0].startswith("→ status")  # 选中项居中窗口的首行
+    assert not any("(" in line and "/" in line for line in plain)  # 无 (n/m) 计数行
+    menu.move(COMMAND_MENU_MAX_ROWS)  # 越过一屏: 窗口跟随选中项
+    assert strip_terminal_sequences(menu.render(60, COMMAND_MENU_MAX_ROWS)[-1]).startswith("  exit")
 
 
 def test_v2_selected_row_narrow_width_truncates_description():

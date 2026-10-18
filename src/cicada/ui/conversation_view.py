@@ -8,8 +8,9 @@
   HistoryCleared 追加系统条目 (显示文档保留)。
 - 提供可注入 MainScreenFrontend 的开发组合 build(): document_lines 回调是
   01 冻结的显示文档替换点; on_submit 为受理制 (返回 False = 拒绝且草稿保留)。
-- 斜线命令只在 idle 且无 reservation 时执行: /help /status /clear /exit 与
-  //转义文本; 未知命令提示且草稿保留。/clear 在持久会话经共享 async
+- 斜线命令只在 idle 且无 reservation 时执行: /status /clear /exit 与
+  //转义文本; 未知命令提示且草稿保留。(/help 已于 2026-10-18 删除, 命令靠
+  输入 / 的菜单发现。) /clear 在持久会话经共享 async
   clear_context() 可靠提交 (05), 提交期间输入屏障; 非持久保持旧同步入口。
 - 本模块不起 renderer、不写终端: 组合层只投递状态, 渲染请求经 on_update
   回调 (宿主传 frontend.request_render 合并节流)。
@@ -41,7 +42,7 @@
   ApplicationClosed 幂等封存活动运行未完成预览并清阶段, 迟到事件不复活。
 - thinking-budget-visibility 票据 03: 底栏经 FooterComponent budget 回调
   常驻"最近预算"（总需求/上限/近似标记/输入来源；待评估/未启用/超限如实
-  降级）；/help 增加一句口径说明。只读 session.budget, 不新增刷新任务。
+  降级）；预算口径说明原在 /help，随该命令删除。只读 session.budget, 不新增刷新任务。
 - tui-compact-interaction 票据 01 (契约 C1-C3): layout_document 是同源布局
   出口 (lines/hits/anchors 同一次排版), document_lines 只是其兼容包装;
   execute_display_action 执行组/工具/思考/Skill 的 toggle 与工具分页动作
@@ -110,7 +111,6 @@ from cicada.ui.checks import (
     truncation_note,
 )
 from cicada.ui.editor import Editor, EditorStyle
-from cicada.ui.commands import SLASH_COMMANDS
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.model_menu import ModelMenu
@@ -815,26 +815,6 @@ class ConversationView:
         if is_enter_barrier(self._session, self._gate):
             return False
         command = text.strip()
-        if command == "/help":
-            command_width = max(len(item.command) for item in SLASH_COMMANDS)
-            self.transcript.append_information("命令帮助", [
-                ("可用命令", [
-                    f"{item.command:<{command_width}}  {item.description}" for item in SLASH_COMMANDS
-                ]),
-                ("普通文本", ["//内容  发送以斜杠开头的普通文本（转义）"]),
-                ("快捷键", [
-                    "点击工具/思考/Skill 标题逐层展开；滚轮回看，点「最新」返回",
-                    "Ctrl+O 工具/Skill 文档展开/收起",
-                    "Shift+Tab 或点击底栏思考标记：循环 low/high/max（关闭时先启用 low）",
-                    "F6 文档回看：Up/Down 选择 · Enter 展开/分页 · Esc 返回"
-                    "（PageUp/PageDown/Home/End 翻看）",
-                ]),
-                ("预算", [
-                    "底栏「最近预算」为最近一次评估的总需求（输入＋输出预留＋安全余量，"
-                    "~ 为近似）；估/锚/测/未 表示输入来源；完整分解与余量见 /status。",
-                ]),
-            ])
-            return True
         if command == "/status":
             self.transcript.append_information("会话信息", self._status_sections())
             return True
@@ -937,7 +917,7 @@ class ConversationView:
             return self._open_login()
         if command.startswith("/skill") and (len(command) == 6 or command[6].isspace()):
             return self._handle_skill_command(text.lstrip())
-        self.transcript.append_system(f"未知命令: {command}（/help 查看可用命令）")
+        self.transcript.append_system(f"未知命令: {command}（输入 / 查看可用命令）")
         return False  # 未知命令提示且草稿保留
 
     def _handle_name_command(self, text: str) -> bool:

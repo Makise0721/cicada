@@ -9,7 +9,7 @@
   新会话完整块 (>=48 列, r2 Pi 风格): 加粗标题 + 低亮键位行 + 低亮命令入口行 +
   空行 + [工作区]/[启动模型]/[指令]/[Skills] 四个段组 (段标题默认前景, 内容缩进
   2 列低亮); 恢复会话三行短版 (不加段组)。24–47 列降为四行 (恢复两行),
-  1–23 列仅 Cicada 与 /help, 宽度 <= 0 返回空行集。r2 起无图标资产,
+  1–23 列仅 Cicada 与命令入口 (输入 / 查看), 宽度 <= 0 返回空行集;
   所有宽度共用同一文字布局。
 - 动态值捕获时先 sanitize_display、换行/Tab 折成空格、按字段上限裁剪; 渲染再按
   当前可见列宽截断。plain 策略 (捕获时 NO_COLOR 存在或 TERM=dumb) 输出零 ESC;
@@ -50,9 +50,10 @@ _KEYS_LINE = (
     "Enter 发送 · Shift+Enter 换行 · Esc/Ctrl+C 中断 · Ctrl+D 退出 · / 命令"
     " · Ctrl+O 工具/Skill"
 )
-_COMMANDS_LINE = "/help 全部命令 · /model 模型 · /login 配置 · /status 状态"
-_RESUME_COMMANDS_LINE = "/help 帮助 · /status 状态"
-_HELP_LINE = "/help 帮助"
+_COMMANDS_LINE = "输入 / 查看命令 · /model 模型 · /login 配置 · /status 状态"
+_RESUME_COMMANDS_LINE = "输入 / 查看命令 · /status 状态"
+_COMMAND_HINT = "输入 / 查看命令"  # 2026-10-18: /help 删除, 命令入口改为提示
+_COMMAND_HINT_TINY = "/ 查看命令"  # <24 列放不下完整提示 (原 /help 位)
 
 
 @dataclass(frozen=True)
@@ -156,15 +157,15 @@ class WelcomeEntry:
 
     def _lines(self, width: int) -> list[tuple[str, str]]:
         if width < 24:
-            return [("title", "Cicada"), ("dim", "/help")]
+            return [("title", "Cicada"), ("dim", _COMMAND_HINT_TINY)]
         if width < 48:
             if self.facts.resumed:
-                return [("title", "Cicada · 恢复会话"), ("dim", _HELP_LINE)]
+                return [("title", "Cicada · 恢复会话"), ("dim", _COMMAND_HINT)]
             return [
                 ("title", self._title()),
                 ("dim", f"启动模型: {self._model()}"),
                 ("dim", f"指令: {self._instructions()} · Skills: {self._skills_brief()}"),
-                ("dim", _HELP_LINE),
+                ("dim", _COMMAND_HINT),
             ]
         if self.facts.resumed:
             return [

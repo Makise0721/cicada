@@ -173,7 +173,7 @@ async def test_resize_96_40_96_rewraps_and_keeps_draft(tmp_path, monkeypatch):
         h.terminal.set_size(40, 24)  # 40 列: 24–47 档窄窗四行块 (无段组)
         await h.settle()
         assert h.find("保留我"), "resize 后草稿保留"
-        assert h.find("/help 帮助")
+        assert h.find("输入 / 查看命令")
         assert h.vt.find_row("[工作区]") is None, "窄档无段组"
         # 行宽界在文档出口断言 (VT 屏镜像行恒 <= columns, 屏幕行断言恒真无证据力)
         doc = h.view.document_lines(40)
