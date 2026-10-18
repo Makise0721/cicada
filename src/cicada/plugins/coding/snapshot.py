@@ -11,11 +11,10 @@
 这是 checkpoint 一致性检查, 不是操作系统原子快照, 也不能证明检查期间没有发生
 "短暂修改后还原"; 它面向单 Agent、无并发修改的验收工作区。
 
-读取与哈希是同步的 (open/read/hashlib), 所以扫描过程中必须按**时间**定期让出 event loop:
-否则整棵树的内容读取会把宿主协程之外的一切都挤掉 —— 协作取消与 deadline 仍由同步
-`_checkpoint` 在每个检查点照常生效 (冷启动超预算那次正是它记下的 `timeout`), 但子进程的
-存活性轮询、`asyncio.timeout` 计时器与父进程的 `Task.cancel` 都要等 loop 空出来才能跑。
-让出只影响调度, 不改变任何比较结果; 单次连续占用 ≈ `_YIELD_AFTER_S` + 一条路径。
+内容观察由固定数量的有归属 worker 重叠文件 I/O；取消和截止后等全部 worker 真实退出，
+再返回失败，不能把已取消的等待任务当成已停止线程。每轮独立预留字节预算，可靠清单与
+账本仍只在主协程更新；两次扫描都重新打开并读取全部路径。主协程的清单处理与结果比较
+按时间让出，单个阻塞 OS 调用仍不能被硬抢占。
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,6 +55,7 @@ MAX_PATHS = 10_000
 CAPTURE_DEADLINE_S = 60.0  # 两次扫描合计；大工作区在实时扫描/容器 I/O 下 10 秒不足
 READ_CHUNK_BYTES = 256 * 1024
 _CHECKPOINT_EVERY = 128
+_CONTENT_WORKERS = 4
 # 让出控制权的时间间隔: 读取/哈希/比对都是同步工作, 且单条开销随文件系统与杀毒扫描而变,
 # 所以按**时间**让出而不是按条数 —— 单次连续占用 ≈ 本值 + 一条路径, 不随机器快慢漂移。
 _YIELD_AFTER_S = 0.01
@@ -235,18 +236,77 @@ class Snapshotter:
             # 是否产生可用证据"是两件事, 失败捕获不再回滚范围观察。
             self.ledger.observe(frozenset(observed))
         observed |= set(self.ledger.paths)
-        observations: dict[str, SnapshotEntry] = {}
+        paths = sorted(observed, key=lambda path: (path.casefold(), path))
+        self._checkpoint(cancel, deadline)
+        if not paths:
+            return _LedgerScan({}, frozenset(observed), inventory.root)
+        stop = threading.Event()
+        budget_lock = threading.Lock()
         total_bytes = 0
-        yielded_at = time.monotonic()
-        for path in sorted(observed, key=lambda path: (path.casefold(), path)):
-            if time.monotonic() - yielded_at >= _YIELD_AFTER_S:
-                await asyncio.sleep(0)
-                yielded_at = time.monotonic()
-            self._checkpoint(cancel, deadline)
-            exists, sha256, size = await self._read_content(path, cancel, deadline, total_bytes)
-            if size:
+
+        def reserve(size: int) -> None:
+            nonlocal total_bytes
+            with budget_lock:
+                if total_bytes + size > self.max_total_bytes:
+                    raise _CaptureError(
+                        "total_limit", f"snapshot exceeds {self.max_total_bytes} total bytes")
                 total_bytes += size
-            observations[path] = SnapshotEntry(path, exists, size, sha256, modes.get(path))
+
+        def checkpoint() -> None:
+            if stop.is_set():
+                raise asyncio.CancelledError
+            if time.monotonic() >= deadline:
+                raise TimeoutError("snapshot capture deadline exceeded")
+
+        def read_paths(partition: list[str]) -> dict[str, SnapshotEntry]:
+            result = {}
+            try:
+                for path in partition:
+                    checkpoint()
+                    exists, sha256, size = self._read_content(path, checkpoint, reserve)
+                    result[path] = SnapshotEntry(path, exists, size, sha256, modes.get(path))
+                return result
+            except BaseException:
+                stop.set()
+                raise
+
+        async def watch_cancel() -> None:
+            await cancel.wait()
+            stop.set()
+
+        workers = [asyncio.create_task(asyncio.to_thread(read_paths, paths[index::_CONTENT_WORKERS]))
+                   for index in range(min(_CONTENT_WORKERS, len(paths)))]
+        completed = asyncio.gather(*workers, return_exceptions=True)
+        cancellation = asyncio.create_task(watch_cancel())
+        try:
+            results = await asyncio.shield(completed)
+        finally:
+            stop.set()
+            cancellation.cancel()
+            cleanup = asyncio.gather(completed, cancellation, return_exceptions=True)
+            cancelled_during_cleanup = False
+            while True:
+                try:
+                    await asyncio.shield(cleanup)
+                    break
+                except asyncio.CancelledError:
+                    # 不取消 to_thread 的等待者：其终结必须代表线程真实退出。
+                    cancelled_during_cleanup = True
+                    continue
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+        cancel.throw_if_cancelled()
+        errors = [result for result in results if isinstance(result, BaseException)]
+        # 兄弟停止哨兵不能掩盖触发停止的真实读取/预算故障。
+        for error in errors:
+            if not isinstance(error, asyncio.CancelledError):
+                raise error
+        if errors:
+            raise errors[0]
+        self._checkpoint(cancel, deadline)
+        observations = {}
+        for result in results:
+            observations.update(result)
         return _LedgerScan(observations, frozenset(observed), inventory.root)
 
     async def _inventory(self, cancel: CancelToken) -> FileInventory:
@@ -257,8 +317,8 @@ class Snapshotter:
         except Exception as exc:  # 清单失败即范围不可用, 不能只比较半份范围
             raise _CaptureError("inventory", f"file inventory failed: {exc}") from exc
 
-    async def _read_content(
-        self, path: str, cancel: CancelToken, deadline: float, total_bytes: int
+    def _read_content(
+        self, path: str, checkpoint: Callable[[], None], reserve: Callable[[int], None]
     ) -> tuple[bool, str | None, int | None]:
         """读取一个账本路径; 返回 (exists, sha256, size_bytes).
 
@@ -284,32 +344,27 @@ class Snapshotter:
                 "file_limit",
                 f"{path} is {before.st_size} bytes, over the {self.max_file_bytes} byte limit",
             )
-        if total_bytes + before.st_size > self.max_total_bytes:
-            raise _CaptureError(
-                "total_limit", f"snapshot exceeds {self.max_total_bytes} total bytes")
+        reserve(before.st_size)
         digest = hashlib.sha256()
         read_bytes = 0
-        yielded_at = time.monotonic()
+        growth = 0
         try:
             with open(target, "rb") as handle:
                 while True:
-                    self._checkpoint(cancel, deadline)
+                    checkpoint()
                     chunk = handle.read(READ_CHUNK_BYTES)
                     if not chunk:
                         break
                     read_bytes += len(chunk)
-                    if time.monotonic() - yielded_at >= _YIELD_AFTER_S:
-                        # 单个大文件也不能独占 loop: 按时间让出, 与块大小/文件大小无关。
-                        await asyncio.sleep(0)
-                        yielded_at = time.monotonic()
                     if read_bytes > self.max_file_bytes:
                         raise _CaptureError(
                             "file_limit",
                             f"{path} grew past the {self.max_file_bytes} byte limit while reading",
                         )
-                    if total_bytes + read_bytes > self.max_total_bytes:
-                        raise _CaptureError(
-                            "total_limit", f"snapshot exceeds {self.max_total_bytes} total bytes")
+                    added = max(0, read_bytes - before.st_size) - growth
+                    if added:
+                        reserve(added)
+                        growth += added
                     digest.update(chunk)
         except _CaptureError:
             raise

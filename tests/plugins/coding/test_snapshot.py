@@ -6,6 +6,7 @@
 
 import asyncio
 import subprocess
+import threading
 
 import pytest
 
@@ -207,6 +208,70 @@ async def test_deadline_and_cancellation_do_not_return_partial_snapshots(repo):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.parametrize("stop_reason", ["cancel", "growth"])
+async def test_content_workers_finish_and_close_files_before_capture_returns(repo, monkeypatch, stop_reason):
+    import cicada.plugins.coding.snapshot as snapshot_module
+
+    (repo / "blocked.txt").write_bytes(b"x")
+    (repo / "growing.txt").write_bytes(b"x")
+    entered, release, failed = threading.Event(), threading.Event(), threading.Event()
+    handles = []
+    real_open = open
+
+    class GrowingFile:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.handle.close()
+            failed.set()
+
+        def read(self, size):
+            assert entered.wait(5), "other worker did not open its file"
+            with real_open(repo / "growing.txt", "ab") as writer:
+                writer.write(b"changed")
+            return self.handle.read(size)
+
+    def controlled_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        handles.append(handle)
+        if str(path).endswith("blocked.txt"):
+            entered.set()
+            if not release.wait(5):
+                handle.close()
+                raise TimeoutError("test did not release the owned read")
+        if stop_reason == "growth" and str(path).endswith("growing.txt"):
+            return GrowingFile(handle)
+        return handle
+
+    monkeypatch.setattr(snapshot_module, "open", controlled_open, raising=False)
+    snapshotter = make(repo, max_file_bytes=4)
+    task = asyncio.create_task(snapshotter.capture(CancelToken()))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        if stop_reason == "cancel":
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # drain 本身被再次取消也必须等真实文件关闭。
+        else:
+            assert await asyncio.to_thread(failed.wait, 5)
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    if stop_reason == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        capture = await task
+        assert not capture.available and capture.snapshot is None
+        assert capture.failure_kind == "file_limit"
+    assert handles and all(handle.closed for handle in handles)
 
 
 async def test_scope_path_replaced_by_a_directory_is_unavailable(repo):
