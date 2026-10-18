@@ -39,6 +39,66 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
         await h.stop()
 
 
+async def test_argument_command_menu_completion_keeps_draft_without_submit():
+    """带参数命令从菜单补齐: 只回填 `/export `, 不提交; 补齐后的 Enter 才提交全文。"""
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/e"))
+        await h.settle()
+        assert h.find("→ export")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == []  # 命令未被直接发出
+        assert h.editor.get_text() == "/export "  # 命令 + 空格留输入框
+        assert h.editor.cursor_at_end()
+        assert h.find("/export")  # 草稿仍在屏幕上
+        assert not h.find("→ exit")  # 补齐后菜单收起 (草稿含空白)
+        h.terminal.emit(text_keys("report.json"))
+        await h.settle()
+        assert h.editor.get_text() == "/export report.json"
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["/export report.json"]
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
+
+
+@pytest.mark.parametrize("prefix,command", [("/n", "/name"), ("/sk", "/skill")])
+async def test_other_argument_commands_complete_in_draft(prefix, command):
+    """其余带参数命令 (/name、/skill) 同型: 选中后只补齐, 不提交空白参数。"""
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys(prefix))
+        await h.settle()
+        assert h.find(f"→ {command[1:]}")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == []
+        assert h.editor.get_text() == f"{command} "
+        assert h.editor.cursor_at_end()
+    finally:
+        await h.stop()
+
+
+async def test_no_argument_command_still_submits_directly_from_menu():
+    """无参数命令保持原行为: 菜单选中 Enter 直接提交并清空草稿。"""
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/he"))
+        await h.settle()
+        assert h.find("→ help")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["/help"]
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
+
+
 async def test_escape_hides_menu_without_cancelling_or_losing_draft():
     h = Harness(commands=True, escape_timeout=0.001)
     try:

@@ -18,12 +18,15 @@ from cicada.ui.display_style import current_style
 class SlashCommand:
     command: str
     description: str
+    # 需要参数的命令 (参数由用户继续输入): 菜单补齐时只把命令写回草稿,
+    # 绝不直接提交; 无参数命令仍按选中即执行。
+    takes_argument: bool = False
 
 
 SLASH_COMMANDS = (
     SlashCommand("/help", "显示本帮助"),
     SlashCommand("/status", "显示状态与计量"),
-    SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill"),
+    SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill", takes_argument=True),
     SlashCommand("/diff", "审阅工作区差异"),
     SlashCommand("/rewind", "查看并还原各请求的文件改动"),
     SlashCommand("/model", "选择模型（仅影响后继请求）"),
@@ -31,10 +34,10 @@ SLASH_COMMANDS = (
     SlashCommand("/compact", "摘要较早对话以释放上下文（需持久会话）"),
     SlashCommand("/clear", "清空模型历史（已显示记录保留）"),
     SlashCommand("/cost", "显示本进程费用与调用限额"),
-    SlashCommand("/name", "会话名称：/name <名称> · --clear 清除"),
+    SlashCommand("/name", "会话名称：/name <名称> · --clear 清除", takes_argument=True),
     SlashCommand("/resume", "搜索并恢复本工作区会话"),
     SlashCommand("/new", "新建保存会话，验证状态保留"),
-    SlashCommand("/export", "导出诊断报告：/export <路径.md或.json>"),
+    SlashCommand("/export", "导出诊断报告：/export <路径.md或.json>", takes_argument=True),
     SlashCommand("/exit", "退出程序"),
 )
 

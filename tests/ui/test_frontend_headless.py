@@ -110,6 +110,26 @@ async def test_enter_submits_and_clears_draft():
 
 
 @pytest.mark.asyncio
+async def test_menu_completion_of_argument_command_keeps_draft():
+    """带参数命令 (/export) 从菜单补齐只回填草稿, 不提交; 补齐后 Enter 才发出。"""
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/e") + [ENTER])
+        await h.settle()
+        assert h.submitted == []
+        assert h.editor.get_text() == "/export "
+        assert h.editor.cursor_at_end()
+        assert not h.find("→ exit")  # 补齐后菜单收起
+        h.terminal.emit(text_keys("r.md") + [ENTER])
+        await h.settle()
+        assert h.submitted == ["/export r.md"]
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
+
+
+@pytest.mark.asyncio
 async def test_background_stream_updates_entry_while_typing_chinese():
     """P06 最小场景: 后台原位更新同一条目期间输入中文草稿不被破坏。"""
 

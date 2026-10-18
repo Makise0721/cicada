@@ -42,7 +42,7 @@ from typing import Callable
 
 from prompt_toolkit.keys import Keys
 
-from cicada.ui.commands import SlashCommandMenu
+from cicada.ui.commands import SlashCommand, SlashCommandMenu
 from cicada.ui import theme
 from cicada.ui.document_layout import (
     ACTION_EFFORT_CYCLE,
@@ -788,6 +788,11 @@ class MainScreenFrontend:
             return
         self._sync_command_menu()
         selected = self._command_menu.selected if self._command_menu is not None else None
+        if selected is not None and selected.takes_argument:
+            # 需要参数的命令 (/export、/name、/skill 等): 菜单补齐只把命令写回
+            # 草稿, 不提交 —— 参数由用户继续输入, 再次 Enter 才走准入。
+            self._complete_argument_command(selected)
+            return
         # /skill 的任务后缀是用户原文，保留尾随空白和换行直到请求封装。
         command_text = text.lstrip()
         skill_command = command_text.startswith("/skill") and (
@@ -809,6 +814,15 @@ class MainScreenFrontend:
         self._editor.clear()
         if asyncio.iscoroutine(result):
             asyncio.ensure_future(result)
+
+    def _complete_argument_command(self, selected: SlashCommand) -> None:
+        """菜单补齐带参数命令: 草稿变成 `命令 + 空格`, 光标在末尾, 不提交。
+
+        菜单同步会因草稿含空白自动收起; 下一次 Enter 只提交用户补齐的最终文案。
+        """
+        if self._command_menu is not None:
+            self._command_menu.dismiss()
+        self._editor.set_text(f"{selected.command} ")
 
     # --- Escape 前缀定时器 -----------------------------------------------------------
 
