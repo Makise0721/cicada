@@ -260,6 +260,33 @@ async def test_grep_ignore_case_and_include(repo):
     assert rows[0]["text"] == "NEEDLE case"
 
 
+async def test_grep_include_without_slash_matches_basename_at_any_depth(repo):
+    """include 不写 `/` 时按文件名匹配任意深度, 不再对子层返回假 No matches.
+
+    任务记录 01 的障碍 A: `path=src include=*.py` 曾只覆盖 src 的直接子层, 深层文件
+    被静默排除且仍报 complete=true。含 `/` 的模式保持相对 path 的整体匹配。
+    """
+    workspace, inventory = repo
+    deep_only = workspace.root / "src" / "deep" / "gamma.py"
+    deep_only.write_text("nested_needle here\n", encoding="utf-8")
+    git(workspace.root, "add", "src/deep/gamma.py")
+
+    by_name, _ = await run_grep(
+        workspace, inventory, pattern="nested_needle", raw_path="src", include="*.py",
+        ignore_case=False, context=0, limit=100, cancel=CancelToken(),
+    )
+    assert by_name.shown == 1, by_name.content
+    rows = [json.loads(line) for line in by_name.content.splitlines() if line.startswith("{")]
+    assert rows[0]["path"] == str(deep_only)
+
+    # 含 `/` 时按相对 path 的层数匹配: cicada/*.py 不覆盖 src/cicada/plugins/*.py
+    layered, _ = await run_grep(
+        workspace, inventory, pattern="nested_needle", raw_path="src", include="deep/*.py",
+        ignore_case=False, context=0, limit=100, cancel=CancelToken(),
+    )
+    assert layered.shown == 1, layered.content
+
+
 async def test_grep_context_merges_windows_and_counts_matched_lines(repo):
     workspace, inventory = repo
     rendered, _ = await run_grep(

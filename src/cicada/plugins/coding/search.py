@@ -152,6 +152,21 @@ def matches_any(globs: Sequence[Sequence[re.Pattern[str]]], relative: str) -> bo
     return any(glob_matches(matchers, relative) for matchers in globs)
 
 
+def parse_include_glob(pattern: str) -> tuple[re.Pattern[str], ...]:
+    """grep 的 include: 无 `/` 的模式按文件名匹配任意深度 (`*.py` = `**/*.py`).
+
+    与本模块给 glob 工具用的 parse_glob 语义不同: 那里 `*.py` 只匹配 `path` 的直接
+    子层, 对 grep 的 `include` 会造成"文件明明在, 却报 No matches 且 complete=true"
+    的假阴性 (用户按习惯把 include 当文件名过滤器). 含 `/` 的模式仍按原逐段语义整体
+    匹配, 由调用方写清相对哪一层.
+    """
+    if isinstance(pattern, str) and pattern:
+        normalized = pattern.replace("\\", "/")
+        if "/" not in normalized and normalized not in (".", ".."):
+            return parse_glob(f"**/{normalized}", field="include")
+    return parse_glob(pattern, field="include")
+
+
 # --- 文件系统事实 ---
 
 
@@ -378,7 +393,7 @@ async def run_grep(
 ) -> tuple[Rendered, dict[str, int]]:
     started = time.monotonic()
     needle = _prepare_needle(pattern, ignore_case)
-    include_glob = (parse_glob(include, field="include"),)
+    include_glob = (parse_include_glob(include),)
     record = await _list_inventory(inventory, cancel, started)
     scope = resolve_scope(workspace, record, raw_path)
     skipped = {

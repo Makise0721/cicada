@@ -34,7 +34,9 @@ class GrepTool:
             name=TOOL_NAME,
             description=(
                 "在 Git 可见清单内的文本文件中做字面量子串搜索, 输出含绝对路径与 1 起始行号, "
-                "可直接交给 read (不支持正则). include 为相对 path 的限定 glob; context 给出上下文行; "
+                "可直接交给 read (不支持正则). include 为限定 glob: 不含 '/' 时按文件名匹配 "
+                "任意深度 (include=\"*.py\" 等于 \"**/*.py\"), 含 '/' 时相对 path 整体匹配; "
+                "context 给出上下文行; "
                 "ignore_case 用 Unicode casefold. 每条匹配行算一个命中, shown 数匹配行; "
                 "content 严格不超过 8192 UTF-8 bytes, 放不下时标记 truncated 并要求收窄查询."
             ),
