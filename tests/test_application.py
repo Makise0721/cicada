@@ -100,23 +100,40 @@ def _plan(root: Path, command: str = CHECK_COMMAND) -> VerificationPlan:
     )
 
 
-async def test_diagnostic_export_preserves_recorded_receipts_without_revalidation(tmp_path):
+async def test_diagnostic_export_preserves_recorded_receipts_without_revalidation(tmp_path, monkeypatch):
     import json
+    import sys
+    from cicada import diagnostic_export
     from cicada.diagnostic_export import ReportError
 
+    monkeypatch.setattr(diagnostic_export, 'version', lambda name: '1.2.3-test' if name == 'cicada' else None)
     root = _repo(tmp_path)
-    session = await open_application(_config(root, plan=_plan(root), script=_script(
+    plan = VerificationPlan(generate_verification_run_id(), Path(os.path.realpath(root)), (
+        CheckDefinition('check-1', CHECK_COMMAND),
+        CheckDefinition('check-fails', "Write-Output 'private check output'; exit 7"),
+        CheckDefinition('check-not-run', CHECK_COMMAND),
+    ))
+    session = await open_application(_config(root, plan=plan, script=_script(
         {'tool_calls': [{'id': 'w', 'name': 'write', 'arguments': {'path': 'result.txt', 'content': 'private tool body'}}]},
         {'tool_calls': [{'id': 'c', 'name': 'check', 'arguments': {'action': 'run', 'check_id': 'check-1'}}]},
+        {'tool_calls': [{'id': 'f', 'name': 'check', 'arguments': {'action': 'run', 'check_id': 'check-fails'}}]},
         {'text': 'private answer', 'stop': True})))
     try:
         outcome = await session.execute('private user prompt')
-        assert outcome.decision.can_deliver
+        assert not outcome.decision.can_deliver
         before = (session.history, len(session.process_model_calls))
         (root / 'result.txt').write_text('changed after completion', encoding='utf-8')
         destination = session.export_diagnostics(Path('report.json'))
         original = destination.read_bytes()
         report = json.loads(original)
+        assert report['schema_version'] == 1
+        assert report['runtime'] == {'cicada_version': '1.2.3-test',
+                                    'python_version': '.'.join(str(part) for part in sys.version_info[:3])}
+        assert report['latest_request']['checks_at_completion'][0]['failure_kind'] is None
+        assert report['latest_request']['checks_at_completion'][1]['failure_kind'] == 'nonzero_exit'
+        assert outcome.view.checks[1].receipt.failure_kind == 'nonzero_exit'
+        assert report['latest_request']['checks_at_completion'][2]['failure_kind'] is None
+        assert report['latest_request']['change_evidence_failure_kind'] == outcome.evidence.failure_kind
         assert report['latest_request']['snapshot_at_completion'] == outcome.view.snapshot_ref
         assert report['latest_request']['checks_at_completion'][0]['freshness_at_completion'] == 'current'
         assert report['latest_request']['checks_at_completion'][0]['snapshot_before'] == outcome.view.checks[0].receipt.snapshot_before
@@ -124,6 +141,7 @@ async def test_diagnostic_export_preserves_recorded_receipts_without_revalidatio
         assert 'not revalidated' in report['observation']
         assert 'private user prompt' not in original.decode() and 'private tool body' not in original.decode()
         assert 'private answer' not in original.decode()
+        assert 'private check output' not in original.decode()
         assert (session.history, len(session.process_model_calls)) == before
         with pytest.raises(ReportError, match='already exists'):
             session.export_diagnostics(Path('report.json'))
@@ -143,19 +161,26 @@ async def test_diagnostic_export_preserves_recorded_receipts_without_revalidatio
 
 async def test_diagnostic_export_expands_workspace_and_preserves_historical_provenance(tmp_path, monkeypatch):
     import json
+    from cicada import diagnostic_export
     from cicada.persistence.contracts import StoredReceipt
 
+    def missing_distribution(name):
+        assert name == 'cicada'
+        raise diagnostic_export.PackageNotFoundError(name)
+
+    monkeypatch.setattr(diagnostic_export, 'version', missing_distribution)
     root = _repo(tmp_path)
     monkeypatch.setenv('USERPROFILE', str(root))
     session = await open_application(_config(Path('~'), script=_script({'text': 'done', 'stop': True})))
     try:
-        await session.execute('task')
         source = StoredReceipt('old-run', 'old-receipt', 'old-epoch', 'old-request', 'a' * 64,
                                'exited', 0, False, False, True, None)
         session._restored_receipts = (source,)
         destination = session.export_diagnostics(Path('report.json'))
         assert destination == root / 'report.json'
         report = json.loads(destination.read_text(encoding='utf-8'))
+        assert report['runtime']['cicada_version'] is None
+        assert report['latest_request'] is None
         assert report['historical_receipts'][0]['request_id'] == 'old-request'
         assert report['historical_receipts'][0]['verification_run_id'] == 'old-run'
         assert report['historical_receipts_have_current_authority'] is False

@@ -47,8 +47,12 @@ def test_cli_diagnostic_export_uses_settled_outcome_and_refuses_overwrite(tmp_pa
     result = run_cli('--workspace', str(tmp_path), '--script', str(script), '--export-report', 'result.json', 'private prompt')
     assert result.returncode == 0
     report = json.loads((tmp_path / 'result.json').read_text(encoding='utf-8'))
+    assert report['schema_version'] == 1
+    assert report['runtime']['python_version'] == '.'.join(str(part) for part in sys.version_info[:3])
+    assert 'cicada_version' in report['runtime']
     assert report['latest_request']['stop_reason'] == 'stop'
     assert report['latest_request']['model_at_request'] == 'fake'
+    assert report['latest_request']['change_evidence_failure_kind'] is None
     assert 'private prompt' not in json.dumps(report) and 'private answer' not in json.dumps(report)
     original = (tmp_path / 'result.json').read_bytes()
     result = run_cli('--workspace', str(tmp_path), '--script', str(script), '--export-report', 'result.json', 'second')

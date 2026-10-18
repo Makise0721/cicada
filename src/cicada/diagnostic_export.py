@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 
@@ -25,6 +27,10 @@ def _metrics(calls) -> dict:
 def build_report(*, config, persistence, generation: int, outcome, request_model: str | None, model_identity,
                  ordinary_calls, summary_calls, cost, restored_receipts) -> dict:
     """白名单字段序列化；不递归导出模型、异常、消息或工具对象。"""
+    try:
+        cicada_version = version('cicada')
+    except PackageNotFoundError:
+        cicada_version = None
     latest = None
     if outcome is not None:
         view, evidence, decision = outcome.view, outcome.evidence, outcome.decision
@@ -50,16 +56,20 @@ def build_report(*, config, persistence, generation: int, outcome, request_model
                 'snapshot_after': state.receipt.snapshot_after if state.receipt else None,
                 'execution_status': state.receipt.execution_status if state.receipt else None,
                 'exit_code': state.receipt.exit_code if state.receipt else None,
+                'failure_kind': state.receipt.failure_kind if state.receipt else None,
             } for state in view.checks] if view is not None else [],
             'changes_at_completion': [{
                 'path': change.relative_path, 'kind': change.kind,
                 'before_sha256': change.before_sha256, 'after_sha256': change.after_sha256,
             } for change in evidence.changes] if evidence is not None else [],
             'change_evidence_complete': evidence.complete if evidence is not None else None,
+            'change_evidence_failure_kind': evidence.failure_kind if evidence is not None else None,
         }
     return {
         'schema_version': 1,
         'generated_at': datetime.now(timezone.utc).isoformat(),
+        'runtime': {'cicada_version': cicada_version,
+                    'python_version': '.'.join(str(part) for part in sys.version_info[:3])},
         'observation': 'recorded facts; not revalidated at export; no current delivery authority',
         'workspace': str(config.workspace.expanduser().resolve()),
         'session_id': persistence.session_id if persistence is not None else None,
