@@ -210,7 +210,7 @@ async def test_deadline_and_cancellation_do_not_return_partial_snapshots(repo):
         await task
 
 
-@pytest.mark.parametrize("stop_reason", ["cancel", "growth"])
+@pytest.mark.parametrize("stop_reason", ["cancel", "token", "growth"])
 async def test_content_workers_finish_and_close_files_before_capture_returns(repo, monkeypatch, stop_reason):
     import cicada.plugins.coding.snapshot as snapshot_module
 
@@ -251,20 +251,23 @@ async def test_content_workers_finish_and_close_files_before_capture_returns(rep
 
     monkeypatch.setattr(snapshot_module, "open", controlled_open, raising=False)
     snapshotter = make(repo, max_file_bytes=4)
-    task = asyncio.create_task(snapshotter.capture(CancelToken()))
+    token = CancelToken()
+    task = asyncio.create_task(snapshotter.capture(token))
     try:
         assert await asyncio.to_thread(entered.wait, 5)
         if stop_reason == "cancel":
             task.cancel()
             await asyncio.sleep(0)
             task.cancel()  # drain 本身被再次取消也必须等真实文件关闭。
+        elif stop_reason == "token":
+            token.cancel()
         else:
             assert await asyncio.to_thread(failed.wait, 5)
         await asyncio.sleep(0)
         assert not task.done()
     finally:
         release.set()
-    if stop_reason == "cancel":
+    if stop_reason != "growth":
         with pytest.raises(asyncio.CancelledError):
             await task
     else:
