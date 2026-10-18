@@ -51,6 +51,7 @@ CWD_PREVIEW_MAX_BYTES = 1024  # cwd/path preview JSON 编码后 ≤1024 bytes
 OUTPUT_PREVIEW_MAX_BYTES = 8 * 1024  # 模型可见 stdout/stderr 预览上限 (总预算 16 KiB)
 DIFF_MAX_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 256 * 1024
+_BASELINE_YIELD_AFTER_S = 0.01
 _REASON_MAX_BYTES = 512
 
 
@@ -223,7 +224,7 @@ class Verifier:
         if not capture.available:
             return capture
         try:
-            baseline = self._write_baseline(capture.snapshot, cancel)
+            baseline = await self._write_baseline(capture.snapshot, cancel)
         except (OSError, ValueError) as exc:
             self._baseline = None
             return SnapshotCapture(
@@ -820,9 +821,13 @@ class Verifier:
             return self._artifact_factory(label)
         return self.workspace.new_output_file(label)
 
-    def _write_baseline(self, snapshot: Snapshot, cancel: CancelToken) -> _Baseline:
+    async def _write_baseline(self, snapshot: Snapshot, cancel: CancelToken) -> _Baseline:
         files: dict[str, _BaselineFile] = {}
+        yielded_at = time.monotonic()
         for entry in snapshot.entries:
+            if time.monotonic() - yielded_at >= _BASELINE_YIELD_AFTER_S:
+                await asyncio.sleep(0)
+                yielded_at = time.monotonic()
             cancel.throw_if_cancelled()
             if not entry.exists:
                 continue
@@ -830,26 +835,38 @@ class Verifier:
             files[entry.relative_path] = _BaselineFile(
                 entry.relative_path, entry.sha256, len(data), data, entry.git_mode)
         path = self._artifact_path("baseline")
-        with open(path, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps({
-                "schema_version": snapshot.schema_version,
-                "snapshot_ref": snapshot.snapshot_ref,
-                "scope_id": snapshot.scope_id,
-                "policy_id": snapshot.policy_id,
-                "exclusions": list(snapshot.exclusions),
-            }, ensure_ascii=False, sort_keys=True) + "\n")
-            for key in sorted(files, key=lambda p: (p.casefold(), p)):
-                record = files[key]
+        created = False
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as handle:
+                created = True
                 handle.write(json.dumps({
-                    "path": record.relative_path,
-                    "exists": True,
-                    "sha256": record.sha256,
-                    "size_bytes": record.size_bytes,
-                    "git_mode": record.git_mode,
-                    "data_b64": base64.b64encode(record.data).decode("ascii"),
+                    "schema_version": snapshot.schema_version,
+                    "snapshot_ref": snapshot.snapshot_ref,
+                    "scope_id": snapshot.scope_id,
+                    "policy_id": snapshot.policy_id,
+                    "exclusions": list(snapshot.exclusions),
                 }, ensure_ascii=False, sort_keys=True) + "\n")
-        return _Baseline(snapshot.snapshot_ref, snapshot.scope_id, path,
-                         _sha256_file(path), files)
+                for key in sorted(files, key=lambda p: (p.casefold(), p)):
+                    if time.monotonic() - yielded_at >= _BASELINE_YIELD_AFTER_S:
+                        await asyncio.sleep(0)
+                        yielded_at = time.monotonic()
+                    cancel.throw_if_cancelled()
+                    record = files[key]
+                    handle.write(json.dumps({
+                        "path": record.relative_path,
+                        "exists": True,
+                        "sha256": record.sha256,
+                        "size_bytes": record.size_bytes,
+                        "git_mode": record.git_mode,
+                        "data_b64": base64.b64encode(record.data).decode("ascii"),
+                    }, ensure_ascii=False, sort_keys=True) + "\n")
+            digest = _sha256_file(path, cancel.throw_if_cancelled)
+            cancel.throw_if_cancelled()
+            return _Baseline(snapshot.snapshot_ref, snapshot.scope_id, path, digest, files)
+        except BaseException:
+            if created:
+                path.unlink(missing_ok=True)
+            raise
 
     def _verify_baseline_artifact(
         self, baseline: _Baseline, checkpoint: Callable[[], None] | None = None,
@@ -1041,10 +1058,10 @@ def _read_verified(root: Path, entry: SnapshotEntry, max_bytes: int) -> bytes:
     for part in entry.relative_path.split("/"):
         target = target / part
     with open(target, "rb") as handle:
-        data = handle.read(max_bytes + 1)
+        data = handle.read(min(entry.size_bytes, max_bytes) + 1)
     if len(data) > max_bytes:
         raise ValueError(f"{entry.relative_path} exceeds the {max_bytes} byte limit")
-    if _sha256_bytes(data) != entry.sha256:
+    if len(data) != entry.size_bytes or _sha256_bytes(data) != entry.sha256:
         raise ValueError(
             f"{entry.relative_path} changed after the baseline snapshot was captured")
     return data

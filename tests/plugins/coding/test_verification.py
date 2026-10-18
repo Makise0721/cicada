@@ -517,19 +517,66 @@ async def test_every_check_is_compared_against_the_same_final_snapshot(repo):
     assert [change.relative_path for change in evidence.changes] == ["added.txt"]
 
 
-async def test_initialize_failure_has_no_baseline_and_leaves_checks_not_run(repo):
-    (repo / "huge.bin").write_bytes(b"x" * 2048)
+@pytest.mark.parametrize("failure", ["file_limit", "grew", "rewritten"])
+async def test_initialize_failure_has_no_baseline_and_leaves_checks_not_run(repo, failure):
+    if failure == "file_limit":
+        (repo / "huge.bin").write_bytes(b"x" * 2048)
     _, verifier = build(repo, passing(), snapshot_limits={"max_file_bytes": 1024})
+    if failure != "file_limit":
+        original = verifier.snapshotter.capture
+
+        async def changed_after_capture(cancel):
+            capture = await original(cancel)
+            (repo / "sample.py").write_bytes(
+                b"VALUE = 1\nextra" if failure == "grew" else b"VALUE = 2\n")
+            return capture
+
+        verifier.snapshotter.capture = changed_after_capture
     capture = await verifier.initialize(CancelToken())
-    assert not capture.available and capture.failure_kind == "file_limit"
+    assert not capture.available
+    assert capture.failure_kind == ("file_limit" if failure == "file_limit" else "baseline_artifact")
     assert verifier.baseline_snapshot_ref is None
     view = await verifier.refresh(CancelToken())
     assert [state.status for state in view.checks] == ["not_run"]
     assert view.checks[0].freshness == "unknown"
-    assert view.snapshot_ref is None
-    assert any("unavailable" in reason for reason in view.blocking_reasons)
+    if failure == "file_limit":
+        assert view.snapshot_ref is None
+        assert any("unavailable" in reason for reason in view.blocking_reasons)
+    assert view.blocking_reasons
     evidence = await verifier.finalize(CancelToken())
     assert evidence.complete is False and evidence.failure_kind == "no_baseline"
+
+
+@pytest.mark.parametrize("cancellation", ["task", "token"])
+async def test_initialize_cancellation_removes_unpublished_baseline(repo, monkeypatch, cancellation):
+    import cicada.plugins.coding.verification as verification_module
+
+    workspace, verifier = build(repo, CheckDefinition("check-1", "exit 0"))
+    entered = asyncio.Event()
+    offset = [0.0]
+    monkeypatch.setattr(verification_module, "time", SimpleNamespace(
+        monotonic=lambda: time.monotonic() + offset[0]))
+    original = verification_module.json.dumps
+
+    def wrote_record(value, *args, **kwargs):
+        result = original(value, *args, **kwargs)
+        if isinstance(value, dict) and "data_b64" in value:
+            offset[0] += 1.0
+            entered.set()
+        return result
+
+    monkeypatch.setattr(verification_module.json, "dumps", wrote_record)
+    token = CancelToken()
+    task = asyncio.create_task(verifier.initialize(token))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    if cancellation == "task":
+        task.cancel()
+    else:
+        token.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert verifier.baseline_snapshot_ref is None
+    assert list(workspace.output_dir.iterdir()) == []
 
 
 async def test_finalize_reports_added_modified_deleted_with_hashes(repo):
