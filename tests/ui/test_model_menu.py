@@ -429,17 +429,18 @@ async def test_selection_submits_only_option_id_without_request_or_history(tmp_p
         await session.aclose()
 
 
-async def test_status_and_diagnostics_after_selection(tmp_path):
-    """/status 读取有效模型与失效后的预算锚; 启动诊断保留启动事实 (C7/D8)."""
+async def test_model_switch_updates_effective_model_but_keeps_startup_facts(tmp_path):
+    """切换后有效模型更新; 启动事实 (welcome [启动模型] 段) 不随切换改写 (C7/D8).
+
+    原测试经 /status 读取这些事实; 命令已于 2026-10-19 删除, 改为直接核对
+    应用侧有效配置与仍然存在的启动快照条目。
+    """
     bodies: list = []
     answers = iter([ds_response("思考一", "第一答")])
     session = await _ds_session(tmp_path, bodies, answers)
     from cicada.ui.conversation_view import build
 
-    view = build(
-        session,
-        diagnostics=lambda: ["工作区: 启动目录", "模型: deepseek-flash"],
-    )["view"]
+    view = build(session)["view"]
     try:
         assert view.on_submit("/model")
         view.confirm_model_selection("deepseek-v4-pro")
@@ -447,13 +448,13 @@ async def test_status_and_diagnostics_after_selection(tmp_path):
         while view._gate.model_selecting and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
         assert not view._gate.model_selecting
-        assert view.on_submit("/status")
+        # 会话有效模型已切换
+        assert session.config.model_label == "deepseek-v4-pro"
+        # 启动事实保留: welcome 的 [启动模型] 段不随切换改写
         rendered = strip_terminal_sequences(chr(10).join(view.document_lines(90)))
-        assert "模型: deepseek-v4-pro" in rendered  # 会话段: 有效模型
-        # 启动事实保留 (welcome r2 [启动模型] 段内容行 + 启动诊断), 均不随切换改写
-        assert rendered.count("模型: deepseek-flash") == 1  # 启动诊断
         assert "[启动模型]" in rendered and "  deepseek-flash · 思考 high" in rendered
-        assert "锚: 未立锚" in rendered or "占用估计不可得" in rendered  # 锚已失效
+        # /status 已删除: 按未知命令处理
+        assert view.on_submit("/status") is False
     finally:
         view.close()
         await session.aclose()

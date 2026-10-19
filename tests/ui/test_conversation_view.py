@@ -356,11 +356,9 @@ async def test_commands_idle_only_with_escape_and_unknown_hint(tmp_path):
     try:
         assert h.submit("/help") is False  # 2026-10-18 用户裁决删除 /help: 按未知命令处理
         assert any("未知命令" in line for line in h.lines())
-        assert h.submit("/status") is True
-        joined = "\n".join(strip_terminal_sequences(line) for line in h.lines())
-        assert "状态: idle" in joined and "模型: fake" in joined
-        assert "计量: 不可得" in joined  # 无计量数据不当作 0
-        assert h.submit("/未知命令") is False  # 未知命令提示且草稿保留
+        assert h.submit("/status") is False  # 2026-10-19 删除: 同样按未知命令处理
+        assert any("未知命令" in line for line in h.lines())
+        assert h.submit("/成本") is False  # 未知命令提示且草稿保留
         assert any("未知命令" in line for line in h.lines())
         h.view.editor.set_text("/foo 保留草稿")
         assert h.submit("/foo") is False
@@ -376,23 +374,16 @@ async def test_commands_idle_only_with_escape_and_unknown_hint(tmp_path):
         await session.aclose()
 
 
-async def test_status_multiline_field_keeps_its_section_when_total_is_clipped(tmp_path):
-    from dataclasses import replace
-
-    config = replace(_config(_repo(tmp_path), _script()), model_label="fake\n模型续行")
-    session = await open_application(config)
-    view = ConversationView(session, diagnostics=lambda: [f"诊断{i}: 原始值" for i in range(20)])
+async def test_cost_command_shows_disabled_without_ledger(tmp_path):
+    """原 /status 分节裁剪测试随命令删除; 保留一条"命令输出是信息条目"的代表。"""
+    session = await open_application(_config(_repo(tmp_path), _script()))
+    view = ConversationView(session)
     try:
-        assert view.on_submit("/status") is True
+        assert view.on_submit("/cost") is True
         lines = [strip_terminal_sequences(line).strip() for line in view.document_lines(100)]
-        session_heading, metrics_heading, config_heading = (
-            lines.index(name) for name in ("会话", "计量", "配置")
-        )
-        assert "模型续行" in lines[session_heading:metrics_heading]
-        assert "计量: 不可得" in lines[metrics_heading:config_heading]
-        assert "模型续行" not in lines[config_heading:]
-        assert any("…[已截断: 显示" in line for line in lines)
-        assert session.history == ()
+        assert "费用控制" in lines
+        assert any("未启用" in line for line in lines)
+        assert session.history == ()  # 命令不写模型历史
     finally:
         view.close()
         await session.aclose()
@@ -414,7 +405,7 @@ async def test_clear_keeps_display_and_appends_system_entry(tmp_path):
         assert [type(e) for e in after[: len(before)]] == before
         assert "已清空模型历史" in "\n".join(h.lines())
         # 清空后空闲命令继续可用
-        assert h.submit("/status") is True
+        assert h.submit("/cost") is True
     finally:
         h.close()
         await session.aclose()
@@ -551,7 +542,7 @@ async def test_process_uncertain_error_entry_then_idle_commands_usable(tmp_path)
         )
         # 任务终结且 idle: reservation 释放, 诊断/清空/退出不被锁死
         assert h.view._gate.busy() is False
-        assert h.submit("/status") is True
+        assert h.submit("/cost") is True
         assert h.submit("/clear") is True
         assert session.history == ()
         assert session.has_process_uncertain() is True  # 清空历史不解锁: 锁存是 session 层事实

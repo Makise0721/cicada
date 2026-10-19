@@ -1,7 +1,8 @@
-"""票据 05 检查投影单元检查: 来源四分类、回执收集、/status 事实与有界限额.
+"""票据 05 检查投影单元检查: 来源四分类、回执收集与结论条目.
 
 自旧 test_presenter 的检查语义迁移到新前端投影层; 真实 Git/PowerShell 的
 端到端语义在 tests/e2e/test_tui_verification.py 覆盖。
+2026-10-19 删 /status: 该页的检查事实 (status_lines) 与截断限额随之删除。
 """
 
 from __future__ import annotations
@@ -26,12 +27,8 @@ from cicada.ui.checks import (
     NORMAL_MODE_CHECK_LABEL,
     NOT_RUN_CHECK_LABEL,
     PROCESS_UNCERTAIN_LABEL,
-    STATUS_MAX_LINES,
     CheckProjection,
     artifact_line,
-    bound_status_lines,
-    change_scope_text,
-    check_status_text,
     clip_lines,
     delivery_lines,
 )
@@ -105,7 +102,7 @@ def _outcome(
     )
 
 
-# --- clip_lines / bound_status_lines (限额与截断标记) ------------------------------------------
+# --- clip_lines (限额与截断标记) --------------------------------------------------------------
 
 
 def test_clip_lines_respects_line_and_byte_bounds():
@@ -128,27 +125,6 @@ def test_clip_lines_single_huge_line_clips_at_byte_bound():
     kept, total_lines, total_bytes, truncated = clip_lines(text, 32, 8192)
     assert truncated and len(kept) == 1
     assert len(kept[0].encode("utf-8")) <= 8192
-
-
-def test_bound_status_lines_passthrough_within_limits():
-    lines = [f"状态: idle", "模型: fake", "计量: 不可得"]
-    assert bound_status_lines(lines) == lines
-
-
-def test_bound_status_lines_marks_line_overflow():
-    lines = [f"row-{i}" for i in range(STATUS_MAX_LINES + 5)]
-    bounded = bound_status_lines(lines)
-    assert len(bounded) == STATUS_MAX_LINES + 1
-    assert bounded[-1].startswith("…[已截断: 显示 20/")
-    assert "UTF-8 bytes]" in bounded[-1]
-
-
-def test_bound_status_lines_marks_field_overflow():
-    long_field = "字段: " + "汉" * 400  # > 512 bytes
-    bounded = bound_status_lines([long_field])
-    assert len(bounded) == 1
-    assert "…[已截断: 512/" in bounded[0] and "UTF-8 bytes]" in bounded[0]
-    assert bounded[0].count("汉") < 400, "字段本体已被截断"
 
 
 # --- artifact_line ---------------------------------------------------------------------------
@@ -265,13 +241,10 @@ def test_check_projection_collects_receipt_ids_and_resets_per_request():
 def test_check_projection_quiet_in_normal_mode():
     projection = CheckProjection(_StubSession(verification_run_id=None))
     assert projection.on_request_completed(_outcome()) is None, "正常完成无条目"
-    # 普通模式完成后 /status 如实显示未启用检查 (口径同旧状态栏)
-    assert projection.status_lines() == ["检查: 未启用检查"]
 
 
-def test_check_projection_status_lines_check_mode():
+def test_check_projection_concludes_in_check_mode():
     projection = CheckProjection(_StubSession(verification_run_id="vr-1"))
-    assert projection.status_lines() == ["验证运行: vr-1", "检查: 不可得"]
     outcome = _outcome(
         view=_view(CheckState("check-1", _receipt("r-1"), "current")),
         evidence=ChangeEvidence(
@@ -280,26 +253,7 @@ def test_check_projection_status_lines_check_mode():
         ),
         decision=DeliveryDecision(True, True, ()),
     )
-    assert projection.on_request_completed(outcome) is not None
-    status = "\n".join(projection.status_lines())
-    assert f"检查: check-1=passed/current" in status
-    assert "累计改动口径: 相对启动基线 0 项变更" in status
+    lines = projection.on_request_completed(outcome)
+    assert lines is not None and lines[0] == "检查结论"
+    assert any("check-1" in line for line in lines)
 
-
-def test_check_status_text_normal_mode_and_uncertain():
-    session = _StubSession(verification_run_id=None)
-    assert check_status_text(_outcome(), session) == NORMAL_MODE_CHECK_LABEL
-    latch = _StubSession(verification_run_id="vr-1", process_uncertain=True)
-    outcome = _outcome(view=_view(CheckState("check-1", _receipt("r-1"), "current")))
-    assert PROCESS_UNCERTAIN_LABEL in check_status_text(outcome, latch)
-
-
-def test_change_scope_text_incomplete_evidence():
-    incomplete = ChangeEvidence(
-        baseline_snapshot_ref=None, snapshot_ref=None, scope_id=None, changes=(),
-        artifact_path=None, artifact_sha256=None, complete=False,
-        failure_kind="scan_failed",
-    )
-    outcome = _outcome(evidence=incomplete)
-    assert change_scope_text(outcome) == "累计改动口径: 相对启动基线（不完整: scan_failed）"
-    assert change_scope_text(_outcome()) is None

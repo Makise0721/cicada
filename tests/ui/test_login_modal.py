@@ -69,7 +69,6 @@ async def test_real_vt_login_replace_masks_secret_saves_once_and_preserves_draft
         assert session.persistence == before and session.history == ()
         assert h.view.editor.get_text() == '原聊天草稿\n第二行'
         assert (h.view.editor.state.cursor_line, h.view.editor.state.cursor_col) == position
-        h.view.on_submit('/status')
         h.view.on_submit('/cost')
         await h.settle()
         for needle in ('modal-sentinel', snapshot.defaults.credential_ref, h.view._session._login_view.revision):
@@ -156,7 +155,6 @@ async def test_slash_help_parameter_rejection_and_escape_are_local(tmp_path):
         assert h.view.login_modal.is_open
         h.terminal.emit([ESCAPE])
         h.view.on_submit('/login tail-secret')
-        h.view.on_submit('/status')
         await h.settle()
         assert 'tail-secret' not in h.terminal.output_text
         assert '不接受参数' in strip_terminal_sequences(h.terminal.output_text)
@@ -242,7 +240,7 @@ async def test_fake_configuration_is_lazy_until_explicit_login(tmp_path):
     h = TUIHarness(session)
     try:
         await h.start()
-        h.view.on_submit('/status')
+        h.view.on_submit('/cost')  # 普通命令不读登录环境 (/status 已删除)
         assert reads == []
         h.view.on_submit('/login')
         assert reads == [True] and h.view.login_modal.wizard.view.model == 'deepseek-flash'

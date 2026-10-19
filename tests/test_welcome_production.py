@@ -255,7 +255,7 @@ def test_resumed_session_welcome_has_no_logo_and_replies_again(monkeypatch, tmp_
     assert events == ['main-start', 'main-stop']
     welcome = main.notes.get('welcome_text')
     assert welcome is not None, '主屏未出现恢复欢迎'
-    for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '输入 / 查看命令 · /status 状态'):
+    for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '输入 / 查看命令'):
         assert needle in welcome
     assert not any(mark in welcome for mark in _LOGO_CHARS), '恢复短欢迎无标志'
     assert main.notes.get('restored_seen'), '恢复投影的旧记录不可见'

@@ -42,7 +42,7 @@ def interactive(monkeypatch):
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
     sessions = []
 
-    async def tui(session, *, initial_prompt, diagnostics):
+    async def tui(session, *, initial_prompt):
         assert terminal.stopped and terminal.starts == terminal.stops == 1
         sessions.append(session)
         try:

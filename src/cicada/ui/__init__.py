@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from cicada.ui.conversation_view import ConversationView
 from cicada.ui.commands import SlashCommandMenu
@@ -42,13 +42,11 @@ async def run_tui_session(
     *,
     initial_prompt: str | None = None,
     terminal: Terminal | None = None,
-    diagnostics: Callable[[], list[str]] | None = None,
 ) -> int:
     """运行 Pi 主屏前端直至退出并完成应用关闭收尾; 返回进程退出码。
 
     session 由调用方 open; 关闭顺序: frontend 停止 (恢复终端模式) ->
-    await session.aclose() (关闭监督) -> 退订观察者。diagnostics 为 /status
-    注入的只读诊断行 (CLI 提供的不可变对象行化, 限额归 /status 组装层)。
+    await session.aclose() (关闭监督) -> 退订观察者。
     """
     if terminal is None:
         terminal = PromptToolkitTerminal()
@@ -64,7 +62,6 @@ async def run_tui_session(
         session,
         on_exit=lambda: _request_exit(refs),
         on_update=_request_render,
-        diagnostics=diagnostics,
     )
     view.editor.focused = True  # 硬件光标标记: IME 候选窗跟随编辑光标
     # 会话不可恢复崩溃 (execute 异常且 state 已入 closing/closed): 退出码优先 1

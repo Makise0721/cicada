@@ -440,7 +440,8 @@ def test_tui_startup_is_quiet_no_prompt_or_config_lines(tmp_path, monkeypatch, c
     captured: dict = {}
 
     async def fake_run_tui_session(session, **kwargs):
-        captured["has_diagnostics"] = kwargs.get("diagnostics") is not None
+        # /status 与诊断注入已删除 (2026-10-19): 入口只传 session 与首问
+        captured["kwargs"] = dict(kwargs)
         return 0
 
     monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
@@ -451,7 +452,7 @@ def test_tui_startup_is_quiet_no_prompt_or_config_lines(tmp_path, monkeypatch, c
     code = m.main()
     out = capsys.readouterr().out
     assert code == 0
-    assert captured["has_diagnostics"], "CLI 必须注入诊断"
+    assert "diagnostics" not in captured["kwargs"], "诊断注入链路已删除"
     assert "prompt version=" not in out, "TUI 启动不打印 prompt 身份行"
     assert "[config model=" not in out, "TUI 启动不打印 config 行"
     assert "[check_mode" not in out

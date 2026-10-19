@@ -15,7 +15,7 @@ workspace 根目录 AGENTS.md (C1); --no-auto-instructions 关闭自动选择, �
 不可用同样先于 preflight 报错。指令来源 mode 仅供显示, 不进入提示身份。
 
 --tui 进入交互终端 (生产组合: 共享应用 + Pi 主屏前端, 见 cicada.ui; 正常启动
-安静, /status 提供有界可追溯诊断, 检查事实由 RequestOutcome 投影); UI 可选依赖
+安静, 检查事实由 RequestOutcome 投影); UI 可选依赖
 缺失或 stdin/stdout 非 TTY 退出码 2; 位置 prompt 可省略 (空启动), 给出则作为
 首问提交; 进程退出码: 启动失败 2, UI 不可恢复/关闭错误优先 1, 正常关闭取最后
 一条请求的退出码 (无请求 0). 单次模式要求位置 prompt; 普通 UI 导入要求为零 (T14).
@@ -452,7 +452,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         if skills_snapshot.diagnostics:
             for diagnostic in skills_snapshot.diagnostics:
                 print(f"[skills diagnostic: {diagnostic}]")
-    if not args.tui:  # TUI 静默: prompt 身份进 /status (P12)
+    if not args.tui:  # TUI 静默: 启动身份不打印 (P12; 原 /status 页已删除)
         _print_prompt_info(prompt_info)
     plan: VerificationPlan | None = None
     if checks:
@@ -734,34 +734,10 @@ async def _run_tui(
             print('用户默认值已保存；应用打开失败', file=sys.stderr)
         print(f"{exc}", file=sys.stderr)
         return 2
-    # /status 的只读诊断: CLI 组装不可变快照后注入, UI 不读取 provider 闭包
-    from functools import partial
-
-    from cicada.ui.diagnostics import UIDiagnostics, diagnostics_lines
-
-    plan = app_config.plan
-    info = app_config.prompt_info
-    diagnostics = UIDiagnostics(
-        workspace=str(app_config.workspace),
-        model_label=app_config.model_label or None,
-        prompt_version=info.version,
-        prompt_sha256=info.prompt_sha256,
-        instructions_path=(
-            str(info.instructions_path) if info.instructions_path is not None else None
-        ),
-        instructions_sha256=info.instructions_sha256,
-        instructions_mode=info.instructions_mode,
-        verification_run_id=plan.verification_run_id if plan is not None else None,
-        check_ids=tuple(check.check_id for check in plan.checks) if plan is not None else (),
-        check_timeout_s=plan.checks[0].timeout_s if plan is not None else None,
-        max_turns=app_config.max_turns,
-    )
     # 恢复阻断: UI 可查看 (新请求被应用拒绝); 无新请求关闭后退出码 3 (契约 §6),
     # 关闭错误/不可恢复失败优先 1
     view_only = session.view_only_reason is not None
-    code = await run_tui_session_fn(
-        session, initial_prompt=initial_prompt, diagnostics=partial(diagnostics_lines, diagnostics)
-    )
+    code = await run_tui_session_fn(session, initial_prompt=initial_prompt)
     if code == 1:
         return 1
     return 3 if view_only else code

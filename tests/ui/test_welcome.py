@@ -90,7 +90,7 @@ async def test_new_session_welcome_first_single_no_request_no_history(tmp_path):
         assert "[启动模型]" in text and "  fake · 思考 不可得" in text  # 无持久身份: 思考不可得
         assert "[指令]" in text and "  未指定" in text
         assert "[Skills]" in text and "  未启用" in text
-        assert "输入 / 查看命令 · /model 模型 · /login 配置 · /status 状态" in text
+        assert "输入 / 查看命令 · /model 模型 · /login 配置" in text
         assert "Enter 发送 · Shift+Enter 换行" in text
     finally:
         h.close()
@@ -308,7 +308,7 @@ async def test_resume_shows_short_welcome_before_restored_history(tmp_path):
         assert len(_welcome_entries(resumed)) == 1
         rendered = _text(resumed)
         assert "恢复会话 · 启动快照" in rendered
-        assert "输入 / 查看命令 · /status 状态" in rendered
+        assert "输入 / 查看命令" in rendered
         assert "Enter 发送" not in rendered, "恢复短欢迎无键位行"
         # 恢复投影保留且在欢迎之后
         assert rendered.index("恢复会话") < rendered.index("已恢复历史：1 条请求")
@@ -608,7 +608,7 @@ def test_r2_full_block_line_order_and_indent():
     visible = [strip_terminal_sequences(line) for line in lines]
     assert visible[1].startswith("Cicada 0.1.0 · 新会话 · 启动快照")
     assert visible[2].startswith("Enter 发送 · Shift+Enter 换行")
-    assert visible[3] == "输入 / 查看命令 · /model 模型 · /login 配置 · /status 状态"
+    assert visible[3] == "输入 / 查看命令 · /model 模型 · /login 配置"
     assert visible[4] == ""
     assert visible[5] == "[工作区]" and visible[6] == "  ~/codex_space/cicada"
     assert visible[7] == "[启动模型]" and visible[8] == "  deepseek-flash · 思考 high"
@@ -635,7 +635,7 @@ def test_r2_resume_short_block_has_no_sections(plain):
     assert len(lines) == 4
     assert "恢复会话 · 启动快照" in visible[1]
     assert visible[2] == "启动模型: deepseek-flash · 思考 high"
-    assert visible[3] == "输入 / 查看命令 · /status 状态"
+    assert visible[3] == "输入 / 查看命令"
     assert not any(line.startswith("[") for line in visible)
     if plain:
         assert all("\x1b" not in line for line in lines)

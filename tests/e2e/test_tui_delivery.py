@@ -46,6 +46,7 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
     紧凑交互 01 起前端持有自有视口 (帧 ≤ rows): 屏幕只呈现文档窗口,
     "保留全文"与分组顺序是同源文档事实, 经 view.document_lines 核对;
     屏幕级断言只留窗口内真实可见事实 (无 SGR 碎片、光标在输入行)。
+    2026-10-19 删 /status 后, 命令输出代表改用 /cost (费用控制信息块)。
     """
     session = await open_application(
         make_config(tmp_path, script_json({"text": "回答结束。", "stop": True}), chunks=1)
@@ -67,12 +68,7 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
         ]
 
     try:
-        task = asyncio.ensure_future(run_tui_session(
-            session, terminal=stage.terminal,
-            diagnostics=lambda: [
-                "prompt 版本: builtin:p4-v1", "prompt sha256: " + "a" * 64, "轮次上限: 50",
-            ],
-        ))
+        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
         assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
         stage.emit(text_keys("hi"))
         stage.emit([ENTER])
@@ -80,32 +76,28 @@ async def test_command_output_has_sections_and_space_from_answer_and_editor(tmp_
             lambda: "回答结束。" in "".join(stage.text().split()) and session.state == "idle"
         )
         await asyncio.sleep(0.05)
-        stage.emit(text_keys("/status"))
+        stage.emit(text_keys("/cost"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: any("会话信息" in line for line in doc_lines())), (
+        assert await wait_until(lambda: any("费用控制" in line for line in doc_lines())), (
             "命令输出进入同源文档 (窗口可能只呈尾部)"
         )
         compact = "".join("".join(doc_lines()).split())
-        assert "a" * 64 in compact, "窄窗换行保留完整 hash (文档级)"
+        assert "费用控制" in compact
         assert not re.search(r"\[[0-9;]+m", stage.text()), "不能显示被拆开的 SGR 碎片"
         cursor_row = stage.vt.cursor_row
         # 输入行现在有 › 提示符与空态占位 (tui-aesthetics §C); 光标仍在该行
         assert "›" in stage.vt.screen_text()[cursor_row], "硬件光标仍在输入行"
         # 同一文档在宽窗口重新排版，分组顺序与留白是同源文档事实 (视口只呈窗口)。
         stage.set_size(100, 45)
-        assert await wait_until(lambda: stage.contains("会话信息"))
+        assert await wait_until(lambda: stage.contains("费用控制"))
         lines = doc_lines()
         answer = lines.index(" 回答结束。")
-        info = lines.index(" 会话信息")
+        info = next(i for i, line in enumerate(lines) if line.strip() == "费用控制")
         assert not any(lines[answer + 1:info])
         assert info > answer + 1
-        for heading in (" 会话", " 计量", " 检查", " 配置"):
-            assert heading in lines[info:]
-        assert " 状态: idle" in lines
-        assert " 模型: fake" in lines
-        assert " prompt 版本: builtin:p4-v1" in lines
-        assert " 轮次上限: 50" in lines
+        assert any("未启用" in line for line in lines[info:])
         assert not any(line.startswith(" /help") for line in lines)
+        assert not any("/status" in line for line in lines), "命令已删除, 菜单不再列出"
         assert len(model_of(session).requests) == 1
         assert len(session.history) == 2, "显示命令不进入模型历史"
         stage.emit(text_keys("/exit"))
@@ -123,12 +115,16 @@ async def test_slash_menu_selects_and_executes_existing_command(tmp_path):
     try:
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("/"))
-        assert await wait_until(lambda: stage.contains("→ status")), "输入斜杠后列出可用命令"
-        assert all(stage.contains(name) for name in ("status", "skill", "diff")), (
-            "2026-10-18 起 /help 删除、菜单一次可见 9 行, 首屏含 status/skill/diff"
+        # 2026-10-19 删 /status 后首个候选是 /skill (带参数, 只补齐不提交)
+        assert await wait_until(lambda: stage.contains("→ skill")), "输入斜杠后列出可用命令"
+        assert all(stage.contains(name) for name in ("skill", "diff", "cost")), (
+            "2026-10-18 起 /help 删除、菜单一次可见 9 行; /status 已删"
         )
+        # 过滤到唯一无参数候选 /cost, 菜单 Enter 走原准入直接执行
+        stage.emit(text_keys("cos"))
+        assert await wait_until(lambda: stage.contains("→ cost"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle")), "Enter 执行选中的 /status"
+        assert await wait_until(lambda: stage.contains("费用控制")), "Enter 执行选中的 /cost"
         assert session.history == ()
         assert model_of(session).requests == []
         stage.emit(text_keys("/exit"))
@@ -161,24 +157,24 @@ async def test_slash_menu_enter_remains_silent_until_request_is_idle(tmp_path, m
         assert await wait_until(lambda: stage.contains("fake"))
         stage.emit(text_keys("问题") + [ENTER])
         assert await wait_until(lambda: session.state == "executing")
-        # /help 删除后菜单第二项是带参数的 /skill (菜单 Enter 只补齐), 这里用前缀
-        # 直接过滤到唯一候选 /status: 菜单选中的无参数命令 Enter 仍走原准入。
-        stage.emit(text_keys("/st") + [ENTER])
+        # /help 与 /status 均已删除: 用前缀直接过滤到唯一候选 /cost
+        # (无参数), 菜单选中的无参数命令 Enter 仍走原准入。
+        stage.emit(text_keys("/cos") + [ENTER])
         # 完成渲染是同源文档事实 (40x8 菜单打开时文档窗口 0 行, 屏幕无可呈)
         assert await wait_until(
             lambda: session.state == "idle"
             and any("完成回答" in line for line in views[0].document_lines(40))
         )
-        assert not stage.contains("状态: idle")
+        assert not stage.contains("费用控制")
         assert len(model_of(session).requests) == 1
-        assert "→ status" in "\n".join(stage.vt.screen_text())
-        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /st"  # 提示符 + 草稿 (§C)
+        assert "→ cost" in "\n".join(stage.vt.screen_text())
+        assert stage.vt.screen_text()[stage.vt.cursor_row].strip() == "› /cos"  # 提示符 + 草稿 (§C)
         stage.emit([ENTER])
-        # /status 经菜单 Enter 执行: 40x8 跟随窗口只呈尾部, 首行 "状态: idle"
+        # /cost 经菜单 Enter 执行: 40x8 跟随窗口只呈尾部, 信息块标题
         # 是同源文档事实 (紧凑交互 01); 有色环境标签带 SGR, 内容事实剥样式后匹配
         assert await wait_until(
             lambda: any(
-                "状态: idle" in strip_terminal_sequences(line)
+                "费用控制" in strip_terminal_sequences(line)
                 for line in views[0].document_lines(40)
             )
         )
@@ -613,93 +609,6 @@ async def test_resize_reflows_visible_document(tmp_path):
     finally:
         if session.state != "closed":
             await session.aclose()
-
-
-# --- P12: /status 诊断注入与有界限额 (CLI 提供不可变诊断对象) ---------------------------
-
-
-async def test_status_diagnostics_injected_and_bounded(tmp_path):
-    session = await open_application(
-        make_config(git_repo(tmp_path), script_json({"text": "回答", "stop": True}), chunks=1)
-    )
-    stage = StageTerminal()
-
-    def diagnostics() -> list[str]:
-        return [
-            "prompt 版本: builtin:p4-v1",
-            "prompt sha256: " + "a" * 64,
-            "超长字段: " + "汉" * 400,  # > 512 bytes: 必须截断并给标记
-        ]
-
-    try:
-        task = asyncio.ensure_future(
-            run_tui_session(session, terminal=stage.terminal, diagnostics=diagnostics)
-        )
-        assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
-        stage.emit(text_keys("/status"))
-        stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle"))
-        flat = stage.flat()
-        assert "prompt 版本: builtin:p4-v1" in flat
-        assert "prompt sha256: " + "a" * 64 in flat
-        assert "…[已截断: 512/" in flat, "超长字段按 512 bytes 限额截断并标记"
-        stage.emit(text_keys("/exit"))
-        stage.emit([ENTER])
-        code = await asyncio.wait_for(task, timeout=15)
-        assert code == 0
-        assert session.state == "closed"
-    finally:
-        if session.state != "closed":
-            await session.aclose()
-
-
-async def test_run_tui_cli_assembles_diagnostics_from_config(tmp_path):
-    """__main__._run_tui: 诊断快照来自 ApplicationConfig 已发布字段 (P12 组装路径)."""
-    from cicada.__main__ import _run_tui
-    from cicada.plugins.coding.verification import generate_verification_run_id
-    from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
-    from cicada.ui import run_tui_session as run_fn
-
-    root = git_repo(tmp_path)
-    plan = VerificationPlan(
-        verification_run_id=generate_verification_run_id(),
-        root=Path(os.path.realpath(root)),
-        checks=(CheckDefinition("check-1", "exit 0", timeout_s=30.0),),
-    )
-    app_config = make_config(root, script_json({"text": "答", "stop": True}), chunks=1, plan=plan)
-    stage = StageTerminal()
-    captured: list[str] = []
-
-    async def runner(session, **kwargs):
-        assert kwargs.get("diagnostics") is not None, "CLI 必须注入诊断"
-        captured.extend(kwargs["diagnostics"]())
-
-        async def driver():
-            assert await wait_until(lambda: stage.terminal.started and stage.terminal.written)
-            stage.emit(text_keys("/status"))
-            stage.emit([ENTER])
-            assert await wait_until(lambda: stage.contains("状态: idle"))
-            stage.emit(text_keys("/exit"))
-            stage.emit([ENTER])
-
-        driver_task = asyncio.ensure_future(driver())
-        code = await run_fn(session, terminal=stage.terminal, **kwargs)
-        await driver_task
-        return code
-
-    code = await asyncio.wait_for(
-        _run_tui(runner, app_config, initial_prompt=None), timeout=30
-    )
-    assert code == 0, "无请求完成: 正常关闭退出码 0"
-    # 诊断快照字段与 ApplicationConfig/prompt_info/plan 一致
-    assert f"工作区: {root}" in " ".join(captured) or any("工作区:" in line for line in captured)
-    assert any("prompt 版本: stage-acceptance" in line for line in captured)
-    assert any("prompt sha256: " for line in captured if line.startswith("prompt sha256"))
-    assert any("检查配置: ids=check-1" in line for line in captured)
-    assert any("检查超时: 30s" in line for line in captured)
-    assert any("轮次上限: 6" in line for line in captured)
-    # /status 实际显示包含注入诊断
-    assert stage.contains("prompt 版本: stage-acceptance")
 
 
 # --- 审查修复回归: 晚到关闭错误 / 不可恢复崩溃 / 终端恢复留痕 -------------------------

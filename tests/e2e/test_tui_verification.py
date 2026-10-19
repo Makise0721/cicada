@@ -209,17 +209,15 @@ async def test_t09_uncertain_latch_survives_clear_and_commands_remain(tmp_path, 
             lambda: "process_uncertain: new coding requests" in stage.flat()
         ), "拒绝文本如实成条"
 
-        # 未知锁存后 idle 的 /status、/clear、/exit 仍可用 (P14)
-        stage.emit(text_keys("/status"))
-        stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle"))
-        assert "进程终结未知（锁存）" in stage.flat()
+        # 未知锁存后 idle 的 /clear、/exit 仍可用 (P14); /status 已于 2026-10-19 删除,
+        # 锁存事实由被拒错误条目与 /clear 后的提示承担
         stage.emit(text_keys("/clear"))
         stage.emit([ENTER])
         # 第二次清空确认: 视口只呈窗口, 累计计数是同源文档事实 (紧凑交互 01)
         assert await wait_until(
             lambda: "".join(views[0].document_lines(100)).count("已清空模型历史") >= 2
         )
+        assert "进程终结未知（锁存）" in stage.flat(), "清空不解锁锁存, 提示仍在"
         stage.emit(text_keys("/exit"))
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
@@ -500,31 +498,6 @@ async def test_t06_unstarted_tool_completion_after_model_error(tmp_path, monkeyp
         stage.emit([ENTER])
         code = await asyncio.wait_for(task, timeout=15)
         assert code == 1, "模型错误请求退出码 1"
-        assert session.state == "closed"
-    finally:
-        if session.state != "closed":
-            await session.aclose()
-
-
-# --- 普通模式 /status: 未启用检查 ----------------------------------------------------------------
-
-
-async def test_status_normal_mode_reports_check_not_enabled(tmp_path):
-    session = await open_application(
-        make_config(git_repo(tmp_path), script_json({"text": "普通回答", "stop": True}), chunks=1)
-    )
-    stage = StageTerminal()
-    try:
-        task = asyncio.ensure_future(run_tui_session(session, terminal=stage.terminal))
-        await _run_until_idle(session, stage, "普通问题", requests=1)
-        stage.emit(text_keys("/status"))
-        stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle"))
-        assert stage.contains("检查: 未启用检查")
-        stage.emit(text_keys("/exit"))
-        stage.emit([ENTER])
-        code = await asyncio.wait_for(task, timeout=15)
-        assert code == 0
         assert session.state == "closed"
     finally:
         if session.state != "closed":

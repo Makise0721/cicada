@@ -29,7 +29,6 @@ class SlashCommand:
 COMMAND_MENU_MAX_ROWS = 9  # 菜单一次可见的候选行数 (不含已移除的分页计数行)
 
 SLASH_COMMANDS = (
-    SlashCommand("/status", "显示状态与计量"),
     SlashCommand("/skill", "显示 Skills 目录；/skill <名称> [任务] 发送该 Skill", takes_argument=True),
     SlashCommand("/diff", "审阅工作区差异"),
     SlashCommand("/rewind", "查看并还原各请求的文件改动"),

@@ -9,8 +9,8 @@
 - 检查结论条目只在 decision 非空 (检查模式) 时追加; 正常完成保持安静。
 - 进程未知锁存显示取 session.has_process_uncertain() (应用层单调事实),
   不再由展示层自存副本。
-- /status 检查事实与限额 (20 行/8192 bytes 总限额、512 bytes 单字段限额与
-  截断标记) 也在此实现 (P12)。
+- 512 bytes 单字段限额与截断标记仍在此实现 (P12), 现服务 /skill 目录行;
+  原 /status 页及其 20 行总限额已于 2026-10-19 随命令删除。
 
 本模块只读: 不执行工具、不写会话、不计算自制的 PASS; 检查/交付事实一律取自
 outcome.view / outcome.evidence / outcome.decision (程序判定)。
@@ -35,11 +35,9 @@ CURRENT_RUN_CHECK_LABEL = "本次检查"
 PROCESS_UNCERTAIN_LABEL = "进程终结未知（锁存）"
 NOT_RUN_CHECK_LABEL = "未运行"
 
-# 阻断原因与 /status 的有界性 (P12; 阻断原因沿用旧工具卡限额)
+# 阻断原因的有界性 (P12; 沿用旧工具卡限额; 原 /status 总限额随命令删除)
 BLOCKING_MAX_LINES = 32
 BLOCKING_MAX_BYTES = 8192
-STATUS_MAX_LINES = 20
-STATUS_MAX_BYTES = 8192
 STATUS_FIELD_MAX_BYTES = 512
 # 检查结论条目整体限额 (同旧 presenter _bounded_body 口径)
 DELIVERY_MAX_LINES = 64
@@ -140,35 +138,8 @@ def delivery_lines(
     return lines
 
 
-def check_status_text(outcome: "RequestOutcome", session: "ApplicationSession") -> str | None:
-    """检查状态摘要 (旧 _check_status_text 移植); view 为 None 即未启用检查。"""
-    if outcome.view is None:
-        return NORMAL_MODE_CHECK_LABEL
-    parts: list[str] = []
-    if session.has_process_uncertain():
-        parts.append(PROCESS_UNCERTAIN_LABEL)
-    if outcome.view.checks:
-        parts.extend(
-            f"{state.check_id}={state.status}/{state.freshness}" for state in outcome.view.checks
-        )
-    else:
-        parts.append(NOT_RUN_CHECK_LABEL)
-    return " ".join(parts)
-
-
-def change_scope_text(outcome: "RequestOutcome") -> str | None:
-    """累计改动口径 (旧 _change_scope_text 移植); 无证据为 None。"""
-    evidence = outcome.evidence
-    if evidence is None:
-        return None
-    if not evidence.complete:
-        detail = f"（不完整: {evidence.failure_kind}）" if evidence.failure_kind else "（不完整）"
-        return f"累计改动口径: 相对启动基线{detail}"
-    return f"累计改动口径: 相对启动基线 {len(evidence.changes)} 项变更"
-
-
 class CheckProjection:
-    """检查/交付事实的显示投影: 回执收集 + 结论行 + /status 事实 (票据 05)。
+    """检查/交付事实的显示投影: 回执收集 + 结论行 (票据 05)。
 
     订阅侧职责: 每条内核事件经 observe_event 收集 check 回执身份; 阶段通知经
     note_phase 在新请求开始时清零本轮回执; RequestCompleted 经
@@ -179,7 +150,6 @@ class CheckProjection:
     def __init__(self, session: "ApplicationSession") -> None:
         self._session = session
         self._receipts_this_request: set[str] = set()
-        self._last_completed: "RequestOutcome | None" = None
 
     # --- 订阅侧入口 ------------------------------------------------------------------
 
@@ -200,12 +170,11 @@ class CheckProjection:
                 self._receipts_this_request.add(receipt_id)
 
     def on_request_completed(self, outcome: "RequestOutcome") -> list[str] | None:
-        """记录最近完成 outcome; 检查模式返回结论行, 正常模式返回 None (安静)。
+        """检查模式返回结论行, 正常模式返回 None (安静)。
 
         结论行整体受 64 行/16384 bytes 限额约束 (同旧 presenter _bounded_body),
         超限给截断标记; 阻断原因段另受 32 行/8192 bytes 限额。
         """
-        self._last_completed = outcome
         if outcome.decision is None:
             return None
         lines = ["检查结论", *delivery_lines(outcome, self._session, self._receipts_this_request)]
@@ -217,45 +186,17 @@ class CheckProjection:
             kept.extend(truncation_note(tuple(kept), original_lines, original_bytes, True))
         return kept
 
-    # --- /status 事实 -----------------------------------------------------------------
-
-    def status_lines(self) -> list[str]:
-        """/status 的检查事实: 验证运行 + 最近完成请求的检查摘要与累计口径。"""
-        lines: list[str] = []
-        if self._session.verification_run_id is not None:
-            lines.append(f"验证运行: {self._session.verification_run_id}")
-        if self._last_completed is None:
-            if self._session.verification_run_id is not None:
-                lines.append(f"检查: 不可得")
-            return lines
-        check = check_status_text(self._last_completed, self._session)
-        if check is not None:
-            lines.append(f"检查: {check}")
-        scope = change_scope_text(self._last_completed)
-        if scope is not None:
-            lines.append(scope)
-        return lines
-
 
 def clip_status_field(line: str) -> str:
-    """单字段 512 UTF-8 bytes 限额: 超限按字符边界截断并给截断标记 (P12)。"""
+    """单字段 512 UTF-8 bytes 限额: 超限按字符边界截断并给截断标记 (P12)。
+
+    现用于 /skill 目录行 (原 /status 页已删除, 限额口径沿用)。
+    """
     encoded = line.encode("utf-8")
     if len(encoded) <= STATUS_FIELD_MAX_BYTES:
         return line
     clipped = encoded[:STATUS_FIELD_MAX_BYTES].decode("utf-8", errors="ignore")
     return f"{clipped}…[已截断: {STATUS_FIELD_MAX_BYTES}/{len(encoded)} UTF-8 bytes]"
-
-
-def bound_status_lines(lines: list[str]) -> list[str]:
-    """/status 总限额 (20 行/8192 UTF-8 bytes) + 单字段限额与截断标记 (P12)。"""
-    bounded = [clip_status_field(line) for line in lines]
-    total = "\n".join(bounded)
-    if len(bounded) <= STATUS_MAX_LINES and len(total.encode("utf-8")) <= STATUS_MAX_BYTES:
-        return bounded
-    kept, original_lines, original_bytes, truncated = clip_lines(
-        total, STATUS_MAX_LINES, STATUS_MAX_BYTES
-    )
-    return [*kept, *truncation_note(kept, original_lines, original_bytes, truncated)]
 
 
 __all__ = [
@@ -272,12 +213,7 @@ __all__ = [
     "NOT_RUN_CHECK_LABEL",
     "PROCESS_UNCERTAIN_LABEL",
     "STATUS_FIELD_MAX_BYTES",
-    "STATUS_MAX_BYTES",
-    "STATUS_MAX_LINES",
     "artifact_line",
-    "bound_status_lines",
-    "change_scope_text",
-    "check_status_text",
     "clip_lines",
     "clip_status_field",
     "delivery_lines",

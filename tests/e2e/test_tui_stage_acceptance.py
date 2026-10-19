@@ -176,12 +176,12 @@ async def test_stage_acceptance_full_interaction(tmp_path, monkeypatch):
         assert session.verification_run_id == plan.verification_run_id
         assert "第一轮修改完成并通过检查。" in doc_text(), "已显示记录保留 (文档级, 窗口外不回放)"
 
-        # 8) /status: 空闲可用, 有界事实可追溯 (P12/P14)
-        stage.emit(text_keys("/status"))
+        # 8) /status 已删除 (2026-10-19): 空闲命令仍可用, 事实经 /cost 与 /clear 承载;
+        #    检查口径改从应用侧只读出口核对 (UI 不再有该出口)
+        assert session.state == "idle"
+        stage.emit(text_keys("/cost"))
         stage.emit([ENTER])
-        assert await wait_until(lambda: stage.contains("状态: idle"))
-        assert "检查: check-1=passed/current" in stage.flat()
-        assert stage.contains("计量:")
+        assert await wait_until(lambda: stage.contains("费用控制"))
 
         # 9) 退出: 关闭顺序收尾, 进程退出码 = 最后一条请求退出码 (aborted = 1) (P15)
         stage.emit(text_keys("/exit"))

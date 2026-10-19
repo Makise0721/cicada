@@ -30,7 +30,7 @@ def test_login_saved_defaults_reach_next_real_cli_request(monkeypatch, tmp_path,
                 ENTER, KeyPress(Keys.Up, '\x1b[A'), ENTER, ENTER, ENTER])
 
     terminal = ScriptTerminal()
-    async def tui(session, *, initial_prompt, diagnostics):
+    async def tui(session, *, initial_prompt):
         sessions.append(session)
         async def quit_after_save():
             async with asyncio.timeout(5):
@@ -46,7 +46,7 @@ def test_login_saved_defaults_reach_next_real_cli_request(monkeypatch, tmp_path,
         closer = asyncio.create_task(quit_after_save())
         try:
             return await asyncio.wait_for(run_tui_session(session, terminal=terminal,
-                initial_prompt=initial_prompt, diagnostics=diagnostics), 8)
+                initial_prompt=initial_prompt), 8)
         finally:
             await closer
     monkeypatch.setattr('cicada.ui.run_tui_session', tui)

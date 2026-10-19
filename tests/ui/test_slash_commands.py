@@ -23,7 +23,7 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
         assert h.find("→ exit")
         h.terminal.emit([DOWN])
         await h.settle()
-        assert h.find("→ status")
+        assert h.find("→ skill")  # 2026-10-19 删 /status 后首个候选
         h.terminal.emit(text_keys("c"))
         await h.settle()
         # 02: /c 前缀现有 compact/clear 两个候选, 选中首个
@@ -31,7 +31,7 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
         h.terminal.emit([DOWN])
         await h.settle()
         assert h.find("→ clear")
-        assert not h.find("显示状态与计量")
+        assert not h.find("审阅工作区差异")
         h.terminal.emit([ENTER])
         assert h.submitted == ["/clear"]
         assert h.editor.is_empty()
@@ -88,12 +88,12 @@ async def test_no_argument_command_still_submits_directly_from_menu():
     h = Harness(commands=True)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/st"))
+        h.terminal.emit(text_keys("/di"))
         await h.settle()
-        assert h.find("→ status")
+        assert h.find("→ diff")
         h.terminal.emit([ENTER])
         await h.settle()
-        assert h.submitted == ["/status"]
+        assert h.submitted == ["/diff"]
         assert h.editor.is_empty()
     finally:
         await h.stop()
@@ -108,28 +108,28 @@ async def test_escape_hides_menu_without_cancelling_or_losing_draft():
         h.terminal.emit([ESCAPE])
         await h.settle()
         assert h.editor.get_text() == "/"
-        assert not h.find("显示状态与计量")
+        assert not h.find("显示 Skills 目录")
         assert h.escape_count == 0
         h.frontend.request_render()
         await h.settle()
-        assert not h.find("显示状态与计量")
+        assert not h.find("显示 Skills 目录")
         h.terminal.emit([BACKSPACE] + text_keys("/"))
         await h.settle()
-        assert h.find("→ status")
+        assert h.find("→ skill")
     finally:
         await h.stop()
 
 
-@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /status"])
+@pytest.mark.parametrize("text", ["//内容", "/unknown", "普通 /diff"])
 async def test_non_command_prefix_keeps_original_editing_and_submission(text):
     """非命令形态不打开菜单、原样提交: // 转义、过滤为空、斜杠不在草稿开头
-    ("/status 参数" 的过滤为空分支与 "/unknown" 同型, 不再单列)。"""
+    ("/diff 参数" 的过滤为空分支与 "/unknown" 同型, 不再单列)。"""
     h = Harness(commands=True)
     try:
         await h.start()
         h.terminal.emit(text_keys(text))
         await h.settle()
-        assert not h.find("→ status")
+        assert not h.find("→ skill")
         h.terminal.emit([ENTER])
         assert h.submitted == [text]
     finally:
@@ -175,7 +175,7 @@ async def test_alt_enter_and_multiline_paste_do_not_confirm_menu():
         h.terminal.emit([KeyPress(Keys.BracketedPaste, "/\n内容")])
         await h.settle()
         assert h.editor.get_text() == "/\n内容"
-        assert not h.find("→ status")
+        assert not h.find("→ skill")
         assert h.submitted == []
     finally:
         await h.stop()
@@ -187,7 +187,7 @@ async def test_moving_cursor_out_of_prefix_returns_to_text_editing():
         await h.start()
         h.terminal.emit(text_keys("/s") + [KeyPress(Keys.Home, "\x1b[H")])
         await h.settle()
-        assert not h.find("→ status")
+        assert not h.find("→ skill")
         h.terminal.emit(text_keys("普通"))
         assert h.editor.get_text() == "普通/s"
     finally:
@@ -222,7 +222,7 @@ def test_v2_selected_row_full_width_highlight():
     menu.sync("/", at_end=True)
     lines = menu.render(60, 4)
     selected = lines[0]
-    assert strip_terminal_sequences(selected).startswith("→ status")
+    assert strip_terminal_sequences(selected).startswith("→ skill")
     assert selected.startswith(SEL_BG) and selected.endswith("\x1b[0m")
     assert ARROW_FG in selected and NAME_FG in selected and DESC_FG in selected
     assert visible_width(strip_terminal_sequences(selected)) == 60  # 整行背景补齐
@@ -240,7 +240,7 @@ def test_menu_shows_nine_rows_without_counter():
     lines = menu.render(60, COMMAND_MENU_MAX_ROWS)
     plain = [strip_terminal_sequences(line) for line in lines]
     assert len(lines) == COMMAND_MENU_MAX_ROWS == 9
-    assert plain[0].startswith("→ status")  # 选中项居中窗口的首行
+    assert plain[0].startswith("→ skill")  # 选中项居中窗口的首行
     assert not any("(" in line and "/" in line for line in plain)  # 无 (n/m) 计数行
     menu.move(COMMAND_MENU_MAX_ROWS)  # 越过一屏: 窗口跟随选中项
     assert strip_terminal_sequences(menu.render(60, COMMAND_MENU_MAX_ROWS)[-1]).startswith("  exit")

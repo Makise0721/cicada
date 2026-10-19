@@ -8,27 +8,26 @@
   HistoryCleared 追加系统条目 (显示文档保留)。
 - 提供可注入 MainScreenFrontend 的开发组合 build(): document_lines 回调是
   01 冻结的显示文档替换点; on_submit 为受理制 (返回 False = 拒绝且草稿保留)。
-- 斜线命令只在 idle 且无 reservation 时执行: /status /clear /exit 与
+- 斜线命令只在 idle 且无 reservation 时执行: /clear /exit 与
   //转义文本; 未知命令提示且草稿保留。(/help 已于 2026-10-18 删除, 命令靠
-  输入 / 的菜单发现。) /clear 在持久会话经共享 async
+  输入 / 的菜单发现; /status 已于 2026-10-19 删除。)
+  /clear 在持久会话经共享 async
   clear_context() 可靠提交 (05), 提交期间输入屏障; 非持久保持旧同步入口。
 - 本模块不起 renderer、不写终端: 组合层只投递状态, 渲染请求经 on_update
   回调 (宿主传 frontend.request_render 合并节流)。
-- 正常对话不出现内部 phase 标签; 诊断细节归 /status (只读 diagnostics 对象
-  经 build(diagnostics=...) 注入, 本模块默认只给已发布事实)。
+- 正常对话不出现内部 phase 标签。
 - 工具组经 ToolDocument 投影 (tui-compact-interaction 票据 01): 同一模型轮次
   聚合为一个紧凑组, 新建组经 add_entry 挂载显示文档; 检查事实经
-  CheckProjection 消费 RequestCompleted.outcome; /status 汇集检查事实与注入
-  诊断并施加有界限额。
+  CheckProjection 消费 RequestCompleted.outcome。
 - 票据 05: 订阅前先把恢复快照 (restored_requests/restored_interrupted) 投影
   成只读历史条目 (ui/restore_view), 查看状态原因如实成条; 保存失败显示真实
   未保存事实 (后继编码由应用 storage_failed 锁存拒绝)。
 - tui-startup-welcome 01: 订阅前在显示文档开头追加本视图唯一的启动欢迎条目
   (ui/welcome.py, 启动事实一次捕获后冻结); 查看状态原因不依附"有恢复记录"
   条件, 零记录恢复的查看状态同样如实成条。
-- 票据 04: /status 新增预算段 (占用/上限/预留/余量/来源/锚/校准偏差) 与摘要段
-  (压缩次数/边界/摘要计量单列), 只读出口为 session.budget 与
-  session.summary_records; 恢复显示在压缩边界插入程序条目。
+- 票据 04: 预算与摘要的只读出口为 session.budget 与 session.summary_records;
+  恢复显示在压缩边界插入程序条目。(/status 已于 2026-10-19 删除, 该页原有的
+  预算/摘要/计量/检查/配置段随命令一并移除。)
 - DeepSeek 阶段票据 04 (契约 C7): /model 打开模型菜单 (本地操作, 非 UserMessage);
   菜单确认同步置 model 屏障 (先于任务创建), select_model 只提交 option ID;
   ModelChanged 刷新底栏有效模型并追加确认条目, 失败有界成条, closing 不重开。
@@ -135,12 +134,6 @@ from cicada.ui.document_layout import (
 )
 from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
 from cicada.ui.transcript import Transcript
-from cicada.ui.status import (
-    budget_sections,
-    clip_status_sections,
-    observation_line,
-    token_observation_lines,
-)
 from cicada.ui.welcome import build_welcome_entry
 from cicada.ui.display_style import DisplayStyle
 
@@ -163,7 +156,6 @@ class ConversationView:
         editor: Editor | None = None,
         on_exit: Callable[[], None] | None = None,
         on_update: Callable[[], None] | None = None,
-        diagnostics: Callable[[], list[str]] | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._session = session
@@ -180,7 +172,6 @@ class ConversationView:
         )
         self._on_exit = on_exit
         self._on_update = on_update
-        self._diagnostics = diagnostics
         # 票据 05: 工具卡文档片段与检查事实投影 (先于显示文档: 展开标志注入)
         self.tools = ToolDocument()
         # local-skills-v1 票据 03: Skill 正文展开与工具输出共用全局展开标志
@@ -840,9 +831,6 @@ class ConversationView:
         if is_enter_barrier(self._session, self._gate):
             return False
         command = text.strip()
-        if command == "/status":
-            self.transcript.append_information("会话信息", self._status_sections())
-            return True
         if command == '/cost':
             cost = self._session.cost
             self.transcript.append_information('费用控制', [('',
@@ -1199,56 +1187,6 @@ class ConversationView:
             raise
         self._gate.note_compact_settled()
 
-    def _status_sections(self) -> list[tuple[str, list[str]]]:
-        """/status: 已发布状态 + 持久化事实 + 检查事实 + 计量口径 + 注入诊断; 有界 (P12)。"""
-        session_lines = [
-            f"状态: {self._session.state}",
-            f"模型: {self._session.config.model_label or '不可得'}",
-        ]
-        persistence = self._session.persistence
-        if persistence is not None:
-            # 05: 会话/保存/恢复来源事实进入状态页
-            session_lines.extend([
-                f"会话 ID: {persistence.session_id}",
-                f"名称: {persistence.user_name or self._session.session_short_title or '未命名'}",
-                f"模式: {persistence.mode} · epoch {persistence.epoch_id[:8]}",
-                (
-                    f"上下文代次: {persistence.context_generation} · "
-                    f"已保存 {persistence.saved_request_count} 条 · "
-                    f"恢复 {persistence.restored_request_count} 条"
-                ),
-                f"历史模型调用: {persistence.restored_model_call_count} 次",
-            ])
-            if persistence.storage_failed is not None:
-                session_lines.append(f"保存失败已锁存: {persistence.storage_failed}")
-            if self._session.view_only_reason is not None:
-                session_lines.append(f"查看状态: {self._session.view_only_reason}")
-            if self._session.session_cleanup_failed is not None:
-                session_lines.append(f"会话清理失败已锁存: {self._session.session_cleanup_failed}")
-            if self._session.has_process_uncertain():
-                session_lines.append(PROCESS_UNCERTAIN_LABEL)
-        diagnostics = self._diagnostics() if self._diagnostics is not None else []
-        # CLI 诊断重复提供相同模型事实时只展示一次，保留任何不同的诊断值。
-        diagnostics = [line for line in diagnostics if line != session_lines[1]]
-        budget = self._session.budget
-        cost = self._session.cost
-        sections = [
-            ("会话", session_lines),
-            *([('费用', [f'本进程调用 {cost.calls} · 已结算上界 {cost.settled_upper_cny or "不可得"} 元 · 详见 /cost'])] if cost is not None else []),
-            *budget_sections(
-                budget, self._session.summary_records, persistent=persistence is not None,
-            ),
-            ("计量", [
-                self.transcript.metrics_summary(),
-                self.transcript.cache_summary(),
-                observation_line(self._session.cache_observation),
-                *token_observation_lines(budget),
-            ]),
-            ("检查", self._checks.status_lines()),
-            ("配置", [*diagnostics, *self._session.login_status]),
-        ]
-        return clip_status_sections(sections)
-
 
 def build(
     session: ApplicationSession,
@@ -1256,7 +1194,6 @@ def build(
     editor: Editor | None = None,
     on_exit: Callable[[], None] | None = None,
     on_update: Callable[[], None] | None = None,
-    diagnostics: Callable[[], list[str]] | None = None,
     clock: Callable[[], float] | None = None,
 ) -> dict:
     """开发组合入口: 返回可直接注入 MainScreenFrontend 的回调集合。
@@ -1271,7 +1208,6 @@ def build(
         editor=editor,
         on_exit=on_exit,
         on_update=on_update,
-        diagnostics=diagnostics,
         clock=clock,
     )
     return {

@@ -50,8 +50,8 @@ _KEYS_LINE = (
     "Enter 发送 · Shift+Enter 换行 · Esc/Ctrl+C 中断 · Ctrl+D 退出 · / 命令"
     " · Ctrl+O 工具/Skill"
 )
-_COMMANDS_LINE = "输入 / 查看命令 · /model 模型 · /login 配置 · /status 状态"
-_RESUME_COMMANDS_LINE = "输入 / 查看命令 · /status 状态"
+_COMMANDS_LINE = "输入 / 查看命令 · /model 模型 · /login 配置"
+_RESUME_COMMANDS_LINE = "输入 / 查看命令"
 _COMMAND_HINT = "输入 / 查看命令"  # 2026-10-18: /help 删除, 命令入口改为提示
 _COMMAND_HINT_TINY = "/ 查看命令"  # <24 列放不下完整提示 (原 /help 位)
 

@@ -171,10 +171,11 @@ def test_tui_uses_same_defaults_and_key_for_initial_prompt(monkeypatch, tmp_path
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
 
-    async def tui(session, *, initial_prompt, diagnostics):
+    async def tui(session, *, initial_prompt):
         try:
             result = await session.execute(initial_prompt)
-            assert 'file-sentinel-key' not in repr(session.config) + repr(session.history) + repr(diagnostics())
+            # /status 与诊断注入已删除: key 仍不得出现在会话可观察面
+            assert 'file-sentinel-key' not in repr(session.config) + repr(session.history)
             return result.exit_code
         finally:
             await session.aclose()

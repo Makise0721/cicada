@@ -141,7 +141,6 @@ async def test_name_command_same_batch_barrier_query_clear_and_list(tmp_path):
         assert not view.enter_barrier() and view.editor.get_text() == 'x'
         assert session.persistence.user_name == '中文 空档'
         assert harness.submit('/name')
-        assert harness.submit('/status')
         assert '中文 空档' in '\n'.join(harness.lines(80))
         directory = root / '.cicada' / 'sessions'
         page = list_sessions(directory=directory)
@@ -331,7 +330,8 @@ async def test_save_failure_shown_and_followups_refused(tmp_path, monkeypatch):
         harness.close()
 
 
-async def test_status_persistence_section_after_save(tmp_path):
+async def test_persistence_facts_survive_save(tmp_path):
+    """原 /status 的会话 ID/模式/代次/计数段随命令删除; 应用侧事实仍可读。"""
     root = _repo(tmp_path)
     session = await open_application(
         _persistence_config(root, _script({"text": "答", "stop": True}), session_id=None)
@@ -340,12 +340,13 @@ async def test_status_persistence_section_after_save(tmp_path):
     try:
         assert harness.submit("第一问")
         await harness.wait_request_done()
-        assert harness.submit("/status")
-        rendered = strip_terminal_sequences(chr(10).join(harness.lines(80)))
-        assert "会话 ID: " in rendered
-        assert "模式: save · epoch " in rendered
-        assert "上下文代次: 0" in rendered
-        assert "已保存 1 条" in rendered
+        state = session.persistence
+        assert state is not None
+        assert state.session_id
+        assert state.mode == "save"
+        assert state.context_generation == 0
+        assert state.saved_request_count == 1
+        assert harness.submit("/status") is False, "命令已删除, 按未知处理"
     finally:
         await session.aclose()
         harness.close()
@@ -400,12 +401,10 @@ async def test_compacted_session_restore_shows_boundary_and_rebuilds_summary_fac
         records = resumed_session.summary_records
         assert len(records) == 1, "恢复重建摘要事实"
         assert records[0].last_request_seq == resumed_session.restored_requests[0].seq
-        assert resumed.submit("/status")
-        status = strip_terminal_sequences(chr(10).join(resumed.lines(90)))
-        assert "压缩: 1 次 · 最近原因 manual" in status
-        assert "摘要计量: 1 次 · 累计输入 10" in status
+        # /status 已删除: 摘要计量从应用侧只读出口核对 (原显示行不再存在)
+        assert records[0].metrics is not None
+        assert records[0].metrics.input_tokens == 10
         assert records[0].metrics.cache_hit_input_tokens == 7
-        assert "已提交摘要缓存: 已知命中 7 · 已知未命中 3 · 成对样本份额 70.0% · 覆盖 1/1 次" in status
         assert resumed.view.transcript.cache_summary().endswith("尚无调用"), "恢复普通计量不导入本进程"
         assert resumed_session.budget.anchor is None, "恢复计量不恢复锚"
     finally:
