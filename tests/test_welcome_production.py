@@ -33,6 +33,8 @@ _LOGO_CHARS = '█▄▀'
 _WELCOME_LEAKS = ('启动快照', '启动模型', '输入 / 查看命令')
 _BUSY_MARKERS = ('正在输出…', '正在收尾…', '正在取消…',
                  '正在执行…', '等待模型…', '正在思考…')  # 票据 02: 忙态文案全集
+_BUSY_STATUS_LINES = ('working',)  # 2026-10-19 模型三段统一; 按整行匹配,
+# 不按子串: 工作区路径或回答正文里出现同拼写会被误判成一直在忙
 
 
 def text_keys(text: str) -> list[KeyPress]:
@@ -98,7 +100,13 @@ class MainProbeTerminal(FakeTerminal):
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
             screen = '\n'.join(self.vt.screen_text(strip_blank_tail=False))
-            if not any(marker in screen for marker in _BUSY_MARKERS):
+            busy = any(marker in screen for marker in _BUSY_MARKERS)
+            if not busy:
+                # working 状态行独占一行 (无 spinner/文案前缀): 按整行判定,
+                # 不让路径或回答里的同拼写误判
+                busy = any(line.strip() in _BUSY_STATUS_LINES
+                           for line in self.vt.screen_text(strip_blank_tail=False))
+            if not busy:
                 return
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError('VT 屏忙状态行未消退')

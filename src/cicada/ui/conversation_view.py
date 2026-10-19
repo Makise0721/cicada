@@ -38,7 +38,8 @@
   裁决移除 Ctrl+T 切换, 点击/文档焦点为唯一展开入口。
 - thinking-budget-visibility 票据 02: AssistantReasoningDelta 进有界思考
   预览 (transcript.stream_reasoning_delta); 状态行按真实事件区分等待模型/
-  思考/输出, 屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
+  思考/输出 (2026-10-19 用户裁决: 三段统一为 working 单字母高亮动效),
+  屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
   ApplicationClosed 幂等封存活动运行未完成预览并清阶段, 迟到事件不复活。
 - thinking-budget-visibility 票据 03: 底栏经 FooterComponent budget 回调
   常驻"最近预算"（总需求/上限/近似标记/输入来源；待评估/未启用/超限如实
@@ -146,6 +147,10 @@ from cicada.ui.display_style import DisplayStyle
 # 状态行 (规格 §F): braille spinner 与节奏; 帧由可注入时钟决定 (测试可冻结)
 SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 SPINNER_INTERVAL_S = 0.1
+# 模型响应阶段 (等待/思考/输出) 的固定文案: 高亮单个字母自左向右循环,
+# 不带头符号也不带尾随光标符 (2026-10-19 用户裁决)
+WORKING_TEXT = "working"
+WORKING_STEP_S = 0.15  # 单个字母高亮停留时长; 整圈 7 × 0.15 ≈ 1.05s
 
 
 class ConversationView:
@@ -571,10 +576,13 @@ class ConversationView:
         """输入框上方状态行: 忙时 1 行 (spinner + 真实状态文案), 空闲 0 行。
 
         宽度 < 4 放不下 spinner + 空格 + 1 列文案, 不占行 (防御截断无噪音)。
+        模型响应阶段 (working) 只有单字母高亮动效, 不带 spinner 也不带尾随符号。
         """
         text = self._status_text()
         if text is None or width < 4:
             return []
+        if text == WORKING_TEXT:
+            return [self._render_working(width)]
         frame = SPINNER_FRAMES[int(self._clock() / SPINNER_INTERVAL_S) % len(SPINNER_FRAMES)]
         text = truncate_to_width(text, max(1, width - 2))
         return [
@@ -582,6 +590,24 @@ class ConversationView:
             + theme.fg_open(theme.MUTED_GRAY) + " " + text
             + self.display_style.sgr("0")
         ]
+
+    def _render_working(self, width: int) -> str:
+        """working 动效: 高亮字母自左向右逐列推进, 到尾回到首个字母循环。
+
+        放不下时按列取前缀 (不加省略号: 动效不该在句尾多出一个被高亮的符号)。
+        plain 策略下颜色不生效, 静态显示同一文案: 改字形会让可见文字随帧变化,
+        既不是"高亮"也会让按文案识别的宿主判断失配。
+        """
+        text = WORKING_TEXT[: max(1, width)]
+        if self.display_style.plain:
+            return text
+        active = int(self._clock() / WORKING_STEP_S) % len(text)
+        return (
+            theme.fg_open(theme.MUTED_GRAY) + text[:active]
+            + theme.fg_open(theme.EDITOR_BORDER) + text[active]
+            + theme.fg_open(theme.MUTED_GRAY) + text[active + 1 :]
+            + self.display_style.sgr("0")
+        )
 
     def _status_text(self) -> str | None:
         """状态文案只取真实状态: 屏障/取消/执行/reservation 窗口, 空闲 None。"""
@@ -606,13 +632,11 @@ class ConversationView:
         if self._session.state == "finalizing":
             return "正在收尾…"  # 模型已停笔, 持久化/检查收尾中 (审查 06-3)
         if self._session.state == "executing" or self._gate.busy():
-            # 票据 02 (D4): 模型阶段以真实事件为准, 无增量时只显示执行事实
-            if self._model_stage == "thinking":
-                return "正在思考…"
-            if self._model_stage == "answering":
-                return "正在输出…"
-            if self._model_stage == "waiting":
-                return "等待模型…"
+            # 票据 02 (D4): 模型阶段以真实事件为准, 无增量时只显示执行事实;
+            # 2026-10-19 用户裁决: 等待/思考/输出三段统一为 working 动效,
+            # 工具执行仍如实显示"正在执行…"
+            if self._model_stage in ("waiting", "thinking", "answering"):
+                return WORKING_TEXT
             return "正在执行…"
         return None
 
@@ -636,8 +660,9 @@ class ConversationView:
 
     async def _spin(self) -> None:
         try:
-            while self._status_text() is not None:
-                await asyncio.sleep(SPINNER_INTERVAL_S)
+            while (text := self._status_text()) is not None:
+                # working 的字母步长比 braille 慢: 按当前文案取节奏, 避免空帧重绘
+                await asyncio.sleep(WORKING_STEP_S if text == WORKING_TEXT else SPINNER_INTERVAL_S)
                 if self._on_update is not None:
                     self._on_update()
         except asyncio.CancelledError:
