@@ -113,22 +113,21 @@ async def test_badge_click_cycles_once_model_name_and_draft_untouched(tmp_path):
     session.subscribe(lambda u: changes.append(u) if isinstance(u, ReasoningEffortChanged) else None)
     try:
         await h.start()
-        budget_row = h.vt.find_row("最近预算")
-        assert budget_row is not None, h.vt.screen_text()
-        row = budget_row - 1  # 底栏行 1 (欢迎区也含同文本, 不可用 find_row 首个匹配)
-        assert h.vt.line_text(row).endswith("思考 high")
+        brand_row = h.vt.find_row("cicada · [high]")
+        assert brand_row is not None, h.vt.screen_text()
+        row = brand_row  # 单行底栏: 档位徽标与模型同一行 (2026-10-19 裁决)
         h.view.editor.insert_text("草稿")
         history_before = session.history
-        h.click(55, row)  # 徽标内
+        h.click(12, row)  # "[high]" 区间: 品牌 "cicada" 后两列分隔, 徽标起第 9 列
         assert await h.wait_idle()
         await h.settle()  # 节流渲染落屏后再核对屏幕事实
         assert session.reasoning_effort.current == "max"  # 循环 high → max
         assert len(changes) == 1
         assert session.history == history_before and bodies == []  # 零请求/零模型调用
-        assert h.vt.find_row("思考 max") is not None
+        assert h.vt.find_row("[max]") is not None
         assert h.view.editor.get_text() == "草稿"  # 点击不触碰草稿
-        # 模型名 (徽标左侧) 无命中: 无新事务
-        h.click(40, row)
+        # 模型名 (徽标右侧) 无命中: 无新事务
+        h.click(30, row)
         await h.settle()
         assert session.reasoning_effort.current == "max" and len(changes) == 1
         assert h.view._gate.model_selecting is False

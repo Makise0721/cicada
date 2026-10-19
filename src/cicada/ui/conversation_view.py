@@ -41,8 +41,10 @@
   屏障、取消、收尾优先; RunFinished/RequestCompleted/闸门错误/
   ApplicationClosed 幂等封存活动运行未完成预览并清阶段, 迟到事件不复活。
 - thinking-budget-visibility 票据 03: 底栏经 FooterComponent budget 回调
-  常驻"最近预算"（总需求/上限/近似标记/输入来源；待评估/未启用/超限如实
-  降级）；预算口径说明原在 /help，随该命令删除。只读 session.budget, 不新增刷新任务。
+  以 ctx 段常驻最近预算（近似百分比/上限/输入来源短标；待评估/未启用/超限
+  如实降级）；预算口径说明原在 /help，随该命令删除。只读 session.budget,
+  不新增刷新任务。2026-10-19 用户裁决: 底栏改为单行分段
+  （cicada · [档位] 模型 · 工作区 · ctx · 累计）。
 - tui-compact-interaction 票据 01 (契约 C1-C3): layout_document 是同源布局
   出口 (lines/hits/anchors 同一次排版), document_lines 只是其兼容包装;
   execute_display_action 执行组/工具/思考/Skill 的 toggle 与工具分页动作
@@ -233,7 +235,7 @@ class ConversationView:
             )
         self._unsubscribe = session.subscribe(self._on_application_update)
         # 04 底栏: 工作区/模型来自配置事实, 计量来自显示文档累计;
-        # 03 (契约 C5): 预算回调每帧至多读取一次 session.budget, 底栏显示最近预算
+        # 03 (契约 C5): 预算回调每帧至多读取一次 session.budget, 底栏 ctx 段显示最近预算
         self.footer = FooterComponent(
             str(session.config.workspace),
             session.config.model_label,

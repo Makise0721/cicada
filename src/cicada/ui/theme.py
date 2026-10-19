@@ -2,9 +2,10 @@
 
 来源: pi-mono@1a584a7a packages/coding-agent/src/modes/interactive/theme/dark.json、
 components/footer.ts、user-message.ts (MIT, Copyright (c) 2025 Mario Zechner);
-只取固定外观事实: 颜色值、用户消息 Box(outputPad,1) 背景盒、底栏两行布局与
-左右对齐/退让规则。thinking 级别配色、费用、cache、上下文百分比、扩展状态
-在本期没有对应事实, 不显示、不伪造 (规格 P13)。
+只取固定外观事实: 颜色值、用户消息 Box(outputPad,1) 背景盒、底栏左右对齐/退让
+规则。thinking 级别配色、费用、cache、上下文百分比、扩展状态在本期没有对应
+事实, 不显示、不伪造 (规格 P13)。底栏布局已于 2026-10-19 按用户裁决改为单行
+分段 (见 FooterComponent), 不再沿用上游两行布局。
 
 边界:
 - 本模块是纯排版: 不订阅事件、不写终端; 会话事实经 provider 回调注入
@@ -37,6 +38,12 @@ EDITOR_BORDER = "#b294bb"  # 用户截图固定的外观色 (dark.json thinkingH
 EDITOR_PLACEHOLDER = "#6a6a6a"  # 空态占位提示 (规格 §C)
 MENU_SEL_BG = "#2d2d3d"         # 斜线菜单选中行背景 (规格 §D)
 FOOTER_DIM = "#808080"  # 底栏低亮 (tui-aesthetics 规格 §E 提亮, 原 #666666)
+# 单行分段底栏配色 (2026-10-19 用户裁决): 品牌最暗, 档位/模型强调黄,
+# 工作区蓝, ctx 与累计为中性亮灰; 越靠右越次要, 让位顺序与亮度一致。
+FOOTER_BRAND = "#6f6f6f"
+FOOTER_ACCENT = "#ffd75f"
+FOOTER_PATH = "#6ba3d4"
+FOOTER_TEXT = "#c9cdd6"
 MUTED_GRAY = "#808080"
 MD_HEADING = "#f0c674"
 MD_LINK = "#81a2be"
@@ -232,7 +239,7 @@ def assistant_markdown_lines(text: str, width: int) -> list[str]:
     return lines
 
 
-# --- 底栏 (Pi footer.ts: 工作区行 + 计量左/模型右, #666666 低亮度) ----------------------
+# --- 底栏 (2026-10-19 用户裁决: 单行分段; 来源 pi footer.ts 的两行布局已退场) ----------
 
 
 def format_tokens(count: int) -> str:
@@ -264,69 +271,64 @@ def format_workspace(workspace: str) -> str:
     return workspace
 
 
-_BUDGET_SOURCE_LABELS = {
-    # 输入来源标签 (规格 D5): 完整 / 短; unknown 即使有数值也保留"输入未知" (契约 C5)
-    "estimated": ("输入估计", "估"),
-    "anchored": ("输入锚定", "锚"),
-    "measured": ("输入实测", "测"),
-    "unknown": ("输入未知", "未"),
+_CTX_SOURCE_LABELS = {
+    # ctx 段输入来源短标 (契约 C5): unknown 即使有数值也保留"未", 不称为实测
+    "estimated": "估",
+    "anchored": "锚",
+    "measured": "测",
+    "unknown": "未",
 }
 
+_SEGMENT_SEPARATOR = " · "
+_SEGMENT_SEPARATOR_FG = "#585858"  # 分隔点比正文更低亮 (外观对齐参考稿)
 
-def _budget_levels(snapshot: BudgetSnapshot | None) -> list[str]:
-    """最近预算段候选级别, 从完整到简略 (思考可见性规格 D6、契约 C5)。
 
-    数值/分母/近似标记只整段出现; 待评估/未启用不补 0; 快照与报告上限不一致
-    按待评估显示, 不拼接不同身份的数值。
+def _ctx_levels(snapshot: BudgetSnapshot | None) -> list[str]:
+    """底栏 ctx 段候选级别, 从完整到简略 (思考可见性规格 D6、契约 C5)。
+
+    近似标记/百分比/分母只整段出现; 待评估/未启用不补 0; 快照与报告上限不一致
+    按待评估显示, 不拼接不同身份的数值; 超限由原始整数判定, 标记不被 format_tokens
+    舍入或列宽截断抹掉。
     """
     if snapshot is None:
-        return ["预算未启用", "未启用"]
+        return ["ctx: 未启用"]
     report = snapshot.report
     if report is None:
         # 无报告: 空间充足时显示已知上限, 不伪造占用 (C5)
-        return [
-            f"最近预算 待评估 · 上限 {format_tokens(snapshot.limit)}",
-            "预算 待评估",
-            "待评估",
-        ]
+        return [f"ctx: 待评估/{format_tokens(snapshot.limit)}", "ctx: 待评估"]
     if snapshot.limit != report.limit:
-        return ["最近预算 待评估", "预算 待评估", "待评估"]
+        return ["ctx: 待评估"]
     total, limit = report.total_estimate, report.limit
-    numbers = f"~{format_tokens(total)}/{format_tokens(limit)}"
-    long_source, short_source = _BUDGET_SOURCE_LABELS.get(report.source, ("输入未知", "未"))
-    percent = f"{total * 100 / limit:.1f}%"  # 原始整数计算, 一位小数, 不封顶
-    if total > limit:  # 超限由原始整数判定, 优先保留 (D5/D6)
-        return [
-            f"最近预算 超限 {numbers} · {percent} · {long_source}",
-            f"最近预算 超限 {numbers} · {long_source}",
-            f"预算 超限 {numbers} · {short_source}",
-            f"预算 超限 {numbers}",
-            "预算 超限",
-            "超限",
-        ]
+    percent = f"~{total * 100 / limit:.1f}%"  # 原始整数计算, 一位小数, 不封顶
+    limit_text = format_tokens(limit)
+    source = _CTX_SOURCE_LABELS.get(report.source, "未")
+    flag = "超限 " if total > limit else ""  # 超限优先保留 (D5/D6)
     return [
-        f"最近预算 {numbers} · {percent} · {long_source}",
-        f"最近预算 {short_source} {numbers}",
-        f"预算 {short_source} {numbers}",
-        f"预算 {short_source}",
-        "预算",
+        f"ctx: {flag}{percent}/{limit_text} {source}",
+        f"ctx: {flag}{percent}/{limit_text}",
+        f"ctx: {flag}{percent}".rstrip(),
     ]
 
 
 class FooterComponent:
-    """两行底栏: 行 1 工作区左 + 模型右 (同一行水平对齐), 行 2 预算先 + 累计 (dim)。
+    """单行分段底栏 (2026-10-19 用户裁决, 外观对齐参考稿):
+
+        cicada · [high] deepseek-flash · ~/repo · ctx: ~26.9%/131k 估 · 累计 ↑5.8k · ↓849
+
+    四类事实按固定顺序、低亮分隔点连接; 品牌最暗, 档位与模型强调黄, 工作区蓝,
+    ctx 与累计中性亮灰。窄窗按段整体降级/丢弃, 绝不在段内截出半个数值。
 
     metrics 回调返回 (输入累计, 输入含缺失, 输出累计, 输出含缺失);
     None 字段按规格省略, 有值但部分调用缺失时标注 (部分)。
     budget 回调 (契约 C5) 返回应用只读预算快照, 每次 render 至多读取一次;
-    行 2 以最近预算为先, 完整累计放得下才追加。低高度 (rows < 12) 单行以
-    预算为先, 模型名仅在预算段完整保留时加入, 累计与工作区让位 (规格 D6)。
+    ctx 段展示最近一次预算评估 (近似标记/百分比/上限/输入来源短标);
+    未注入回调时按"ctx: 未启用"呈现, 不补 0。
     effort 回调 (03, C6) 返回 (生效档位|None=关闭, 事务目标档位) 或 None=
-    不支持; None 时不绘制徽标。徽标挂在模型右段 (「模型 · 思考 low」),
-    放不下先缩写 (R:low/R:off, 只留当前值) 再整体省略; 事务目标不伪造已
-    生效, 缩写不含目标。实际渲染的徽标列区间记入 badge_spans 供帧命中。
-    未注入 budget 的独立旧调用者保持原 两行/单行计量 行为。
+    不支持; None 时不绘制档位徽标。档位缩写不含事务目标 (不伪造已生效)。
+    实际渲染的档位徽标列区间记入 badge_spans 供帧命中。
     """
+
+    _BRAND = "cicada"
 
     def __init__(
         self,
@@ -366,115 +368,113 @@ class FooterComponent:
             joined = f"累计 {joined}"
         return joined
 
-    def _budget_segment(self, snapshot: BudgetSnapshot | None, width: int) -> str:
-        """按可用宽度取第一个放得下的预算级别; 极窄防御截断纯文字 (D6)。"""
-        levels = _budget_levels(snapshot)
-        for level in levels:
-            if visible_width(level) <= width:
-                return level
-        return truncate_to_width(levels[-1], width)
-
-    def _right_segment(self, model: str, available: int) -> tuple[str, int, int] | None:
-        """模型 + 思考强度徽标右段 (C6); 返回 (文本, 徽标起列偏移, 徽标列宽)。
-
-        完整徽标放不下先缩写, 再省略徽标只留模型; 返回的偏移/列宽只在文本
-        完整保留时有效 (调用方在右段被截断时不得生成命中)。
-        """
-        right = model
-        offset = -1
-        badge_width = 0
+    def _badge_text(self) -> str:
+        """思考强度档位徽标文本 (C6); 不支持思考时为空串 (不绘制也不占列)。"""
         facts = self._effort() if self._effort is not None else None
-        if facts is not None:
-            current, pending = facts
-            full = "思考关闭" if current is None else f"思考 {current}"
-            if pending is not None:
-                full = f"{full} → {pending}"  # 旧值仍为当前值, 不伪造已生效 (C6)
-            short = "R:off" if current is None else f"R:{current}"
-            for badge in (full, short):
-                candidate = f"{model} · {badge}"
-                if visible_width(candidate) + 2 <= available:
-                    offset = visible_width(model) + 3
-                    badge_width = visible_width(badge)
-                    right = candidate
-                    break
-        if offset < 0 and visible_width(right) + 2 > available:
-            return None  # 模型段自身放不下: 右段整体让位
-        return (right, offset, badge_width)
+        if facts is None:
+            return ""
+        current, pending = facts
+        text = "off" if current is None else current
+        if pending is not None:
+            text = f"{text}→{pending}"  # 旧值仍为当前值, 不伪造已生效 (C6)
+        return f"[{text}]"
+
+    def _segments(self) -> dict[str, tuple[str, str, int]]:
+        """本帧各段事实: 种类 -> (文本, 前景色, 段内徽标列宽)。
+
+        档位徽标并入模型段 ("[high] deepseek-flash"), 与参考稿一致不留分隔点;
+        空文本段由调用方整体省略。
+        """
+        badge = self._badge_text()
+        model = self._model_label or "不可得"
+        return {
+            "brand": (self._BRAND, FOOTER_BRAND, 0),
+            "model": (f"{badge} {model}" if badge else model, FOOTER_ACCENT, len(badge)),
+            "workspace": (format_workspace(self._workspace), FOOTER_PATH, 0),
+            "stats": (self._stats_left(), FOOTER_TEXT, 0),
+        }
+
+    def _compose(
+        self,
+        kinds: tuple[str, ...],
+        segments: dict[str, tuple[str, str, int]],
+        ctx_text: str,
+    ) -> tuple[str, int, int, int]:
+        """按段拼一行; 返回 (行, 可见宽, 徽标起列, 徽标列宽), 未渲染徽标时列宽 0。"""
+        pieces: list[str] = []
+        column = 0
+        badge_start = 0
+        badge_width = 0
+        for kind in kinds:
+            text, color = (ctx_text, FOOTER_TEXT) if kind == "ctx" else segments[kind][:2]
+            if not text:
+                continue
+            if pieces:
+                column += visible_width(_SEGMENT_SEPARATOR)
+                pieces.append(fg(_SEGMENT_SEPARATOR_FG, _SEGMENT_SEPARATOR))
+            if kind == "model":
+                badge_width = segments[kind][2]
+                badge_start = column
+            pieces.append(fg(color, text))
+            column += visible_width(text)
+        return "".join(pieces), column, badge_start, badge_width
 
     def render(self, width: int, rows: int) -> list[str]:
         with self.display_style.use():
             return self._render(width, rows)
 
     def _render(self, width: int, rows: int) -> list[str]:
-        dim = FOOTER_DIM
-        model = self._model_label or "不可得"
         self.badge_spans = ()  # 命中列只属于本次渲染; 每帧重算 (D5 同源)
-        if self._budget is None:
-            # 未注入预算回调的旧调用者: 原底栏行为 (契约 C5 兼容)
-            stats_left = self._stats_left()
-            if rows < 12:
-                return [fg(dim, _line_with_right(stats_left, model, width))]
-            first = _line_with_right(format_workspace(self._workspace), model, width, keep_right=True)
-            return [fg(dim, first), fg(dim, truncate_to_width(stats_left, width, "..."))]
-        snapshot = self._budget()  # 契约 C5: 每 render 至多读取一次
-        budget_seg = self._budget_segment(snapshot, width)
-        if rows < 12:
-            # 低高度单行: 预算段完整保留优先, 模型/徽标放得下才右对齐加入 (D6);
-            # available 不含间隔列——_right_segment 内部自带 min_padding 2 (与
-            # 基线 budget+2+model<=width 同口径, 审查 03-F1)
-            right = self._right_segment(model, width - visible_width(budget_seg))
-            if right is not None:
-                text, offset, badge_width = right
-                self._record_badge(0, text, offset, badge_width, width)
-                return [fg(dim, _line_with_right(budget_seg, text, width))]
-            return [fg(dim, truncate_to_width(budget_seg, width))]
-        # 行 1 维持工作区/模型; 行 2 预算为先, 完整累计放得下才追加 (D6)
-        right = self._right_segment(model, width)
-        if right is None:
-            right = (model, -1, 0)
-        text, offset, badge_width = right
-        first = _line_with_right(format_workspace(self._workspace), text, width, keep_right=True)
-        self._record_badge(0, text, offset, badge_width, width)
-        second = budget_seg
-        stats_left = self._stats_left()
-        if stats_left:
-            combined = f"{budget_seg} · {stats_left}"
-            if visible_width(combined) <= width:
-                second = combined
-        return [fg(dim, first), fg(dim, second)]
+        # 契约 C5: 每 render 至多读取一次预算; 未注入回调的老调用者按"未启用"呈现,
+        # 与预算停用时同一文案, 不另开布局分支
+        snapshot = self._budget() if self._budget is not None else None
+        ctx_levels = _ctx_levels(snapshot)
+        segments = self._segments()
+        # 降级顺序 (2026-10-19 裁决): 累计最先让位, 其次整个工作区段, 然后 ctx
+        # 明细逐级简化 (去来源→去分母→只留百分比), 最后才动档位/模型 (最长且最
+        # 常看, 只在极窄时缩写为 [off]/[high] 之外的形式并最终省略)。每级整段
+        # 保留或整段消失, 段内不截半个数值, 也不退化成没有数值的空标签 ("ctx:")。
+        candidates: list[tuple[tuple[str, ...], int]] = [
+            (("brand", "model", "workspace", "ctx", "stats"), 0),
+            (("brand", "model", "workspace", "ctx"), 0),
+            (("brand", "model", "workspace", "ctx"), 1),
+            (("brand", "model", "workspace", "ctx"), 2),
+            (("brand", "model", "workspace"), -1),
+            (("brand", "model", "ctx"), 0),
+            (("brand", "model", "ctx"), 1),
+            (("brand", "model", "ctx"), 2),
+            (("brand", "model"), -1),
+            (("brand",), -1),
+        ]
+        for kinds, index in candidates:
+            ctx_text = ctx_levels[min(index, len(ctx_levels) - 1)] if "ctx" in kinds else ""
+            line, line_width, badge_start, badge_width = self._compose(
+                kinds, segments, ctx_text
+            )
+            if line_width > width:
+                continue
+            if badge_width:
+                self._record_badge(badge_start, badge_width, width)
+            return [line]
+        # 极窄兜底: 品牌 + 无档位的模型名按列截断 (截断后档位不呈现, 也就无命中);
+        # 连模型名都放不下才只留品牌。始终保证帧宽不超过终端。
+        brand = fg(FOOTER_BRAND, self._BRAND)
+        if width > visible_width(_SEGMENT_SEPARATOR) + visible_width(self._BRAND):
+            room = width - visible_width(_SEGMENT_SEPARATOR) - visible_width(self._BRAND)
+            model = truncate_to_width(self._model_label or "不可得", room)
+            if model:
+                return [
+                    brand
+                    + fg(_SEGMENT_SEPARATOR_FG, _SEGMENT_SEPARATOR)
+                    + fg(FOOTER_ACCENT, model)
+                ]
+        return [fg(FOOTER_BRAND, truncate_to_width(self._BRAND, width))]
 
-    def _record_badge(
-        self, row: int, text: str, offset: int, badge_width: int, width: int
-    ) -> None:
-        """右段完整保留时记录徽标列区间 (C6); 被裁掉的徽标无 hit。"""
-        if offset < 0 or badge_width <= 0:
+    def _record_badge(self, offset: int, badge_width: int, width: int) -> None:
+        """左对齐行内徽标列区间 (C6): 徽标整段保留才可点, 被裁掉无 hit。"""
+        if offset < 0 or badge_width <= 0 or offset + badge_width > width:
             return
-        text_width = visible_width(text)
-        if text_width + 2 > width:
-            return  # keep_right 分支未走 (右段被截断): 无命中
-        start = width - text_width + offset
-        self.badge_spans = ((row, start, start + badge_width),)
-
-
-def _line_with_right(left: str, right: str, width: int, *, keep_right: bool = False) -> str:
-    """左文本 + 右对齐文本拼成一行 (纯文本); 默认左端优先, keep_right 时右端优先。"""
-    min_padding = 2
-    if visible_width(left) > width:
-        left = truncate_to_width(left, width, "...")
-    left_width = visible_width(left)
-    right_width = visible_width(right)
-    if left_width + min_padding + right_width <= width:
-        return left + " " * (width - left_width - right_width) + right
-    if keep_right and right_width + min_padding <= width:
-        left = truncate_to_width(left, width - right_width - min_padding, "...")
-        left_width = visible_width(left)
-        return left + " " * (width - left_width - right_width) + right
-    available = width - left_width - min_padding
-    if available > 0:
-        truncated_right = truncate_to_width(right, available, "")
-        pad = " " * max(0, width - left_width - visible_width(truncated_right))
-        return left + pad + truncated_right
-    return left
+        self.badge_spans = ((0, offset, offset + badge_width),)
 
 
 __all__ = [
@@ -483,7 +483,11 @@ __all__ = [
     "DIFF_REMOVED",
     "EDITOR_BORDER",
     "EDITOR_PLACEHOLDER",
+    "FOOTER_ACCENT",
+    "FOOTER_BRAND",
     "FOOTER_DIM",
+    "FOOTER_PATH",
+    "FOOTER_TEXT",
     "FooterComponent",
     "MD_CODE",
     "MD_CODE_BLOCK",

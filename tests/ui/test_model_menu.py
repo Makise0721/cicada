@@ -229,7 +229,8 @@ async def test_model_menu_opens_highlights_and_confirms_through_vt(tmp_path):
         assert len(model_rows) >= 2  # 确认条目 + 底栏
         footer_row = h.screen()[model_rows[-1]]
         assert model_rows[-1] >= len(h.screen()) - 2  # 底栏区 (末尾两行内)
-        assert footer_row.lstrip().startswith("~")  # 模型与工作区同一行 (水平对齐)
+        # 单行底栏 (2026-10-19 裁决): 品牌打头, 模型与工作区/ctx 同一行
+        assert footer_row.startswith("cicada · [high] deepseek-v4-pro")
         assert h.find("已切换模型")
         assert session.config.model_label == "deepseek-v4-pro"
         # 确认后继请求使用新模型 (A13): 经前端键位提交, mock HTTP 体核对
