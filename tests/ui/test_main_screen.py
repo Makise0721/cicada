@@ -109,7 +109,12 @@ def test_no_change_frame_writes_nothing():
     vt, writes, doc, screen = build()
     doc.lines = ["a", "b"]
     render(screen, 20, 10)
-    assert len(writes) == 2  # 帧 + 无光标标记时的隐藏光标写
+    # 光标序列并入同一同步更新块 (状态行动画每帧重绘该行, 单独写出会让光标
+    # 先停在刚写入行再下一笔挪走, 表现为多一个闪烁光标)
+    assert len(writes) == 1
+    frame = writes[0]
+    assert "\x1b[?25l" in frame
+    assert frame.index("\x1b[?25l") < frame.index("\x1b[?2026l")
     writes.clear()
     render(screen, 20, 10)
     assert writes == []  # P10: 无修改帧不重复写屏
@@ -187,6 +192,28 @@ def test_cursor_marker_positions_hardware_cursor():
     # 硬件光标定位到标记列 (col 10 -> CHA 11G)
     assert "\x1b[11G" in frame
     assert vt.cursor_visible
+
+
+def test_cursor_restore_inside_sync_block_when_redrawing_line_above_editor():
+    """状态行动画每帧重绘编辑器上方一行: 光标定位必须在同一同步更新块内。
+
+    单独写出时终端先提交"光标停在刚写入行", 下一笔才挪回输入框; 状态行
+    每 150ms 重绘一次, 表现为 working 后面挂着一个一直闪烁的光标。
+    """
+    vt, writes, doc, screen = build()
+    doc.lines = ["对话", "", "editor " + CURSOR_MARKER]
+    render(screen, 20, 10)
+    writes.clear()
+    # 只改光标上方的一行 (等价于状态行动效帧)
+    doc.lines = ["对话 working", "", "editor " + CURSOR_MARKER]
+    render(screen, 20, 10)
+    frame = "".join(writes)
+    assert "working" in frame
+    begin = frame.index("\x1b[?2026h")
+    end = frame.index("\x1b[?2026l", begin)
+    sync_block = frame[begin:end]
+    assert "\x1b[8G" in sync_block, "光标列定位必须在同步块内"
+    assert vt.cursor_visible and vt.cursor_col == 7  # 仍在 editor 行尾
 
 
 def test_no_marker_hides_cursor():

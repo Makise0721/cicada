@@ -434,17 +434,17 @@ class MainScreen:
                     self.ui_failures.append(f"line {i} exceeds width ({visible_width(line)} > {width}); truncated")
                     line = truncate_to_width(line, width)
                 out.append(("\r\n" if i > 0 else "") + line)
-            out.append("\x1b[?2026l")
-            self._write("".join(out))
             self._cursor_row = max(0, len(new_lines) - 1)
             self._hardware_cursor_row = self._cursor_row
+            out.append(self._cursor_sequence(cursor_pos, len(new_lines)))
+            out.append("\x1b[?2026l")
+            self._write("".join(out))
             if clear:
                 self._max_lines_rendered = len(new_lines)
             else:
                 self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
             buffer_length = max(height, len(new_lines))
             self._previous_viewport_top = max(0, buffer_length - height)
-            self._position_hardware_cursor(cursor_pos, len(new_lines))
             self._previous_lines = new_lines
             self._previous_width = width
             self._previous_height = height
@@ -521,11 +521,13 @@ class MainScreen:
                 move_back = max(0, extra_lines - 1 + clear_start_offset)
                 if move_back > 0:
                     out.append(f"\x1b[{move_back}A")
-                out.append("\x1b[?2026l")
-                self._write("".join(out))
                 self._cursor_row = target_row
                 self._hardware_cursor_row = target_row
-            self._position_hardware_cursor(cursor_pos, len(new_lines))
+                out.append(self._cursor_sequence(cursor_pos, len(new_lines)))
+                out.append("\x1b[?2026l")
+                self._write("".join(out))
+            else:
+                self._position_hardware_cursor(cursor_pos, len(new_lines))
             self._previous_lines = new_lines
             self._previous_width = width
             self._previous_height = height
@@ -580,14 +582,16 @@ class MainScreen:
             for _ in range(extra_lines):
                 out.append("\r\n\x1b[2K")
             out.append(f"\x1b[{extra_lines}A")
+        # 光标定位并入同一同步更新块: 否则终端先提交"光标停在刚写入行"(状态行
+        # 动画每帧重绘该行, 表现为 working 后面多一个闪烁光标), 下一笔才挪走
+        self._hardware_cursor_row = final_cursor_row
+        out.append(self._cursor_sequence(cursor_pos, len(new_lines)))
         out.append("\x1b[?2026l")
         self._write("".join(out))
 
         self._cursor_row = max(0, len(new_lines) - 1)
-        self._hardware_cursor_row = final_cursor_row
         self._max_lines_rendered = max(self._max_lines_rendered, len(new_lines))
         self._previous_viewport_top = max(prev_viewport_top, final_cursor_row - height + 1)
-        self._position_hardware_cursor(cursor_pos, len(new_lines))
         self._previous_lines = new_lines
         self._previous_width = width
         self._previous_height = height
@@ -599,12 +603,23 @@ class MainScreen:
 
         show/hide 按状态变化去重, 无变化帧不重复写 (P10); 光标移动仍逐帧写。
         """
+        data = self._cursor_sequence(cursor_pos, total_lines)
+        if data:
+            self._write(data)
+
+    def _cursor_sequence(self, cursor_pos: tuple[int, int] | None, total_lines: int) -> str:
+        """光标定位序列 (不写出), 供渲染路径并入同一同步更新块。
+
+        单独写出会让终端先提交"光标停在最后一次写入处"(状态行动画每帧都重绘
+        那一行, 于是光标停在 working 末尾) 再下一帧才挪回输入框; 表现为状态行
+        后面多出一个一直闪烁的光标。
+        """
         want_visible = cursor_pos is not None and total_lines > 0 and self.show_hardware_cursor
         if not want_visible:
             if self._cursor_shown is not False:
-                self._write("\x1b[?25l")
                 self._cursor_shown = False
-            return
+                return "\x1b[?25l"
+            return ""
         target_row = max(0, min(cursor_pos[0], total_lines - 1))
         target_col = max(0, cursor_pos[1])
         row_delta = target_row - self._hardware_cursor_row
@@ -614,12 +629,11 @@ class MainScreen:
         elif row_delta < 0:
             buffer += f"\x1b[{-row_delta}A"
         buffer += f"\x1b[{target_col + 1}G"
-        if buffer:
-            self._write(buffer)
         self._hardware_cursor_row = target_row
         if self._cursor_shown is not True:
-            self._write("\x1b[?25h")
+            buffer += "\x1b[?25h"
             self._cursor_shown = True
+        return buffer
 
     def _extract_cursor_position(self, lines: list[str], height: int) -> tuple[int, int] | None:
         """从可见视口找 CURSOR_MARKER, 计算可见列并剥除标记。"""
