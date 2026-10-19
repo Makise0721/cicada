@@ -79,7 +79,8 @@ def test_environment_without_user_directory_and_override_unused_bad_credentials(
     monkeypatch.setenv('DEEPSEEK_API_KEY', ' environment-sentinel ')
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '任务'], root)
     assert code == 0, err
-    assert requests[-1][0] == 'Bearer environment-sentinel' and not root.exists()
+    assert requests[-1][0] == 'Bearer environment-sentinel'
+    assert (root / 'config.toml').exists() and not (root / 'credentials.json').exists()
     write_config(root)
     (root / 'credentials.json').write_bytes(b'bad-json-secret-sentinel')
     original_open = Path.open
@@ -323,14 +324,15 @@ def test_help_list_fake_and_selector_cancel_skip_user_config_and_key(monkeypatch
     assert not root.exists()
 
 
-def test_missing_key_exits_without_input_http_or_user_creation(monkeypatch, tmp_path, requests):
+def test_missing_key_exits_without_input_http_after_default_config_creation(monkeypatch, tmp_path, requests):
     root = tmp_path / 'absent-user'
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
     monkeypatch.setattr('builtins.input', lambda *args: pytest.fail('unexpected interaction'))
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '任务'], root)
     assert code == 2 and 'DEEPSEEK_API_KEY' in err and '--tui' in err
-    assert requests == [] and not root.exists() and not (tmp_path / '.cicada').exists()
+    assert requests == [] and (root / 'config.toml').exists()
+    assert not (root / 'credentials.json').exists() and not (tmp_path / '.cicada').exists()
 
 
 def test_provider_uses_resolved_key_even_if_environment_changes_before_setup(monkeypatch, tmp_path, requests):
@@ -382,3 +384,23 @@ def test_user_context_limit_still_obeys_check_mode_minimum(monkeypatch, tmp_path
     write_config(root, 'num_ctx = 16384\nmax_output_tokens = 4096\n')
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--check-command', 'echo checked', '任务'], root)
     assert code == 2 and '32768' in err and requests == []
+
+
+@pytest.mark.parametrize('flags, expected', [
+    (['--check-command', 'Write-Output ok'], '32768'),
+    (['--max-output-tokens', '32768'], 'invalid DeepSeek config'),
+])
+def test_new_config_from_competing_writer_is_revalidated(monkeypatch, tmp_path, requests, flags, expected):
+    from cicada.plugins.user_config import FileUserConfigStore
+
+    def competing_publish(store):
+        store.root.mkdir()
+        (store.root / 'config.toml').write_text(
+            'version = 1\n[defaults]\nnum_ctx = 8192\nmax_output_tokens = 4096\n',
+            encoding='utf-8',
+        )
+        return True
+
+    monkeypatch.setattr(FileUserConfigStore, 'ensure_default_config', competing_publish)
+    code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), *flags, '任务'], tmp_path / 'user')
+    assert code == 2 and expected in err and requests == []

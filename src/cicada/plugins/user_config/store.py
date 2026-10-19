@@ -37,6 +37,31 @@ def _config_bytes(defaults: UserDefaults) -> bytes:
     return raw
 
 
+def _create_default_config(root: Path) -> None:
+    """只在目标仍缺失时发布完整默认配置，不覆盖并发创建的文件。"""
+    temporary = None
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix='.config.toml-', suffix='.tmp', dir=root)
+        temporary = Path(name)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(_config_bytes(UserDefaults()))
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, root / 'config.toml')
+        except FileExistsError:
+            pass
+    except OSError:
+        raise UserConfigError('config', 'write-failed') from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                raise UserConfigError('config', 'write-failed') from None
+
+
 def _atomic_replace(path: Path, raw: bytes, cancelled: threading.Event) -> None:
     """worker 独占临时文件；replace 之前最后检查尚未接受的取消。"""
     temporary = None
@@ -169,6 +194,13 @@ class FileUserConfigStore:
         # 一份最近观察供02核对；原始字节只留在Adapter，不派生key hash。
         self._observation: tuple[str, bytes | None, bytes | None, str] | None = None
         self._save_task: asyncio.Task | None = None
+
+    def ensure_default_config(self) -> bool:
+        """启动时补齐缺失的配置；返回是否观察到缺失。load 保持只读。"""
+        if _read(self.root / 'config.toml', 'config') is not None:
+            return False
+        _create_default_config(self.root)
+        return True
 
     def load(self, environment_key: str | None = None) -> UserConfigSnapshot:
         environment = None

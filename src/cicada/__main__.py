@@ -556,7 +556,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 return 2
         try:
             store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
-            snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
+            environment_key = os.environ.get('DEEPSEEK_API_KEY')
+            snapshot = store.load(environment_key)
             resolved, config, sources = resolve_deepseek_config(
                 snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
             )
@@ -570,6 +571,23 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         if checks and config.num_ctx < CHECK_MODE_MIN_NUM_CTX:
             print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
             return 2
+        if isinstance(store, FileUserConfigStore):
+            try:
+                if store.ensure_default_config():
+                    snapshot = store.load(environment_key)
+                    resolved, config, sources = resolve_deepseek_config(
+                        snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
+                    )
+                    defaults = resolved.defaults
+            except UserConfigError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid DeepSeek config: {exc}", file=sys.stderr)
+                return 2
+            if checks and config.num_ctx < CHECK_MODE_MIN_NUM_CTX:
+                print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
+                return 2
         if resolved.credential is None:
             if not args.tui:
                 print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
@@ -762,7 +780,7 @@ def main(*, user_config_store: UserConfigStore | None = None,
             if interactive_default else "Cicada coding agent"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''DeepSeek 用户默认配置：读取当前用户 ~/.cicada/config.toml，不会读取工作区配置。
+        epilog='''DeepSeek 用户默认配置：真实模型启动时读取 ~/.cicada/config.toml，缺失时生成默认文件；不读取工作区配置。
 新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
 普通 --resume 继承存档模型配置；凭据每次启动按有效 DEEPSEEK_API_KEY > 文件引用。
 help、list 与 fake 不读取这些文件。文件存在但无效时明确失败。

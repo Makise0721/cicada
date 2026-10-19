@@ -147,7 +147,7 @@ def test_real_mode_displays_default_and_cli_num_ctx(tmp_path, monkeypatch):
     mock = _ApiMock(monkeypatch)
     proc = mock.run("--workspace", str(tmp_path), "任务")
     assert proc.returncode == 0, proc.stderr
-    assert "context_requested=131072 source=default" in proc.stdout
+    assert "context_requested=131072 source=user" in proc.stdout
     proc = mock.run("--workspace", str(tmp_path), "--num-ctx", "65536", "任务")
     assert proc.returncode == 0, proc.stderr
     assert "context_requested=65536 source=cli" in proc.stdout
@@ -939,7 +939,7 @@ def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path, mo
     assert len(mock.requests) == count
     adopted = mock.run("--workspace", str(tmp_path), "--resume", session_id, "--resume-with-current-config", "第二问")
     assert adopted.returncode == 0, adopted.stderr
-    assert "context_requested=131072 source=default" in adopted.stdout
+    assert "context_requested=131072 source=user" in adopted.stdout
     stored = _latest_epoch_launch(tmp_path, session_id)
     assert stored.launch.provider == "deepseek"
     assert stored.launch.options["num_ctx"] == 131072

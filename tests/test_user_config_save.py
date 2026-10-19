@@ -14,7 +14,64 @@ import pytest
 
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.plugins.user_config import store as files
-from cicada.user_config import LoginSubmission, SecretValue, UserDefaults
+from cicada.user_config import LoginSubmission, SecretValue, UserConfigError, UserDefaults
+
+
+def test_missing_config_is_initialized_once_without_credentials(tmp_path):
+    root = tmp_path / 'user'
+    store = FileUserConfigStore(root)
+    assert store.ensure_default_config()
+    first = store.load()
+    path = root / 'config.toml'
+    expected = files._config_bytes(UserDefaults())
+    assert path.read_bytes() == expected
+    assert first.defaults == UserDefaults() and first.fields == files.DEFAULT_FIELDS
+    assert first.credential is None and not (root / 'credentials.json').exists()
+    path.write_bytes(expected + b'\n')
+    assert not store.ensure_default_config()
+    assert store.load().defaults == UserDefaults()
+    assert path.read_bytes() == expected + b'\n'
+
+
+def test_default_creation_keeps_config_created_by_another_writer(monkeypatch, tmp_path):
+    root = tmp_path / 'user'
+    path = root / 'config.toml'
+
+    def competing_publish(source, target):
+        assert Path(target) == path
+        path.write_text('version = 1\n[defaults]\nthink = false\n', encoding='utf-8')
+        raise FileExistsError
+
+    monkeypatch.setattr(os, 'link', competing_publish)
+    store = FileUserConfigStore(root)
+    assert store.ensure_default_config()
+    snapshot = store.load()
+    assert not snapshot.defaults.think and path.read_text(encoding='utf-8').endswith('think = false\n')
+    assert not list(root.glob('*.tmp'))
+
+
+def test_default_creation_reports_write_failure_without_partial_config(monkeypatch, tmp_path):
+    root = tmp_path / 'user'
+    monkeypatch.setattr(os, 'link', lambda *_: (_ for _ in ()).throw(OSError('private path')))
+    with pytest.raises(UserConfigError, match='config: write-failed'):
+        FileUserConfigStore(root).ensure_default_config()
+    assert not (root / 'config.toml').exists() and not list(root.glob('*.tmp'))
+
+
+def test_default_creation_cleanup_failure_has_fixed_error(monkeypatch, tmp_path):
+    root = tmp_path / 'user'
+    original_unlink = Path.unlink
+
+    def blocked_unlink(path, *args, **kwargs):
+        if path.suffix == '.tmp':
+            raise OSError('private path')
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'unlink', blocked_unlink)
+    with pytest.raises(UserConfigError, match='config: write-failed') as error:
+        FileUserConfigStore(root).ensure_default_config()
+    assert 'private path' not in str(error.value)
+    assert (root / 'config.toml').read_bytes() == files._config_bytes(UserDefaults())
 
 
 async def seed(root, key='old-sentinel'):

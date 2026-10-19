@@ -73,13 +73,14 @@ def test_first_run_saves_before_open_and_initial_prompt_once(monkeypatch, tmp_pa
         assert needle.encode() not in archive.read_bytes()
 
 
-def test_wizard_cancel_has_no_config_application_or_epoch(monkeypatch, tmp_path, requests, interactive):
+def test_wizard_cancel_keeps_default_config_without_application_or_epoch(monkeypatch, tmp_path, requests, interactive):
     terminal, sessions = interactive
     terminal.keys = [ENTER, PASTE, KeyPress(Keys.Escape, '\x1b')]
     root = tmp_path / 'user'
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '首问'], root)
     assert code == 0 and sessions == [] and requests == [], err
-    assert not root.exists() and not (tmp_path / '.cicada').exists()
+    assert (root / 'config.toml').exists() and not (root / 'credentials.json').exists()
+    assert not (tmp_path / '.cicada').exists()
     assert terminal.stopped and 'startup-sentinel' not in terminal.output_text
 
 
@@ -140,7 +141,10 @@ def test_invalid_local_inputs_fail_before_wizard(monkeypatch, tmp_path, requests
     root = tmp_path / 'user'
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', *flags, '问'], root)
     assert code == 2 and requests == [] and interactive[0].starts == 0, err
-    assert not root.exists()
+    if flags == ['--check-command', 'Write-Output ok']:
+        assert (root / 'config.toml').exists()
+    else:
+        assert not root.exists()
 
 
 def test_non_tty_never_starts_wizard(monkeypatch, tmp_path, requests, interactive):

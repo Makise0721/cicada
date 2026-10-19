@@ -40,7 +40,7 @@ cicada --list-sessions
 
 ## 交互与真实任务
 
-在目标工作区运行 `cicada` 进入 TUI；首次缺凭据时显示遮蔽输入向导。也可预先设置 `$env:DEEPSEEK_API_KEY`。用户配置和独立凭据文件位于 `~/.cicada/`，登录只保存配置，不验证账号。
+在目标工作区运行 `cicada` 进入 TUI；首次缺凭据时显示遮蔽输入向导。也可预先设置 `$env:DEEPSEEK_API_KEY`。用户配置位于 `~/.cicada/config.toml`，真实模型启动时若缺失会生成默认文件；凭据单独存放，登录不验证账号。
 
 启动自动加载 `~/.cicada/AGENTS.md`、工作区根 `AGENTS.md`，以及 `~/.cicada/skills/`、工作区 `.agents/skills/` 下的 Skill。项目同名 Skill 优先；`--instructions-file` 和 `--skills-dir` 分别替换自动来源，`--no-auto-instructions`、`--no-auto-skills` 可关闭自动读取。普通恢复会核对资源是否变化。
 
