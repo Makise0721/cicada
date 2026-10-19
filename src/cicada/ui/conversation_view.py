@@ -62,7 +62,6 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from pathlib import Path
 from typing import Callable
 
 from cicada.application import (
@@ -87,7 +86,7 @@ from cicada.application import (
 )
 from cicada.persistence.contracts import validate_session_name
 from cicada.costs import cost_lines
-from cicada.diagnostic_export import ReportError
+from cicada.session_export import ExportError, export_session_html
 from cicada.skills import MAX_SKILL_LIST_BYTES, MAX_SKILL_LIST_LINES, SkillsError
 from cicada.core.events import (
     AssistantCompleted,
@@ -837,16 +836,21 @@ class ConversationView:
                 [*cost_lines(cost), '范围：本次进程；重启新建额度', f'账本：{cost.ledger_path}']
                 if cost is not None else ['未启用；启动时用 --cost-limit-cny/--max-model-calls 设置'])])
             return True
-        if command == '/export' or command.startswith('/export '):
-            path = command[len('/export'):].strip()
-            if not path:
-                self.transcript.append_system('用法：/export <路径.md或.json>（不覆盖已有文件）')
-                return True
+        if command == '/export':
+            # 自动命名 + 导出 HTML + 唤起浏览器 (2026-10-19 用户裁决);
+            # 不再接受路径参数, 也不再写诊断报告 (那是 /export-report/CLI 的事)
             try:
-                destination = self._session.export_diagnostics(Path(path))
-                self.transcript.append_system(f'诊断已导出：{destination}')
-            except ReportError as exc:
+                result = export_session_html(self._session)
+            except ExportError as exc:
                 self.transcript.append_error(str(exc))
+                return True
+            opened = '并已在浏览器打开' if result.opened else '；未能自动打开浏览器'
+            self.transcript.append_system(f'会话已导出：{result.path}{opened}')
+            return True
+        if command.startswith('/export '):
+            self.transcript.append_system(
+                '用法：/export（无参数）；文件名按时间与会话 ID 自动生成'
+            )
             return True
         if text.startswith("/name") and (len(text) == 5 or text[5].isspace()):
             return self._handle_name_command(text)

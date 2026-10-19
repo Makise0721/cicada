@@ -2327,6 +2327,11 @@ class ApplicationSession:
                         self._request_store.session_id, self._request_id, self._request_epoch))
 
     @property
+    def tool_names(self) -> tuple[str, ...]:
+        """当前组装解析出的工具名 (只读显示出口; 不含 schema 与实现)。"""
+        return tuple(spec.name for spec in self._request_tool_specs())
+
+    @property
     def process_model_calls(self) -> tuple[ModelCallCompleted, ...]:
         return tuple(self._process_model_calls)
 

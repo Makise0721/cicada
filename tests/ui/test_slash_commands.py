@@ -40,26 +40,29 @@ async def test_menu_wraps_selection_and_filters_typed_prefix():
 
 
 async def test_argument_command_menu_completion_keeps_draft_without_submit():
-    """带参数命令从菜单补齐: 只回填 `/export `, 不提交; 补齐后的 Enter 才提交全文。"""
+    """带参数命令从菜单补齐: 只回填 `/name `, 不提交; 补齐后的 Enter 才提交全文。
+
+    2026-10-19 起 /export 不再带参数, 代表改用 /name。
+    """
     h = Harness(commands=True)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/e"))
+        h.terminal.emit(text_keys("/na"))
         await h.settle()
-        assert h.find("→ export")
+        assert h.find("→ name")
         h.terminal.emit([ENTER])
         await h.settle()
         assert h.submitted == []  # 命令未被直接发出
-        assert h.editor.get_text() == "/export "  # 命令 + 空格留输入框
+        assert h.editor.get_text() == "/name "  # 命令 + 空格留输入框
         assert h.editor.cursor_at_end()
-        assert h.find("/export")  # 草稿仍在屏幕上
-        assert not h.find("→ exit")  # 补齐后菜单收起 (草稿含空白)
-        h.terminal.emit(text_keys("report.json"))
+        assert h.find("/name")  # 草稿仍在屏幕上
+        assert not h.find("→ new")  # 补齐后菜单收起 (草稿含空白)
+        h.terminal.emit(text_keys("发布前"))
         await h.settle()
-        assert h.editor.get_text() == "/export report.json"
+        assert h.editor.get_text() == "/name 发布前"
         h.terminal.emit([ENTER])
         await h.settle()
-        assert h.submitted == ["/export report.json"]
+        assert h.submitted == ["/name 发布前"]
         assert h.editor.is_empty()
     finally:
         await h.stop()

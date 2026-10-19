@@ -111,19 +111,22 @@ async def test_enter_submits_and_clears_draft():
 
 @pytest.mark.asyncio
 async def test_menu_completion_of_argument_command_keeps_draft():
-    """带参数命令 (/export) 从菜单补齐只回填草稿, 不提交; 补齐后 Enter 才发出。"""
+    """带参数命令 (/name) 从菜单补齐只回填草稿, 不提交; 补齐后 Enter 才发出。
+
+    2026-10-19 起 /export 不再带参数, 代表改用 /name。
+    """
     h = Harness(commands=True)
     try:
         await h.start()
-        h.terminal.emit(text_keys("/e") + [ENTER])
+        h.terminal.emit(text_keys("/na") + [ENTER])
         await h.settle()
         assert h.submitted == []
-        assert h.editor.get_text() == "/export "
+        assert h.editor.get_text() == "/name "
         assert h.editor.cursor_at_end()
-        assert not h.find("→ exit")  # 补齐后菜单收起
-        h.terminal.emit(text_keys("r.md") + [ENTER])
+        assert not h.find("→ new")  # 补齐后菜单收起
+        h.terminal.emit(text_keys("新名称") + [ENTER])
         await h.settle()
-        assert h.submitted == ["/export r.md"]
+        assert h.submitted == ["/name 新名称"]
         assert h.editor.is_empty()
     finally:
         await h.stop()

@@ -40,7 +40,7 @@ SLASH_COMMANDS = (
     SlashCommand("/name", "会话名称：/name <名称> · --clear 清除", takes_argument=True),
     SlashCommand("/resume", "搜索并恢复本工作区会话"),
     SlashCommand("/new", "新建保存会话，验证状态保留"),
-    SlashCommand("/export", "导出诊断报告：/export <路径.md或.json>", takes_argument=True),
+    SlashCommand("/export", "导出本次会话为 HTML 并在浏览器打开"),
     SlashCommand("/exit", "退出程序"),
 )
 
