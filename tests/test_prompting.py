@@ -132,19 +132,20 @@ def test_hash_stability_across_calls(tmp_path):
 
 def test_select_instructions_modes(tmp_path):
     # 缺失 = absent, 不报错; 存在 = automatic; 显式与关闭优先, 不查磁盘候选
-    assert select_instructions_file(tmp_path).mode == "absent"
-    assert select_instructions_file(tmp_path).path is None
+    user_dir = tmp_path / "test-user-home"
+    assert select_instructions_file(tmp_path, user_dir=user_dir).mode == "absent"
+    assert select_instructions_file(tmp_path, user_dir=user_dir).path is None
     (tmp_path / "AGENTS.md").write_text("规则", encoding="utf-8")
-    auto = select_instructions_file(tmp_path)
+    auto = select_instructions_file(tmp_path, user_dir=user_dir)
     assert auto.mode == "automatic" and auto.path == str(tmp_path / "AGENTS.md")
-    other = select_instructions_file(tmp_path, explicit_path="TEAM.md")
+    other = select_instructions_file(tmp_path, explicit_path="TEAM.md", user_dir=user_dir)
     assert other.mode == "explicit" and other.path == "TEAM.md"
-    off = select_instructions_file(tmp_path, auto_enabled=False)
+    off = select_instructions_file(tmp_path, auto_enabled=False, user_dir=user_dir)
     assert off.mode == "disabled" and off.path is None
     # 关闭自动时不检查根候选: 即便 AGENTS.md 是目录也不报错
     (tmp_path / "AGENTS.md").unlink()
     (tmp_path / "AGENTS.md").mkdir()
-    assert select_instructions_file(tmp_path, auto_enabled=False).mode == "disabled"
+    assert select_instructions_file(tmp_path, auto_enabled=False, user_dir=user_dir).mode == "disabled"
 
 
 def test_select_instructions_rejects_directory_and_reparse(tmp_path):
@@ -210,6 +211,36 @@ def test_compose_default_derivation_unchanged(tmp_path):
     (tmp_path / "TEAM.md").write_text("规则", encoding="utf-8")
     _, with_path = compose_system_prompt(tmp_path, "TEAM.md")
     assert with_path.instructions_mode == "explicit"
+
+
+def test_user_and_project_instructions_are_ordered_and_identified(tmp_path):
+    user_dir = tmp_path / "home" / ".cicada"
+    user_dir.mkdir(parents=True)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (user_dir / "AGENTS.md").write_text("通用规则", encoding="utf-8")
+    (workspace / "AGENTS.md").write_text("项目规则", encoding="utf-8")
+
+    selected = select_instructions_file(workspace, user_dir=user_dir)
+    prompt, info = compose_system_prompt(
+        workspace, selected.path, instructions_mode=selected.mode,
+        instruction_sources=selected.sources,
+    )
+    assert prompt.index("通用规则") < prompt.index("项目规则")
+    assert tuple(scope for scope, _, _ in info.instruction_sources) == ("user", "project")
+    assert info.instructions_sha256 != info.instruction_sources[-1][2]
+    assert compose_system_prompt(
+        workspace, selected.path, instructions_mode=selected.mode,
+        instruction_sources=selected.sources,
+    )[1].prompt_sha256 == info.prompt_sha256
+
+    explicit = select_instructions_file(workspace, explicit_path="AGENTS.md", user_dir=user_dir)
+    explicit_prompt, _ = compose_system_prompt(
+        workspace, explicit.path, instructions_mode=explicit.mode,
+    )
+    assert "通用规则" not in explicit_prompt
+    assert "项目规则" in explicit_prompt
+    assert select_instructions_file(workspace, auto_enabled=False, user_dir=user_dir).sources == ()
 
 
 # --- P4 §1/§6: 实际工具名单与指定检查声明 -----------------------------------------------

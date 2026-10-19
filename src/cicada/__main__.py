@@ -9,9 +9,9 @@
 - --script: fake model 剧本 (见 parse_script), 用于确定性回归;
 - 缺省: 真实模型默认 DeepSeek Flash thinking; 可用 --model 选择 API 模型。
 --script 与真实模型旗标 (--model/--think/--num-ctx) 互斥, 混用退出码 2.
-两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加项目指令,
+两种模式均使用内置系统提示 (PROMPT_VERSION); --instructions-file 在其后追加显式指令,
 文件错误 (缺失/超限/非 UTF-8) 先于 preflight 失败, 退出码 2. 无显式文件时自动选择
-workspace 根目录 AGENTS.md (C1); --no-auto-instructions 关闭自动选择, 自动候选
+用户级与 workspace 根目录 AGENTS.md; --no-auto-instructions 关闭自动选择, 自动候选
 不可用同样先于 preflight 报错。指令来源 mode 仅供显示, 不进入提示身份。
 
 --tui 进入交互终端 (生产组合: 共享应用 + Pi 主屏前端, 见 cicada.ui; 正常启动
@@ -107,7 +107,7 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import list_sessions, read_session_identity
-from cicada.plugins.skills import load_skill_catalog
+from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.user_config import (
     LoginResult, UserConfigError, UserConfigSnapshot, UserConfigStore,
@@ -291,6 +291,10 @@ def _print_prompt_info(info: PromptInfo) -> None:
     line = f"[prompt version={info.version} workspace={info.workspace}"
     if info.instructions_path is not None:
         line += f" instructions={info.instructions_path} instructions_sha256={info.instructions_sha256}"
+    if len(info.instruction_sources) > 1:
+        line += " instruction_sources=" + ",".join(
+            f"{scope}:{path}" for scope, path, _ in info.instruction_sources
+        )
     line += f" prompt_sha256={info.prompt_sha256}]"
     print(line)
 
@@ -393,18 +397,20 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     # 指令文件错误先于 preflight/bootstrap (P3 §4.2); Skills 目录错误同为启动输入
     # 错误, 在存档身份预读与 provider 探测之前 (D8)
     skills_snapshot = None
-    if args.skills_dir is not None:
-        try:
+    try:
+        if args.skills_dir is not None:
             skills_snapshot = load_skill_catalog(args.skills_dir, workspace)
-        except SkillCatalogError as exc:
-            print(f"invalid skills directory: {exc}", file=sys.stderr)
-            return 2
+        elif not args.no_auto_skills:
+            skills_snapshot = load_auto_skill_catalog(workspace)
+    except SkillCatalogError as exc:
+        print(f"invalid skills directory: {exc}", file=sys.stderr)
+        return 2
     if args.skill is not None:
-        # 03 (D8): --skill 需要 --skills-dir; 名称/限额错误在 provider 探测与
+        # 03 (D8): --skill 需要有效目录; 名称/限额错误在 provider 探测与
         # 应用 open 之前退出码 2。位置 prompt 是任务, 省略时 helper 填固定指令
         if skills_snapshot is None:
             print(
-                "--skill 需要 --skills-dir: 显式选择从启用目录的冻结快照取正文",
+                "--skill 需要 --skills-dir 或自动发现的 Skill 目录",
                 file=sys.stderr,
             )
             return 2
@@ -423,7 +429,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if skills_snapshot is not None:
         prompt_tools = prompt_tools + ("load_skill",)
     try:
-        # C1: 启动层来源选择 (显式 > --no-auto-instructions > 根目录 AGENTS.md);
+        # 启动层来源选择 (显式 > --no-auto-instructions > 用户级与项目级 AGENTS.md);
         # 自动候选的 reparse/目录/不可读在此报错, 正文仍由组装链有界读取一次
         selection = select_instructions_file(
             workspace,
@@ -437,6 +443,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             checks=check_prompts,
             skills=skills_snapshot,
             instructions_mode=selection.mode,
+            instruction_sources=selection.sources if selection.mode == "automatic" else None,
         )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
@@ -820,26 +827,30 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
         "--num-ctx", type=int, help="本地窗口上限 (默认 131072)"
     )
     parser.add_argument(
-        "--instructions-file", help="追加到系统提示的项目指令文件 (≤16 KiB UTF-8; 两种模式可用)"
+        "--instructions-file", help="替换自动指令的指定文件 (≤16 KiB UTF-8; 两种模式可用)"
     )
     parser.add_argument(
         "--no-auto-instructions", action="store_true",
         help=(
-            "关闭根目录 AGENTS.md 自动加载 (无项目指令启动); "
+            "关闭用户级和工作区根 AGENTS.md 自动加载; "
             "显式 --instructions-file 不受影响, 仍照常加载"
         ),
     )
     parser.add_argument(
         "--skills-dir",
         help=(
-            "启用本地 Skills 的目录 (相对 workspace; 直接子目录各含一份 SKILL.md)。"
-            "恢复会话不从存档继承, 须显式重传同一目录"
+            "只使用指定的本地 Skills 目录 (相对 workspace; 直接子目录各含 SKILL.md)。"
+            "旧版显式 Skills 会话恢复时须重传同一目录"
         ),
+    )
+    parser.add_argument(
+        "--no-auto-skills", action="store_true",
+        help="关闭用户级和项目级 Skills 自动发现；显式 --skills-dir 仍生效",
     )
     parser.add_argument(
         "--skill",
         help=(
-            "显式发送一个 Skill 的正文作为首条请求 (名称须在 --skills-dir 目录中; "
+            "显式发送一个 Skill 的正文作为首条请求 (名称须在有效 Skill 目录中; "
             "位置 prompt 作为任务, 省略时用固定指令; 手动专用 Skill 也允许显式选择)"
         ),
     )

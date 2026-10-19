@@ -626,6 +626,22 @@ def test_r2_skills_section_three_states(skills_count, expected):
     assert lines[12] == expected
 
 
+def test_auto_user_and_project_instructions_are_visible_in_welcome():
+    lines = WelcomeEntry(
+        _facts(instruction_scopes=("user", "project"), instructions_mode="automatic"),
+        plain=True,
+    ).render(96)
+    assert "用户 AGENTS.md + 项目 AGENTS.md · 自动" in lines[10]
+
+
+def test_auto_skill_sources_and_override_are_visible_in_welcome():
+    lines = WelcomeEntry(
+        _facts(skill_scopes=("user", "project"), overridden_skills=("shared",)),
+        plain=True,
+    ).render(120)
+    assert "3 个 · 用户+项目 · 项目覆盖 shared · /skill 查看目录" in lines[12]
+
+
 @pytest.mark.parametrize("plain", [True, False])
 def test_r2_resume_short_block_has_no_sections(plain):
     """恢复保持三行短版: 无段组、无键位行, 宽度档文案同 v1 (含 40/10 窄档)。"""

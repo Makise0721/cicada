@@ -1114,7 +1114,7 @@ class ConversationView:
         if not payload:
             if self._session.skills is None:
                 self.transcript.append_system(
-                    "未启用 Skills：启动时用 --skills-dir 指定目录后可用。"
+                    "未启用 Skills：放入约定目录或用 --skills-dir 指定目录。"
                 )
                 return False  # 无目录是拒绝: 显示原因并保留草稿 (A07)
             self.transcript.append_information("Skills 目录", self._skill_catalog_sections())
@@ -1136,14 +1136,17 @@ class ConversationView:
         """
         skills = self._session.skills
         if skills is None:  # 防御: 调用方已拦截未启用
-            return [("Skills", ["未启用 Skills：启动时用 --skills-dir 指定目录后可用。"])]
-        rows = [
-            f"root: {skills.root}",
-            f"manifest sha256:{skills.manifest_sha256[:12]} · 共 {len(skills.infos)} 个 Skill",
-        ]
+            return [("Skills", ["未启用 Skills：放入约定目录或用 --skills-dir 指定目录。"])]
+        rows = (
+            [f"{scope}: {path}" for scope, path in skills.roots]
+            if skills.roots else [f"root: {skills.root}"]
+        )
+        rows.append(f"manifest sha256:{skills.manifest_sha256[:12]} · 共 {len(skills.infos)} 个 Skill")
         for info in skills.infos:
             marker = "（手动专用，模型不可自行加载）" if info.disable_model_invocation else ""
-            rows.append(f"/skill {info.name}{marker}  {info.description}")
+            scope = f"[{info.scope}] " if skills.roots else ""
+            rows.append(f"/skill {info.name}{marker}  {scope}{info.description}")
+        rows.extend(skills.diagnostics)
         rows.append("用法: /skill <名称> [任务] — 将该 Skill 正文作为下一条请求发送。")
         fields = [clip_status_field(row) for row in rows]
         total = "\n".join(fields)

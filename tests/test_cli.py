@@ -17,12 +17,17 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 from test_persistence_application import _latest_epoch_identity as _latest_epoch_launch
 
 
-def run_cli(*args: str) -> subprocess.CompletedProcess:
+def run_cli(*args: str, home: Path | None = None) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
         "PYTHONPATH": str(SRC),
         "PYTHONIOENCODING": "utf-8",
     }
+    if home is None and "--workspace" in args:
+        home = Path(args[args.index("--workspace") + 1]) / "test-user-home"
+    if home is not None:
+        env["USERPROFILE"] = str(home)
+        env["HOME"] = str(home)
     return subprocess.run(
         [sys.executable, "-m", "cicada", *args],
         capture_output=True,
@@ -106,6 +111,8 @@ class _ApiMock:
         self.monkeypatch.setattr(cli.sys, "stdout", out)
         self.monkeypatch.setattr(cli.sys, "stderr", err)
         workspace = Path(args[args.index("--workspace") + 1])
+        self.monkeypatch.setenv("USERPROFILE", str(workspace / "test-user-home"))
+        self.monkeypatch.setenv("HOME", str(workspace / "test-user-home"))
         code = cli.main(user_config_store=FileUserConfigStore(workspace / "test-user"))
         return subprocess.CompletedProcess(args, code, out.value, err.value)
 
@@ -211,6 +218,33 @@ def test_auto_instructions_loaded_explicit_overrides_and_can_disable(tmp_path, m
     assert "instructions=" in proc.stdout and "RULES.md" in proc.stdout
     assert "显式来源优先" in mock3.requests[0]["messages"][0]["content"]
     assert "仓库约定：自动来源" not in mock3.requests[0]["messages"][0]["content"]
+
+
+def test_cli_user_and_project_instructions_and_explicit_replacement(tmp_path):
+    home = tmp_path / "home"
+    user_dir = home / ".cicada"
+    user_dir.mkdir(parents=True)
+    (user_dir / "AGENTS.md").write_text("通用规则", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("项目规则", encoding="utf-8")
+    script = _script(tmp_path)
+    auto = run_cli("--workspace", str(workspace), "--script", str(script), "任务", home=home)
+    assert auto.returncode == 0, auto.stderr
+    assert "instruction_sources=user:" in auto.stdout
+    assert ",project:" in auto.stdout
+    explicit = run_cli(
+        "--workspace", str(workspace), "--script", str(script),
+        "--instructions-file", "AGENTS.md", "任务", home=home,
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    assert "instruction_sources=" not in explicit.stdout
+    disabled = run_cli(
+        "--workspace", str(workspace), "--script", str(script),
+        "--no-auto-instructions", "任务", home=home,
+    )
+    assert disabled.returncode == 0, disabled.stderr
+    assert "instructions=" not in disabled.stdout
 
 
 def test_auto_instructions_error_precedes_preflight_and_model_request(tmp_path):

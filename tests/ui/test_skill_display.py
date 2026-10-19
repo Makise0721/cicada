@@ -19,7 +19,7 @@ from cicada.application import (
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import StreamDone
 from cicada.plugins.fake_model import fake_model_plugin
-from cicada.plugins.skills import load_skill_catalog
+from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog
 from cicada.prompting import compose_system_prompt
 from cicada.persistence.contracts import LaunchIdentity
 from cicada.skills import (
@@ -208,6 +208,25 @@ async def test_bare_skill_shows_catalog_usage_and_manual_marker(tmp_path):
         assert "用法: /skill <名称> [任务]" in text
         assert "manifest sha256:" in text
         assert h.user_entries() == []
+    finally:
+        h.view.close()
+        await session.aclose()
+
+
+async def test_auto_skill_catalog_shows_effective_source(tmp_path):
+    root = tmp_path / "ws"
+    user_dir = tmp_path / "home" / ".cicada"
+    write_skill(user_dir / "skills", "shared", body="User body")
+    write_skill(root / ".agents" / "skills", "shared", body="Project body")
+    snapshot = load_auto_skill_catalog(root, user_dir=user_dir)
+    session = await open_application(make_config(root, HeldModel(), snapshot))
+    h = Harness(session)
+    try:
+        assert h.submit("/skill") is True
+        text = "\n".join(h.lines())
+        assert "user:" in text and "project:" in text
+        assert "/skill shared" in text and "[project]" in text
+        assert "overrides user source" in text
     finally:
         h.view.close()
         await session.aclose()

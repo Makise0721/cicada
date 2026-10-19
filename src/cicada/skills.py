@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 MANIFEST_VERSION = "local-skills:1"
 SKILLS_PROMPT_VERSION = "builtin:p4-v1+skills:1"
+AUTO_SKILLS_PROMPT_VERSION = "builtin:p4-v1+skills:auto1"
 LOAD_SKILL_TOOL_NAME = "load_skill"
 
 SKILL_NAME_PATTERN = re.compile(r"^(?:[a-z0-9]+(?:-[a-z0-9]+)*)$")
@@ -76,6 +77,7 @@ class SkillInfo:
     base_dir: str
     source_sha256: str
     disable_model_invocation: bool = False
+    scope: str = "explicit"
 
 
 @dataclass(frozen=True)
@@ -95,11 +97,15 @@ class SkillCatalogSnapshot:
     documents: tuple[SkillDocument, ...]
     manifest_sha256: str
     diagnostics: tuple[str, ...] = ()
+    roots: tuple[tuple[str, str], ...] = ()
+    overridden_names: tuple[str, ...] = ()
 
     def view(self) -> SkillCatalogView:
         """只读目录视图 (元数据/root/manifest, 不含正文) — 会话只读出口."""
         return SkillCatalogView(
-            root=self.root, manifest_sha256=self.manifest_sha256, infos=self.infos
+            root=self.root, manifest_sha256=self.manifest_sha256, infos=self.infos,
+            diagnostics=self.diagnostics, roots=self.roots,
+            overridden_names=self.overridden_names,
         )
 
     @property
@@ -114,6 +120,9 @@ class SkillCatalogView:
     root: str
     manifest_sha256: str
     infos: tuple[SkillInfo, ...]
+    diagnostics: tuple[str, ...] = ()
+    roots: tuple[tuple[str, str], ...] = ()
+    overridden_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -383,6 +392,7 @@ def catalog_prompt_section(snapshot: SkillCatalogSnapshot) -> str:
                 "source_path": info.source_path,
                 "base_dir": info.base_dir,
                 "source_sha256": info.source_sha256,
+                **({"scope": info.scope} if snapshot.roots else {}),
             },
             ensure_ascii=False,
         )

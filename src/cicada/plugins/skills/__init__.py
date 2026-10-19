@@ -6,12 +6,13 @@ bootstrap 不做第二次文件读取。共享接口: skills_plugin(snapshot)。
 
 from __future__ import annotations
 
-from cicada.plugins.skills.loader import load_skill_catalog
+from cicada.plugins.skills.loader import load_auto_skill_catalog, load_skill_catalog
 from cicada.plugins.skills.tool import CATALOG_CAPABILITY, LoadSkillTool, skills_plugin
 
 __all__ = [
     "CATALOG_CAPABILITY",
     "LoadSkillTool",
     "load_skill_catalog",
+    "load_auto_skill_catalog",
     "skills_plugin",
 ]

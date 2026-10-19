@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from cicada.plugins.skills import load_skill_catalog, skills_plugin
+from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog, skills_plugin
 from cicada.plugins.skills import loader as loader_module
 from cicada.plugins.skills import tool as tool_module
 from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
@@ -28,6 +28,7 @@ from cicada.skills import (
     MAX_SKILL_FILE_BYTES,
     MAX_SKILL_REQUEST_BYTES,
     SKILLS_PROMPT_VERSION,
+    AUTO_SKILLS_PROMPT_VERSION,
     SKILL_REQUEST_PREFIX,
     SkillCatalogError,
     SkillCatalogSnapshot,
@@ -68,6 +69,29 @@ def write_skill(root: Path, name: str, *, description: str = "A test skill.",
 
 def load(root: Path) -> SkillCatalogSnapshot:
     return load_skill_catalog(str(root), root.parent)
+
+
+def test_auto_catalog_project_wins_and_freezes_sources(tmp_path):
+    user_dir = tmp_path / "home" / ".cicada"
+    user_root = user_dir / "skills"
+    project_root = tmp_path / "workspace" / ".agents" / "skills"
+    write_skill(user_root, "shared", body="User body")
+    write_skill(user_root, "general")
+    write_skill(project_root, "shared", body="Project body")
+
+    snapshot = load_auto_skill_catalog(project_root.parents[1], user_dir=user_dir)
+    assert snapshot is not None
+    assert [info.name for info in snapshot.infos] == ["general", "shared"]
+    assert find_skill(snapshot, "shared", allow_manual=True).body == "Project body\n"
+    assert snapshot.infos[-1].scope == "project"
+    assert len(snapshot.roots) == 2
+    assert any("overrides user source" in item for item in snapshot.diagnostics)
+    prompt, info = compose_system_prompt(project_root.parents[1], skills=snapshot)
+    assert info.version == AUTO_SKILLS_PROMPT_VERSION
+    assert "Project body" not in prompt
+    write_skill(project_root, "shared", body="Changed body")
+    assert find_skill(snapshot, "shared", allow_manual=True).body == "Project body\n"
+    assert load_auto_skill_catalog(project_root.parents[1], user_dir=user_dir).manifest_sha256 != snapshot.manifest_sha256
 
 
 # --- 发现与元数据 (A02) ---------------------------------------------------------------------
@@ -424,6 +448,9 @@ async def test_load_skill_tool_success_errors_and_details(tmp_path, monkeypatch)
 
 def run_cli(*args: str) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
+    workspace = Path(args[args.index("--workspace") + 1])
+    env["USERPROFILE"] = str(workspace / "test-user-home")
+    env["HOME"] = str(workspace / "test-user-home")
     return subprocess.run(
         [sys.executable, "-m", "cicada", *args],
         capture_output=True, text=True, encoding="utf-8", env=env, timeout=120,
@@ -496,6 +523,56 @@ def test_cli_resume_requires_skills_dir_retransmission(tmp_path):
         "--skills-dir", str(root), "--resume", session_id, "任务",
     )
     assert again.returncode == 0, again.stderr
+
+
+def test_cli_auto_skills_explicit_override_and_resume(tmp_path):
+    project_root = tmp_path / ".agents" / "skills"
+    write_skill(project_root, "project", body="Project body")
+    explicit_root = tmp_path / "explicit"
+    write_skill(explicit_root, "explicit", body="Explicit body")
+    script = _script_file(tmp_path)
+
+    saved = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--save-session", "--skill", "project",
+    )
+    assert saved.returncode == 0, saved.stderr
+    assert "skills=1" in saved.stdout
+    session_id = next(
+        line.split("id=")[1].split()[0]
+        for line in saved.stdout.splitlines() if line.startswith("[session id=")
+    )
+    resumed = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--resume", session_id, "任务",
+    )
+    assert resumed.returncode == 0, resumed.stderr
+
+    explicit = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--skills-dir", str(explicit_root), "--skill", "explicit",
+    )
+    assert explicit.returncode == 0, explicit.stderr
+    assert "skills=1" in explicit.stdout
+    disabled = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--no-auto-skills", "--skill", "project",
+    )
+    assert disabled.returncode == 2
+    assert "--skill 需要 --skills-dir" in disabled.stderr
+
+    write_skill(project_root, "project", body="Changed body")
+    conflict = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--resume", session_id, "任务",
+    )
+    assert conflict.returncode == 2
+    assert "config conflicts" in conflict.stderr
+    adopted = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script),
+        "--resume", session_id, "--resume-with-current-config", "任务",
+    )
+    assert adopted.returncode == 0, adopted.stderr
 
 
 # --- 显式请求封装 (票据 03, 契约 §4): 纯构造与有界解码 ------------------------------------------

@@ -1,27 +1,31 @@
-"""系统提示构造: 内置提示 + 显式指令文件的有界加载与组装.
+"""系统提示构造: 内置提示 + 指令文件的有界加载与组装.
 
 纯函数模块: 只返回文本与来源信息, 不读写 Agent 状态, 不导入内核/运行时/插件.
 契约 (P3 计划 §4.2): 内置提示固定版本标识; 指令文件 16 KiB 原始字节上限, 先有界读取
-limit+1 再按 UTF-8-sig 解码; 相对路径以 workspace 为根; 稳定顺序 内置 → 项目指令;
+limit+1 再按 UTF-8-sig 解码; 相对路径以 workspace 为根; 稳定顺序 内置 → 用户指令 → 项目指令;
 raw bytes hash 与组装文本 hash 分别标注.
 
 P4 §1/§6: 工具名单来自启动层的实际注册配置 (默认含 glob/grep), 指定检查模式把
 启动者声明的 check-id/命令/timeout 如实写进提示, 但检查结果状态由运行时投影提供,
 不在提示里伪造. 本模块仍不导入插件层, 检查声明用本地 CheckPrompt 记录承载.
 
-project-context-v1 C1: select_instructions_file 只做启动来源选择 (显式 > 关闭 >
-根目录 AGENTS.md), 不读正文; mode 仅供显示, 不进入提示文本或持久身份.
+select_instructions_file 只做启动来源选择 (显式 > 关闭 > 用户级与项目级
+AGENTS.md), 不读正文; mode 仅供显示, 不进入提示文本或持久身份.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from cicada.skills import SKILLS_PROMPT_VERSION, SkillCatalogSnapshot, catalog_prompt_section
+from cicada.skills import (
+    AUTO_SKILLS_PROMPT_VERSION, SKILLS_PROMPT_VERSION, SkillCatalogSnapshot,
+    catalog_prompt_section,
+)
 
 PROMPT_VERSION = "builtin:p4-v1"
 MAX_INSTRUCTIONS_BYTES = 16 * 1024
@@ -56,9 +60,10 @@ class PromptInfo:
     version: str
     workspace: Path
     instructions_path: Path | None
-    instructions_sha256: str | None  # 源文件原始字节
+    instructions_sha256: str | None  # 单文件原始字节；双来源为有序来源摘要
     prompt_sha256: str  # 组装后文本的 UTF-8
     instructions_mode: str | None = None  # 仅供显示; None = 未传 mode 的旧构造
+    instruction_sources: tuple[tuple[str, Path, str], ...] = ()  # scope, path, raw sha256
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,7 @@ class InstructionSelection:
 
     path: str | None
     mode: str
+    sources: tuple[tuple[str, str], ...] = ()  # scope, path; 自动模式为 user → project
 
     def __post_init__(self) -> None:
         if self.mode not in INSTRUCTIONS_MODES:
@@ -82,30 +88,36 @@ class InstructionSelection:
 
 
 def select_instructions_file(
-    workspace: Path, *, explicit_path: str | None = None, auto_enabled: bool = True
+    workspace: Path, *, explicit_path: str | None = None, auto_enabled: bool = True,
+    user_dir: Path | None = None,
 ) -> InstructionSelection:
-    """启动层指令来源选择: 显式文件 > 关闭自动 > 根目录 AGENTS.md (C1).
+    """显式文件全替自动来源；自动来源按用户级、项目级顺序选择。
 
     只选择来源, 不读正文。自动候选用 lstat 区分: 缺失是正常 absent;
     reparse point、目录或不可访问抛 InstructionsError, 不以 exists() 吞掉
     权限错误。显式路径沿用旧加载规则, 在此不做额外检查。
     """
     if explicit_path is not None:
-        return InstructionSelection(explicit_path, "explicit")
+        return InstructionSelection(explicit_path, "explicit", (("explicit", explicit_path),))
     if not auto_enabled:
         return InstructionSelection(None, "disabled")
-    candidate = workspace / INSTRUCTIONS_FILENAME
-    try:
-        st = os.lstat(candidate)
-    except FileNotFoundError:
-        return InstructionSelection(None, "absent")
-    except OSError as exc:
-        raise InstructionsError(f"cannot inspect instructions file {candidate}: {exc}") from exc
-    if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-        raise InstructionsError(f"automatic instructions file {candidate} is a reparse point")
-    if stat.S_ISDIR(st.st_mode):
-        raise InstructionsError(f"automatic instructions file {candidate} is a directory")
-    return InstructionSelection(str(candidate), "automatic")
+    sources = []
+    for scope, candidate in (
+        ("user", (user_dir if user_dir is not None else Path.home() / ".cicada") / INSTRUCTIONS_FILENAME),
+        ("project", workspace / INSTRUCTIONS_FILENAME),
+    ):
+        try:
+            st = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise InstructionsError(f"cannot inspect instructions file {candidate}: {exc}") from exc
+        if getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise InstructionsError(f"automatic instructions file {candidate} is a reparse point")
+        if stat.S_ISDIR(st.st_mode):
+            raise InstructionsError(f"automatic instructions file {candidate} is a directory")
+        sources.append((scope, str(candidate)))
+    return InstructionSelection(sources[-1][1], "automatic", tuple(sources)) if sources else InstructionSelection(None, "absent")
 
 
 def _resolve_instructions_mode(instructions_path: str | None, mode: str | None) -> str:
@@ -208,6 +220,7 @@ def compose_system_prompt(
     checks: tuple[CheckPrompt, ...] = (),
     skills: SkillCatalogSnapshot | None = None,
     instructions_mode: str | None = None,
+    instruction_sources: tuple[tuple[str, str], ...] | None = None,
 ) -> tuple[str, PromptInfo]:
     """组装系统提示: 内置提示在前, Skills 目录段紧随, 项目指令以明确来源标记追加在后.
 
@@ -224,16 +237,33 @@ def compose_system_prompt(
     version = PROMPT_VERSION
     if skills is not None:
         prompt += "\n" + catalog_prompt_section(skills)
-        version = SKILLS_PROMPT_VERSION
+        version = AUTO_SKILLS_PROMPT_VERSION if skills.roots else SKILLS_PROMPT_VERSION
     resolved: Path | None = None
     raw_hash: str | None = None
-    if instructions_path is not None:
-        text, resolved, raw_hash = load_instructions(instructions_path, workspace)
+    sources = instruction_sources if instruction_sources is not None else (
+        (("project", instructions_path),) if instructions_path is not None else ()
+    )
+    if instruction_sources is not None and (sources[-1][1] if sources else None) != instructions_path:
+        raise ValueError("instruction sources do not match selected path")
+    observed = []
+    for scope, path in sources:
+        text, source_path, source_hash = load_instructions(path, workspace)
+        observed.append((scope, source_path, source_hash))
         if text.strip():
+            label = "User" if scope == "user" else "Project"
             prompt += (
-                f"\n--- Project instructions (source: {resolved}, sha256:{raw_hash}) ---\n"
+                f"\n--- {label} instructions (source: {source_path}, sha256:{source_hash}) ---\n"
                 f"{text.rstrip()}\n"
             )
+    if observed:
+        resolved = observed[-1][1]
+        raw_hash = observed[-1][2]
+        if len(observed) > 1:
+            payload = json.dumps(
+                [(scope, str(path), digest) for scope, path, digest in observed],
+                ensure_ascii=False, separators=(",", ":"),
+            )
+            raw_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     info = PromptInfo(
         version=version,
         workspace=workspace.resolve(),
@@ -241,5 +271,6 @@ def compose_system_prompt(
         instructions_sha256=raw_hash,
         prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         instructions_mode=mode,
+        instruction_sources=tuple(observed),
     )
     return prompt, info

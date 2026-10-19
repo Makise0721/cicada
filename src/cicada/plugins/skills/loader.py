@@ -1,6 +1,6 @@
 """Skills 目录发现与冻结快照: 同步有界启动读取, 候选的任何错误整体拒绝.
 
-发现范围 (D1): 只看根目录直接子目录中的 SKILL.md, 不递归/不扫描用户目录;
+发现范围 (D1): 单根加载只看直接子目录中的 SKILL.md, 不递归;
 根本身的显式 junction 解析到实际目录, 其下条目与主文档的 reparse point 拒绝;
 普通文件/无主文档子目录/隐藏子目录跳过; 空目录允许启用。
 格式 (D2): Markdown + YAML frontmatter 基本格式; SafeLoader 拒绝别名/锚/
@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import stat
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -315,4 +317,53 @@ def load_skill_catalog(root_str: str, workspace: Path) -> SkillCatalogSnapshot:
         documents=tuple(documents),
         manifest_sha256=manifest_sha256(root_text, tuple(documents)),
         diagnostics=tuple(diagnostics),
+    )
+
+
+def load_auto_skill_catalog(
+    workspace: Path, *, user_dir: Path | None = None,
+) -> SkillCatalogSnapshot | None:
+    """用户级与项目级目录的单次启动快照；项目同名 Skill 覆盖用户级。"""
+    candidates = (
+        ("user", (user_dir if user_dir is not None else Path.home() / ".cicada") / "skills"),
+        ("project", workspace / ".agents" / "skills"),
+    )
+    roots: list[tuple[str, str]] = []
+    selected: dict[str, SkillDocument] = {}
+    diagnostics: list[str] = []
+    overridden_names: list[str] = []
+    for scope, candidate in candidates:
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise SkillCatalogError("root", str(candidate), str(exc)) from exc
+        catalog = load_skill_catalog(str(candidate), workspace)
+        roots.append((scope, catalog.root))
+        diagnostics.extend(catalog.diagnostics)
+        for document in catalog.documents:
+            previous = selected.get(document.info.name)
+            if previous is not None:
+                overridden_names.append(document.info.name)
+                diagnostics.append(
+                    f"{document.info.name}: project source {document.info.source_path} "
+                    f"overrides user source {previous.info.source_path}"
+                )
+            selected[document.info.name] = replace(
+                document, info=replace(document.info, scope=scope)
+            )
+    if not roots:
+        return None
+    if len(selected) > MAX_SKILLS:
+        raise SkillCatalogError(
+            "skill_limit", str(workspace), f"more than {MAX_SKILLS} effective skills"
+        )
+    documents = tuple(selected[name] for name in sorted(selected))
+    root_text = json.dumps(roots, ensure_ascii=False, separators=(",", ":"))
+    return SkillCatalogSnapshot(
+        root=root_text, documents=documents,
+        manifest_sha256=manifest_sha256(root_text, documents),
+        diagnostics=tuple(diagnostics), roots=tuple(roots),
+        overridden_names=tuple(overridden_names),
     )

@@ -68,6 +68,9 @@ class WelcomeFacts:
     skills_count: int | None
     resumed: bool
     instructions_mode: str | None = None  # explicit/automatic; None = 旧构造 (只显文件名)
+    instruction_scopes: tuple[str, ...] = ()
+    skill_scopes: tuple[str, ...] = ()
+    overridden_skills: tuple[str, ...] = ()
 
 
 def _clean_field(value: str, limit: int) -> str:
@@ -122,6 +125,11 @@ def capture_welcome_facts(session: ApplicationSession) -> WelcomeFacts:
         skills_count=None if skills is None else len(skills.infos),
         resumed=resumed,
         instructions_mode=config.prompt_info.instructions_mode,
+        instruction_scopes=tuple(
+            scope for scope, _, _ in getattr(config.prompt_info, "instruction_sources", ())
+        ),
+        skill_scopes=() if skills is None else tuple(scope for scope, _ in skills.roots),
+        overridden_skills=() if skills is None else skills.overridden_names,
     )
 
 
@@ -199,20 +207,31 @@ class WelcomeEntry:
     def _instructions(self) -> str:
         if self.facts.instructions_name is None:
             return "未指定"
+        if self.facts.instruction_scopes == ("user", "project"):
+            return "用户 AGENTS.md + 项目 AGENTS.md · 自动"
+        if self.facts.instruction_scopes == ("user",):
+            return f"用户 {self.facts.instructions_name} · 自动"
         mode = INSTRUCTION_MODE_LABELS.get(self.facts.instructions_mode or "")
         if mode is None:  # 旧构造无 mode: 保持只显短文件名的旧显示
             return self.facts.instructions_name
         return f"{self.facts.instructions_name} · {mode}"
 
     def _skills_brief(self) -> str:
-        return "未启用" if self.facts.skills_count is None else f"{self.facts.skills_count} 个"
+        if self.facts.skills_count is None:
+            return "未启用"
+        scopes = "+".join("用户" if scope == "user" else "项目" for scope in self.facts.skill_scopes)
+        return f"{self.facts.skills_count} 个" + (f" · {scopes}" if scopes else "")
 
     def _skills_content(self) -> str:
         if self.facts.skills_count is None:
             return "未启用"
         if self.facts.skills_count == 0:
-            return "0 个"
-        return f"{self.facts.skills_count} 个 · /skill 查看目录"
+            return self._skills_brief()
+        content = self._skills_brief()
+        if self.facts.overridden_skills:
+            names = ", ".join(self.facts.overridden_skills)
+            content += f" · 项目覆盖 {_clean_field(names, 30)}"
+        return content + " · /skill 查看目录"
 
     # --- 样式 (规格 r2): plain 零 ESC; 有色只套截断后文本, 行末一次复位 -----------------
 

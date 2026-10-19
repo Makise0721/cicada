@@ -149,6 +149,7 @@ from cicada.reporting import DeliveryDecision, decide_delivery
 from cicada.runtime.plugin import PluginDefinition
 from cicada.runtime.runtime import CapabilityError
 from cicada.skills import (
+    AUTO_SKILLS_PROMPT_VERSION,
     LOAD_SKILL_TOOL_NAME,
     SKILLS_PROMPT_VERSION,
     SkillCatalogSnapshot,
@@ -3117,9 +3118,10 @@ def _validate_skills_prompt_identity(config: "ApplicationConfig") -> None:
     实际 PromptInfo 相等 (adopt_current_config 不豁免)。错配 = 启动错误。
     """
     info = config.prompt_info
-    if info.version != SKILLS_PROMPT_VERSION:
+    expected_version = AUTO_SKILLS_PROMPT_VERSION if config.skills.roots else SKILLS_PROMPT_VERSION
+    if info.version != expected_version:
         raise ValueError(
-            f"skills enabled requires prompt version {SKILLS_PROMPT_VERSION}, got {info.version}"
+            f"skills enabled requires prompt version {expected_version}, got {info.version}"
         )
     actual = hashlib.sha256(config.system_prompt.encode("utf-8")).hexdigest()
     if actual != info.prompt_sha256:
