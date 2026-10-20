@@ -43,6 +43,86 @@ from cicada.plugins.session_store import SQLiteSessionStore, open_session_store
 UUID = "123e4567-e89b-42d3-a456-426614174000"
 
 
+@pytest.mark.parametrize("publication_fails", [False, True])
+async def test_legacy_migration_cleanup_failure_releases_source_lease(
+    tmp_path, monkeypatch, publication_fails,
+):
+    from cicada.plugins.session_store import migration
+
+    workspace = tmp_path / "ws"
+    legacy = workspace / ".cicada" / "sessions"
+    source = open_session_store(directory=legacy, session_id=None, workspace=workspace)
+    session_id = source.session_id
+    await source.aclose()
+    runtime = tmp_path / "runtime"
+    original_replace = migration.os.replace
+    original_rmdir = Path.rmdir
+
+    def replace(source_path, destination_path):
+        if publication_fails and Path(destination_path).suffix == ".sqlite3":
+            raise OSError("publication refused")
+        return original_replace(source_path, destination_path)
+
+    def rmdir(path):
+        if path.name.startswith(".migrate-"):
+            raise PermissionError("cleanup refused")
+        return original_rmdir(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migration.os, "replace", replace)
+        patch.setattr(Path, "rmdir", rmdir)
+        with pytest.raises(StorageUnavailableError) as caught:
+            migration.migrate_legacy_session(workspace, session_id, runtime_dir=runtime)
+    if publication_fails:
+        assert "publication refused" in str(caught.value)
+        assert any("cleanup refused" in note for note in caught.value.__notes__)
+    else:
+        assert "cleanup refused" in str(caught.value)
+    # 真实 lease 必须已经可重新取得，不只检查 spy 或目录是否仍在。
+    resumed = open_session_store(directory=legacy, session_id=session_id, workspace=workspace)
+    await resumed.aclose()
+
+
+async def test_legacy_migration_retry_refreshes_restore_index(tmp_path, monkeypatch):
+    from cicada.plugins.session_store import migration
+
+    workspace = tmp_path / "ws"
+    legacy = workspace / ".cicada" / "sessions"
+    source = open_session_store(directory=legacy, session_id=None, workspace=workspace)
+    session_id = source.session_id
+    await source.aclose()
+    points = workspace / ".cicada" / "restore" / "points"
+    points.mkdir(parents=True)
+    index = points / f"{session_id}.jsonl"
+    first = b'{"entries":[],"point":"first"}\n'
+    second = b'{"entries":[],"point":"continued-by-old-version"}\n'
+    index.write_bytes(first)
+    runtime = tmp_path / "runtime"
+    destination = runtime / "sessions" / f"{session_id}.sqlite3"
+    original_replace = migration.os.replace
+
+    def refuse_database(source_path, destination_path):
+        if Path(destination_path) == destination:
+            raise OSError("publication refused")
+        return original_replace(source_path, destination_path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(migration.os, "replace", refuse_database)
+        with pytest.raises(StorageUnavailableError, match="publication refused"):
+            migration.migrate_legacy_session(workspace, session_id, runtime_dir=runtime)
+    assert not destination.exists()
+    assert (runtime / "restore" / "points" / index.name).read_bytes() == first
+    index.write_bytes(first + second)
+    with sqlite3.connect(legacy / f"{session_id}.sqlite3") as connection:
+        connection.execute("UPDATE session SET user_name = 'continued'")
+    source_bytes = (legacy / f"{session_id}.sqlite3").read_bytes()
+    migration.migrate_legacy_session(workspace, session_id, runtime_dir=runtime)
+    with sqlite3.connect(destination) as connection:
+        assert connection.execute("SELECT user_name FROM session").fetchone()[0] == "continued"
+    assert (runtime / "restore" / "points" / index.name).read_bytes() == first + second
+    assert (legacy / f"{session_id}.sqlite3").read_bytes() == source_bytes
+
+
 def _identity(**overrides) -> StoredIdentity:
     fields = dict(
         provider="fake", model="fake", base_url=None, think=None,

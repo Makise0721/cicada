@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import uuid
 from contextlib import closing
 from pathlib import Path
@@ -52,13 +53,19 @@ def migrate_legacy_session(
     except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
         raise StorageUnavailableError(f"legacy session migration failed: {exc}") from exc
     finally:
-        if temp_dir is not None:
-            temp_db = temp_dir / source.name
-            if temp_db.exists():
-                temp_db.unlink()
-            if temp_dir.exists():
+        failure = sys.exception()
+        try:
+            if temp_dir is not None:
+                temp_db = temp_dir / source.name
+                temp_db.unlink(missing_ok=True)
                 temp_dir.rmdir()
-        _release_lease(lease)
+        except OSError as exc:
+            if failure is not None:
+                failure.add_note(f"legacy session migration cleanup failed: {exc}")
+            else:
+                raise StorageUnavailableError(f"legacy session migration cleanup failed: {exc}") from exc
+        finally:
+            _release_lease(lease)
 
 
 def _copy_restore_material(source: Path, destination: Path, session_id: str) -> None:
@@ -105,11 +112,12 @@ def _copy_restore_material(source: Path, destination: Path, session_id: str) -> 
                 if staged.exists():
                     staged.unlink()
     target_index = destination / "points" / index.name
-    if not target_index.exists():
-        staged_index = target_index.with_name(f".migrate-{uuid.uuid4().hex}")
-        try:
-            staged_index.write_bytes(rows)
-            os.replace(staged_index, target_index)
-        finally:
-            if staged_index.exists():
-                staged_index.unlink()
+    # 目标 DB 尚未发布时，旧索引可能来自一次失败的迁移。持有源 lease
+    # 重新复制本次索引，让重试使用的 DB 与还原点来自同一轮源档。
+    staged_index = target_index.with_name(f".migrate-{uuid.uuid4().hex}")
+    try:
+        staged_index.write_bytes(rows)
+        os.replace(staged_index, target_index)
+    finally:
+        if staged_index.exists():
+            staged_index.unlink()

@@ -103,7 +103,7 @@ def collect(session) -> dict:
         },
         "tools": list(session.tool_names),
         "system_prompt": config.system_prompt,
-        "messages": _messages(session.history, session.process_model_calls),
+        "messages": _messages(session.history),
         "metrics": _aggregate_metrics(session.process_model_calls),
     }
 
@@ -138,15 +138,13 @@ def _aggregate_metrics(calls) -> dict:
     return result
 
 
-def _messages(history: tuple[Message, ...], calls) -> list[dict]:
+def _messages(history: tuple[Message, ...]) -> list[dict]:
     """规范历史 -> 渲染条目; 同轮工具结果合并进对应助手条目。
 
-    计量按"第 N 次模型调用"与"第 N 个助手条目"顺序对齐: 会话历史不保留
-    run_id, 因此不做身份配对; 数量不足或超出时不显示该轮计量 (不伪造)。
+    会话历史不保留调用身份，恢复、clear 或切换后不能与本进程计量按序
+    配对。逐消息计量保持未知；本进程累计计量由独立汇总提供。
     """
-    call_list = list(calls)
     blocks: list[dict] = []
-    assistant_seen = 0
     for message in history:
         if isinstance(message, UserMessage):
             blocks.append({"kind": "user", "text": message.text})
@@ -160,14 +158,6 @@ def _messages(history: tuple[Message, ...], calls) -> list[dict]:
                 "tools": [],
                 "metrics": None,
             }
-            if assistant_seen < len(call_list):
-                call = call_list[assistant_seen]
-                entry["metrics"] = {
-                    "input_tokens": call.metrics.input_tokens if call.metrics else None,
-                    "output_tokens": call.metrics.output_tokens if call.metrics else None,
-                    "elapsed_s": call.elapsed_s,
-                }
-            assistant_seen += 1
             blocks.append(entry)
         elif isinstance(message, ToolResultMessage):
             result = message.result

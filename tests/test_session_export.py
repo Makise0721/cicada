@@ -36,6 +36,33 @@ def test_default_name_marks_missing_session():
     assert name == "cicada-session-20261019-010203-nosessio.html"
 
 
+def test_collect_does_not_assign_process_metrics_to_history(tmp_path):
+    """恢复/clear 后历史没有调用身份，逐消息计量保持未知。"""
+    from types import SimpleNamespace
+    from cicada.core.events import ModelCallCompleted
+    from cicada.core.ports import ModelMetrics
+    from cicada.session_export import collect
+
+    session = SimpleNamespace(
+        config=SimpleNamespace(workspace=tmp_path, model_label="fake", max_turns=6,
+                               system_prompt="system"),
+        persistence=None, tool_names=(),
+        reasoning_effort=SimpleNamespace(enabled=False),
+        history=(UserMessage("old"), AssistantMessage("restored"),
+                 UserMessage("new"), AssistantMessage("current")),
+        process_model_calls=(ModelCallCompleted(
+            run_id="new-run", turn_index=0, stop_reason="stop",
+            metrics=ModelMetrics(input_tokens=987, output_tokens=123), elapsed_s=0.5),),
+    )
+    payload = collect(session)
+    assert all(message["metrics"] is None for message in payload["messages"]
+               if message["kind"] == "assistant")
+    assert payload["metrics"]["input_tokens"] == 987
+    assert payload["metrics"]["calls"] == 1
+    session.history = (UserMessage("after clear"), AssistantMessage("answer"))
+    assert collect(session)["messages"][-1]["metrics"] is None
+
+
 def _payload(**overrides) -> dict:
     payload = {
         "file_name": "x.html",
