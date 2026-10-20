@@ -63,7 +63,7 @@ Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默�
 
 先退出 Cicada，保留当前 wheel 和配套依赖清单。在目标版本下载目录重复安装步骤，将安装命令加上 `--force --reinstall`；回退使用先前保留版本的 wheel 和配套清单。不要只替换 wheel 而沿用另一版本的依赖清单。
 
-升级前保留旧档副本。回退到 a1 会读取工作区旧档，a2 迁移后新增记录仍在用户级目录，不自动回写旧档；两版本交替续写会形成不同历史。`uv tool uninstall cicada` 只卸载工具环境及命令，会话、用户配置和费用账本保留。
+升级前保留旧档副本。a1→a2 的工具声明有变化，恢复时需 `--resume <ID> --resume-with-current-config` 显式采用当前配置。回退到 a1 会读取工作区旧档，a2 新增记录不自动回写，两版本交替续写会形成不同历史。`uv tool uninstall cicada` 保留会话、用户配置和费用账本。
 
 问题反馈入口：[GitHub Issues](https://github.com/Makise0721/cicada/issues)。更多参数和退出码见 `cicada --help`。
 
