@@ -1157,10 +1157,36 @@ def _immediate_txn(connection: sqlite3.Connection) -> None:
     connection.execute("BEGIN IMMEDIATE")
 
 
+def _make_sessions_dir(directory: Path) -> None:
+    """逐层创建并把失败层与 winerror 一并报出，避免只剩一个笼统路径。"""
+    missing: list[Path] = []
+    probe = directory
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for target in reversed(missing):
+        try:
+            target.mkdir()
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            detail = (
+                f"cannot create {target}"
+                f" (parent exists={target.parent.is_dir()}"
+                f", winerror={getattr(exc, 'winerror', None)}"
+                f", errno={exc.errno}): {exc}"
+            )
+            raise StorageUnavailableError(detail) from exc
+
+
 def _create_store(directory: Path, canonical_workspace: str) -> SQLiteSessionStore:
     session_id = str(uuid.uuid4())
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        _make_sessions_dir(directory)
+    except StorageUnavailableError:
+        raise
     except OSError as exc:
         raise StorageUnavailableError(f"cannot create the sessions directory: {exc}") from exc
     db_path = directory / f"{session_id}.sqlite3"

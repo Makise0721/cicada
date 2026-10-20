@@ -1297,3 +1297,46 @@ async def test_list_sessions_corrupt_json_rows_count_conservatively(tmp_path, pa
     entry = page.entries[0]
     assert entry.session_id == session_id and entry.error is None, "坏行是保守计数, 不作废整档"
     assert entry.unproven_activities == 1 and entry.untrusted_receipts == 1
+
+
+async def test_sessions_dir_creation_failure_names_level_and_winerror(tmp_path, monkeypatch):
+    """建库目录失败时报出具体层级与 winerror, 不能只剩一句笼统的拒绝访问.
+
+    真实故障是目标父目录可写、同名目录名不可建 (旧安装的解释器写用户主目录
+    被拒), 只报路径无法定位; 诊断必须给出失败层与系统错误码。
+    """
+    from cicada.plugins.session_store import store as store_module
+
+    blocked = tmp_path / "user" / "workspaces" / "hash" / "sessions"
+    # 父目录先于子目录创建: 被拒的最浅层才是真实失败点, 诊断必须报这一层。
+    shallowest = tmp_path / "user"
+
+    def refuse(self, *args, **kwargs):
+        raise PermissionError(13, "Access is denied", str(self))
+
+    monkeypatch.setattr(Path, "mkdir", refuse)
+    with pytest.raises(StorageUnavailableError) as excinfo:
+        store_module._make_sessions_dir(blocked)
+    message = str(excinfo.value)
+    assert f"cannot create {shallowest}" in message, "失败层路径必须可读"
+    assert "winerror=" in message and "errno=13" in message
+    assert "parent exists=" in message
+    assert str(blocked) not in message.split("cannot create ")[1], "不能把最深目标误报成失败层"
+
+
+async def test_sessions_dir_creation_skips_existing_levels(tmp_path, monkeypatch):
+    """已存在的层级不重复创建; 只建缺失部分, 不因目标已存在而报错."""
+    from cicada.plugins.session_store import store as store_module
+
+    target = tmp_path / "sessions"
+    target.mkdir()
+    created: list[Path] = []
+    original = Path.mkdir
+
+    def record(self, *args, **kwargs):
+        created.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record)
+    store_module._make_sessions_dir(target)
+    assert created == [], "目标已存在时不应再调用 mkdir"
