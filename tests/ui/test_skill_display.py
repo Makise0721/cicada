@@ -423,7 +423,7 @@ async def test_ctrl_o_toggles_skill_body_and_shares_tool_flag(tmp_path):
         collapsed = h.lines()
         # 标题按列宽换行: 名称与路径可能分块, 逐段断言
         assert "Skill 文档" in "\n".join(collapsed)
-        assert "SKILL.md" in "\n".join(collapsed)
+        assert "SKILL.md" in "".join(line.strip() for line in collapsed)
         assert "正文已收起" in "\n".join(collapsed)
         assert "Alpha body line one." not in "\n".join(collapsed)
         h.view.handle_ctrl_o()  # 与工具输出共享的全局展开标志

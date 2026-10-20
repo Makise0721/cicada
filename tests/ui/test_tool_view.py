@@ -637,16 +637,18 @@ async def test_session_cards_update_and_toggle_keeps_request_and_tool_counts(tmp
     doc.toggle_expand()  # Ctrl+O: 单工具直接开详情 (6 行初始预览 + 分页动作)
     expanded = doc.render_lines(80)
     expanded_plain = [strip_terminal_sequences(line) for line in expanded]
-    assert any("mod_00.py" in line for line in expanded_plain)  # 初始 6 行预览
-    assert not any("sample.py" in line for line in expanded_plain)  # 字母序第 13 行, 未披露
+    # 文件名可能跨物理行换行，先还原可见文字；分页仍按 6 个物理行。
+    expanded_text = "".join(line.strip() for line in expanded_plain)
+    assert "mod_00.py" in expanded_text
+    assert "sample.py" not in expanded_text  # 字母序第 13 行, 未披露
     assert any("更多" in line for line in expanded_plain)  # 13 个 py 文件超出 6 行预览
     key = ("live", "run-1", 0, "c1")
     doc.tool_output_more(key)  # 「更多」每次 +20 输出物理行 (长路径折行, 两次必全覆盖)
     doc.tool_output_more(key)
-    assert any("sample.py" in line for line in plain_lines(doc, 80))
+    assert "sample.py" in "".join(line.strip() for line in plain_lines(doc, 80))
     doc.tool_output_reset(key)  # 「收起详情」恢复 6 行初始预览
     reset_plain = plain_lines(doc, 80)
-    assert not any("sample.py" in line for line in reset_plain)
+    assert "sample.py" not in "".join(line.strip() for line in reset_plain)
     assert any("更多" in line for line in reset_plain)
     doc.toggle_expand()  # 统一收起后渲染回到最初收起态
     assert doc.render_lines(80) == collapsed
