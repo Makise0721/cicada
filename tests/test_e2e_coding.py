@@ -110,6 +110,11 @@ def run_cli(*args: str) -> subprocess.CompletedProcess:
         "PYTHONPATH": str(SRC),
         "PYTHONIOENCODING": "utf-8",
     }
+    if "--workspace" in args:
+        # 用户级运行状态跟着用例走且必须在工作区外, 不写开发者真实主目录。
+        home = Path(args[args.index("--workspace") + 1]).parent / "test-user-home"
+        env["USERPROFILE"] = str(home)
+        env["HOME"] = str(home)
     return subprocess.run(
         [sys.executable, "-m", "cicada", *args],
         capture_output=True,

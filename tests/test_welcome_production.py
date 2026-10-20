@@ -21,7 +21,7 @@ from cicada import __main__ as cli
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.ui.terminal_io import FakeTerminal
-from test_cli import _CaptureStream
+from test_cli import _CaptureStream, _runtime
 from test_user_config_startup import invoke, requests, write_config
 from tests.ui.vt_screen import VtScreen
 
@@ -59,7 +59,7 @@ def _assert_body_has_no_welcome(body: dict) -> None:
 
 
 def _assert_archive_has_no_welcome(workspace) -> None:
-    archives = list((workspace / '.cicada' / 'sessions').glob('*.sqlite3'))
+    archives = list((_runtime(workspace) / 'sessions').glob('*.sqlite3'))
     assert len(archives) == 1
     raw = archives[0].read_bytes()
     for needle in _WELCOME_LEAKS:

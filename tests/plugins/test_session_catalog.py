@@ -10,6 +10,30 @@ from cicada.core.cancel import CancelToken
 from cicada.plugins.session_store import SessionCatalogReader, open_session_store
 
 
+async def test_combined_catalog_sees_legacy_and_user_sessions(tmp_path):
+    from cicada.application import make_session_catalog_reader
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    current = tmp_path / "user-sessions"
+    legacy = workspace / ".cicada" / "sessions"
+    stores = [
+        open_session_store(directory=current, session_id=None, workspace=workspace),
+        open_session_store(directory=legacy, session_id=None, workspace=workspace),
+    ]
+    ids = {store.session_id for store in stores}
+    for store in stores:
+        await store.aclose()
+    reader = make_session_catalog_reader(
+        directory=current, legacy_directory=legacy, workspace=str(workspace))
+    try:
+        snapshot = await reader.observe(CancelToken())
+        assert snapshot.complete
+        assert {entry.session_id for entry in snapshot.entries} == ids
+    finally:
+        await reader.aclose()
+
+
 async def test_catalog_metadata_scope_and_readonly_validation(tmp_path, monkeypatch):
     from cicada.plugins.session_store import catalog
 

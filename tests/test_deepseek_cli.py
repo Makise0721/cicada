@@ -10,7 +10,7 @@ from cicada import __main__ as cli
 from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import read_session_identity
 from cicada.plugins.user_config import FileUserConfigStore
-from test_cli import _CaptureStream
+from test_cli import _CaptureStream, _runtime, _use_workspace_home
 from test_deepseek_application import response
 
 
@@ -20,6 +20,7 @@ def invoke(monkeypatch, args):
     monkeypatch.setattr(cli.sys, "stdout", out)
     monkeypatch.setattr(cli.sys, "stderr", err)
     workspace = Path(args[args.index('--workspace') + 1])
+    _use_workspace_home(monkeypatch, workspace)
     return cli.main(user_config_store=FileUserConfigStore(workspace / 'test-user')), out.value, err.value
 
 
@@ -42,7 +43,7 @@ def test_default_flash_and_pro_explicit_limits_persist_and_restore(monkeypatch, 
         "--reasoning-effort", "low", "第一问"])
     assert code == 0, err
     session_id = out.split("[session id=")[1].split(" ")[0]
-    identity = read_session_identity(directory=tmp_path / ".cicada" / "sessions",
+    identity = read_session_identity(directory=_runtime(tmp_path) / "sessions",
                                     session_id=session_id, workspace=tmp_path).launch
     assert identity.provider == "deepseek" and identity.think is True
     assert identity.options == {"num_ctx": 65536, "max_tokens": 4096, "reasoning_effort": "low"}

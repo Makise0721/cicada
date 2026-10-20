@@ -282,6 +282,10 @@ def cli_fixture(tmp_path, monkeypatch):
     root.mkdir()
     workspace, git, _ = repository(root)
     workspace.rename(root / "workspace")
+    # 用户级运行状态跟着用例走且必须在被检查工作区之外。
+    home = root.parent / "test-user-home"
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
     original = runner.cli_arguments
     def arguments(run_root, prompt):
         args = original(run_root, prompt)

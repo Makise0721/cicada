@@ -10,8 +10,23 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from cicada.state_paths import workspace_state_dir
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+
+
+def _runtime(workspace: Path, *, home: Path | None = None) -> Path:
+    user_home = home if home is not None else workspace / "test-user-home"
+    return workspace_state_dir(workspace, user_dir=user_home / ".cicada")
+
+
+def _use_workspace_home(monkeypatch, workspace: Path) -> Path:
+    """进程内 main()/cli.main() 的主目录固定在工作区内, 与 _runtime 同一口径。"""
+    home = workspace / "test-user-home"
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
 
 # 04: 与应用级测试共享存档身份读取 helper (避免同段 SQL 复制)
 from test_persistence_application import _latest_epoch_identity as _latest_epoch_launch
@@ -74,7 +89,7 @@ def test_cost_profile_and_actual_cli_model_share_persisted_allowance(tmp_path, m
     result = api.run('--workspace', str(tmp_path), '--cost-limit-cny', '2', '--cost-profile', 'prices.json',
                      '--max-model-calls', '1', 'task')
     assert result.returncode == 0 and len(api.requests) == 1
-    ledger = json.loads(next((tmp_path / '.cicada' / 'cost').glob('*.json')).read_text(encoding='utf-8'))
+    ledger = json.loads(next((_runtime(tmp_path) / 'cost').glob('*.json')).read_text(encoding='utf-8'))
     assert ledger['calls'] == 1 and ledger['settled_upper_cny'] == '0.01' and ledger['pending_upper_cny'] == '0.00'
     assert ledger['checked_at'] == '2026-10-15' and 'cli-mock-key' not in json.dumps(ledger)
     assert 'example.invalid/prices' in result.stdout
@@ -111,8 +126,7 @@ class _ApiMock:
         self.monkeypatch.setattr(cli.sys, "stdout", out)
         self.monkeypatch.setattr(cli.sys, "stderr", err)
         workspace = Path(args[args.index("--workspace") + 1])
-        self.monkeypatch.setenv("USERPROFILE", str(workspace / "test-user-home"))
-        self.monkeypatch.setenv("HOME", str(workspace / "test-user-home"))
+        _use_workspace_home(self.monkeypatch, workspace)
         code = cli.main(user_config_store=FileUserConfigStore(workspace / "test-user"))
         return subprocess.CompletedProcess(args, code, out.value, err.value)
 
@@ -121,6 +135,90 @@ def _script(tmp_path: Path) -> Path:
     script = tmp_path / "script.json"
     script.write_text(json.dumps([{"text": "done", "stop": True}]), encoding="utf-8")
     return script
+
+
+def test_cli_keeps_runtime_state_outside_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    script = tmp_path / "write.json"
+    script.write_text(json.dumps([
+        {"tool_calls": [{"id": "w1", "name": "write", "arguments": {
+            "path": "note.txt", "content": "created by fake model"}}]},
+        {"text": "done", "stop": True},
+    ]), encoding="utf-8")
+    result = run_cli("--workspace", str(workspace), "--script", str(script),
+                     "--save-session", "create file", home=home)
+    assert result.returncode == 0, result.stderr
+    assert (workspace / "note.txt").read_text(encoding="utf-8") == "created by fake model"
+    assert not (workspace / ".cicada").exists()
+    state = _runtime(workspace, home=home)
+    assert list((state / "sessions").glob("*.sqlite3"))
+    assert (state / "outputs").is_dir()
+    assert list((state / "restore" / "points").glob("*.jsonl"))
+
+
+def test_resume_copies_legacy_session_before_continuing(tmp_path):
+    import asyncio
+    import shutil
+    import sqlite3
+
+    from cicada.application import TOOL_CAPABILITIES, _tool_fingerprint, default_definitions
+    from cicada.boot import bootstrap
+    from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+
+    async def legacy_fingerprint() -> str:
+        app = await bootstrap(
+            default_definitions(workspace, fake_model_plugin(FakeModel([]))),
+            tool_capabilities=TOOL_CAPABILITIES, system_prompt="",
+        )
+        try:
+            return _tool_fingerprint(app, legacy_output_paths=True)
+        finally:
+            await app.aclose()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    old_home = tmp_path / "old-home"
+    home = tmp_path / "home"
+    first_script = tmp_path / "first-write.json"
+    first_script.write_text(json.dumps([
+        {"tool_calls": [{"id": "w1", "name": "write", "arguments": {
+            "path": "old.txt", "content": "old"}}]},
+        {"text": "done", "stop": True},
+    ]), encoding="utf-8")
+    script = _script(tmp_path)
+    saved = run_cli("--workspace", str(workspace), "--script", str(first_script),
+                    "--save-session", "first", home=old_home)
+    assert saved.returncode == 0, saved.stderr
+    session_id = saved.stdout.split("[session id=")[1].split(" ")[0]
+    source_state = _runtime(workspace, home=old_home)
+    with sqlite3.connect(source_state / "sessions" / f"{session_id}.sqlite3") as connection:
+        row = connection.execute("SELECT identity_json FROM epoch ORDER BY opened_at DESC LIMIT 1").fetchone()
+        payload = json.loads(row[0])
+        payload["tool_fingerprint"] = asyncio.run(legacy_fingerprint())
+        connection.execute("UPDATE epoch SET identity_json = ? WHERE identity_json = ?",
+                           (json.dumps(payload), row[0]))
+    current = _runtime(workspace, home=home) / "sessions"
+    legacy = workspace / ".cicada" / "sessions"
+    legacy.mkdir(parents=True)
+    for suffix in (".sqlite3", ".lock"):
+        shutil.copy2(source_state / "sessions" / f"{session_id}{suffix}",
+                     legacy / f"{session_id}{suffix}")
+    shutil.copytree(source_state / "restore", workspace / ".cicada" / "restore")
+    old_bytes = (legacy / f"{session_id}.sqlite3").read_bytes()
+    listing = run_cli("--workspace", str(workspace), "--list-sessions", home=home)
+    assert listing.returncode == 0 and session_id in listing.stdout
+    resumed = run_cli("--workspace", str(workspace), "--script", str(script),
+                      "--resume", session_id, "second", home=home)
+    assert resumed.returncode == 0, resumed.stderr
+    assert (current / f"{session_id}.sqlite3").is_file()
+    assert list((_runtime(workspace, home=home) / "restore" / "points").glob("*.jsonl"))
+    assert (legacy / f"{session_id}.sqlite3").read_bytes() == old_bytes
+    adopted = _latest_epoch_launch(workspace, session_id, directory=current)
+    assert adopted.launch.sources["tool_output_location"] == "user-workspace-state"
+    listing = run_cli("--workspace", str(workspace), "--list-sessions", home=home)
+    assert listing.stdout.count(session_id) == 1
 
 
 def test_num_ctx_non_integer_rejected(tmp_path):
@@ -408,10 +506,13 @@ def test_tui_missing_ui_dependency_exits_cleanly(tmp_path):
     (blocker / "prompt_toolkit.py").write_text(
         "raise ImportError('simulated missing prompt_toolkit')", encoding="utf-8"
     )
+    home = tmp_path / "test-user-home"
     env = {
         **os.environ,
         "PYTHONPATH": f"{blocker}{os.pathsep}{SRC}",
         "PYTHONIOENCODING": "utf-8",
+        "USERPROFILE": str(home),
+        "HOME": str(home),
     }
     proc = subprocess.run(
         [sys.executable, "-m", "cicada", "--tui", "--workspace", str(tmp_path), "首问"],
@@ -440,7 +541,9 @@ def test_plain_mode_has_zero_ui_imports(tmp_path):
         "assert 'prompt_toolkit' not in sys.modules, 'UI 依赖被普通模式导入'; "
         "assert 'rich' not in sys.modules, 'rich 被普通模式导入'"
     )
-    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8",
+           "USERPROFILE": str(tmp_path / "test-user-home"),
+           "HOME": str(tmp_path / "test-user-home")}
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,
@@ -479,6 +582,7 @@ def test_tui_startup_is_quiet_no_prompt_or_config_lines(tmp_path, monkeypatch, c
         return 0
 
     monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
+    _use_workspace_home(monkeypatch, tmp_path)
     monkeypatch.setattr(
         sys, "argv",
         ["cicada", "--tui", "--workspace", str(tmp_path), "--script", str(script)],
@@ -569,7 +673,7 @@ def test_resume_zero_epoch_archive_reports_missing_identity(tmp_path):
 
     async def _seed() -> str:
         store = open_session_store(
-            directory=work / ".cicada" / "sessions", session_id=None, workspace=work
+            directory=_runtime(work) / "sessions", session_id=None, workspace=work
         )
         session_id = store.session_id
         await store.aclose()
@@ -598,7 +702,7 @@ def test_resume_with_current_config_adopts_check_mode_and_records_epoch(tmp_path
     assert f"[session id={session_id} mode=resume restored_requests=1]" in adopted.stdout
     assert "[session saved request_id=" in adopted.stdout
 
-    stored = _latest_epoch_launch(work, session_id)
+    stored = _latest_epoch_launch(work, session_id, directory=_runtime(work) / "sessions")
     assert stored.launch.checks_signature is not None, "新 epoch 记录采用的检查模式"
     assert stored.launch.sources.get("resume_config") == "current"
     assert "checks_signature" in stored.launch.sources.get("changed_fields", "")
@@ -701,7 +805,7 @@ def test_resume_config_conflict_names_field(tmp_path):
 
 
 def test_resume_after_workspace_move_rejected(tmp_path):
-    """存档绑定解析后的真实路径: 整个工作区 (含 .cicada) 移动后拒绝恢复。"""
+    """工作区路径变化后不能在新命名空间误恢复旧会话。"""
     import shutil
 
     work = tmp_path / "ws3"
@@ -719,7 +823,7 @@ def test_resume_after_workspace_move_rejected(tmp_path):
                    "--resume", session_id, "问")
     assert proc.returncode == 2
     assert "session store open failed" in proc.stderr
-    assert "workspace" in proc.stderr
+    assert "no session archive" in proc.stderr
 
 
 class _CaptureStream:
@@ -757,6 +861,7 @@ def _run_main_with_storage_failure(tmp_path, monkeypatch, method: str):
     out, err = _CaptureStream(), _CaptureStream()
     monkeypatch.setattr(sys, "stdout", out)
     monkeypatch.setattr(sys, "stderr", err)
+    _use_workspace_home(monkeypatch, tmp_path)
     monkeypatch.setattr(
         sys, "argv",
         ["cicada", "--workspace", str(tmp_path), "--script", str(script),
@@ -790,7 +895,7 @@ def _seed_archive(work: Path, session_id: str, *, open_activity: bool) -> None:
 
     from cicada.persistence.codec import dumps_strict
 
-    db = work / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    db = _runtime(work) / "sessions" / f"{session_id}.sqlite3"
     prompt_payload = dumps_strict({"prompt": "被中断的问"})
     request_id = "11111111-2222-4333-8444-555555555555"
     arguments = {"command": "Start-Sleep -Seconds 30"}
@@ -892,7 +997,7 @@ def test_resume_unknown_saved_option_key_rejected(tmp_path, monkeypatch):
     first = mock.run("--workspace", str(tmp_path), "--save-session", "问")
     assert first.returncode == 0, first.stderr
     session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-    db = tmp_path / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    db = _runtime(tmp_path) / "sessions" / f"{session_id}.sqlite3"
     with sqlite3.connect(db) as connection:
         row = connection.execute("SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1").fetchone()
         payload = json.loads(row[0])
@@ -927,7 +1032,7 @@ def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path, mo
     first = mock.run("--workspace", str(tmp_path), "--num-ctx", "65536", "--save-session", "第一问")
     assert first.returncode == 0, first.stderr
     session_id = first.stdout.split("[session id=")[1].split(" ")[0]
-    db = tmp_path / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    db = _runtime(tmp_path) / "sessions" / f"{session_id}.sqlite3"
     with sqlite3.connect(db) as connection:
         row = connection.execute("SELECT identity_json FROM epoch ORDER BY opened_at DESC, rowid DESC LIMIT 1").fetchone()
         payload = json.loads(row[0])
@@ -940,7 +1045,7 @@ def test_real_mode_resume_with_current_config_overrides_inheritance(tmp_path, mo
     adopted = mock.run("--workspace", str(tmp_path), "--resume", session_id, "--resume-with-current-config", "第二问")
     assert adopted.returncode == 0, adopted.stderr
     assert "context_requested=131072 source=user" in adopted.stdout
-    stored = _latest_epoch_launch(tmp_path, session_id)
+    stored = _latest_epoch_launch(tmp_path, session_id, directory=_runtime(tmp_path) / "sessions")
     assert stored.launch.provider == "deepseek"
     assert stored.launch.options["num_ctx"] == 131072
     assert stored.launch.sources["resume_config"] == "current"
@@ -974,7 +1079,7 @@ def test_fake_resume_records_new_script_source_per_epoch(tmp_path):
     assert second.returncode == 0, second.stderr
     assert ">> glob" not in second.stdout, "后继剧本只服务新调用, 旧剧本不重放"
 
-    stored = _latest_epoch_launch(work, session_id)
+    stored = _latest_epoch_launch(work, session_id, directory=_runtime(work) / "sessions")
     assert stored.launch.sources.get("script") == str(second_script), "新剧本来源记入新 epoch"
 
 
@@ -1024,13 +1129,13 @@ def test_list_sessions_marks_bad_archive_and_occupied(tmp_path):
     proc = run_cli("--workspace", str(work), "--script", str(script), "--save-session", "问")
     assert proc.returncode == 0, proc.stderr
     session_id = proc.stdout.split("[session id=")[1].split(" ")[0]
-    (work / ".cicada" / "sessions" / "00000000-1111-4222-8333-444444444444.sqlite3").write_bytes(
+    (_runtime(work) / "sessions" / "00000000-1111-4222-8333-444444444444.sqlite3").write_bytes(
         b"not a database"
     )
     # 同进程持有 lease: 子进程列表看到占用标注
     from cicada.plugins.session_store import open_session_store
 
-    holder = open_session_store(directory=work / ".cicada" / "sessions",
+    holder = open_session_store(directory=_runtime(work) / "sessions",
                                 session_id=session_id, workspace=work)
     try:
         listing = run_cli("--workspace", str(work), "--list-sessions")
@@ -1094,6 +1199,9 @@ def _run_main(monkeypatch, argv, *, tui_code: int = 0):
     """进程内 main(): TTY 替身 + run_tui_session 替身; 返回 (退出码, stderr 捕获)。"""
     import cicada.__main__ as m
 
+    if "--workspace" in argv:
+        _use_workspace_home(monkeypatch, Path(argv[argv.index("--workspace") + 1]))
+
     async def fake_run_tui_session(session, **kwargs):
         return tui_code
 
@@ -1112,7 +1220,7 @@ def test_tui_persistent_save_allowed_and_default(tmp_path, monkeypatch):
         code, err = _run_main(monkeypatch, ["--tui", "--workspace", str(tmp_path),
                                             "--script", str(_script(tmp_path)), *extra])
         assert code == 0, err.value
-    archives = list((tmp_path / ".cicada" / "sessions").glob("*.sqlite3"))
+    archives = list((_runtime(tmp_path) / "sessions").glob("*.sqlite3"))
     assert len(archives) == 2, "两次 TUI 启动各自动保存一个新会话"
 
 
@@ -1155,7 +1263,7 @@ def test_tui_resume_selector_pick_opens_session(tmp_path, monkeypatch):
     session_id = save.stdout.split("[session id=")[1].split(" ")[0]
 
     async def fake_selector(workspace: Path):
-        assert (workspace / ".cicada" / "sessions").is_dir()
+        assert (_runtime(workspace) / "sessions").is_dir()
         return session_id
 
     monkeypatch.setattr(m, "_launch_session_selector", fake_selector)
@@ -1207,6 +1315,7 @@ def test_tui_resume_with_initial_prompt_executes_once(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr("cicada.ui.run_tui_session", fake_run_tui_session)
+    _use_workspace_home(monkeypatch, work)
     err = _CaptureTTY()
     monkeypatch.setattr(sys, "stdin", _CaptureTTY())
     monkeypatch.setattr(sys, "stdout", _CaptureTTY())
@@ -1230,7 +1339,7 @@ def test_tui_resume_with_initial_prompt_executes_once(tmp_path, monkeypatch):
 
 def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
     """审查 05-F10: 列表入口零模型探测 (A12) 且零 UI 依赖导入."""
-    (tmp_path / ".cicada" / "sessions").mkdir(parents=True)
+    (_runtime(tmp_path) / "sessions").mkdir(parents=True)
     proc = run_cli("--workspace", str(tmp_path), "--list-sessions")
     assert proc.returncode == 0, proc.stderr
 
@@ -1243,7 +1352,9 @@ def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
         "assert 'prompt_toolkit' not in sys.modules, 'UI 依赖被列表入口导入'; "
         "assert 'rich' not in sys.modules, 'rich 被列表入口导入'"
     )
-    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8",
+           "USERPROFILE": str(tmp_path / "test-user-home"),
+           "HOME": str(tmp_path / "test-user-home")}
     proc = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True, text=True, encoding="utf-8", env=env, timeout=60,

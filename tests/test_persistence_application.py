@@ -747,9 +747,9 @@ async def test_resume_with_tool_fingerprint_mismatch_refused_and_lease_released(
 # --- 04: --resume-with-current-config (显式采用当前配置) ---------------------------------------
 
 
-def _latest_epoch_identity(root: Path, session_id: str):
+def _latest_epoch_identity(root: Path, session_id: str, *, directory: Path | None = None):
     """读存档最新 epoch 的身份; 用于核对差异记录通道."""
-    db = root / ".cicada" / "sessions" / f"{session_id}.sqlite3"
+    db = (directory if directory is not None else root / ".cicada" / "sessions") / f"{session_id}.sqlite3"
     connection = sqlite3.connect(str(db))
     try:
         row = connection.execute(

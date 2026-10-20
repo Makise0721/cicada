@@ -10,13 +10,21 @@ import pytest
 from cicada import __main__ as cli
 from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import read_session_identity
-from test_cli import _CaptureStream
+from test_cli import _CaptureStream, _runtime, _use_workspace_home
 from test_deepseek_application import response
+
+
+def sessions_dir(workspace) -> Path:
+    """运行状态在用户级目录; invoke() 把该用例的主目录放在工作区内。"""
+    return _runtime(workspace) / 'sessions'
 
 
 def invoke(monkeypatch, args, root):
     from cicada.plugins.user_config import FileUserConfigStore
 
+    workspace = Path(args[args.index('--workspace') + 1]) if '--workspace' in args else None
+    if workspace is not None:
+        _use_workspace_home(monkeypatch, workspace)
     out, err = _CaptureStream(), _CaptureStream()
     monkeypatch.setattr(cli.sys, "argv", ["cicada", *args])
     monkeypatch.setattr(cli.sys, "stdout", out)
@@ -65,13 +73,13 @@ def test_file_defaults_and_credentials_reach_actual_request(monkeypatch, tmp_pat
     assert body['thinking'] == {'type': 'disabled'}
     assert 'reasoning_effort' not in body and body['max_tokens'] == 4096
     session_id = out.split('[session id=')[1].split(' ')[0]
-    identity = read_session_identity(directory=tmp_path / '.cicada' / 'sessions',
+    identity = read_session_identity(directory=sessions_dir(tmp_path),
                                      session_id=session_id, workspace=tmp_path).launch
     assert identity.options['num_ctx'] == 65536
     assert identity.sources['model'] == 'user'
     for secret in ('file-sentinel-key', ref):
         assert secret not in out + err + repr(identity)
-        assert secret.encode() not in (tmp_path / '.cicada' / 'sessions' / f'{session_id}.sqlite3').read_bytes()
+        assert secret.encode() not in (sessions_dir(tmp_path) / f'{session_id}.sqlite3').read_bytes()
 
 
 def test_environment_without_user_directory_and_override_unused_bad_credentials(monkeypatch, tmp_path, requests):
@@ -113,7 +121,7 @@ def test_each_cli_field_overrides_user_defaults(monkeypatch, tmp_path, requests,
     for field, value in expected.items():
         assert requests[-1][1][field] == value
     session_id = out.split('[session id=')[1].split(' ')[0]
-    identity = read_session_identity(directory=tmp_path / '.cicada' / 'sessions',
+    identity = read_session_identity(directory=sessions_dir(tmp_path),
                                     session_id=session_id, workspace=tmp_path).launch
     assert identity.sources[source] == 'cli'
     if source == 'num_ctx':
@@ -128,7 +136,7 @@ def test_omitted_file_fields_use_builtin_defaults(monkeypatch, tmp_path, request
     body = requests[0][1]
     assert body['model'] == 'deepseek-flash' and body['reasoning_effort'] == 'max'
     assert body['max_tokens'] == 32768 and body['thinking'] == {'type': 'enabled'}
-    identity = read_session_identity(directory=tmp_path / '.cicada' / 'sessions',
+    identity = read_session_identity(directory=sessions_dir(tmp_path),
         session_id=out.split('[session id=')[1].split(' ')[0], workspace=tmp_path).launch
     assert identity.sources['model'] == 'default' and identity.sources['reasoning_effort'] == 'user'
 
@@ -148,7 +156,7 @@ def test_restore_ignores_user_values_and_adopt_uses_them(monkeypatch, tmp_path, 
     assert auth == 'Bearer replacement-file-sentinel'
     assert body['model'] == 'deepseek-v4-pro' and body['reasoning_effort'] == 'low'
     assert body['max_tokens'] == 4096 and body['thinking'] == {'type': 'enabled'}
-    identity = read_session_identity(directory=tmp_path / '.cicada' / 'sessions',
+    identity = read_session_identity(directory=sessions_dir(tmp_path),
                                     session_id=session_id, workspace=tmp_path).launch
     assert identity.sources['model'] == 'archive'
     (root / 'credentials.json').write_bytes(b'broken')
@@ -350,6 +358,7 @@ def test_provider_uses_resolved_key_even_if_environment_changes_before_setup(mon
 
     monkeypatch.setattr(store, 'load', load)
     out, err = _CaptureStream(), _CaptureStream()
+    _use_workspace_home(monkeypatch, tmp_path)
     monkeypatch.setattr(cli.sys, 'argv', ['cicada', '--workspace', str(tmp_path), '任务'])
     monkeypatch.setattr(cli.sys, 'stdout', out)
     monkeypatch.setattr(cli.sys, 'stderr', err)

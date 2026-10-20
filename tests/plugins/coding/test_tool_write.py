@@ -36,6 +36,22 @@ async def test_creates_with_nested_parents(tmp_path):
     assert "[mutation=committed]" in r.content and "created" in r.content
 
 
+async def test_cross_volume_staging_uses_temporary_target_sibling(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    ws = Workspace.create(root, data_dir=tmp_path / "user-state")
+    monkeypatch.setattr(ws.files, "_user_state_same_volume", lambda: False)
+    tool = WriteTool(ws)
+    created = await run(tool, path="file.txt", content="first")
+    assert not created.is_error, created.content
+    await read_basis(ws, "file.txt")
+    replaced = await run(tool, path="file.txt", content="second")
+    assert not replaced.is_error, replaced.content
+    assert (root / "file.txt").read_text(encoding="utf-8") == "second"
+    assert not (root / ".cicada").exists()
+    assert not list(root.glob(".cicada-mutation-*"))
+
+
 async def test_overwrites_existing_requires_read_first(tmp_path):
     ws, tool, _ = make(tmp_path)
     f = ws.root / "a.txt"

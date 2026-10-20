@@ -54,11 +54,14 @@ def _call(id_: str, name: str, **arguments) -> dict:
 
 
 def _launch(evidence: Path, *args: str) -> subprocess.CompletedProcess:
+    # 用户级运行状态跟着证据目录走且必须在被检查仓库之外。
+    home = evidence.parent / "test-user-home"
     return subprocess.run(
         [sys.executable, str(OBSERVER), "--evidence-dir", str(evidence), "--", *args],
         capture_output=True, text=True, encoding="utf-8", timeout=120,
         env={**os.environ, "PYTHONPATH": str(PROJECT / "src"),
-             "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"},
+             "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1",
+             "USERPROFILE": str(home), "HOME": str(home)},
     )
 
 

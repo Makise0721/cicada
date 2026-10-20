@@ -21,6 +21,7 @@ from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog, s
 from cicada.plugins.skills import loader as loader_module
 from cicada.plugins.skills import tool as tool_module
 from cicada.prompting import DEFAULT_TOOLS, compose_system_prompt
+from cicada.state_paths import workspace_state_dir
 from cicada.skills import (
     DEFAULT_SKILL_TASK,
     MANIFEST_VERSION,
@@ -447,6 +448,7 @@ async def test_load_skill_tool_success_errors_and_details(tmp_path, monkeypatch)
 
 
 def run_cli(*args: str) -> subprocess.CompletedProcess:
+    # 子进程主目录固定在工作区内, 与本文件 workspace_state_dir 断言同一口径。
     env = {**os.environ, "PYTHONPATH": str(SRC), "PYTHONIOENCODING": "utf-8"}
     workspace = Path(args[args.index("--workspace") + 1])
     env["USERPROFILE"] = str(workspace / "test-user-home")
@@ -858,7 +860,7 @@ def test_cli_skill_envelope_reaches_committed_archive(tmp_path):
         for line in saved.stdout.splitlines() if line.startswith("[session id=")
     )
     store = open_session_store(
-        directory=tmp_path / ".cicada" / "sessions", session_id=session_id, workspace=tmp_path
+        directory=workspace_state_dir(tmp_path, user_dir=tmp_path / "test-user-home" / ".cicada") / "sessions", session_id=session_id, workspace=tmp_path
     )
     try:
         snapshot = store.recovery_snapshot()
@@ -882,7 +884,7 @@ def test_cli_skill_envelope_reaches_committed_archive(tmp_path):
         for line in saved_default.stdout.splitlines() if line.startswith("[session id=")
     )
     store_default = open_session_store(
-        directory=tmp_path / ".cicada" / "sessions", session_id=session_id_default,
+        directory=workspace_state_dir(tmp_path, user_dir=tmp_path / "test-user-home" / ".cicada") / "sessions", session_id=session_id_default,
         workspace=tmp_path,
     )
     try:

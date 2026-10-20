@@ -16,7 +16,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cicada.state_paths import workspace_state_dir
+
 SRC = Path(__file__).resolve().parents[2] / "src"
+
+
+def _state_dir(workspace: Path) -> Path:
+    """run_cli 把该仓库的主目录设在仓库的上一级, 状态目录随之落在工作区外。"""
+    return workspace_state_dir(workspace, user_dir=workspace.parent / "test-user-home" / ".cicada")
+
 
 APP_NO_TOOLS_OK = 'def build_run_summary(result):\n    return "summary"\n'
 APP_WITH_TOOLS_OK = 'def build_run_summary(result, tools_ok=False):\n    return "summary"\n'
@@ -33,6 +41,12 @@ def run_cli(*args: str, timeout: int = 180) -> subprocess.CompletedProcess:
         "PYTHONPATH": str(SRC),
         "PYTHONIOENCODING": "utf-8",
     }
+    if "--workspace" in args:
+        # 用户级运行状态跟着用例走且必须在工作区外: 工作区内的状态目录会进入
+        # 检查模式的 Git 快照, 让检查自己改动了被检查的代码。
+        home = Path(args[args.index("--workspace") + 1]).parent / "test-user-home"
+        env["USERPROFILE"] = str(home)
+        env["HOME"] = str(home)
     return subprocess.run(
         [sys.executable, "-m", "cicada", *args],
         capture_output=True,
@@ -263,6 +277,7 @@ def test_powershell_timeout_latch_survives_later_check_pass(tmp_path):
 
 def test_check_output_artifact_tampered_blocks_delivery(tmp_path):
     repo = make_repo(tmp_path, app_content=APP_WITH_TOOLS_OK)
+    outputs = _state_dir(repo) / "outputs"
     # 检查通过且产生输出, 才有可被篡改的输出工件
     check_with_output = (
         "Write-Output 'running tools_ok check'; " + CHECK_TOOLS_OK
@@ -271,8 +286,8 @@ def test_check_output_artifact_tampered_blocks_delivery(tmp_path):
         run_check("c1"),
         call(
             "p1", "powershell",
-            {"command": "Get-ChildItem .cicada/outputs -Filter 'powershell-output-*' | "
-                        "ForEach-Object { Add-Content -Path $_.FullName -Value 'tampered' }"},
+            {"command": f"Get-ChildItem '{outputs}' -Filter 'powershell-output-*' | "
+                        f"ForEach-Object {{ Add-Content -Path $_.FullName -Value 'tampered' }}"},
         ),
         stop(),
     ])
@@ -288,9 +303,10 @@ def test_check_output_artifact_tampered_blocks_delivery(tmp_path):
 
 def test_baseline_artifact_deleted_blocks_evidence(tmp_path):
     repo = make_repo(tmp_path, app_content=APP_WITH_TOOLS_OK)
+    outputs = _state_dir(repo) / "outputs"
     script = write_script(repo, [
         run_check("c1"),
-        call("p1", "powershell", {"command": "Remove-Item .cicada/outputs/baseline-*.txt"}),
+        call("p1", "powershell", {"command": f"Remove-Item '{outputs}/baseline-*.txt'"}),
         stop(),
     ])
     proc = checked_cli(repo, script)

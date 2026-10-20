@@ -10,7 +10,7 @@ from cicada.application import ApplicationOpenError
 from cicada.plugins.session_store import read_session_identity
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.ui.terminal_io import FakeTerminal
-from test_cli import _CaptureStream
+from test_cli import _CaptureStream, _runtime
 from test_user_config_startup import invoke, requests, write_config
 
 ENTER = KeyPress(Keys.ControlM, '\r')
@@ -65,7 +65,7 @@ def test_first_run_saves_before_open_and_initial_prompt_once(monkeypatch, tmp_pa
     assert requests[0][1]['reasoning_effort'] == 'high'
     terminal, sessions = interactive
     assert FileUserConfigStore(root).load().credential.reveal() == 'startup-sentinel'
-    archive = next((tmp_path / '.cicada' / 'sessions').glob('*.sqlite3'))
+    archive = next((_runtime(tmp_path) / 'sessions').glob('*.sqlite3'))
     identity = read_session_identity(directory=archive.parent, session_id=archive.stem, workspace=tmp_path)
     assert identity.launch.sources['model'] == 'user'
     for needle in ('startup-sentinel', FileUserConfigStore(root).load().defaults.credential_ref):
@@ -180,7 +180,7 @@ def test_credentials_only_resume_keeps_recovery_block(monkeypatch, tmp_path, req
     code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--save-session', '旧问'], root)
     assert code == 0, err
     session_id = out.split('[session id=')[1].split(' ')[0]
-    directory = tmp_path / '.cicada' / 'sessions'
+    directory = _runtime(tmp_path) / 'sessions'
 
     async def unfinished():
         store = open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
@@ -231,7 +231,7 @@ def test_selector_then_wizard_then_main_screen_sequence(monkeypatch, tmp_path, r
         from cicada.application import make_session_catalog_reader
         from cicada.ui.selector import run_session_selector
         picker = ScriptTerminal([])
-        directory = workspace / '.cicada' / 'sessions'
+        directory = _runtime(workspace) / 'sessions'
         reader = make_session_catalog_reader(directory=directory)
 
         async def observe(cancel):

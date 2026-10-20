@@ -277,16 +277,13 @@ async def test_artifact_write_failure_still_reports_applied(tmp_path, monkeypatc
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
     await read_basis(ws, "big.txt")
-    original_resolve = ws.resolve_for_write
 
-    def guarded(raw: str):
-        if ".cicada" in raw:
-            raise PathNotAllowedError(
-                f"path {raw!r} resolves outside workspace root (junction probe)"
-            )
-        return original_resolve(raw)
+    def guarded(candidate):
+        raise PathNotAllowedError(
+            f"path {candidate!r} resolves outside workspace root (junction probe)"
+        )
 
-    monkeypatch.setattr(ws, "resolve_for_write", guarded)
+    monkeypatch.setattr(ws, "resolve_output_for_write", guarded)
     r = await run(tool, path="big.txt", edits=edits)
     assert not r.is_error
     # edit 已生效且未被回滚
@@ -354,15 +351,12 @@ async def test_long_artifact_error_is_bounded_after_edit_applied(tmp_path, monke
     ws, tool = make(tmp_path)
     f, edits, expected_text = big_edit_args(ws)
     await read_basis(ws, "big.txt")
-    original_resolve = ws.resolve_for_write
     error_text = "失败🎉" * 10000
 
-    def guarded(raw):
-        if ".cicada" in raw:
-            raise OSError(error_text)
-        return original_resolve(raw)
+    def guarded(candidate):
+        raise OSError(error_text)
 
-    monkeypatch.setattr(ws, "resolve_for_write", guarded)
+    monkeypatch.setattr(ws, "resolve_output_for_write", guarded)
     result = await run(tool, path="big.txt", edits=edits)
     assert not result.is_error
     assert f.read_text(encoding="utf-8") == expected_text
@@ -394,8 +388,8 @@ def test_wide_path_metadata_fallback_stays_within_byte_cap(tmp_path, monkeypatch
     ws, tool = make(tmp_path)
     path = ws.root.joinpath(*(["汉" * 200] * 88), "a.txt")
     monkeypatch.setattr(
-        ws, "resolve_for_write",
-        lambda raw: (_ for _ in ()).throw(PathNotAllowedError("artifact destination rejected")),
+        ws, "resolve_output_for_write",
+        lambda candidate: (_ for _ in ()).throw(PathNotAllowedError("artifact destination rejected")),
     )
     header = f"edit applied: {tool._display(path)}, 1 replacement(s), first changed line 1"
     result = tool._spill_diff(
