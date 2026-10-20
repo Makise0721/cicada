@@ -783,12 +783,13 @@ def test_resume_without_id_rejected_outside_tui(tmp_path):
     assert "UUIDv4" in proc.stderr
 
 
-def test_resume_config_conflict_names_field(tmp_path):
-    """同配置恢复之外的变化在副作用前拒绝, 且不先做模型可达性探测。
+def test_resume_config_conflict_names_field(tmp_path, monkeypatch):
+    """用自有测试凭据进入恢复校验，配置变化在模型请求前拒绝。
 
     存档由 fake 会话写入 (provider=fake); 恢复时改用真实模型旗标 ->
-    provider 冲突先于 API 凭据与网络操作报出。
+    provider 冲突先于网络操作报出，不依赖宿主是否配置凭据。
     """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-config-conflict-sentinel")
     work = tmp_path / "ws2"
     work.mkdir()
     script = tmp_path / "s.json"

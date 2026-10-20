@@ -209,7 +209,11 @@ async def test_catalog_sql_deadline_closes_connection(tmp_path, monkeypatch):
                    " SELECT x+1 FROM n WHERE x<10000000) SELECT x AS created_at FROM n")
     monkeypatch.setattr(catalog, 'CATALOG_FILE_TIMEOUT_S', 0.01)
     entry, = (await reader.observe(CancelToken())).entries
-    assert entry.error and 'interrupted' in entry.error
+    # 单档预算也覆盖连接前后的 checkpoint，慢宿主可能先到该出口。
+    assert entry.error in (
+        'OperationalError: interrupted',
+        'TimeoutError: session metadata SQL budget exhausted',
+    )
     with pytest.raises(sqlite3.ProgrammingError, match='closed database'):
         opened[-1].execute('SELECT 1')
     await reader.aclose()
