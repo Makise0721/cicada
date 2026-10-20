@@ -1,16 +1,16 @@
 # Cicada
 
-Cicada 是面向 Windows 的 Python coding agent，支持 DeepSeek Flash/Pro、文件读写、PowerShell、指定检查、会话保存恢复与费用准入。当前预览版本为 **0.1.0a1**。
+Cicada 是面向 Windows 的 Python coding agent，支持 DeepSeek Flash/Pro、文件读写、PowerShell、指定检查、会话保存恢复与费用准入。本分支版本为 **0.1.0a2**；公开发布状态见 [Releases](https://github.com/Makise0721/cicada/releases)，a1 用法见[历史说明](https://github.com/Makise0721/cicada/blob/v0.1.0a1/README.md)。
 
 ## 环境与安装
 
 验证环境：Windows 11、PowerShell 7、Python 3.12（包验证为 3.12.10）；需要安装 `uv`。真实任务使用自己的 DeepSeek 凭据，离线演示无需凭据。
 
-在空的下载目录运行以下 PowerShell 命令；文件随 [v0.1.0a1 预览发布](https://github.com/Makise0721/cicada/releases/tag/v0.1.0a1) 提供，发布说明包含变更和已知问题。
+发布后在空的下载目录运行以下 PowerShell 命令，从 [v0.1.0a2](https://github.com/Makise0721/cicada/releases/tag/v0.1.0a2) 下载；本地候选使用交付包内文件，跳过下载循环，从哈希校验开始。发布说明包含变更和已知问题。
 
 ```powershell
-$release = 'https://github.com/Makise0721/cicada/releases/download/v0.1.0a1'
-$wheel = 'cicada-0.1.0a1-py3-none-any.whl'
+$release = 'https://github.com/Makise0721/cicada/releases/download/v0.1.0a2'
+$wheel = 'cicada-0.1.0a2-py3-none-any.whl'
 foreach ($file in @($wheel, 'requirements-windows-py312.txt', 'SHA256SUMS')) {
     Invoke-WebRequest "$release/$file" -OutFile $file
 }
@@ -50,7 +50,7 @@ cicada
 cicada --max-model-calls 5 '阅读这个项目，说明入口和运行方法，暂不修改文件'
 ```
 
-Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export report.json` 导出，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
+Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export` 导出 HTML，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
 
 ## 检查、费用与恢复
 
@@ -63,7 +63,7 @@ Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默�
 
 先退出 Cicada，保留当前 wheel 和配套依赖清单。在目标版本下载目录重复安装步骤，将安装命令加上 `--force --reinstall`；回退使用先前保留版本的 wheel 和配套清单。不要只替换 wheel 而沿用另一版本的依赖清单。
 
-这是首个公开预览，尚无历史公开包可回退；已有源码安装请先保留原路径和安装方式。`uv tool uninstall cicada` 只卸载工具环境及命令，工作区会话、用户配置和费用账本保留。
+升级前保留旧档副本。回退到 a1 会读取工作区旧档，a2 迁移后新增记录仍在用户级目录，不自动回写旧档；两版本交替续写会形成不同历史。`uv tool uninstall cicada` 只卸载工具环境及命令，会话、用户配置和费用账本保留。
 
 问题反馈入口：[GitHub Issues](https://github.com/Makise0721/cicada/issues)。更多参数和退出码见 `cicada --help`。
 
