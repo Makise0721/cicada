@@ -4,7 +4,7 @@
 - 只作为 FileAccess 的可选捕获汇被调用: 发布前落预行 (commit_state=unknown),
   发布在同一队列内落定后追加结算行; 捕获 IO 失败向上抛, 由发布路径映射为
   not_written + reason=restore_capture_failed, 不静默降级;
-- 只写工作区 `<root>/.cicada/restore/` 自有文件 (blobs/<sha256> 与
+- 只写组合层指定的运行状态目录下 `restore/` 自有文件 (blobs/<sha256> 与
   points/<session_id>.jsonl); 不改会话 SQLite schema, 不依赖 git;
 - 保留: 每会话最近 100 点、工作区 blob 总量 ≤512 MiB 逐出最旧点、启动机会式清理
   30 天前点; 逐出/缺失标 expired, 不伪装可还原; 清理拒绝 reparse/symlink;
@@ -228,8 +228,9 @@ def _new_point_id() -> str:
 class RestoreStore:
     """单一工作区的还原点引擎: 捕获汇 + 存储 + 保留是同一实例 (线程安全)."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, data_dir: Path | None = None) -> None:
         self._root = Path(root)
+        self._data_dir = Path(data_dir) if data_dir is not None else self._root / ".cicada"
         self._lock = threading.RLock()
         self._context: _RequestContext | None = None
         # 收尾来源标记写失败时按会话挂起 (见 end_request): 待本会话下一次成功追加时
@@ -582,7 +583,7 @@ class RestoreStore:
     # ---- 存储细节 ----
 
     def _restore_root(self) -> Path:
-        return self._root / ".cicada" / "restore"
+        return self._data_dir / "restore"
 
     def _blobs_dir(self) -> Path:
         return self._restore_root() / "blobs"
@@ -598,7 +599,7 @@ class RestoreStore:
         root = self._restore_root()
         if path != root and root not in path.parents:
             raise RestoreStoreError(f"path is outside the restore root: {path}")
-        reparse = _reparse_in_chain(self._root, path)
+        reparse = _reparse_in_chain(self._data_dir, path)
         if reparse is not None:
             raise RestoreStoreError(f"refusing to follow a reparse point: {reparse}")
 
@@ -893,7 +894,7 @@ def restore_plugin() -> PluginDefinition:
 
     def setup(ctx: PluginContext) -> None:
         workspace: Workspace = ctx.require("coding.workspace")
-        store = RestoreStore(workspace.root)
+        store = RestoreStore(workspace.root, data_dir=workspace.data_dir)
         workspace.install_restore_capture(store)
         ctx.provide(RESTORE_CAPABILITY, store)
 

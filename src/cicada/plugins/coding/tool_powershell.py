@@ -91,7 +91,7 @@ class PowerShellTool:
             description=(
                 "在 workspace 内以 pwsh -NoProfile -NonInteractive 执行命令. "
                 "stdout/stderr 按到达序合并; 最终 content (含状态行与提示) 严格不超过 50 KiB UTF-8, "
-                "超限时只保留有界 tail, 完整输出持续写入工作区 .cicada/outputs 下的工件 (最多 16 MiB)."
+                "超限时只保留有界 tail, 完整输出持续写入用户级运行状态目录下的工件 (最多 16 MiB)."
             ),
             parameters={
                 "type": "object",

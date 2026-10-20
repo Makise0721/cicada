@@ -13,6 +13,7 @@ from cicada.plugins.deepseek.protocol import BASE_URL as DEEPSEEK_BASE_URL, REQU
 from cicada.plugins.coding.verification_contracts import CheckDefinition
 from cicada.plugins.session_store.store import validate_session_id
 from cicada.skills import SKILLS_PROMPT_VERSION
+from cicada.state_paths import workspace_state_dir
 from cicada.user_config import (
     ResolvedLaunchConfig, UserConfigSnapshot, UserDefaults, resolve_launch_config,
 )
@@ -126,7 +127,7 @@ def prepare_cost_control(args: argparse.Namespace, workspace: Path) -> CostLedge
     if amount is not None and profile_path is None:
         raise CostError('--cost-limit-cny requires an explicit --cost-profile')
     profile = CostProfile.load(workspace / profile_path) if profile_path is not None else None
-    return CostLedger(workspace / '.cicada' / 'cost', limit=positive_amount(amount) if amount is not None else None,
+    return CostLedger(workspace_state_dir(workspace) / 'cost', limit=positive_amount(amount) if amount is not None else None,
                       max_calls=calls, profile=profile)
 
 

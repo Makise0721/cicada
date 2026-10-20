@@ -329,7 +329,7 @@ class FileAccess:
         original = self._workspace.resolve(raw_path)
         key = str(target).casefold()
         # reserved staging 不允许 edit/write (C3): unknown 保留材料是证据
-        reserved_staging = self._workspace.root / ".cicada" / "mutations"
+        reserved_staging = self._workspace.data_dir / "mutations"
         if target == reserved_staging or reserved_staging in target.parents:
             return _outcome(
                 STATE_NOT_WRITTEN, "unsupported_target", str(target),
@@ -371,7 +371,7 @@ class FileAccess:
                         "cancelled before publication; file not modified",
                         caller_cancelled=True,
                     )
-                staging = self._workspace.root / ".cicada" / "mutations" / uuid.uuid4().hex
+                staging = self._staging_path(target)
                 ticket, refusal = await asyncio.to_thread(
                     self._capture_before, target, "create", None, new_bytes)
                 if refusal is not None:
@@ -439,7 +439,7 @@ class FileAccess:
                 caller_cancelled=True, before_stamp=entry,
             )
 
-        staging = self._workspace.root / ".cicada" / "mutations" / uuid.uuid4().hex
+        staging = self._staging_path(target)
         ticket, refusal = await asyncio.to_thread(
             self._capture_before, target, "modify", snapshot.data, new_bytes)
         if refusal is not None:
@@ -828,12 +828,32 @@ class FileAccess:
             current_matches=True, cleanup_warning=warning, after_stamp=after_stamp,
         )
 
+    def _staging_path(self, target: Path) -> Path:
+        """原子发布需同卷；跨卷时仅在目标旁短暂放置单次暂存目录。"""
+        marker = uuid.uuid4().hex
+        if self._user_state_same_volume():
+            return self._workspace.data_dir / "mutations" / marker
+        return target.parent / f".cicada-mutation-{marker}"
+
+    def _user_state_same_volume(self) -> bool:
+        return self._workspace.data_dir.stat().st_dev == self._workspace.root.stat().st_dev
+
     def _check_staging(self, staging: Path) -> None:
         """只接受程序分配的同卷目录; 路径别名不能成为暂存或清理授权."""
-        assigned_root = self._workspace.root / ".cicada" / "mutations"
-        if staging.parent != assigned_root or len(staging.name) != 32 \
-                or any(c not in "0123456789abcdef" for c in staging.name):
+        assigned_root = self._workspace.data_dir / "mutations"
+        marker = staging.name
+        user_staging = staging.parent == assigned_root and len(marker) == 32
+        sibling_staging = marker.startswith(".cicada-mutation-") \
+            and len(marker) == len(".cicada-mutation-") + 32
+        if not (user_staging or sibling_staging) \
+                or any(c not in "0123456789abcdef" for c in marker[-32:]):
             raise native.UnsupportedTargetError(f"unassigned staging path: {staging}")
+        if sibling_staging:
+            try:
+                if self._workspace.resolve_within_root(str(staging.parent)) != staging.parent:
+                    raise native.UnsupportedTargetError(f"staging is outside workspace: {staging}")
+            except PathNotAllowedError as exc:
+                raise native.UnsupportedTargetError(f"staging is outside workspace: {staging}") from exc
         if native.reparse_ancestor(staging) is not None \
                 or Path(os.path.realpath(staging)) != staging:
             raise native.UnsupportedTargetError(f"staging crosses a reparse point: {staging}")

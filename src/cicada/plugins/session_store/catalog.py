@@ -238,3 +238,30 @@ class SessionCatalogReader:
         finally:
             if connection is not None:
                 connection.close()
+
+
+class CombinedSessionCatalogReader:
+    """新旧目录的只读视图；同 ID 使用用户级副本。"""
+
+    def __init__(self, *, directory: Path, legacy_directory: Path, workspace: str | None) -> None:
+        self.current = SessionCatalogReader(directory=directory, workspace=workspace)
+        self.legacy = SessionCatalogReader(directory=legacy_directory, workspace=workspace)
+
+    async def observe(self, cancel: CancelToken) -> SessionCatalogSnapshot:
+        current = await self.current.observe(cancel)
+        legacy = await self.legacy.observe(cancel)
+        entries = {entry.session_id: entry for entry in legacy.entries}
+        entries.update({entry.session_id: entry for entry in current.entries})
+        ordered = sorted(entries.values(), key=lambda entry: (
+            -entry.updated_at if entry.updated_at is not None else float("inf"), entry.session_id,
+        ))
+        complete = current.complete and legacy.complete and len(ordered) <= CATALOG_MAX_ENTRIES
+        reason = None if complete else current.reason or legacy.reason or "candidate-limit"
+        return SessionCatalogSnapshot(
+            uuid.uuid4().hex, current.directory, tuple(ordered[:CATALOG_MAX_ENTRIES]), complete, reason)
+
+    async def aclose(self) -> None:
+        try:
+            await self.current.aclose()
+        finally:
+            await self.legacy.aclose()

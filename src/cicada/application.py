@@ -104,6 +104,9 @@ from cicada.plugins.session_store import (
     SESSION_CATALOG_CAPABILITY, SessionCatalogReader, SQLiteSessionStore,
     open_session_store, session_store_plugin,
 )
+from cicada.plugins.session_store.catalog import CombinedSessionCatalogReader
+from cicada.plugins.session_store.migration import migrate_legacy_session
+from cicada.state_paths import legacy_session_directory
 from cicada.file_completion import FileCompletionResult
 from cicada.plugins.coding.file_completion import (
     FILE_COMPLETION_CAPABILITY,
@@ -177,14 +180,20 @@ CLOSE_SUPERVISION_S = 15.0
 _UNDEAD_GRACE_S = 2.0
 
 
-def make_session_catalog_reader(*, directory: Path, workspace: str | None = None) -> SessionCatalogPort:
+def make_session_catalog_reader(
+    *, directory: Path, workspace: str | None = None, legacy_directory: Path | None = None,
+) -> SessionCatalogPort:
     """组合层创建 reader；None 仅供旧任意目录启动调用兼容。"""
+    if legacy_directory is not None and legacy_directory != directory:
+        return CombinedSessionCatalogReader(
+            directory=directory, legacy_directory=legacy_directory, workspace=workspace)
     return SessionCatalogReader(directory=directory, workspace=workspace)
 
 
 def default_definitions(
     workspace: Path, model_plugin: PluginDefinition, plan: VerificationPlan | None = None,
     *, skills: SkillCatalogSnapshot | None = None, restore: bool = False,
+    runtime_dir: Path | None = None,
 ) -> list[PluginDefinition]:
     """内置 Coding 能力 + 模型插件 (+ 检查模式验证服务 + Skills 能力) 的启动名单.
 
@@ -193,7 +202,7 @@ def default_definitions(
     且配置开启捕获的组合才装配), 为假时不安装捕获汇, edit/write 行为逐位不变。
     """
     definitions: list[PluginDefinition] = [
-        workspace_plugin(workspace),
+        workspace_plugin(workspace, data_dir=runtime_dir),
         inventory_plugin(),
         file_completion_plugin(),
         change_review_plugin(),
@@ -270,6 +279,7 @@ class ApplicationConfig:
     # 编辑照常工作且不产生还原点 (受限环境出口)
     restore_capture: bool = True
     cost_control: CostLedger | None = None
+    runtime_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.workspace, Path):
@@ -284,6 +294,8 @@ class ApplicationConfig:
             raise ValueError("restore_capture must be a bool")
         if self.cost_control is not None and not isinstance(self.cost_control, CostLedger):
             raise ValueError('cost_control must be a CostLedger or None')
+        if self.runtime_dir is not None and not isinstance(self.runtime_dir, Path):
+            raise ValueError('runtime_dir must be a Path or None')
         if self.persistence is not None:
             if not isinstance(self.persistence, PersistenceConfig):
                 raise ValueError("persistence must be a PersistenceConfig or None")
@@ -766,7 +778,8 @@ class ApplicationSession:
         if self._store is None:
             raise RewindError("unavailable", "还原点查看需要持久会话。")
         # 关闭捕获只影响后继写入，仍可只读查看本会话已有历史点。
-        store = self._restore_store or RestoreStore(Path(self._config.workspace))
+        store = self._restore_store or RestoreStore(
+            Path(self._config.workspace), data_dir=_runtime_dir(self._config))
         workspace = self._app.runtime.capability("coding.workspace")
         reader = RewindReader(store, workspace, self._store.session_id, self._epoch_id)
         self._rewind_active = True
@@ -3095,17 +3108,25 @@ def _incomplete_evidence(reason: str) -> ChangeEvidence:
     )
 
 
-def _tool_fingerprint(app: App) -> str:
+def _tool_fingerprint(app: App, *, legacy_output_paths: bool = False) -> str:
     """bootstrap 解析后的实际工具声明指纹: 稳定顺序 + 完整 schema 内容."""
     tools = getattr(app.agent, "_tools", {})
-    specs = [
-        {
-            "name": tools[name].spec.name,
-            "description": tools[name].spec.description,
-            "parameters": tools[name].spec.parameters,
-        }
-        for name in sorted(tools)
-    ]
+    specs = []
+    for name in sorted(tools):
+        spec = tools[name].spec
+        description = spec.description
+        if legacy_output_paths and name == "edit":
+            description = description.replace(
+                "写入用户级运行状态目录的唯一文件",
+                "写入 workspace 的 .cicada/outputs/ 唯一文件",
+            )
+        elif legacy_output_paths and name == "powershell":
+            description = description.replace(
+                "超限时只保留有界 tail, 完整输出持续写入用户级运行状态目录下的工件 (最多 16 MiB).",
+                "超限时只保留有界 tail, 完整输出持续写入工作区 .cicada/outputs 下的工件 (最多 16 MiB).",
+            )
+        specs.append({"name": spec.name, "description": description,
+                      "parameters": spec.parameters})
     encoded = json.dumps(specs, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -3354,6 +3375,20 @@ async def _open_restore_store(app: App, enabled: bool) -> tuple[RestoreStore | N
     return store, warnings
 
 
+def _runtime_dir(config: ApplicationConfig) -> Path:
+    # 直接调用旧应用 API 的调用方继续使用原位置；CLI 显式传用户级目录。
+    return config.runtime_dir if config.runtime_dir is not None else Path(config.workspace) / ".cicada"
+
+
+def _open_switch_store(config: ApplicationConfig, session_id: str) -> SQLiteSessionStore:
+    if config.runtime_dir is not None:
+        migrate_legacy_session(config.workspace, session_id, runtime_dir=config.runtime_dir)
+    return open_session_store(
+        directory=_runtime_dir(config) / "sessions", session_id=session_id,
+        workspace=config.workspace,
+    )
+
+
 def _open_persistent_store(
     config: ApplicationConfig,
 ) -> tuple[SQLiteSessionStore, RecoverySnapshot]:
@@ -3362,7 +3397,7 @@ def _open_persistent_store(
     assert persistence is not None
     try:
         store = open_session_store(
-            directory=Path(config.workspace) / ".cicada" / "sessions",
+            directory=_runtime_dir(config) / "sessions",
             session_id=persistence.session_id,
             workspace=config.workspace,
         )
@@ -3540,17 +3575,21 @@ async def open_application(
     restore_enabled = store is not None and config.restore_capture
     if store is not None:
         catalog = make_session_catalog_reader(
-            directory=Path(config.workspace) / ".cicada" / "sessions", workspace=str(config.workspace),
+            directory=_runtime_dir(config) / "sessions", workspace=str(config.workspace),
+            legacy_directory=(legacy_session_directory(config.workspace)
+                              if config.runtime_dir is not None else None),
         )
         definitions.append(session_store_plugin(store, catalog))
         definitions.extend(_bind_store_last_cleanup(
             default_definitions(config.workspace, config.model_plugin, plan,
-                                skills=config.skills, restore=restore_enabled)
+                                skills=config.skills, restore=restore_enabled,
+                                runtime_dir=config.runtime_dir)
         ))
     else:
         definitions.extend(
             default_definitions(config.workspace, config.model_plugin, plan,
-                                skills=config.skills, restore=restore_enabled)
+                                skills=config.skills, restore=restore_enabled,
+                                runtime_dir=config.runtime_dir)
         )
 
     if store is not None:
@@ -3598,13 +3637,22 @@ async def open_application(
             fingerprint = _tool_fingerprint(app)
             saved_identity = snapshot.identity
             adopt = config.persistence.adopt_current_config
+            legacy_tool_upgrade = False
             if saved_identity is not None and not adopt:
                 if saved_identity.tool_fingerprint != fingerprint:
-                    raise ApplicationOpenError(
-                        "restored session tool declarations differ from the current launch "
-                        "(tool_fingerprint)"
-                    )
+                    legacy_tool_upgrade = (
+                        saved_identity.tool_fingerprint ==
+                        _tool_fingerprint(app, legacy_output_paths=True))
+                    if not legacy_tool_upgrade:
+                        raise ApplicationOpenError(
+                            "restored session tool declarations differ from the current launch "
+                            "(tool_fingerprint)"
+                        )
             epoch_launch = config.persistence.identity
+            if legacy_tool_upgrade:
+                epoch_launch = replace(epoch_launch, sources={
+                    **epoch_launch.sources, "tool_output_location": "user-workspace-state",
+                })
             if (
                 saved_identity is not None
                 and adopt
@@ -3671,11 +3719,9 @@ async def open_application(
                 review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
                 catalog_reader=app.runtime.capability(SESSION_CATALOG_CAPABILITY),
                 new_store_factory=lambda: open_session_store(
-                    directory=Path(config.workspace) / ".cicada" / "sessions",
+                    directory=_runtime_dir(config) / "sessions",
                     session_id=None, workspace=config.workspace),
-                resume_store_factory=lambda session_id: open_session_store(
-                    directory=Path(config.workspace) / ".cicada" / "sessions",
-                    session_id=session_id, workspace=config.workspace),
+                resume_store_factory=lambda session_id: _open_switch_store(config, session_id),
                 restore_store=restore_store,
                 restore_warnings=restore_warnings,
             )

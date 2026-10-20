@@ -107,8 +107,10 @@ from cicada.plugins.coding.verification_contracts import (
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.deepseek import deepseek_plugin
 from cicada.plugins.session_store import list_sessions, read_session_identity
+from cicada.plugins.session_store.migration import migrate_legacy_session
 from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog
 from cicada.plugins.user_config import FileUserConfigStore
+from cicada.state_paths import legacy_session_directory, session_directory, workspace_state_dir
 from cicada.user_config import (
     LoginResult, UserConfigError, UserConfigSnapshot, UserConfigStore,
     UserDefaults, resolve_launch_config,
@@ -137,8 +139,9 @@ async def _read_saved_identity(workspace: Path, session_id: str) -> StoredIdenti
     写租约与原子迁移由 open_application 完成。
     """
     try:
+        migrate_legacy_session(workspace, session_id)
         identity = read_session_identity(
-            directory=Path(workspace) / ".cicada" / "sessions",
+            directory=session_directory(workspace),
             session_id=session_id,
             workspace=Path(workspace),
         )
@@ -212,15 +215,38 @@ def _run_list_sessions(args: argparse.Namespace) -> int:
     if args.prompt is not None:
         print("--list-sessions 不执行请求, 不接受位置 prompt", file=sys.stderr)
         return 2
-    directory = Path(args.workspace) / ".cicada" / "sessions"
     try:
-        page = list_sessions(directory=directory, cursor=args.list_cursor)
+        page = _list_workspace_sessions(Path(args.workspace), args.list_cursor)
     except ValueError as exc:
         print(f"{exc}", file=sys.stderr)
         return 2
     for line in render_session_page(page):
         print(line)
     return 0
+
+
+def _list_workspace_sessions(workspace: Path, cursor: str | None) -> SessionPage:
+    """合并用户级与旧目录的只读列表；同 ID 以用户级副本为准。"""
+    directory = session_directory(workspace)
+    if cursor is None or cursor == "":
+        offset = 0
+    else:
+        try:
+            offset = int(cursor)
+        except ValueError as exc:
+            raise ValueError(f"invalid list cursor: {cursor!r}") from exc
+        if offset < 0:
+            raise ValueError(f"invalid list cursor: {cursor!r}")
+    current = list_sessions(directory=directory, limit=2**31 - 1).entries
+    legacy = list_sessions(directory=legacy_session_directory(workspace), limit=2**31 - 1).entries
+    entries = {row.session_id: row for row in legacy}
+    entries.update({row.session_id: row for row in current})
+    ordered = sorted(entries.values(), key=lambda row: (
+        -row.updated_at if row.updated_at is not None else float("inf"), row.session_id,
+    ))
+    page = ordered[offset:offset + LIST_SESSIONS_PAGE_SIZE]
+    next_cursor = str(offset + LIST_SESSIONS_PAGE_SIZE) if offset + LIST_SESSIONS_PAGE_SIZE < len(ordered) else None
+    return SessionPage(str(directory), tuple(page), next_cursor)
 
 
 def parse_script(raw: str) -> list[list[StreamEvent]]:
@@ -310,8 +336,11 @@ async def _launch_session_selector(workspace: Path) -> str | None:
     terminal = PromptToolkitTerminal()
     from cicada.application import make_session_catalog_reader
 
-    directory = workspace / ".cicada" / "sessions"
-    reader = make_session_catalog_reader(directory=directory, workspace=str(workspace))
+    directory = session_directory(workspace)
+    reader = make_session_catalog_reader(
+        directory=directory, workspace=str(workspace),
+        legacy_directory=legacy_session_directory(workspace),
+    )
     try:
         session_id, restore_errors = await run_session_selector(
             terminal, directory, observe=reader.observe,
@@ -601,7 +630,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
 
                 root = Path(os.path.realpath(workspace.expanduser()))
                 try:
-                    await GitInventory(Workspace(root, root / '.cicada' / 'outputs')).list_files(CancelToken())
+                    await GitInventory(Workspace(root, workspace_state_dir(root) / 'outputs')).list_files(CancelToken())
                 except InventoryError:
                     print('检查模式工作区 Git 预检失败', file=sys.stderr)
                     return 2
@@ -669,6 +698,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         skills=skills_snapshot,
         restore_capture=not args.no_restore_capture,
         cost_control=cost_control,
+        runtime_dir=workspace_state_dir(workspace),
     )
     if args.tui:
         assert run_tui_session_fn is not None
@@ -784,6 +814,8 @@ def main(*, user_config_store: UserConfigStore | None = None,
 新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
 普通 --resume 继承存档模型配置；凭据每次启动按有效 DEEPSEEK_API_KEY > 文件引用。
 help、list 与 fake 不读取这些文件。文件存在但无效时明确失败。
+运行状态按工作区路径保存在 ~/.cicada/workspaces/<路径摘要>/；旧版工作区会话
+在显式恢复时复制到该目录，旧档留在原位供核对。
 
 config.toml 示例（普通字段均可省略；不接受 API key 或 max_request_bytes）：
 version = 1
@@ -815,7 +847,7 @@ credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
 Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不在还原范围。
 还原前自动保存备份点（可选它撤销还原），确认页列出新建文件删除与后继影响。
 还原只改变文件，不回滚对话或检查记录；交付需重新检查。捕获失败拒绝本次编辑。
-数据在工作区 .cicada/restore/；保留每会话最近 100 点、工作区 blob 512 MiB，
+数据在 ~/.cicada/workspaces/<路径摘要>/restore/；保留每会话最近 100 点、工作区 blob 512 MiB，
 启动机会式清理 30 天前点；已清理点不可还原。--no-restore-capture 关闭新捕获，
 已有点仍可查看；非持久会话不捕获，单次 CLI 无还原入口。
 
@@ -827,7 +859,7 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
 {"schema_version":1,"source":"https://example.invalid/pricing","checked_at":"2026-10-15",
  "models":{"deepseek-flash":{"input_cny_per_million":"1.00","output_cny_per_million":"1.00"}}}
 按需增加deepseek-v4-pro。价格应覆盖所用模型/时段的上界；配置单价及输入上界冻结，
-不是实时价格或账户账单。账本在.cicada/cost/，不从旧存档恢复消费额度。''',
+不是实时价格或账户账单。账本在用户级工作区状态目录的 cost/，不从旧存档恢复消费额度。''',
     )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")

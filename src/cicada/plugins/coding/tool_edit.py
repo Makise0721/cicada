@@ -41,8 +41,8 @@ class EditTool:
                 "读取后文件被改动也会因版本不一致被拒绝, 需重新 read. "
                 "全部 old_text 在原始内容上匹配且必须唯一; 任一编辑非法则整体不写入. "
                 "成功结果先给出 applied/路径/替换数/first_changed_line, 再附 unified diff; "
-                "总输出不超过 50 KiB UTF-8, 超限时完整 diff 写入 workspace 的 "
-                ".cicada/outputs/ 唯一文件, 结果标 diff_truncated=true 并给出可 read 的路径."
+                "总输出不超过 50 KiB UTF-8, 超限时完整 diff 写入用户级运行状态目录的唯一文件, "
+                "结果标 diff_truncated=true 并给出可 read 的路径."
             ),
             parameters={
                 "type": "object",
@@ -270,15 +270,14 @@ class EditTool:
     def _spill_diff(
         self, ctx: ToolContext, path: Path, header: str, diff: str, details: dict
     ) -> ToolResult:
-        """diff 超预算: 完整 diff 落盘 .cicada/outputs, content 给有界预览."""
+        """diff 超预算: 完整 diff 落盘输出目录, content 给有界预览."""
         artifact: Path | None = None
         artifact_error: str | None = None
         try:
             candidate = self._workspace.new_output_file(f"edit-diff-{self._display(path)}")
-            # 写入前再经 resolve_for_write 校验 canonical 目标, 防 .cicada/outputs
-            # 被 junction 指到工作区外 (P3 C2)
-            target = self._workspace.resolve_for_write(str(candidate))
-            target.write_bytes(diff.encode("utf-8"))
+            target = self._workspace.resolve_output_for_write(candidate)
+            with target.open("xb") as handle:
+                handle.write(diff.encode("utf-8"))
             artifact = target
         except Exception as exc:  # artifact 失败不回滚 edit; 取消 (BaseException) 仍传播
             artifact_error = str(exc)

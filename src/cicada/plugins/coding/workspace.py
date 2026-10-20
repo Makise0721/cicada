@@ -45,6 +45,7 @@ class Workspace:
 
     root: Path
     output_dir: Path
+    data_dir: Path = field(init=False)
     _locks: dict[str, asyncio.Lock] = field(default_factory=dict, repr=False, compare=False)
     _output_seq: "itertools.count[int]" = field(default_factory=itertools.count, repr=False, compare=False)
     files: "FileAccess" = field(init=False, repr=False, compare=False)
@@ -56,13 +57,15 @@ class Workspace:
         # 延迟导入打破 workspace -> file_access -> workspace 的模块环
         from cicada.plugins.coding.file_access import FileAccess
 
+        self.data_dir = self.output_dir.parent
         self.files = FileAccess(self)
 
     @classmethod
-    def create(cls, root: Path) -> Workspace:
-        """canonical root; output_dir 默认 <root>/.cicada/outputs (创建目录)."""
+    def create(cls, root: Path, *, data_dir: Path | None = None) -> Workspace:
+        """canonical root; data_dir 由组合层指定，创建输出目录。"""
         canonical_root = Path(os.path.realpath(Path(root).expanduser()))
-        output_dir = canonical_root / ".cicada" / "outputs"
+        effective_data_dir = data_dir if data_dir is not None else canonical_root / ".cicada"
+        output_dir = effective_data_dir / "outputs"
         output_dir.mkdir(parents=True, exist_ok=True)
         return cls(root=canonical_root, output_dir=output_dir)
 
@@ -158,6 +161,12 @@ class Workspace:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         return self.output_dir / f"{safe}-{stamp}-{next(self._output_seq):04d}-{uuid.uuid4().hex[:8]}.txt"
 
+    def resolve_output_for_write(self, candidate: Path) -> Path:
+        """只允许内部输出目录的直属文件，拒绝目录链被重定向。"""
+        if candidate.parent != self.output_dir or Path(os.path.realpath(self.output_dir)) != self.output_dir:
+            raise PathNotAllowedError(f"output path is not in the assigned output directory: {candidate}")
+        return candidate
+
     def _within_root(self, path: Path) -> bool:
         root_parts = [part.casefold() for part in self.root.parts]
         path_parts = [part.casefold() for part in path.parts]
@@ -169,11 +178,11 @@ class Workspace:
         return str(Path(os.path.realpath(path))).casefold()
 
 
-def workspace_plugin(root: Path) -> PluginDefinition:
+def workspace_plugin(root: Path, *, data_dir: Path | None = None) -> PluginDefinition:
     """coding-workspace 插件: 提供 coding.workspace 能力."""
 
     def setup(ctx: PluginContext) -> None:
-        ctx.provide("coding.workspace", Workspace.create(root))
+        ctx.provide("coding.workspace", Workspace.create(root, data_dir=data_dir))
 
     return PluginDefinition(
         name="coding-workspace", setup=setup, provides=frozenset({"coding.workspace"})
