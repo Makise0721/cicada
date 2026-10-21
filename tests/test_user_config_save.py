@@ -14,7 +14,9 @@ import pytest
 
 from cicada.plugins.user_config import FileUserConfigStore
 from cicada.plugins.user_config import store as files
-from cicada.user_config import LoginSubmission, SecretValue, UserConfigError, UserDefaults
+from cicada.user_config import (
+    LoginSubmission, SecretValue, UserConfigError, UserDefaults, ModelProfile, ProviderProfile,
+)
 
 
 def test_missing_config_is_initialized_once_without_credentials(tmp_path):
@@ -317,3 +319,80 @@ asyncio.run(store.save(LoginSubmission(UserDefaults(think=False),'replace',snaps
         assert after.credential is None
     assert not list(root.glob('*.tmp'))
     assert (await reopened.save(replacing(after))).defaults_saved
+
+
+def gateway(*, api_key_env=None):
+    return ProviderProfile('work.gateway', '工作网关', 'openai-chat-completions',
+                           'https://gateway.example/v1',
+                           (ModelProfile('coder.v1', 'org/remote-model', context_window=65536,
+                                         max_output_tokens=4096),), 'coder.v1', api_key_env=api_key_env)
+
+
+async def test_profile_save_preserves_other_provider_credentials_and_default(monkeypatch, tmp_path):
+    monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+    store = await seed(tmp_path / 'user')
+    initial = store.load()
+    chosen = UserDefaults('work.gateway', 'coder.v1', False, 'high', 65536, 4096)
+    saved = await store.save(LoginSubmission(chosen, 'replace', initial.revision,
+        credential=SecretValue('work-sentinel'), provider_profile=gateway(), set_default=False))
+    assert saved.defaults_saved
+    assert store.load().defaults.provider == 'deepseek'
+    assert store.load().credential.reveal() == 'old-sentinel'
+    selected = store.load(provider_id='work.gateway')
+    assert selected.defaults == replace(chosen, credential_ref=selected.defaults.credential_ref)
+    assert selected.credential.reveal() == 'work-sentinel'
+    profile = next(provider for provider in selected.providers if provider.id == 'work.gateway')
+    assert profile.models[0].model_id == 'org/remote-model'
+    view = store.read_view(provider_id='work.gateway')
+    assert all(provider.credential_ref is None for provider in view.providers)
+    assert 'work-sentinel' not in repr(view)
+    assert (await store.save(LoginSubmission(chosen, 'keep', view.revision,
+        provider_profile=gateway(), set_default=True))).defaults_saved
+    assert store.load().defaults.provider == 'work.gateway'
+    assert store.load().credential.reveal() == 'work-sentinel'
+    assert store.load(provider_id='deepseek').credential.reveal() == 'old-sentinel'
+
+
+async def test_profile_environment_is_selected_per_instance_and_invalid_does_not_fall_back(monkeypatch, tmp_path):
+    store = await seed(tmp_path / 'user')
+    initial = store.load()
+    chosen = UserDefaults('work.gateway', 'coder.v1', False, 'high', 65536, 4096)
+    assert (await store.save(LoginSubmission(chosen, 'replace', initial.revision,
+        credential=SecretValue('work-file-sentinel'),
+        provider_profile=gateway(api_key_env='WORK_LLM_KEY')))).defaults_saved
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'deepseek-env-sentinel')
+    monkeypatch.setenv('WORK_LLM_KEY', 'work-env-sentinel')
+    assert store.load('wrong-global-sentinel').credential.reveal() == 'work-env-sentinel'
+    assert store.load(provider_id='deepseek').credential.reveal() == 'deepseek-env-sentinel'
+    with pytest.raises(UserConfigError, match='environment: invalid-key'):
+        store.load('', provider_id='deepseek')
+    monkeypatch.setenv('WORK_LLM_KEY', '')
+    with pytest.raises(UserConfigError, match='environment: invalid-key'):
+        store.load()
+    monkeypatch.delenv('WORK_LLM_KEY')
+    assert store.load().credential.reveal() == 'work-file-sentinel'
+
+
+async def test_profile_credentials_keep_old_refs_and_oversize_save_publishes_nothing(monkeypatch, tmp_path):
+    monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+    store = await seed(tmp_path / 'user')
+    initial = store.load()
+    provider = initial.providers[0]
+    assert (await store.save(LoginSubmission(initial.defaults, 'replace', initial.revision,
+        credential=SecretValue('second-sentinel'), provider_profile=provider))).defaults_saved
+    for key in ('third-sentinel', 'fourth-sentinel'):
+        current = store.load()
+        assert (await store.save(replacing(current, key))).defaults_saved
+    path = store.root / 'credentials.json'
+    entries = json.loads(path.read_bytes())['entries']
+    assert {entry['api_key'] for entry in entries.values()} == {
+        'old-sentinel', 'second-sentinel', 'third-sentinel', 'fourth-sentinel'}
+    # 文件已经接近上限时，下次凭据增长须在发布任何文件前拒绝。
+    current = store.load()
+    before_config = (store.root / 'config.toml').read_bytes()
+    before_credentials = path.read_bytes()
+    monkeypatch.setattr(files, 'FILE_LIMIT', max(len(before_config), len(before_credentials)))
+    result = await store.save(replacing(current, 'x' * 4096))
+    assert not result.defaults_saved and result.error_code == 'file-too-large'
+    assert path.read_bytes() == before_credentials
+    assert (store.root / 'config.toml').read_bytes() == before_config

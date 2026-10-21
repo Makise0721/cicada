@@ -263,7 +263,7 @@ def test_v1_archive_opens_and_upgrades_in_place(tmp_path):
         user_version, schema_version, has_summaries = _raw_version(
             tmp_path / "sessions" / f"{session_id}.sqlite3"
         )
-        assert (user_version, schema_version, has_summaries) == (4, 4, True)
+        assert (user_version, schema_version, has_summaries) == (5, 5, True)
     finally:
         asyncio.run(store.aclose())
     # 重开幂等: 已是 v3, 请求与身份不变
@@ -376,7 +376,7 @@ def test_migration_process_kill_leaves_complete_v1_or_v3(tmp_path, kill_step):
         snapshot = store.recovery_snapshot()
         assert len(snapshot.requests) == 1
         user_version, schema_version, _has_summaries = _raw_version(db_path)
-        assert (user_version, schema_version) in {(1, 1), (4, 4)}, "不留混合版本"
+        assert (user_version, schema_version) in {(1, 1), (5, 5)}, "不留混合版本"
     finally:
         asyncio.run(store.aclose())
 

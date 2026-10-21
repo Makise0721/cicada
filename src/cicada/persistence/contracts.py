@@ -19,7 +19,7 @@ from cicada.models import SafeModelIdentity
 
 # --- 版本与限额 (contracts §2; 调整须新版本, 不在同一版本默默改变语义) -----------------
 
-SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 # SQLite application_id: "CIC1" 的 32 位编码, 区分 Cicada 会话库
 SESSION_APPLICATION_ID = 0x43494331
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Callable
 from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import urlsplit
+import re
 
 from cicada.budget import BudgetConfig, RequestTokenCounter
 from cicada.core.cancel import CancelToken
@@ -49,12 +50,30 @@ class SafeModelIdentity:
             if not isinstance(pair, tuple) or len(pair) != 2:
                 raise ValueError("SafeModelIdentity.options must be immutable pairs")
             key, value = pair
-            if key not in ("num_ctx", "num_predict", "max_tokens", "reasoning_effort") or key in seen:
+            if key not in (
+                "num_ctx", "num_predict", "max_tokens", "reasoning_effort", "protocol",
+                "model_key", "profile_version", "stream_usage", "output_token_field",
+            ) or key in seen:
                 raise ValueError("SafeModelIdentity.options has unknown or duplicate key")
             seen.add(key)
             if key == "reasoning_effort":
                 if value not in ("low", "high", "max"):
                     raise ValueError("SafeModelIdentity.reasoning_effort is invalid")
+            elif key == "protocol":
+                if value not in ("deepseek-chat", "openai-chat-completions"):
+                    raise ValueError("SafeModelIdentity.protocol is invalid")
+            elif key == "model_key":
+                if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+                    raise ValueError("SafeModelIdentity.model_key is invalid")
+            elif key == "profile_version":
+                if type(value) is not int or value != 1:
+                    raise ValueError("SafeModelIdentity.profile_version is invalid")
+            elif key == "stream_usage":
+                if type(value) is not bool:
+                    raise ValueError("SafeModelIdentity.stream_usage must be bool")
+            elif key == "output_token_field":
+                if value not in ("max_tokens", "max_completion_tokens"):
+                    raise ValueError("SafeModelIdentity.output_token_field is invalid")
             elif type(value) is not int or value <= 0:
                 raise ValueError(f"SafeModelIdentity.{key} must be positive int")
 
@@ -63,6 +82,9 @@ class SafeModelIdentity:
 class ModelOption:
     id: str
     label: str
+    available: bool = True
+    reason: str | None = None
+    is_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +98,9 @@ class ModelBinding:
     validate_request: Callable[[ModelRequest], None]
     token_counter: RequestTokenCounter | None = None
     summary_token_counter: RequestTokenCounter | None = None
+    option_id: str | None = None
+    label: str | None = None
+    catalog_revision: str | None = None
 
 
 @dataclass(frozen=True)

@@ -338,7 +338,7 @@ async def test_restore_capture_owned_by_persistent_request_and_session_route(tmp
         else:
             assert session._restore_store is None and not (root / ".cicada/restore").exists()
         with sqlite3.connect(session._store.capture().db_path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
     finally:
         await session.aclose()
 

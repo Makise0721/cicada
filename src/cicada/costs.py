@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 from cicada.core.ports import ModelMetrics
+from cicada.models import SafeModelIdentity
 
 SERVER_INPUT_BOUND = 1_100_000
 
@@ -57,10 +58,36 @@ class ModelPrice:
     model: str
     input_rate: Decimal
     output_rate: Decimal
+    provider: str = 'deepseek'
+    protocol: str = 'deepseek-chat'
+    base_url: str = 'https://api.deepseek.com'
+    input_token_bound: int = SERVER_INPUT_BOUND
 
     def __post_init__(self) -> None:
         if not _valid_amount(self.input_rate) or not _valid_amount(self.output_rate):
             raise CostError('model prices require positive amounts with at most 8 decimal places')
+        if (not isinstance(self.model, str) or not self.model or len(self.model) > 512
+                or not isinstance(self.provider, str) or not self.provider or len(self.provider) > 128
+                or any(char.isspace() or ord(char) < 32 for char in self.provider)
+                or self.protocol not in ('deepseek-chat', 'openai-chat-completions')):
+            raise CostError('invalid model price identity')
+        try:
+            if not isinstance(self.base_url, str):
+                raise ValueError
+            endpoint = urlsplit(self.base_url)
+            if (endpoint.scheme not in ('https', 'http') or not endpoint.hostname
+                    or endpoint.username is not None or endpoint.password is not None
+                    or endpoint.query or endpoint.fragment
+                    or (endpoint.scheme == 'http' and endpoint.hostname not in ('localhost', '127.0.0.1', '::1'))):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise CostError('invalid model price endpoint') from None
+        if type(self.input_token_bound) is not int or not 0 < self.input_token_bound <= 1_000_000_000:
+            raise CostError('invalid model price input bound')
+
+    @property
+    def route(self) -> tuple[str, str, str, str]:
+        return self.provider, self.protocol, self.base_url, self.model
 
     def upper(self, inputs: int, outputs: int) -> Decimal:
         return _money(self.upper_cents(inputs, outputs))
@@ -80,6 +107,7 @@ class CostProfile:
     checked_at: str
     sha256: str
     prices: tuple[ModelPrice, ...]
+    schema_version: int = 1
 
     @classmethod
     def load(cls, path: Path) -> CostProfile:
@@ -90,29 +118,59 @@ class CostProfile:
                 raise ValueError
             data = json.loads(raw.decode('utf-8'), object_pairs_hook=_strict_pairs,
                               parse_constant=lambda _: None)
-            if set(data) != {'schema_version', 'source', 'checked_at', 'models'} or type(data['schema_version']) is not int or data['schema_version'] != 1:
+            if (set(data) != {'schema_version', 'source', 'checked_at', 'models'}
+                    or type(data['schema_version']) is not int or data['schema_version'] not in (1, 2)):
                 raise ValueError
             url = urlsplit(data['source'])
             if url.scheme != 'https' or not url.hostname or url.username or url.password or url.query or url.fragment:
                 raise ValueError
             date.fromisoformat(data['checked_at'])
-            if not isinstance(data['models'], dict) or not data['models']:
-                raise ValueError
             prices = []
-            for model, rates in data['models'].items():
-                if not isinstance(model, str) or not model or len(model) > 128:
+            if data['schema_version'] == 1:
+                if not isinstance(data['models'], dict) or not data['models']:
                     raise ValueError
-                if set(rates) != {'input_cny_per_million', 'output_cny_per_million'}:
+                for model, rates in data['models'].items():
+                    if not isinstance(model, str) or not model or len(model) > 128:
+                        raise ValueError
+                    if set(rates) != {'input_cny_per_million', 'output_cny_per_million'}:
+                        raise ValueError
+                    prices.append(ModelPrice(model, positive_amount(rates['input_cny_per_million']),
+                                             positive_amount(rates['output_cny_per_million'])))
+            else:
+                if not isinstance(data['models'], list) or not data['models'] or len(data['models']) > 256:
                     raise ValueError
-                prices.append(ModelPrice(model, positive_amount(rates['input_cny_per_million']),
-                                         positive_amount(rates['output_cny_per_million'])))
-            return cls(data['source'], data['checked_at'], hashlib.sha256(raw).hexdigest(), tuple(prices))
+                for rates in data['models']:
+                    if set(rates) != {'provider', 'protocol', 'base_url', 'model', 'input_token_bound',
+                                      'input_cny_per_million', 'output_cny_per_million'}:
+                        raise ValueError
+                    prices.append(ModelPrice(
+                        rates['model'], positive_amount(rates['input_cny_per_million']),
+                        positive_amount(rates['output_cny_per_million']), rates['provider'],
+                        rates['protocol'], rates['base_url'], rates['input_token_bound'],
+                    ))
+                if len({price.route for price in prices}) != len(prices):
+                    raise ValueError
+            return cls(data['source'], data['checked_at'], hashlib.sha256(raw).hexdigest(),
+                       tuple(prices), data['schema_version'])
         except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
             raise CostError('invalid or unreadable cost profile') from None
 
-    def price(self, model: str) -> ModelPrice:
+    def price(self, model: str | SafeModelIdentity) -> ModelPrice:
+        if isinstance(model, SafeModelIdentity):
+            options = dict(model.options)
+            protocol = options.get('protocol')
+            if protocol is None and model.provider == 'deepseek':
+                protocol = 'deepseek-chat'
+            route = model.provider, protocol, model.base_url, model.model
+        elif isinstance(model, str) and self.schema_version == 1:
+            # 旧字符串入口只有原 DeepSeek 官方语义，不能匹配 v2 网关价格。
+            route = 'deepseek', 'deepseek-chat', 'https://api.deepseek.com', model
+        else:
+            raise CostError('cost profile requires the full selected model identity')
+        if self.schema_version == 1 and route[:3] != ('deepseek', 'deepseek-chat', 'https://api.deepseek.com'):
+            raise CostError('legacy cost profile only supports the official DeepSeek endpoint')
         for price in self.prices:
-            if price.model == model:
+            if price.route == route:
                 return price
         raise CostError('cost profile has no price for the selected model')
 
@@ -131,7 +189,8 @@ class CostSnapshot:
     ledger_path: str
     scope: str = 'current-process; restart creates a new allowance'
     prices: tuple[tuple[str, str, str], ...] = ()
-    input_token_bound: int = SERVER_INPUT_BOUND
+    input_token_bound: int | None = SERVER_INPUT_BOUND
+    input_token_bounds: tuple[tuple[str, str, str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +199,7 @@ class _Reservation:
     output_cap: int
     price: ModelPrice | None
     amount: int
+    input_token_bound: int = SERVER_INPUT_BOUND
 
 
 class CostLedger:
@@ -169,7 +229,11 @@ class CostLedger:
             str(_money(self._pending.amount if self._pending else 0)) if profile else None,
             self._sealed, profile.source if profile else None, profile.checked_at if profile else None,
             profile.sha256 if profile else None, str(self.path),
-            prices=tuple((p.model, str(p.input_rate), str(p.output_rate)) for p in profile.prices) if profile else ())
+            prices=tuple((p.model if profile.schema_version == 1 else f'{p.provider}/{p.model}',
+                          str(p.input_rate), str(p.output_rate)) for p in profile.prices) if profile else (),
+            input_token_bound=SERVER_INPUT_BOUND if profile is None or profile.schema_version == 1 else None,
+            input_token_bounds=tuple((*p.route, p.input_token_bound) for p in profile.prices)
+                if profile is not None and profile.schema_version == 2 else ())
 
     def _persist(self) -> None:
         temporary = self.path.with_suffix('.tmp')
@@ -184,20 +248,47 @@ class CostLedger:
             self._sealed = 'cost ledger write failed'
             raise CostError(self._sealed) from None
 
-    def reserve(self, model: str, output_cap: int) -> _Reservation:
-        if type(output_cap) is not int or output_cap <= 0:
-            raise CostError('model cost output cap must be a positive integer')
+    def _check_available(self) -> None:
         if self._sealed:
             raise CostError(self._sealed)
         if self._pending is not None:
             raise CostError('a model cost reservation is still pending')
         if self.max_calls is not None and self._calls >= self.max_calls:
             raise CostError('model call limit reached; not sent')
-        price = self.profile.price(model) if self.profile else None
-        amount = price.upper_cents(SERVER_INPUT_BOUND, output_cap) if price else 0
+
+    def validate_identity(self, identity: SafeModelIdentity) -> None:
+        """切换前只读核对身份和适用上界；不创建账本或消费额度。"""
+        if not isinstance(identity, SafeModelIdentity):
+            raise CostError('cost validation requires a safe model identity')
+        self._check_available()
+        if self.profile is None:
+            return
+        price = self.profile.price(identity)
+        options = dict(identity.options)
+        context = options.get('num_ctx')
+        output = options.get('max_tokens', options.get('num_predict'))
+        if type(context) is not int or context <= 0 or context > price.input_token_bound:
+            raise CostError('selected model context exceeds the configured cost input bound')
+        if type(output) is not int or output <= 0:
+            raise CostError('selected model has no cost output cap')
+        amount = price.upper_cents(price.input_token_bound, output)
         if self.limit is not None and _money(self._settled + amount) > self.limit:
             raise CostError('model cost upper bound exceeds remaining allowance; not sent')
-        reservation = _Reservation(self._calls + 1, output_cap, price, amount)
+
+    def reserve(self, model: str | SafeModelIdentity, output_cap: int) -> _Reservation:
+        if not isinstance(model, (str, SafeModelIdentity)):
+            raise CostError('model cost reservation requires a model identity')
+        if type(output_cap) is not int or output_cap <= 0:
+            raise CostError('model cost output cap must be a positive integer')
+        self._check_available()
+        if isinstance(model, SafeModelIdentity):
+            self.validate_identity(model)
+        price = self.profile.price(model) if self.profile else None
+        input_bound = price.input_token_bound if price else SERVER_INPUT_BOUND
+        amount = price.upper_cents(input_bound, output_cap) if price else 0
+        if self.limit is not None and _money(self._settled + amount) > self.limit:
+            raise CostError('model cost upper bound exceeds remaining allowance; not sent')
+        reservation = _Reservation(self._calls + 1, output_cap, price, amount, input_bound)
         self._pending = reservation
         self._calls += 1
         self._persist()
@@ -209,7 +300,7 @@ class CostLedger:
         valid = complete
         if reservation.price:
             valid = valid and metrics is not None and (
-                type(metrics.input_tokens) is int and 0 <= metrics.input_tokens <= SERVER_INPUT_BOUND
+                type(metrics.input_tokens) is int and 0 <= metrics.input_tokens <= reservation.input_token_bound
                 and type(metrics.output_tokens) is int and 0 <= metrics.output_tokens <= reservation.output_cap)
         if not valid:
             self._sealed = 'model cost unresolved; restart with a new allowance to continue'

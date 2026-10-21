@@ -51,12 +51,16 @@ def _versions_and_pointer(path):
 
 def _legacy_name_archive(tmp_path, version):
     directory, session_id, path = _legacy(tmp_path, min(version, 2))
-    if version == 3:
+    if version >= 3:
         with sqlite3.connect(path) as connection:
             epoch_id = connection.execute('SELECT epoch_id FROM epoch').fetchone()[0]
             connection.execute('ALTER TABLE session ADD COLUMN current_epoch_id TEXT REFERENCES epoch(epoch_id)')
             connection.execute('UPDATE session SET schema_version=3, current_epoch_id=?', (epoch_id,))
             connection.execute('PRAGMA user_version=3')
+            if version == 4:
+                connection.execute('ALTER TABLE session ADD COLUMN user_name TEXT NULL')
+                connection.execute("UPDATE session SET schema_version=4, user_name='已命名'")
+                connection.execute('PRAGMA user_version=4')
     return directory, session_id, path
 
 
@@ -83,11 +87,11 @@ async def test_v4_migration_failure_rolls_back_all_earlier_steps(tmp_path, monke
         handle = store.submit_name('中文名称', expected_epoch_id=epoch_id)
         assert await handle.wait() == await handle.wait() == '中文名称'
         assert store.recovery_snapshot() == replace(snapshot, user_name='中文名称')
-        assert _versions_and_pointer(path) == (4, (4, epoch_id))
+        assert _versions_and_pointer(path) == (5, (5, epoch_id))
         with pytest.raises(store_module.UnknownArchiveVersionError):
             monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 3)
             read_session_identity(directory=directory, session_id=session_id, workspace=tmp_path)
-        monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 4)
+        monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 5)
     finally:
         await store.aclose()
 
@@ -107,6 +111,40 @@ async def test_corrupt_v4_names_refused_without_rewriting_archive(tmp_path):
             read_session_identity(directory=path.parent, session_id=session_id, workspace=tmp_path)
         assert list_sessions(directory=path.parent).entries[0].error
         assert path.read_bytes() == before
+
+
+async def test_v5_upgrade_preserves_v4_payloads_and_rolls_back_marker_fault(tmp_path, monkeypatch):
+    directory, session_id, path = _legacy_name_archive(tmp_path, 4)
+    with sqlite3.connect(path) as connection:
+        original_records = connection.execute('SELECT * FROM records ORDER BY seq').fetchall()
+        original_epochs = connection.execute('SELECT * FROM epoch ORDER BY epoch_id').fetchall()
+    original_bytes = path.read_bytes()
+    assert read_session_identity(directory=directory, session_id=session_id, workspace=tmp_path)
+    assert list_sessions(directory=directory).entries[0].user_name == '已命名'
+    assert path.read_bytes() == original_bytes
+    steps = store_module._V5_MIGRATION_STEPS
+
+    def fail(connection):
+        raise RuntimeError('injected v5 marker fault')
+
+    monkeypatch.setattr(store_module, '_V5_MIGRATION_STEPS', (steps[0], fail))
+    with pytest.raises(RuntimeError, match='v5 marker fault'):
+        open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
+    assert path.read_bytes() == original_bytes
+    monkeypatch.setattr(store_module, '_V5_MIGRATION_STEPS', steps)
+    store = open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
+    try:
+        assert store.recovery_snapshot().user_name == '已命名'
+        assert _versions_and_pointer(path)[0] == 5
+        with sqlite3.connect(path) as connection:
+            assert connection.execute('SELECT * FROM records ORDER BY seq').fetchall() == original_records
+            assert connection.execute('SELECT * FROM epoch ORDER BY epoch_id').fetchall() == original_epochs
+        monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 4)
+        with pytest.raises(store_module.UnknownArchiveVersionError):
+            read_session_identity(directory=directory, session_id=session_id, workspace=tmp_path)
+        monkeypatch.setattr(store_module, 'SESSION_SCHEMA_VERSION', 5)
+    finally:
+        await store.aclose()
 
 
 @pytest.mark.parametrize("version", [1, 2])
@@ -132,7 +170,7 @@ async def test_legacy_migration_preserves_payloads_and_identity(tmp_path, versio
     try:
         snapshot = store.recovery_snapshot()
         assert snapshot.canonical_history == (UserMessage("第一问"), AssistantMessage("回答"))
-        assert _versions_and_pointer(path) == (4, (4, epoch_id))
+        assert _versions_and_pointer(path) == (5, (5, epoch_id))
         if version == 2:
             assert snapshot.summaries == (record,)
             assert snapshot.summaries[0].prefix_sha256 == canonical_prefix_sha256(snapshot.canonical_history)
@@ -185,7 +223,7 @@ m.open_session_store(directory=Path({str(directory)!r}), session_id={session_id!
     store = open_session_store(directory=directory, session_id=session_id, workspace=tmp_path)
     try:
         assert len(store.recovery_snapshot().requests) == 1
-        assert _versions_and_pointer(path)[0] == 4
+        assert _versions_and_pointer(path)[0] == 5
     finally:
         await store.aclose()
 
@@ -213,7 +251,7 @@ async def test_old_pre_read_and_upgrade_agree_on_open_or_legacy_order(tmp_path, 
 async def test_v3_pointer_wins_same_timestamp_reverse_uuid_and_survives_closed_epoch(tmp_path, monkeypatch):
     store = open_session_store(directory=tmp_path / "sessions", session_id=None, workspace=tmp_path)
     path = store.db_path
-    assert _versions_and_pointer(path) == (4, (4, None))
+    assert _versions_and_pointer(path) == (5, (5, None))
     first_id = "ffffffff-ffff-4fff-bfff-ffffffffffff"
     second_id = "00000000-0000-4000-8000-000000000000"
     ids = iter([first_id, second_id])
@@ -294,6 +332,13 @@ def test_summary_call_identity_optional_and_strict(tmp_path):
                                  (("num_ctx", 131072), ("max_tokens", 2048), ("reasoning_effort", "high")), 2097152)
     updated = replace(record, call_identity=identity)
     assert decode_summary_record(strict_load(encode_summary_record(updated))) == updated
+    gateway = SafeModelIdentity('work', 'org/model', 'https://example.invalid/v1', False, (
+        ('protocol', 'openai-chat-completions'), ('profile_version', 1), ('model_key', 'coder'),
+        ('num_ctx', 65536), ('max_tokens', 2048), ('stream_usage', False),
+        ('output_token_field', 'max_completion_tokens'),
+    ), 2097152)
+    gateway_record = replace(record, call_identity=gateway)
+    assert decode_summary_record(strict_load(encode_summary_record(gateway_record))) == gateway_record
     for bad in (None, {}, {**strict_load(encode_summary_record(updated))["call_identity"], "secret": "key"}):
         payload = strict_load(old)
         payload["call_identity"] = bad

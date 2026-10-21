@@ -216,6 +216,12 @@ _V4_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
     lambda connection: connection.execute("PRAGMA user_version = 4"),
 )
 
+# 新身份使用已有严格 options 字段；历史记录和指纹不作回写。
+_V5_MIGRATION_STEPS: tuple[Callable[[sqlite3.Connection], None], ...] = (
+    lambda connection: connection.execute("UPDATE session SET schema_version = 5"),
+    lambda connection: connection.execute("PRAGMA user_version = 5"),
+)
+
 
 def _verify_v2_structure(connection: sqlite3.Connection) -> None:
     """迁移提交前的 v2 结构核对: 双版本标记与新表在位 (PA04, 提交前最后一道)."""
@@ -1260,7 +1266,7 @@ def _resume_store(directory: Path, session_id: str, canonical_workspace: str) ->
             if archive_version >= 2:
                 state.summaries = _load_summaries(connection, state)
             if archive_version < SESSION_SCHEMA_VERSION:
-                _upgrade_to_v4(connection, state)
+                _upgrade_to_v5(connection, state)
                 state.schema_version = SESSION_SCHEMA_VERSION
         except sqlite3.OperationalError as exc:
             connection.close()
@@ -1331,7 +1337,7 @@ def _check_identity(connection: sqlite3.Connection) -> int:
     version = int(row[0]) if row is not None else 0
     if version == SESSION_SCHEMA_VERSION:
         return version
-    if version in (1, 2, 3) and SESSION_SCHEMA_VERSION > version:
+    if version in (1, 2, 3, 4) and SESSION_SCHEMA_VERSION > version:
         return version  # 历史档: 原子升级路径 (PA04)
     if version > SESSION_SCHEMA_VERSION or version not in (0, 1):
         raise UnknownArchiveVersionError(
@@ -1368,8 +1374,8 @@ def _check_schema_tables(connection: sqlite3.Connection, expected: frozenset[str
         raise ArchiveFormatError(f"session archive is missing tables: {sorted(missing)}")
 
 
-def _upgrade_to_v4(connection: sqlite3.Connection, state: _LoadedState) -> None:
-    """已完整验证的 v1–v3 单事务升级，不回写请求或摘要 JSON。"""
+def _upgrade_to_v5(connection: sqlite3.Connection, state: _LoadedState) -> None:
+    """已完整验证的 v1–v4 单事务升级，不回写请求或摘要 JSON。"""
     _immediate_txn(connection)
     try:
         if state.schema_version == 1:
@@ -1382,13 +1388,16 @@ def _upgrade_to_v4(connection: sqlite3.Connection, state: _LoadedState) -> None:
             connection.execute(
                 "UPDATE session SET current_epoch_id = ?", (state.current_epoch_id,)
             )
-        for step in _V4_MIGRATION_STEPS:
+        if state.schema_version < 4:
+            for step in _V4_MIGRATION_STEPS:
+                step(connection)
+        for step in _V5_MIGRATION_STEPS:
             step(connection)
-        if _check_identity(connection) != 4:
-            raise ArchiveFormatError("v4 migration did not confirm user_version")
+        if _check_identity(connection) != 5:
+            raise ArchiveFormatError("v5 migration did not confirm user_version")
         row = connection.execute("SELECT schema_version, current_epoch_id, user_name FROM session").fetchone()
-        if row != (4, state.current_epoch_id, None):
-            raise ArchiveFormatError("v4 migration did not confirm session metadata")
+        if row != (5, state.current_epoch_id, state.user_name):
+            raise ArchiveFormatError("v5 migration did not confirm session metadata")
         connection.execute("COMMIT")
     except BaseException:
         connection.execute("ROLLBACK")
