@@ -106,6 +106,7 @@ from cicada.plugins.coding.verification_contracts import (
 )
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.deepseek import deepseek_plugin
+from cicada.plugins.model_catalog import model_catalog_plugin, option_id, profile_identity
 from cicada.plugins.session_store import list_sessions, read_session_identity
 from cicada.plugins.session_store.migration import migrate_legacy_session
 from cicada.plugins.skills import load_auto_skill_catalog, load_skill_catalog
@@ -354,32 +355,132 @@ async def _launch_session_selector(workspace: Path) -> str | None:
 
 async def _launch_first_run(
     store: UserConfigStore, snapshot: UserConfigSnapshot, defaults: UserDefaults, *,
-    explicit: dict[str, object], credentials_only: bool,
+    explicit: dict[str, object], credentials_only: bool, first_run: bool = False,
 ) -> LoginResult | None:
     """missing-only 接缝；安全视图重新观察变化时拒绝覆盖旧启动配置。"""
     from cicada.ui.login_wizard import run_startup_login
     from cicada.ui.terminal_io import PromptToolkitTerminal
 
-    view = store.read_view()
+    view = (store.read_view(provider_id=snapshot.defaults.provider, model_key=snapshot.defaults.model)
+            if snapshot.providers else store.read_view())
     observed = UserDefaults(view.provider, view.model, view.think, view.reasoning_effort,
                             view.num_ctx, view.max_output_tokens)
+    safe_profiles = tuple(replace(p, credential_ref=None) for p in snapshot.providers)
     if (observed != replace(snapshot.defaults, credential_ref=None)
+            or (snapshot.providers and view.providers != safe_profiles)
             or view.credential_present or view.credential_source != 'missing'):
         raise UserConfigError('config', 'configuration-changing')
     view = replace(view, provider=defaults.provider, model=defaults.model, think=defaults.think,
         reasoning_effort=defaults.reasoning_effort, num_ctx=defaults.num_ctx,
         max_output_tokens=defaults.max_output_tokens, credentials_only=credentials_only,
         effect=('只补凭据，本次仍继承存档' if credentials_only else
-                '保存下次默认值；本次显式 CLI 参数仍优先'))
+                '保存连接配置；本次显式 CLI 参数仍优先'))
     result, errors = await run_startup_login(
         PromptToolkitTerminal(), store, view,
-        save_defaults=snapshot.defaults if credentials_only else defaults, explicit=explicit)
+        save_defaults=snapshot.defaults if credentials_only else defaults, explicit=explicit,
+        initial_set_default=first_run)
     if errors:
         # 终端底层异常不经通用展示，以免包含秘密；保留恢复失败事实。
         print('login terminal restore errors', file=sys.stderr)
         return LoginResult(bool(result and result.defaults_saved), False,
                            'not-requested', 'terminal-failed')
     return result
+
+
+def _startup_selection_args(args, result):
+    """启动向导选择供本次使用；显式 CLI 参数仍优先，不依赖是否修改默认值。"""
+    selected = argparse.Namespace(**vars(args))
+    if selected.provider is None and result.selected_provider is not None:
+        selected.provider = result.selected_provider
+    if (selected.model is None and selected.provider == result.selected_provider
+            and result.selected_model is not None):
+        selected.model = result.selected_model
+    return selected
+
+
+async def _prepare_catalog_launch(args, store, saved_launch, prompt_info, plan, max_turns, *, allow_login=True):
+    """先核对安全连接，再解析所选凭据；存档设置不被当前默认值覆盖。"""
+    profiles = store.read_profiles()
+    provider_id = saved_launch.provider if saved_launch else args.provider
+    model_key = (dict(saved_launch.options).get('model_key', saved_launch.model)
+                 if saved_launch else args.model)
+    if saved_launch:
+        provider = next((p for p in profiles if p.id == provider_id), None)
+        model = next((m for m in provider.models if m.key == model_key), None) if provider else None
+        protocol = dict(saved_launch.options).get('protocol', 'deepseek-chat')
+        if (provider is None or model is None or provider.protocol != protocol
+                or provider.base_url != saved_launch.base_url or model.model_id != saved_launch.model):
+            raise UserConfigError('config', 'archive-connection-changed')
+        if ((args.provider is not None and args.provider != provider_id)
+                or (args.model is not None and args.model != model_key)):
+            raise UserConfigError('config', 'archive-config-conflict')
+        for name, previous in (
+            ('num_ctx', saved_launch.options['num_ctx']),
+            ('max_output_tokens', saved_launch.options['max_tokens']),
+            ('think', saved_launch.think),
+            ('reasoning_effort', saved_launch.options.get('reasoning_effort', 'high')),
+        ):
+            if getattr(args, name) is not None and getattr(args, name) != previous:
+                raise UserConfigError('config', 'archive-config-conflict')
+    snapshot = store.load(provider_id=provider_id, model_key=model_key)
+    defaults = snapshot.defaults
+    provider = next(p for p in snapshot.providers if p.id == defaults.provider)
+    model = next(m for m in provider.models if m.key == defaults.model)
+    if saved_launch:
+        values = dict(saved_launch.options)
+        model = replace(model, context_window=values['num_ctx'], max_output_tokens=values['max_tokens'],
+            think=bool(saved_launch.think), reasoning_effort=values.get('reasoning_effort', 'high'),
+            stream_usage=values.get('stream_usage', True),
+            output_token_field=values.get('output_token_field', 'max_tokens'))
+    else:
+        if provider.protocol == 'openai-chat-completions' and (args.think is True or args.reasoning_effort is not None):
+            raise UserConfigError('config', 'unsupported-thinking')
+        model = replace(model,
+            context_window=args.num_ctx if args.num_ctx is not None else model.context_window,
+            max_output_tokens=args.max_output_tokens if args.max_output_tokens is not None else model.max_output_tokens,
+            think=args.think if args.think is not None else model.think,
+            reasoning_effort=args.reasoning_effort if args.reasoning_effort is not None else model.reasoning_effort)
+    provider = replace(provider, models=tuple(model if m.key == model.key else m for m in provider.models))
+    profiles = tuple(provider if p.id == provider.id else p for p in snapshot.providers)
+    safe = profile_identity(provider, model)
+    if plan is not None and model.context_window < CHECK_MODE_MIN_NUM_CTX:
+        raise UserConfigError('config', 'check-context-too-small')
+    sources = {name: ('archive' if saved_launch else 'cli' if getattr(args, arg) is not None else 'user')
+        for name, arg in (('provider', 'provider'), ('model', 'model'), ('num_ctx', 'num_ctx'),
+                          ('max_tokens', 'max_output_tokens'), ('think', 'think'),
+                          ('reasoning_effort', 'reasoning_effort'))}
+    identity = LaunchIdentity(provider=safe.provider, model=safe.model, base_url=safe.base_url,
+        think=safe.think, options=dict(safe.options), max_request_bytes=safe.max_request_bytes,
+        max_turns=max_turns, prompt_version=prompt_info.version,
+        prompt_sha256=prompt_info.prompt_sha256, instructions_sha256=prompt_info.instructions_sha256,
+        checks_signature=verification_checks_signature(plan.checks) if plan else None, sources=sources)
+    if saved_launch and conflicting_launch_fields(saved_launch, identity):
+        raise UserConfigError('config', 'archive-config-conflict')
+    if snapshot.credential is None and provider.auth != 'none':
+        if not args.tui or not allow_login:
+            raise UserConfigError('credential', 'missing-credential')
+        result = await _launch_first_run(store, snapshot, defaults,
+            explicit={}, credentials_only=saved_launch is not None)
+        if result is None:
+            return None
+        if not result.defaults_saved or result.error_code:
+            raise UserConfigError('login', 'save-failed')
+        # 配置向导可以选择另一供应商；以保存后的选择重走同一解析链。
+        launch_args = args if saved_launch else _startup_selection_args(args, result)
+        return await _prepare_catalog_launch(launch_args, store, saved_launch, prompt_info, plan, max_turns,
+                                             allow_login=False)
+    selected = option_id(provider.id, model.key)
+    initial_plugin = None
+    if provider.protocol == 'deepseek-chat' and provider.id == 'deepseek' and model.key == model.model_id:
+        from cicada.plugins.deepseek import DeepSeekConfig
+        initial_plugin = deepseek_plugin(DeepSeekConfig(model=model.model_id, think=model.think,
+            reasoning_effort=model.reasoning_effort, num_ctx=model.context_window,
+            max_tokens=model.max_output_tokens), api_key=snapshot.credential.reveal())
+    plugin = model_catalog_plugin(profiles, selected,
+        credential=lambda pid, key: store.load(provider_id=pid, model_key=key),
+        default_id=option_id(*store.read_default_reference()), initial_plugin=initial_plugin)
+    return plugin, f'{provider.name} / {model.name or model.model_id}', identity, BudgetConfig(
+        model.context_window, model.max_output_tokens)
 
 
 async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore | None = None) -> int:
@@ -533,9 +634,25 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         except ValueError as exc:
             print(f"--resume: {exc}", file=sys.stderr)
             return 2
+    catalog_store = None
+    catalog_launch = False
+    if args.script is None:
+        catalog_store = user_config_store if user_config_store is not None else FileUserConfigStore(Path.home() / '.cicada')
+        if hasattr(catalog_store, 'read_profiles'):
+            try:
+                profiles = catalog_store.read_profiles()
+                catalog_launch = (args.provider not in (None, 'deepseek')
+                    or any(p.id != 'deepseek' or p.protocol != 'deepseek-chat'
+                           or any(m.key != m.model_id for m in p.models) for p in profiles)
+                    or bool(saved_launch and 'protocol' in saved_launch.options))
+            except UserConfigError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
     # API 路径启用预算; fake 默认不安装预算层。
     budget_config: BudgetConfig | None = None
     defaults_saved = False
+    first_run = False
+    catalog_reprepared = None
     if args.script is not None:
         try:
             script = parse_script(Path(args.script).read_text(encoding="utf-8"))
@@ -557,6 +674,18 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             sources={"script": str(Path(args.script))},
         )
         preflight = None
+    elif catalog_launch:
+        try:
+            prepared = await _prepare_catalog_launch(args, catalog_store, saved_launch, prompt_info, plan, max_turns)
+            if prepared is None:
+                return 0
+            model_plugin, model_label, identity, budget_config = prepared
+        except (UserConfigError, ValueError):
+            print('模型配置、凭据或恢复身份不匹配；请检查 /login，恢复可显式使用 --resume-with-current-config', file=sys.stderr)
+            return 2
+        preflight = None
+        if not args.tui:
+            print(f'[config provider={identity.provider} model={identity.model} context_requested={budget_config.num_ctx}]')
     else:
         provider = args.provider or (saved_launch.provider if saved_launch is not None else "deepseek")
         if saved_launch is not None and provider != saved_launch.provider:
@@ -603,6 +732,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         if isinstance(store, FileUserConfigStore):
             try:
                 if store.ensure_default_config():
+                    first_run = True
                     snapshot = store.load(environment_key)
                     resolved, config, sources = resolve_deepseek_config(
                         snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
@@ -618,6 +748,11 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 print(f'检查模式要求有效 num_ctx >= {CHECK_MODE_MIN_NUM_CTX}', file=sys.stderr)
                 return 2
         if resolved.credential is None:
+            # 取消过首次向导后，自动生成的默认文件仍在；首次成功配置应保留默认勾选。
+            first_run = first_run or (
+                archive is None and snapshot.defaults.credential_ref is None
+                and all(value is None for value in explicit.values())
+                and snapshot.defaults == UserDefaults())
             if not args.tui:
                 print('DEEPSEEK_API_KEY is missing: 请设置 DEEPSEEK_API_KEY 或配置引用的文件凭据后重试；'
                       '交互入口为 --tui', file=sys.stderr)
@@ -636,7 +771,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                     return 2
             try:
                 result = await _launch_first_run(store, snapshot, defaults,
-                    explicit=explicit, credentials_only=archive is not None)
+                    explicit=explicit, credentials_only=archive is not None, first_run=first_run)
                 if result is None:
                     return 0
                 defaults_saved = result.defaults_saved
@@ -644,13 +779,20 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                     print(('用户默认值已保存；' if defaults_saved else '') +
                           'login failed: ' + (result.error_code or 'save-failed'), file=sys.stderr)
                     return 2
-                snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
-                resolved, config, sources = resolve_deepseek_config(
-                    snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
-                )
-                defaults = resolved.defaults
-                if resolved.credential is None:
-                    raise UserConfigError('credential', 'missing-credential')
+                if hasattr(store, 'read_profiles'):
+                    launch_args = args if saved_launch else _startup_selection_args(args, result)
+                    catalog_reprepared = await _prepare_catalog_launch(
+                        launch_args, store, saved_launch, prompt_info, plan, max_turns, allow_login=False)
+                    if catalog_reprepared is None:
+                        return 0
+                else:
+                    snapshot = store.load(os.environ.get('DEEPSEEK_API_KEY'))
+                    resolved, config, sources = resolve_deepseek_config(
+                        snapshot, explicit=explicit, archive=archive, saved_launch=saved_launch,
+                    )
+                    defaults = resolved.defaults
+                    if resolved.credential is None:
+                        raise UserConfigError('credential', 'missing-credential')
             except UserConfigError as exc:
                 print(('用户默认值已保存；' if defaults_saved else '') + str(exc), file=sys.stderr)
                 return 2
@@ -658,23 +800,33 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 print(('用户默认值已保存；' if defaults_saved else '') +
                       'login startup failed', file=sys.stderr)
                 return 2
-        safe = config.identity
-        identity = LaunchIdentity(
-            provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
-            options=dict(safe.options), max_request_bytes=safe.max_request_bytes, max_turns=max_turns,
-            prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
-            instructions_sha256=prompt_info.instructions_sha256,
-            checks_signature=verification_checks_signature(plan.checks) if plan is not None else None,
-            sources=sources,
-        )
-        budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
-        model_plugin = deepseek_plugin(config, api_key=resolved.credential.reveal())
-        model_label = config.model
-        preflight = None
-        if not args.tui:
-            print(f"[config provider=deepseek model={config.model} context_requested={config.num_ctx} "
-                  f"source={sources['num_ctx']} think={str(config.think).lower()} "
-                  f"max_tokens={config.max_tokens} reasoning_effort={config.reasoning_effort}]")
+        if catalog_reprepared is not None:
+            model_plugin, model_label, identity, budget_config = catalog_reprepared
+            preflight = None
+        else:
+            safe = config.identity
+            identity = LaunchIdentity(
+                provider=safe.provider, model=safe.model, base_url=safe.base_url, think=safe.think,
+                options=dict(safe.options), max_request_bytes=safe.max_request_bytes, max_turns=max_turns,
+                prompt_version=prompt_info.version, prompt_sha256=prompt_info.prompt_sha256,
+                instructions_sha256=prompt_info.instructions_sha256,
+                checks_signature=verification_checks_signature(plan.checks) if plan is not None else None,
+                sources=sources,
+            )
+            budget_config = BudgetConfig(config.num_ctx, config.max_tokens)
+            model_plugin = deepseek_plugin(config, api_key=resolved.credential.reveal())
+            if snapshot.providers:
+                model_plugin = model_catalog_plugin(snapshot.providers,
+                    option_id(defaults.provider, defaults.model),
+                    credential=lambda pid, key: store.load(provider_id=pid, model_key=key),
+                    default_id=option_id(snapshot.defaults.provider, snapshot.defaults.model),
+                    initial_plugin=model_plugin)
+            model_label = config.model
+            preflight = None
+            if not args.tui:
+                print(f"[config provider=deepseek model={config.model} context_requested={config.num_ctx} "
+                      f"source={sources['num_ctx']} think={str(config.think).lower()} "
+                      f"max_tokens={config.max_tokens} reasoning_effort={config.reasoning_effort}]")
     resume_id = args.resume if isinstance(args.resume, str) else None
     if args.tui or args.save_session or args.resume is not None:
         persistence_config = PersistenceConfig(
@@ -810,38 +962,41 @@ def main(*, user_config_store: UserConfigStore | None = None,
             if interactive_default else "Cicada coding agent"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''DeepSeek 用户默认配置：真实模型启动时读取 ~/.cicada/config.toml，缺失时生成默认文件；不读取工作区配置。
-新建会话及 --resume-with-current-config 每字段按 CLI > 用户文件 > 内置默认。
-普通 --resume 继承存档模型配置；凭据每次启动按有效 DEEPSEEK_API_KEY > 文件引用。
-help、list 与 fake 不读取这些文件。文件存在但无效时明确失败。
-运行状态按工作区路径保存在 ~/.cicada/workspaces/<路径摘要>/；旧版工作区会话
-在显式恢复时复制到该目录，旧档留在原位供核对。
+        epilog='''用户配置：真实模型读取 ~/.cicada/config.toml，缺失时生成 DeepSeek 默认文件。
+内置 DeepSeek 专用协议与 OpenAI Chat Completions 兼容子集；自定义连接不启用私有思考。
+新建/采用当前配置：先选供应商实例和模型，再以 CLI 覆盖该模型设置。
+--provider 是保存的实例 ID，--model 是该实例内的本地模型 key，远端 ID 可以包含斜线。
+普通 --resume 继承存档的非秘密配置；连接改变时须 --resume-with-current-config 显式采用。
+help、list 与 fake 不读取用户连接或凭据。运行状态在 ~/.cicada/workspaces/<路径摘要>/。
 
-config.toml 示例（普通字段均可省略；不接受 API key 或 max_request_bytes）：
-version = 1
+config v2 示例（数值为示例，能力由用户确认；凭据不放入配置）：
+version = 2
 [defaults]
-provider = "deepseek"
-model = "deepseek-flash"
-think = true
-reasoning_effort = "high"
-num_ctx = 131072
-max_output_tokens = 32768
+provider = "work"
+model = "coder"
+[providers.work]
+name = "工作网关"
+protocol = "openai-chat-completions"
+base_url = "https://gateway.example.com/v1"
+default_model = "coder"
+api_key_env = "WORK_LLM_API_KEY"
+[providers.work.models.coder]
+id = "org/model-name"
+context_window = 131072
+max_output_tokens = 8192
+tools = true
 
-文件凭据：config.toml 可添加 [credentials.deepseek] 和 ref = "<UUIDv4>"。
-credentials.json 格式为 {"version":1,"entries":{"<同一UUIDv4>":
-{"provider":"deepseek","api_key":"<key>"}}}。仅按 ref 选择，不搜索孤立条目。
-两个文件须为 UTF-8，各不超过 64 KiB；key 去首尾空白后须非空、无内部空白或
-控制字符，最多 4096 UTF-8 bytes。--tui 缺凭据时在应用打开前启动遮蔽输入向导，
-确认后可靠保存；取消退出且不创建会话。普通恢复只补凭据并保留存档设置。
-非交互缺凭据时退出码 2：设置 DEEPSEEK_API_KEY，或先用 --tui 完成配置。
+Base URL 使用完整 API 根路径，程序追加 /chat/completions，不自动修改 /v1。
+高级模型项：stream_usage=true/false，output_token_field="max_tokens"/"max_completion_tokens"。
+支持旧版 DeepSeek config v1，首次保存到多供应商格式时保留原设置和凭据引用。
+文件 Key 用遮蔽输入保存到独立 credentials.json；环境变量仅读取目标实例的显式声明。
+被声明环境变量存在但无效时拒绝，不借用其他实例的 Key。两个文件各限64KiB。
 
-主屏 /login 不接受参数；↑/↓ 选择、Enter 确认、Tab 返回、Esc/Ctrl+C 取消。
-仅保存：下次新建会话及采用当前配置恢复生效，当前会话不变。
-保存并应用：正常空闲 DeepSeek 会话可选，仅影响后继普通请求与摘要；
-之后 /model 保留新凭据和思考设置。其他提供商或受阻断会话只能保存默认值。
-保存与应用分别报告结果；默认已保存而应用失败时，当前绑定保留。
-保留凭据不会复制环境 key；替换后未来启动仍优先环境变量。
-普通恢复继续继承存档配置；登录不验证账号、额度或远端模型可用性。
+/login 配置已有或新连接及多个模型；↑/↓选择、Enter确认、Tab返回、Esc/Ctrl+C取消。
+保存配置和保存并应用分别选择，设置下次默认另行确认。保存成功但应用受阻分别报告。
+/model 统一目录可直接输入过滤，Enter切换当前对话，Ctrl+D设默认、Ctrl+O关闭目标思考切换、
+Ctrl+L配置所选实例；Esc保留草稿。切换不清空对话或验证事实，不自动发摘要或探测账号。
+默认值与当前模型分别生效；打开菜单/保存配置不验证远端模型可用性。
 
 主屏 /rewind 查看当前持久会话各请求的文件改动，点击查看 diff、计划并确认还原，
 Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不在还原范围。
@@ -853,18 +1008,23 @@ Esc/Ctrl+C 返回。仅捕获 edit/write；PowerShell/check/进程外改动不�
 
 费用控制默认关闭。--max-model-calls 单独限制本进程发送次数；金额上限须同时给
 --cost-limit-cny 与 --cost-profile。普通/摘要共用额度，clear/new/resume/model/login
-不重置，重启新建额度。发送前按1,100,000输入tokens和本次输出cap预留，超限零发送；
+不重置，重启新建额度。发送前按显式输入上界和本次输出cap预留，超限零发送；
 完整成功计量及响应关闭后结算，缺计量/错误/取消保留预留并封口。/cost 查看详情。
 金额与单价最大10亿元、最多8位小数。价格文件为UTF-8 JSON（≤64KiB），示例（非现价）：
 {"schema_version":1,"source":"https://example.invalid/pricing","checked_at":"2026-10-15",
  "models":{"deepseek-flash":{"input_cny_per_million":"1.00","output_cny_per_million":"1.00"}}}
-按需增加deepseek-v4-pro。价格应覆盖所用模型/时段的上界；配置单价及输入上界冻结，
+v1仅适用于DeepSeek官方，输入上界1,100,000；其他实例必须使用价格v2，例如：
+{"schema_version":2,"source":"https://example.invalid/pricing","checked_at":"2026-10-21",
+ "models":[{"provider":"work","protocol":"openai-chat-completions",
+ "base_url":"https://gateway.example.com/v1","model":"org/model-name","input_token_bound":131072,
+ "input_cny_per_million":"1.00","output_cny_per_million":"1.00"}]}
+实例/协议/端点/远端模型必须完全匹配。价格应覆盖所用模型/时段的上界；配置冻结，
 不是实时价格或账户账单。账本在用户级工作区状态目录的 cost/，不从旧存档恢复消费额度。''',
     )
     parser.add_argument("--workspace", default=".", help="工作区根目录 (默认当前目录)")
     parser.add_argument("--script", help="fake model 剧本 JSON 文件; 与真实模型旗标互斥")
-    parser.add_argument("--provider", choices=("deepseek",), help="真实 provider (新会话默认 deepseek; 恢复继承存档)")
-    parser.add_argument("--model", help="deepseek-flash (默认)/deepseek-v4-pro")
+    parser.add_argument("--provider", help="已配置的供应商实例 ID (缺省使用用户默认值；恢复继承存档)")
+    parser.add_argument("--model", help="所选供应商下的模型配置 key；内置 deepseek-flash/deepseek-v4-pro")
     parser.add_argument("--think", action=argparse.BooleanOptionalAction, default=None,
                         help="开启/关闭思考 (默认开启; 思考可在 TUI 展开查看)")
     parser.add_argument("--reasoning-effort", choices=("low", "high", "max"), help="DeepSeek 思考强度 (默认 high)")

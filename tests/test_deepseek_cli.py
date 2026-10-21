@@ -69,13 +69,9 @@ def test_default_flash_and_pro_explicit_limits_persist_and_restore(monkeypatch, 
 ])
 def test_bad_provider_flags_zero_network(monkeypatch, tmp_path, args):
     bodies = mock_provider(monkeypatch)
-    if args[0] == "--provider":
-        with pytest.raises(SystemExit) as exc:
-            invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
-        assert exc.value.code == 2
-    else:
-        code, _, _ = invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
-        assert code == 2
+    # 实例ID由用户目录解析，未知供应商仍在发送前拒绝。
+    code, _, _ = invoke(monkeypatch, ["--workspace", str(tmp_path), *args, "任务"])
+    assert code == 2
     assert bodies == []
 
 

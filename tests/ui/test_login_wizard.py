@@ -20,6 +20,14 @@ from vt_screen import VtScreen
 ENTER = KeyPress(Keys.ControlM, '\r')
 
 
+@pytest.fixture(autouse=True)
+def legacy_login_view(monkeypatch):
+    """本模块保留旧单供应商视图回归；多供应商保存另由新向导集成检查。"""
+    original = FileUserConfigStore.read_view
+    monkeypatch.setattr(FileUserConfigStore, 'read_view',
+                        lambda self, *args, **kwargs: replace(original(self, *args, **kwargs), providers=()))
+
+
 def test_extremely_narrow_pages_stay_inside_terminal_columns(tmp_path):
     view = FileUserConfigStore(tmp_path / 'user').read_view('width-sentinel')
     wizard = LoginWizard(view)
@@ -43,6 +51,8 @@ async def test_first_run_masks_secret_and_saves_once(tmp_path):
     terminal.emit([ENTER, ENTER, ENTER, ENTER])
     result, errors = await asyncio.wait_for(task, 5)
     assert result.defaults_saved and errors == []
+    assert (result.selected_provider, result.selected_model) == (
+        store.load().defaults.provider, store.load().defaults.model)
     assert store.load().credential.reveal() == 'wizard-sentinel'
     assert terminal.started and terminal.stopped
     assert 'wizard-sentinel' not in terminal.output_text

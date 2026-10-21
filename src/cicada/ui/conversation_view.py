@@ -371,25 +371,28 @@ class ConversationView:
             if result is not None:
                 if result.defaults_saved:
                     outcome = result.application_outcome
+                    profiles = getattr(self, '_login_profiles_active', False)
+                    saved = '配置已保存' if profiles else '用户默认值已保存'
                     if outcome == 'applied':
-                        self.transcript.append_system('用户默认值已保存；当前会话已应用新的登录配置。')
+                        self.transcript.append_system(saved + '；当前会话已应用新的登录配置。')
                     elif outcome == 'unchanged':
-                        self.transcript.append_system('用户默认值已保存；当前会话配置与登录设置一致，未变更。')
+                        self.transcript.append_system(saved + '；当前会话配置与登录设置一致，未变更。')
                     elif outcome == 'not-requested':
-                        self.transcript.append_system('用户默认值已保存（下次新会话生效）；当前会话配置保持。')
+                        self.transcript.append_system(saved + ('；当前会话配置保持。' if profiles else
+                                                              '（下次新会话生效）；当前会话配置保持。'))
                     else:
                         self.transcript.append_error(
-                            '用户默认值已保存（下次新会话生效）；当前会话未应用：'
+                            saved + ('；当前会话未应用：' if profiles else '（下次新会话生效）；当前会话未应用：')
                             + (result.error_code or outcome))
                 elif result.error_code is not None:
                     self.transcript.append_error('登录配置未完成：' + result.error_code)
         elif isinstance(update, ConfigurationChanged):
             # 登录 04 (C7): 底栏从有效配置读取; 事件只含安全身份与 epoch
-            self.footer.set_model_label(update.identity.model)
+            self.footer.set_model_label(self._session.config.model_label)
             effort = (dict(update.identity.options).get('reasoning_effort', '-')
                       if update.identity.think else 'off')
             self.transcript.append_system(
-                f"已应用登录配置：{update.identity.model} · 思考={effort}"
+                f"已应用登录配置：{self._session.config.model_label} · 思考={effort}"
                 "（仅影响后继请求；对话、摘要与验证状态保留）。"
             )
         elif isinstance(update, ReasoningEffortChanged):
@@ -1002,11 +1005,12 @@ class ConversationView:
             if not self._view_closed and self._on_update is not None:
                 self._on_update()
 
-    def _open_login(self) -> bool:
+    def _open_login(self, provider_id: str | None = None) -> bool:
         self._gate.note_login_started()  # 同步屏障先于读取/任务创建。
         self.model_menu.dismiss()
         try:
-            view = self._session.login_view()
+            view = self._session.login_view(provider_id) if provider_id is not None else self._session.login_view()
+            self._login_profiles_active = bool(view.providers)
             self.login_modal.open(view)
         except UserConfigError as exc:
             self._gate.note_login_settled()
@@ -1060,7 +1064,9 @@ class ConversationView:
         if not options:
             self.transcript.append_system("当前会话不提供模型选择（无可用模型目录）。")
             return True
-        self.model_menu.open(options, current_id=self._session.config.model_label)
+        revision = self._session.model_catalog_revision
+        self.model_menu.open(options, current_id=self._session.current_model_option_id,
+                             catalog_revision=revision, search_enabled=revision is not None)
         if self._on_update is not None:
             self._on_update()
         return True
@@ -1075,25 +1081,58 @@ class ConversationView:
         self.model_menu.dismiss()  # Enter 确认即收起 (幂等; 前端已收起时无动作)
         if is_enter_barrier(self._session, self._gate):
             return  # 忙碌/finalizing/closing/closed: Enter 静默无动作
-        if option_id == self._session.config.model_label:
+        revision = self.model_menu.catalog_revision
+        if revision is None and option_id == self._session.current_model_option_id:
             return  # 同选 no-op: 不置屏障、不建任务、不发事件
         self._gate.note_model_started()
         self._sync_spinner()
         self._model_task = asyncio.get_running_loop().create_task(
-            self._run_model_select(option_id)
+            self._run_model_select(option_id, revision=revision)
         )
 
-    async def _run_model_select(self, option_id: str) -> None:
+    def handle_model_action(self, action: str, option_id: str) -> None:
+        if is_enter_barrier(self._session, self._gate):
+            return
+        if action == 'configure':
+            self._open_login(option_id.split('/', 1)[0])
+            return
+        option = next((item for item in self._session.model_options if item.id == option_id), None)
+        if option is None or not option.available:
+            self.transcript.append_error('模型不可用：' + (option.reason if option and option.reason else '请检查配置'))
+            return
+        revision = self.model_menu.catalog_revision
+        self.model_menu.dismiss()
+        self._gate.note_model_started()
+        self._sync_spinner()
+        self._model_task = asyncio.get_running_loop().create_task(
+            self._run_model_select(option_id, revision=revision, think=False if action == 'nonthinking' else None,
+                                   make_default=action == 'default'))
+
+    async def _run_model_select(self, option_id: str, *, revision: str | None = None,
+                                think: bool | None = None, make_default: bool = False) -> None:
         """等待模型选择落定; 成功确认由 ModelChanged 投影追加 (底栏同时刷新).
 
         落定 (成功/失败/取消) 都释放屏障 (finally 语义同清空/压缩路径);
         失败显示有界原因 (ModelSelectionError 不含凭据/请求历史), 取消如实传播。
         """
         try:
-            await self._session.select_model(option_id)
+            if make_default:
+                self._login_profiles_active = True
+                result = await self._session.set_default_model(option_id, catalog_revision=revision)
+                if result.defaults_saved:
+                    self.transcript.append_system('已设为下次启动默认模型；当前模型保持。')
+                elif result.error_code:
+                    self.transcript.append_error('默认模型未保存：' + result.error_code)
+            elif revision is not None or think is not None:
+                await self._session.select_model(option_id, catalog_revision=revision, think=think)
+            else:
+                await self._session.select_model(option_id)
         except Exception as exc:
             self._gate.note_model_settled()
             self.transcript.append_error(f"模型选择失败: {exc}")
+            if revision is not None and ('history' in str(exc).lower() or '历史' in str(exc)):
+                self.transcript.append_system('历史不兼容时，可在 /model 选中目标后按 Ctrl+O 关闭目标思考；'
+                                              '或用 /new 新建会话后选择该模型。')
             if self._on_update is not None:
                 self._on_update()
             return
@@ -1234,6 +1273,7 @@ def build(
         "status_lines": view.status_lines,  # (width) -> 状态行 (规格 §F), 空闲 []
         "model_menu": view.model_menu,  # DeepSeek 04: /model 目录 (契约 C7)
         "on_model_confirm": view.confirm_model_selection,
+        "on_model_action": view.handle_model_action,
         "on_shift_tab": view.handle_shift_tab,  # 票据 03: 思考强度循环 (C6)
         "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
         "modal": view.login_modal,

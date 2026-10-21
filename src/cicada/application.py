@@ -59,14 +59,14 @@ from cicada.core.messages import (
     isolate_tool_result,
 )
 from cicada.core.ports import ModelRequest, ToolSpec
-from cicada.costs import CostControlPort, CostLedger, CostSnapshot
+from cicada.costs import CostControlPort, CostError, CostLedger, CostSnapshot
 from cicada.diagnostic_export import ReportError, build_report, write_report
 from cicada.models import (
     CacheDiagnosticsPort, CacheRequestObservation, ConfigurationRequest, ModelBinding,
     ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ReasoningEffortPort,
     ReasoningEffortState, SafeModelIdentity,
 )
-from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserConfigError, UserConfigStore
+from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserDefaults, UserConfigError, UserConfigStore
 from cicada.persistence.codec import dumps_strict, encode_messages
 from cicada.persistence.routing import SessionStoreRoute, settle
 from cicada.persistence.contracts import (
@@ -1583,6 +1583,20 @@ class ApplicationSession:
     def model_options(self) -> tuple[ModelOption, ...]:
         return self._model_selection.options if self._model_selection is not None else ()
 
+    @property
+    def model_catalog_revision(self) -> str | None:
+        return getattr(self._model_selection, 'revision', None)
+
+    @property
+    def current_model_option_id(self) -> str | None:
+        route = self._model_route
+        return (route.binding.option_id or route.binding.identity.model) if route else None
+
+    def _validate_binding_cost(self, binding: ModelBinding) -> None:
+        if self._config.cost_control is not None:
+            self._config.cost_control.validate_identity(binding.identity)
+            self._config.cost_control.validate_identity(binding.summary_identity)
+
     def _reasoning_capability(self) -> ReasoningEffortPort | None:
         """最新 binding 的普通模型强度能力 (C5); 每次从当前路由取, 不缓存过期 provider。"""
         route = self._model_route
@@ -1616,25 +1630,39 @@ class ApplicationSession:
         if self._view_only_reason or self._storage_failed or self._process_uncertain:
             raise ModelSelectionError(f"{blocked} is blocked by the session state")
 
-    async def select_model(self, option_id: str) -> None:
+    async def select_model(self, option_id: str, *, catalog_revision: str | None = None,
+                           think: bool | None = None) -> None:
         self._check_model_transaction_admission("model selection")
         if self._model_selection is None or self._model_route is None:
             raise ModelSelectionError("model selection is unavailable for this provider")
         if option_id not in {option.id for option in self.model_options}:
             raise ModelSelectionError("unknown model option")
-        if option_id == self._model_route.binding.identity.model:
-            return
+        catalog = self._model_selection if getattr(self._model_selection, 'is_catalog', False) else None
+        if catalog_revision is not None and catalog_revision != self.model_catalog_revision:
+            raise ModelSelectionError('模型目录已变化，请重新打开 /model')
+        current = self._model_route.binding
+        if option_id == self.current_model_option_id and think is None:
+            if catalog is None or current.catalog_revision == catalog.revision:
+                return
         self._model_in_flight = True
         self._model_done = asyncio.get_running_loop().create_future()
         try:
             try:
-                binding = self._model_selection.prepare_model(option_id)
+                binding = (catalog.prepare_model(option_id, think=think) if catalog is not None
+                           else self._model_selection.prepare_model(option_id))
+                self._validate_binding_cost(binding)
                 binding.validate_request(ModelRequest(
                     messages=self._context_projection.project(self._history),
                     tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
                 ))
             except ValueError as exc:
-                raise ModelSelectionError("model selection rejected by configuration or history") from exc
+                if isinstance(exc, CostError):
+                    raise ModelSelectionError('费用准入拒绝：' + str(exc)) from exc
+                if catalog is None:
+                    raise ModelSelectionError("model selection rejected by configuration or history") from exc
+                if isinstance(exc, UserConfigError):
+                    raise ModelSelectionError('目标配置或凭据不可用，请打开 /login 检查') from exc
+                raise ModelSelectionError('配置、费用或历史不兼容；可在 /model 关闭目标思考后切换，或 /new 新建会话') from exc
             persistence = self._config.persistence
             identity = None
             if persistence is not None:
@@ -1644,7 +1672,7 @@ class ApplicationSession:
                     max_request_bytes=safe.max_request_bytes,
                     sources={**persistence.identity.sources, "model": "selection"})
                 persistence = replace(persistence, identity=identity)
-            new_config = replace(self._config, model_label=binding.identity.model,
+            new_config = replace(self._config, model_label=binding.label or binding.identity.model,
                                  budget=binding.budget, persistence=persistence)
             self._notify(OperationBusy(operation="model"))
             if self._store is None:
@@ -1710,11 +1738,17 @@ class ApplicationSession:
         try:
             try:
                 binding = capability.prepare_reasoning_effort(level)
+                current_binding = self._model_route.binding
+                binding = replace(binding, option_id=current_binding.option_id,
+                    label=current_binding.label, catalog_revision=current_binding.catalog_revision)
+                self._validate_binding_cost(binding)
                 binding.validate_request(ModelRequest(
                     messages=self._context_projection.project(self._history),
                     tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
                 ))
             except ValueError as exc:
+                if isinstance(exc, CostError):
+                    raise ModelSelectionError('费用准入拒绝：' + str(exc)) from exc
                 raise ModelSelectionError(
                     "reasoning effort change rejected by configuration or history") from exc
             persistence = self._config.persistence
@@ -1729,7 +1763,7 @@ class ApplicationSession:
                     base_url=safe.base_url, think=safe.think, options=dict(safe.options),
                     max_request_bytes=safe.max_request_bytes, sources=sources)
                 persistence = replace(persistence, identity=identity)
-            new_config = replace(self._config, model_label=binding.identity.model,
+            new_config = replace(self._config, model_label=binding.label or binding.identity.model,
                                  budget=binding.budget, persistence=persistence)
             self._notify(OperationBusy(operation="model"))
             if self._store is None:
@@ -1824,10 +1858,10 @@ class ApplicationSession:
         policy.summary_token_counter = binding.summary_token_counter
         policy.invalidate()
         # 04 (C6): /model 与 /login 从最新接受绑定准备, 不恢复启动缓存对象
-        if isinstance(binding.model, ModelSelectionPort):
-            self._model_selection = binding.model
-        if isinstance(binding.model, ModelConfigurationPort):
-            self._model_configuration = binding.model
+        if not getattr(self._model_selection, 'is_catalog', False):
+            self._model_selection = binding.model if isinstance(binding.model, ModelSelectionPort) else None
+        self._model_configuration = (binding.model
+            if isinstance(binding.model, ModelConfigurationPort) else None)
 
     async def execute(self, prompt: str) -> RequestOutcome:
         if self._session_cleanup_failed is not None:
@@ -2811,7 +2845,7 @@ class ApplicationSession:
                 self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
             raise UserConfigError('login', 'operation-in-progress')
 
-    def login_view(self) -> LoginView:
+    def login_view(self, provider_id: str | None = None) -> LoginView:
         """同步占住编辑窗口后才观察；失败释放，关闭/取消不改变任何会话事实。"""
         self._check_login_admission()
         if self._login_in_flight:
@@ -2822,12 +2856,20 @@ class ApplicationSession:
         try:
             if self._login_store is None:
                 self._login_store = self._login_store_factory()
-            environment = self._login_environment() if self._login_environment else None
-            view = self._login_store.read_view(environment)
-            apply_offered = False
+            catalog = self._model_selection if getattr(self._model_selection, 'is_catalog', False) else None
+            environment = (self._login_environment() if self._login_environment and catalog is None else None)
+            if catalog is not None:
+                selected = provider_id or (self._model_route.binding.identity.provider if self._model_route else None)
+                view = self._login_store.read_view(provider_id=selected)
+                catalog.reload(self._login_store.read_profiles(),
+                    default_id='/'.join(self._login_store.read_default_reference()))
+            else:
+                view = self._login_store.read_view(environment)
+            apply_offered = bool(catalog is not None and not self._view_only_reason
+                                 and not self._storage_failed and not self._process_uncertain)
             if self._model_route is not None:
                 identity = self._model_route.binding.identity
-                if identity.provider == 'deepseek':
+                if catalog is None and identity.provider == 'deepseek':
                     options = dict(identity.options)
                     view = replace(view, model=identity.model, think=identity.think,
                         reasoning_effort=options['reasoning_effort'], num_ctx=options['num_ctx'],
@@ -2894,6 +2936,14 @@ class ApplicationSession:
                     pass  # 尚未起跑的 worker 零写入；已起跑的 Adapter 返回真实结果。
                 except Exception:
                     result = LoginResult(False, False, 'not-requested', 'write-failed')
+            if result.defaults_saved and getattr(self._model_selection, 'is_catalog', False):
+                try:
+                    default_id = '/'.join(self._login_store.read_default_reference())
+                    self._model_selection.reload(self._login_store.read_profiles(), default_id=default_id)
+                except (ValueError, OSError):
+                    result = replace(result, application_outcome='blocked' if submission.target == 'save-and-apply'
+                                     else 'not-requested', error_code='configuration-changed')
+                    return result
             if submission.target == 'save-and-apply':
                 if result.defaults_saved:
                     result = await self._apply_login_configuration(submission, result)
@@ -2922,21 +2972,40 @@ class ApplicationSession:
             return replace(saved, application_outcome='blocked', error_code='session-blocked')
         route = self._model_route
         configuration = self._model_configuration
-        if (route is None or configuration is None
-                or route.binding.identity.provider != 'deepseek'):
+        catalog = self._model_selection if getattr(self._model_selection, 'is_catalog', False) else None
+        if route is None or (catalog is None and (configuration is None
+                or route.binding.identity.provider != 'deepseek')):
             return replace(saved, application_outcome='blocked', error_code='unsupported-target')
         current = route.binding.identity
-        target = replace(current, model=submission.defaults.model,
-            think=submission.defaults.think,
-            options=(('num_ctx', submission.defaults.num_ctx),
-                     ('max_tokens', submission.defaults.max_output_tokens),
-                     ('reasoning_effort', submission.defaults.reasoning_effort)))
-        # 完全 keep + 有效设置相同 = no-op: 不新增 epoch, 不使计量锚失效 (D8)
-        if submission.credential_action == 'keep' and target == current:
-            return replace(saved, application_outcome='unchanged')
         try:
-            binding = configuration.prepare_configuration(
-                ConfigurationRequest(target, submission.credential_action, submission.credential))
+            if catalog is not None:
+                chosen_id = f'{submission.defaults.provider}/{submission.defaults.model}'
+                proposed = submission.provider_profile
+                if proposed is not None:
+                    observed, observed_model = catalog.lookup(chosen_id)
+                    proposed_model = next(m for m in proposed.models if m.key == submission.defaults.model)
+                    if (observed.protocol, observed.base_url, observed.auth, observed_model.model_id) != (
+                            proposed.protocol, proposed.base_url, proposed.auth, proposed_model.model_id):
+                        return replace(saved, application_outcome='blocked', error_code='configuration-changed')
+                binding = catalog.prepare_model(
+                    chosen_id,
+                    credential=submission.credential if submission.credential_action == 'replace' else None)
+                if (submission.credential_action == 'keep' and binding.identity == current
+                        and binding.catalog_revision == route.binding.catalog_revision):
+                    return replace(saved, application_outcome='unchanged')
+            else:
+                target = replace(current, model=submission.defaults.model,
+                    think=submission.defaults.think,
+                    options=(('num_ctx', submission.defaults.num_ctx),
+                             ('max_tokens', submission.defaults.max_output_tokens),
+                             ('reasoning_effort', submission.defaults.reasoning_effort)))
+                if submission.credential_action == 'keep' and target == current:
+                    return replace(saved, application_outcome='unchanged')
+                binding = configuration.prepare_configuration(
+                    ConfigurationRequest(target, submission.credential_action, submission.credential))
+            self._validate_binding_cost(binding)
+        except CostError as exc:
+            return replace(saved, application_outcome='blocked', error_code='cost-admission: ' + str(exc))
         except ValueError:  # UserConfigError 同为 ValueError; 固定分类, 不回显细节
             return replace(saved, application_outcome='blocked', error_code='invalid-model-settings')
         try:
@@ -2959,7 +3028,7 @@ class ApplicationSession:
                 base_url=safe.base_url, think=safe.think, options=dict(safe.options),
                 max_request_bytes=safe.max_request_bytes, sources=sources)
             persistence = replace(persistence, identity=identity)
-        new_config = replace(self._config, model_label=binding.identity.model,
+        new_config = replace(self._config, model_label=binding.label or binding.identity.model,
                              budget=binding.budget, persistence=persistence)
         if self._store is None:
             self._publish_binding(binding, new_config, self._epoch_id)
@@ -2991,6 +3060,30 @@ class ApplicationSession:
         self._publish_binding(binding, new_config, epoch_id)
         self._notify(ConfigurationChanged(binding.identity, epoch_id))
         return LoginResult(True, True, 'applied')
+
+    async def set_default_model(self, option_id: str, *, catalog_revision: str | None = None) -> LoginResult:
+        self._check_model_transaction_admission('default model')
+        catalog = self._model_selection
+        if not getattr(catalog, 'is_catalog', False):
+            raise ModelSelectionError('当前目录不支持保存默认模型')
+        if catalog_revision is not None and catalog_revision != catalog.revision:
+            raise ModelSelectionError('模型目录已变化，请重新打开 /model')
+        provider, model = catalog.lookup(option_id)
+        view = self.login_view(provider_id=provider.id)
+        try:
+            if catalog_revision is not None and catalog_revision != catalog.revision:
+                raise ModelSelectionError('模型目录已变化，请重新打开 /model')
+            # login_view 可能观察到外部编辑，提交只能使用同一最新修订的配置。
+            provider, model = catalog.lookup(option_id)
+            defaults = UserDefaults(provider=provider.id, model=model.key, think=model.think,
+                reasoning_effort=model.reasoning_effort, num_ctx=model.context_window,
+                max_output_tokens=model.max_output_tokens)
+            submission = LoginSubmission(defaults, 'keep', view.revision,
+                provider_profile=replace(provider, credential_ref=None), set_default=True)
+            return await self.configure_login(submission)
+        except BaseException:
+            self.cancel_login()
+            raise
 
     # --- 关闭 ----------------------------------------------------------------------
 
@@ -3521,11 +3614,14 @@ async def open_application(
             model.set_cost_control(config.cost_control)
         binding = model.initial_binding if isinstance(model, ModelSelectionPort) else None
         if binding is not None:
+            if config.cost_control is not None:
+                config.cost_control.validate_identity(binding.identity)
+                config.cost_control.validate_identity(binding.summary_identity)
             policy_state["model_selection"] = model
             policy_state["model_route"] = ModelRoute(binding)
             policy_state["summary_route"] = ModelRoute(binding, summary=True)
             budget_config = binding.budget
-            config = replace(config, budget=budget_config, model_label=binding.identity.model)
+            config = replace(config, budget=budget_config, model_label=binding.label or binding.identity.model)
             if context_projection is None:
                 context_projection = ContextProjection()
             model = policy_state["model_route"]

@@ -7,7 +7,6 @@ from typing import Callable
 from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
-from cicada.plugins.deepseek.protocol import REASONING_EFFORTS
 from cicada.ui.rendering import sanitize_display
 from cicada.ui.terminal_io import Terminal
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
@@ -17,6 +16,16 @@ from cicada.user_config import (
     LoginResult, LoginSubmission, LoginView, SecretValue, UserConfigError,
     UserConfigStore, UserDefaults,
 )
+
+REASONING_EFFORTS = ('low', 'high', 'max')  # 旧登录视图的展示档位；新向导使用模型配置。
+
+
+def make_login_wizard(view: LoginView, **kwargs):
+    if view.providers:
+        from cicada.ui.provider_wizard import ProviderWizard
+        return ProviderWizard(view, **kwargs)
+    kwargs.pop('initial_set_default', None)
+    return LoginWizard(view, **kwargs)
 
 
 class LoginWizard:
@@ -302,7 +311,8 @@ class LoginModal:
         return self.wizard is not None
 
     def open(self, view: LoginView) -> None:
-        self.wizard = LoginWizard(view, title='Cicada · 登录配置', display_style=self.display_style)
+        self.wizard = make_login_wizard(view, title='Cicada · 登录配置', display_style=self.display_style,
+                                       initial_set_default=False)
 
     def dismiss(self) -> None:
         if self.wizard is not None:
@@ -328,13 +338,16 @@ class LoginModal:
 async def run_startup_login(
     terminal: Terminal, store: UserConfigStore, view: LoginView, *,
     save_defaults: UserDefaults | None = None, explicit: dict[str, object] | None = None,
+    initial_set_default: bool | None = None,
 ) -> tuple[LoginResult | None, list[str]]:
     """应用 open 前唯一 writer；结束并恢复后才可进入主屏。"""
-    wizard = LoginWizard(view, save_defaults=save_defaults, explicit=explicit)
+    wizard = make_login_wizard(view, save_defaults=save_defaults, explicit=explicit,
+                               initial_set_default=initial_set_default)
     done = asyncio.Event()
     save_task: asyncio.Task | None = None
     failed = False
     errors: list[str] = []
+    selected_reference: tuple[str, str] | None = None
 
     def render() -> None:
         nonlocal failed
@@ -347,7 +360,7 @@ async def run_startup_login(
             done.set()
 
     def on_input(batch) -> None:
-        nonlocal save_task
+        nonlocal save_task, selected_reference
         if failed or done.is_set():
             return
         for key in batch:
@@ -357,6 +370,7 @@ async def run_startup_login(
                 return
             if action == 'submit':
                 submission = wizard.submission()
+                selected_reference = (submission.defaults.provider, submission.defaults.model)
                 wizard.clear_secret()
                 save_task = asyncio.create_task(store.save(submission))
                 save_task.add_done_callback(lambda _: done.set())
@@ -414,4 +428,7 @@ async def run_startup_login(
                 errors.append('login terminal restore errors')
         except Exception:
             errors.append('login terminal mode restore failed')
+    if result is not None and result.defaults_saved and not result.error_code and selected_reference:
+        result = replace(result, selected_provider=selected_reference[0],
+                         selected_model=selected_reference[1])
     return result, errors

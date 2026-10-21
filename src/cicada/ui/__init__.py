@@ -104,6 +104,7 @@ async def run_tui_session(
         status_lines=view.status_lines,
         model_menu=view.model_menu,
         on_model_confirm=view.confirm_model_selection,
+        on_model_action=view.handle_model_action,
         modal=view.login_modal,
         review=view.review_view,
         rewind=view.rewind_view,

@@ -102,6 +102,7 @@ class MainScreenFrontend:
         status_lines: Callable[[int], list[str]] | None = None,
         model_menu: ModelMenu | None = None,
         on_model_confirm: Callable[[str], None] | None = None,
+        on_model_action: Callable[[str, str], None] | None = None,
         modal: LoginModal | None = None,
         display_style: DisplayStyle | None = None,
         layout_document: Callable[[int, DisplayAction | None], DocumentLayout] | None = None,
@@ -136,6 +137,7 @@ class MainScreenFrontend:
         self._status_lines = status_lines
         self._model_menu = model_menu
         self._on_model_confirm = on_model_confirm
+        self._on_model_action = on_model_action
         self._modal = modal
         self._review = review
         self._rewind = rewind
@@ -530,6 +532,14 @@ class MainScreenFrontend:
         # 置于冲刷之后, 使 Alt+鼠标键同样先派发 Escape (D2 无例外)。
         if key.key is Keys.WindowsMouseEvent:
             return
+        # 目录内的动作先于主屏退出/工具展开，不改变菜单外原键位。
+        if self._model_menu_active() and self._model_menu.search_enabled:
+            action = {Keys.ControlD: 'default', Keys.ControlO: 'nonthinking', Keys.ControlL: 'configure'}.get(key.key)
+            if action is not None:
+                option = self._model_menu.selected
+                if option is not None and self._on_model_action is not None:
+                    self._on_model_action(action, option.id)
+                return
         # Ctrl+C / Ctrl+D: 直接派发 (Escape 前缀已在上方先行派发)
         if key.key in (Keys.ControlC,) or data == "\x03":
             if self._on_ctrl_c is not None:
@@ -623,7 +633,7 @@ class MainScreenFrontend:
             self._disarm_escape_prefix()
             self._dispatch_escape()  # 前缀窗口内的其他键: Escape 先行派发
         # 模型菜单优先键位 (契约 C7): 箭头/Enter 先于普通 editor 命令解释;
-        # 其余键先收起菜单再按原键继续 (编辑新草稿不丢字符)
+        # 跨供应商目录的普通文本进入独立搜索；旧目录其余键先收起再交编辑器。
         if self._model_menu_active():
             if key.key is Keys.Up:
                 self._model_menu.move(-1)
@@ -634,6 +644,17 @@ class MainScreenFrontend:
             if key.key in (Keys.ControlM,) or data == "\r":
                 self._confirm_model_menu()
                 return
+            if self._model_menu.search_enabled:
+                if key.key in (Keys.ControlH, Keys.Backspace):
+                    self._model_menu.filter(self._model_menu.query[:-1])
+                    return
+                if key.key is Keys.ControlU:
+                    self._model_menu.filter('')
+                    return
+                if key.key is Keys.BracketedPaste or not isinstance(key.key, Keys):
+                    if not any(ord(char) < 32 for char in data):
+                        self._model_menu.filter(self._model_menu.query + data)
+                    return
             self._model_menu.dismiss()
         if key.key is Keys.BracketedPaste:
             self._editor.insert_text(data)
@@ -900,6 +921,8 @@ class MainScreenFrontend:
         if self._model_menu is None:
             return
         option = self._model_menu.selected
+        if option is not None and not option.available:
+            return
         self._model_menu.dismiss()
         if option is not None and self._on_model_confirm is not None:
             self._on_model_confirm(option.id)

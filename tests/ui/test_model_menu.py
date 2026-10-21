@@ -92,6 +92,7 @@ class TUIHarness:
             status_lines=self.bundle["status_lines"],
             model_menu=self.bundle["model_menu"],
             on_model_confirm=self.bundle["on_model_confirm"],
+            on_model_action=self.bundle["on_model_action"],
             modal=self.bundle["modal"],
         )
         self.runner: asyncio.Task | None = None
@@ -152,6 +153,16 @@ def test_open_defaults_to_current_and_move_wraps():
     assert menu.move(-1) and menu.selected.id == "deepseek-v4-pro"
     assert menu.dismiss() and not menu.is_open
     assert menu.selected is None and not menu.move(1)
+    menu.open((ModelOption('work/coder', '工作 · Coding', is_default=True),
+               ModelOption('personal/coder', '个人 · Coding', available=False, reason='缺凭据')),
+              current_id='work/coder', catalog_revision='r1', search_enabled=True)
+    menu.filter('PERSONAL')
+    assert menu.selected.id == 'personal/coder' and menu.catalog_revision == 'r1'
+    assert '缺凭据' in strip_terminal_sequences('\n'.join(menu.render(80, 6)))
+    menu.filter('not-present')
+    assert menu.selected is None and '没有匹配' in strip_terminal_sequences('\n'.join(menu.render(80, 6)))
+    menu.filter('')
+    assert '（默认）' in strip_terminal_sequences('\n'.join(menu.render(80, 6)))
 
 
 def test_open_empty_options_stays_closed():

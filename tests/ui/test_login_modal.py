@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -27,6 +28,14 @@ from tests.ui.vt_screen import VtScreen
 PASTE = KeyPress(Keys.BracketedPaste, 'modal-sentinel')
 CTRL_C = KeyPress(Keys.ControlC, '\x03')
 CTRL_D = KeyPress(Keys.ControlD, '\x04')
+
+
+@pytest.fixture(autouse=True)
+def legacy_login_view(monkeypatch):
+    """保留旧视图键序列和保存/关闭证明，不把新增字段当旧页布局。"""
+    original = FileUserConfigStore.read_view
+    monkeypatch.setattr(FileUserConfigStore, 'read_view',
+                        lambda self, *args, **kwargs: replace(original(self, *args, **kwargs), providers=()))
 
 
 async def settled(h):

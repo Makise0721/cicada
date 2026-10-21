@@ -148,6 +148,14 @@ def prepare_restored_launch(
             "请重传与保存时相同的 --skills-dir, "
             "或用 --resume-with-current-config 以当前配置恢复"
         )
+    protocol = launch.options.get('protocol')
+    if protocol in ('openai-chat-completions', 'deepseek-chat'):
+        from cicada.models import SafeModelIdentity
+        SafeModelIdentity(launch.provider, launch.model, launch.base_url, launch.think,
+                          tuple(launch.options.items()), launch.max_request_bytes)
+        if not {'num_ctx', 'max_tokens', 'model_key', 'profile_version'} <= set(launch.options):
+            raise ValueError('存档模型配置不完整')
+        return launch
     if launch.provider not in ("deepseek", "fake"):
         raise ValueError("存档 provider 已不受支持; 使用 --resume-with-current-config 显式采用当前配置")
     if launch.provider == "fake":
