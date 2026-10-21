@@ -1,9 +1,7 @@
 """拥有响应生命周期的 DeepSeek SSE ModelPort；零自动 HTTP 重试。"""
 
-import asyncio
 import hashlib
 import json
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 
@@ -11,7 +9,7 @@ import httpx
 
 from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
-from cicada.core.ports import ModelRequest, StreamDone, StreamEvent
+from cicada.core.ports import ModelRequest, StreamEvent
 from cicada.costs import CostError, CostLedger
 from cicada.models import (
     CacheRequestObservation, ConfigurationRequest, ModelBinding, ModelOption, SafeModelIdentity,
@@ -19,7 +17,10 @@ from cicada.models import (
 from cicada.plugins.deepseek.protocol import (
     BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request, request_body_bytes,
 )
-from cicada.plugins.deepseek.sse import Completion, ProtocolError, SSEDecoder
+from cicada.plugins.deepseek.sse import Completion
+from cicada.plugins.chat_stream import (
+    close_response as _close_response, wait_operation as _wait_operation, stream_chat,
+)
 
 DEFAULT_TIMEOUT = httpx.Timeout(connect=10, read=60, write=30, pool=10)
 CALL_DEADLINE_S = 300.0
@@ -58,57 +59,27 @@ def _request_shape(request: ModelRequest, identity: SafeModelIdentity, body: dic
     )
 
 
-async def _wait_operation(operation, cancel: CancelToken, deadline: float):
-    """发送和每次读取都参与协作取消与同一个总 deadline。"""
-    task = asyncio.ensure_future(operation)
-    cancelled = asyncio.create_task(cancel.wait())
-    delivered = False
-    try:
-        done, _ = await asyncio.wait({task, cancelled}, timeout=max(0, deadline - time.monotonic()),
-                                     return_when=asyncio.FIRST_COMPLETED)
-        if cancelled in done:
-            raise asyncio.CancelledError
-        if task not in done:
-            raise TimeoutError
-        result = task.result()
-        delivered = True
-        return result
-    finally:
-        cancelled.cancel()
-        if not task.done():
-            task.cancel()
-        await asyncio.gather(task, cancelled, return_exceptions=True)
-        # send 与取消同一轮就绪时，响应仍归我们所有，不能丢在 task.result 中。
-        if not delivered and not task.cancelled() and task.exception() is None:
-            result = task.result()
-            if isinstance(result, httpx.Response):
-                await _close_response(result, deadline)
-
-
-async def _close_response(response: httpx.Response, deadline: float) -> bool:
-    """保留关闭任务直到明确结果；调用方取消不会遗弃已经取得的响应。"""
-    close_task = asyncio.create_task(asyncio.wait_for(
-        response.aclose(), timeout=max(0.01, min(10, deadline - time.monotonic()))))
-    interrupted = False
-    while True:
-        try:
-            await asyncio.shield(close_task)
-            return interrupted
-        except asyncio.CancelledError:
-            if close_task.cancelled():
-                raise
-            interrupted = True
-
-
 class DeepSeekModel:
     def __init__(self, client: httpx.AsyncClient, config: DeepSeekConfig, api_key: str, *,
-                 cost_control: CostLedger | None = None) -> None:
+                 cost_control: CostLedger | None = None,
+                 identity_override: SafeModelIdentity | None = None) -> None:
         if not isinstance(api_key, str) or not api_key.strip() or any(c in api_key for c in "\r\n"):
             raise ValueError("DEEPSEEK_API_KEY is missing or invalid")
         self.client = client
         self.config = config
         self._api_key = api_key
         self._cost_control = cost_control
+        if identity_override is not None:
+            options = dict(identity_override.options)
+            if (identity_override.model != config.model or identity_override.base_url != BASE_URL
+                    or identity_override.think != config.think
+                    or identity_override.max_request_bytes != config.max_request_bytes
+                    or options.get("num_ctx") != config.num_ctx
+                    or options.get("max_tokens") != config.max_tokens
+                    or options.get("reasoning_effort") != config.reasoning_effort
+                    or options.get("protocol", "deepseek-chat") != "deepseek-chat"):
+                raise ValueError("DeepSeek identity does not match its effective configuration")
+        self._identity_override = identity_override
         # 缓存 03 (契约 C7): 每实例一份比较基线与最新观察; 换模型/强度/配置
         # 准备出的新实例从空开始, 不持久、不跨进程恢复。
         self._observation: CacheRequestObservation | None = None
@@ -117,6 +88,21 @@ class DeepSeekModel:
         from .tokenizer import FlashTokenCounter, ProTokenCounter
         counter_type = FlashTokenCounter if config.model == "deepseek-flash" else ProTokenCounter
         self._token_counter = counter_type(config)
+
+    @property
+    def identity(self) -> SafeModelIdentity:
+        return self._identity_override or self.config.identity
+
+    def _identity_for(self, config: DeepSeekConfig) -> SafeModelIdentity | None:
+        if self._identity_override is None:
+            return None
+        options = dict(self._identity_override.options)
+        options.update(num_ctx=config.num_ctx, max_tokens=config.max_tokens,
+                       reasoning_effort=config.reasoning_effort)
+        if config.model != self.config.model and "model_key" in options:
+            options["model_key"] = config.model
+        return replace(self._identity_override, model=config.model, think=config.think,
+                       options=tuple(options.items()), max_request_bytes=config.max_request_bytes)
 
     @property
     def cache_observation(self) -> CacheRequestObservation | None:
@@ -136,15 +122,17 @@ class DeepSeekModel:
     @property
     def initial_binding(self) -> ModelBinding:
         summary_config = replace(self.config, think=False, max_tokens=2048)
-        summary = DeepSeekModel(self.client, summary_config, self._api_key, cost_control=self._cost_control)
-        return ModelBinding(self, summary, self.config.identity, summary_config.identity,
+        summary = DeepSeekModel(self.client, summary_config, self._api_key, cost_control=self._cost_control,
+                                identity_override=self._identity_for(summary_config))
+        return ModelBinding(self, summary, self.identity, summary.identity,
                             BudgetConfig(self.config.num_ctx, self.config.max_tokens),
                             BudgetConfig(summary_config.num_ctx, summary_config.max_tokens),
                             self.config.validate_request, self._token_counter, summary._token_counter)
 
     def prepare_model(self, option_id: str) -> ModelBinding:
         config = replace(self.config, model=option_id)
-        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control).initial_binding
+        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control,
+                             identity_override=self._identity_for(config)).initial_binding
 
     @property
     def reasoning_efforts(self) -> tuple[str, ...]:
@@ -159,12 +147,13 @@ class DeepSeekModel:
         if effort not in REASONING_EFFORTS:
             raise ValueError(f"unknown reasoning effort: {effort!r}")
         config = replace(self.config, think=True, reasoning_effort=effort)
-        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control).initial_binding
+        return DeepSeekModel(self.client, config, self._api_key, cost_control=self._cost_control,
+                             identity_override=self._identity_for(config)).initial_binding
 
     def prepare_configuration(self, request: ConfigurationRequest) -> ModelBinding:
         """登录应用准备: 复用既有 client, 零网络/文件 I/O, 旧对象保持不可变。"""
         identity = request.identity
-        if identity.provider != "deepseek" or type(identity.think) is not bool:
+        if identity.provider != self.identity.provider or type(identity.think) is not bool:
             raise ValueError("DeepSeek configuration requires a deepseek identity with explicit think")
         if identity.base_url not in (None, BASE_URL):
             raise ValueError("DeepSeek configuration requires the official endpoint")
@@ -177,7 +166,11 @@ class DeepSeekModel:
             max_request_bytes=identity.max_request_bytes or REQUEST_LIMIT,
         )
         key = self._api_key if request.credential_action == "keep" else request.credential.reveal()
-        return DeepSeekModel(self.client, config, key, cost_control=self._cost_control).initial_binding
+        options.update(dict(config.identity.options))
+        return DeepSeekModel(self.client, config, key, cost_control=self._cost_control,
+                             identity_override=replace(identity, base_url=BASE_URL,
+                                 options=tuple(options.items()),
+                                 max_request_bytes=config.max_request_bytes)).initial_binding
 
     def _record_observation(self, request: ModelRequest, body: dict) -> None:
         """缓存 03 (契约 C7): client.send 实际启动的同步接缝调用一次。
@@ -188,7 +181,7 @@ class DeepSeekModel:
         """
         self._send_sequence += 1
         try:
-            shape = _request_shape(request, self.config.identity, body)
+            shape = _request_shape(request, self.identity, body)
             baseline = self._shape_baseline
             if baseline is None or baseline.identity != shape.identity:
                 observation = CacheRequestObservation(
@@ -224,104 +217,13 @@ class DeepSeekModel:
             self._observation = None
 
     async def stream(self, request: ModelRequest, cancel: CancelToken) -> AsyncIterator[StreamEvent]:
-        if cancel.cancelled:
-            yield StreamDone("aborted")
-            return
-        completion = Completion(think=self.config.think)
-        response = None
-        chunks = None
-        terminal = StreamDone("error", "deepseek request failed")
-        calls = []
-        task_cancelled = False
-        reservation = None
-        deadline = time.monotonic() + CALL_DEADLINE_S
-        try:
-            body = build_request(request, self.config)
-            built = self.client.build_request("POST", BASE_URL + "/chat/completions", content=request_body_bytes(body),
-                headers={"Authorization": "Bearer " + self._api_key, "Accept-Encoding": "identity",
-                         "Content-Type": "application/json"},
-                timeout=DEFAULT_TIMEOUT)
-            if len(built.content) > self.config.max_request_bytes:
-                raise ProtocolError("request exceeds byte limit; not sent")
-            if cancel.cancelled:
-                raise asyncio.CancelledError
-            if self._cost_control is not None:
-                reservation = self._cost_control.reserve(self.config.model, self.config.max_tokens)
-            # 缓存 03 (契约 C7): 观察只在通过本地验证与字节守卫且 send 实际启动
-            # 的同步接缝更新一次, 不能提前到 build_request; 发送后失败仍保留。
-            self._record_observation(request, body)
-            response = await _wait_operation(self.client.send(built, stream=True), cancel, deadline)
-            if not response.is_success:
-                # 不读取错误 body；状态码本身足以分类且不会回显服务提供的秘密。
-                terminal = StreamDone("error", f"deepseek HTTP {response.status_code}")
-            else:
-                if response.headers.get("content-encoding", "identity") != "identity":
-                    raise ProtocolError("unexpected response content encoding")
-                decoder = SSEDecoder()
-                # httpx aiter_bytes 在 EOF 内隐式 aclose，读任务取消会打断关闭并
-                # 留下 is_closed=True 的未释放响应。直接消费已请求 identity 的
-                # transport stream，关闭只在下方受拥有的监督点发生。
-                chunks = response.stream.__aiter__()
-                while True:
-                    try:
-                        chunk = await _wait_operation(anext(chunks), cancel, deadline)
-                    except StopAsyncIteration:
-                        decoder.finish()
-                        if completion.done:
-                            break
-                        raise ProtocolError("stream ended without DONE") from None
-                    for frame in decoder.feed(chunk):
-                        for event in completion.consume(frame):
-                            yield event
-                calls, reason, error = completion.terminal()
-                terminal = StreamDone(reason, error, completion.metrics)
-        except asyncio.CancelledError:
-            task_cancelled = asyncio.current_task().cancelling() > 0
-            terminal = StreamDone("aborted", metrics=completion.metrics)
-            calls = []
-        except TimeoutError:
-            terminal = StreamDone("error", "deepseek call timed out", completion.metrics)
-            calls = []
-        except ProtocolError as exc:
-            terminal = StreamDone("error", f"deepseek protocol error: {exc}", completion.metrics)
-            calls = []
-        except CostError as exc:
-            terminal = StreamDone('error', str(exc), completion.metrics)
-            calls = []
-        except Exception:
-            # 连接、URL、构造或未知异常均不回显 exc/request/Authorization。
-            terminal = StreamDone("error", "deepseek request or stream failed", completion.metrics)
-            calls = []
-        finally:
-            if response is not None:
-                try:
-                    if await _close_response(response, deadline):
-                        task_cancelled = True
-                        terminal = StreamDone("aborted", metrics=completion.metrics)
-                        calls = []
-                except Exception:
-                    terminal = StreamDone("error", "deepseek response close failed", completion.metrics)
-                    calls = []
-            if chunks is not None:
-                try:
-                    await chunks.aclose()
-                except Exception:
-                    terminal = StreamDone("error", "deepseek stream close failed", completion.metrics)
-                    calls = []
-            if reservation is not None:
-                try:
-                    self._cost_control.finish(reservation, terminal.metrics, complete=(
-                        terminal.stop_reason in ('stop', 'tool_use') and terminal.error is None
-                        and completion.done and not cancel.cancelled and not task_cancelled))
-                except CostError as exc:
-                    reason = 'error' if terminal.stop_reason in ('stop', 'tool_use') else terminal.stop_reason
-                    terminal = StreamDone(reason, terminal.error or str(exc), completion.metrics)
-                    calls = []
-        if cancel.cancelled:
-            terminal = StreamDone("aborted", metrics=completion.metrics)
-            calls = []
-        for call in calls:
-            yield call
-        yield terminal
-        if task_cancelled:
-            raise asyncio.CancelledError
+        async for event in stream_chat(
+            request, cancel, client=self.client, endpoint=BASE_URL + "/chat/completions",
+            api_key=self._api_key, identity=self.identity,
+            build_body=lambda value: build_request(value, self.config),
+            completion=Completion(think=self.config.think),
+            max_request_bytes=self.config.max_request_bytes, max_tokens=self.config.max_tokens,
+            timeout=DEFAULT_TIMEOUT, deadline_seconds=CALL_DEADLINE_S, label="deepseek",
+            cost_control=self._cost_control, before_send=self._record_observation,
+        ):
+            yield event
