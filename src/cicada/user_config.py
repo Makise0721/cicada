@@ -129,7 +129,7 @@ class ProviderProfile:
                     pass
             if (endpoint.scheme not in ('https', 'http') or not hostname
                     or endpoint.username is not None or endpoint.password is not None
-                    or endpoint.query or endpoint.fragment
+                    or endpoint.query or endpoint.fragment or '?' in self.base_url or '#' in self.base_url
                     or (endpoint.scheme == 'http' and not loopback)
                     or (self.auth == 'none' and not loopback)):
                 raise ValueError
@@ -142,6 +142,7 @@ class ProviderProfile:
                            or model.context_window > 1048576 or model.max_output_tokens > 393216
                            for model in self.models)):
                 raise UserConfigError('config', 'invalid-provider-settings')
+            object.__setattr__(self, 'base_url', self.base_url.rstrip('/'))
         elif any(model.think for model in self.models):
             raise UserConfigError('config', 'unsupported-thinking')
         if self.auth == 'none' and (self.api_key_env is not None or self.credential_ref is not None):
@@ -214,6 +215,8 @@ class LoginResult:
     session_applied: bool
     application_outcome: Literal['applied', 'unchanged', 'not-requested', 'blocked', 'failed', 'closing']
     error_code: str | None = None
+    selected_provider: str | None = None
+    selected_model: str | None = None
 
 
 class UserConfigStore(Protocol):
@@ -223,9 +226,11 @@ class UserConfigStore(Protocol):
              model_key: str | None = None) -> UserConfigSnapshot: ...
 
     def read_view(self, environment_key: str | None = None, *,
-                  provider_id: str | None = None) -> LoginView: ...
+                  provider_id: str | None = None, model_key: str | None = None) -> LoginView: ...
 
     def read_profiles(self) -> tuple[ProviderProfile, ...]: ...
+
+    def read_default_reference(self) -> tuple[str, str]: ...
 
     async def save(self, submission: LoginSubmission) -> LoginResult: ...
 

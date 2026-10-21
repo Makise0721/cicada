@@ -306,6 +306,11 @@ class FileUserConfigStore:
         """只读连接目录，不打开凭据文件，也不读取环境变量值。"""
         return _configuration(_read(self.root / 'config.toml', 'config'))[2]
 
+    def read_default_reference(self) -> tuple[str, str]:
+        """全局默认引用；不受最近一次 load 的目标选择影响，不读取秘密。"""
+        defaults = _configuration(_read(self.root / 'config.toml', 'config'))[0]
+        return defaults.provider, defaults.model
+
     def load(self, environment_key: str | None = None, *, provider_id: str | None = None,
              model_key: str | None = None) -> UserConfigSnapshot:
         for _ in range(3):
@@ -352,8 +357,8 @@ class FileUserConfigStore:
         raise UserConfigError('config', 'configuration-changing')
 
     def read_view(self, environment_key: str | None = None, *,
-                  provider_id: str | None = None) -> LoginView:
-        snapshot = self.load(environment_key, provider_id=provider_id)
+                  provider_id: str | None = None, model_key: str | None = None) -> LoginView:
+        snapshot = self.load(environment_key, provider_id=provider_id, model_key=model_key)
         d = snapshot.defaults
         provider = next(item for item in snapshot.providers if item.id == d.provider)
         return LoginView(d.provider, d.model, d.think, d.reasoning_effort, d.num_ctx,

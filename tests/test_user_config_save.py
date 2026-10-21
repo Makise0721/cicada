@@ -339,6 +339,7 @@ async def test_profile_save_preserves_other_provider_credentials_and_default(mon
     assert store.load().defaults.provider == 'deepseek'
     assert store.load().credential.reveal() == 'old-sentinel'
     selected = store.load(provider_id='work.gateway')
+    assert store.read_default_reference() == ('deepseek', 'deepseek-flash')
     assert selected.defaults == replace(chosen, credential_ref=selected.defaults.credential_ref)
     assert selected.credential.reveal() == 'work-sentinel'
     profile = next(provider for provider in selected.providers if provider.id == 'work.gateway')
@@ -349,6 +350,7 @@ async def test_profile_save_preserves_other_provider_credentials_and_default(mon
     assert (await store.save(LoginSubmission(chosen, 'keep', view.revision,
         provider_profile=gateway(), set_default=True))).defaults_saved
     assert store.load().defaults.provider == 'work.gateway'
+    assert store.read_default_reference() == ('work.gateway', 'coder.v1')
     assert store.load().credential.reveal() == 'work-sentinel'
     assert store.load(provider_id='deepseek').credential.reveal() == 'old-sentinel'
 
