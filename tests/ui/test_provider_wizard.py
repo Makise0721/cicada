@@ -15,6 +15,14 @@ ENTER = KeyPress(Keys.ControlM, '\r')
 DOWN = KeyPress(Keys.Down, '')
 
 
+def choose(wizard, action):
+    choices = wizard._choices()
+    target = next(index for index, (key, _) in enumerate(choices) if key == action)
+    for _ in range((target - wizard.selection) % len(choices)):
+        wizard.handle(DOWN)
+    return wizard.handle(ENTER)
+
+
 async def _configured(tmp_path):
     store = FileUserConfigStore(tmp_path / 'user')
     snapshot = store.load()
@@ -37,25 +45,20 @@ async def test_provider_key_replace_is_masked_and_keeps_default_and_other_models
     assert isinstance(wizard, ProviderWizard)
     assert wizard._choices()[0][0] == '+custom'
     # 保留 coder，并通过菜单增加第二个远端模型；不覆盖同实例原模型。
-    for key in (KeyPress(Keys.BracketedPaste, '工作'), ENTER, KeyPress(Keys.ControlI, '\t'),
-                ENTER, DOWN, ENTER, DOWN, ENTER):
+    for key in (KeyPress(Keys.BracketedPaste, '工作'), ENTER):
         wizard.handle(key)
+    choose(wizard, 'add_model')
     wizard.handle(KeyPress(Keys.BracketedPaste, 'org/second-model'))
     wizard.handle(ENTER)
-    for key in (*([DOWN] * 8), ENTER):
-        wizard.handle(key)
     # 工作实例 → 凭据 → 新Key；输入内容从不进入显示。
-    for key in (DOWN, DOWN, ENTER, DOWN, ENTER):
-        wizard.handle(key)
+    choose(wizard, 'api_key')
     wizard.handle(KeyPress(Keys.BracketedPaste, 'replacement-work-sentinel'))
     text = '\n'.join(wizard.render_lines(80, 24))
     assert 'replacement-work-sentinel' not in text and '*' in text
     wizard.handle(ENTER)
-    # 设置页在凭据行，跳过默认开关直接到确认。
-    for key in (DOWN, DOWN, ENTER):
-        wizard.handle(key)
+    # 主表单直接保存，默认选择仍独立保留。
     wizard.render_lines(80, 40)
-    assert wizard.handle(ENTER) == 'submit'
+    assert choose(wizard, 'defaults-only') == 'submit'
     submission = wizard.submission()
     assert not submission.set_default and submission.provider_profile.credential_ref is None
     wizard.clear_secret()
@@ -75,15 +78,14 @@ async def test_provider_confirmation_blocks_hidden_connection_and_cancel_discard
     wizard = ProviderWizard(view, title='Cicada · 登录配置')
     for key in (KeyPress(Keys.BracketedPaste, '工作'), ENTER):
         wizard.handle(key)
+    choose(wizard, 'api_key')
     wizard.handle(KeyPress(Keys.BracketedPaste, 'invalid\nsecret'))
     assert 'invalid' not in '\n'.join(wizard.render_lines(80, 24))
     wizard.handle(KeyPress(Keys.BracketedPaste, 'cancel-work-sentinel'))
     wizard.handle(ENTER)
-    for key in (DOWN, DOWN, ENTER):
-        wizard.handle(key)
     narrow = wizard.render_lines(18, 6)
     assert all(visible_width(line) <= 18 for line in narrow)
-    assert wizard.handle(ENTER) is None and not wizard.submitting
+    assert choose(wizard, 'defaults-only') is None and not wizard.submitting
     assert wizard.handle(KeyPress(Keys.Escape, '\x1b')) == 'cancel'
     assert wizard._credential is None
     assert 'cancel-work-sentinel' not in strip_terminal_sequences('\n'.join(wizard.render_lines(80, 40)))
