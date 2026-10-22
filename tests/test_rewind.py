@@ -187,7 +187,7 @@ async def test_rewind_disabled_capture_reads_history_and_failed_admission_keeps_
         listing = await session.open_rewind()
         assert listing.points and "历史代次" in listing.points[0].note
         session.cancel_rewind()
-        session._begin_in_flight = True
+        session._ownership.claim("request")
         view.editor.set_text("/rewind")
         assert view.on_submit("/rewind")
         await view.rewind_view._task
@@ -195,6 +195,6 @@ async def test_rewind_disabled_capture_reads_history_and_failed_admission_keeps_
         assert not view.rewind_view.active
         assert view.editor.get_text() == "/rewind"
     finally:
-        session._begin_in_flight = False
+        session._ownership.release("request")
         view.close()
         await session.aclose()

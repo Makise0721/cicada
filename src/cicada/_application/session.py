@@ -141,6 +141,7 @@ from .contracts import (
     _runtime_dir,
 )
 from . import recovery
+from .ownership import FOREIGN_OWNERS, OperationLedger, busy_refusal
 
 
 REQUEST_FINALIZE_SUPERVISION_S = 90.0
@@ -320,15 +321,15 @@ class ApplicationSession:
         self._summary_route = summary_route
         self._review_reader = review_reader
         self._catalog_reader = catalog_reader
+        # P0-3: 单一所有权令牌; 页面类事务 (审阅/还原点/目录) 持租约到页面关闭
+        self._ownership = OperationLedger()
         self._catalog_task: asyncio.Task | None = None
         self._catalog_token: CancelToken | None = None
         self._file_queries: dict[asyncio.Task, CancelToken] = {}
-        self._rewind_active = False
         self._rewind_reader: RewindReader | None = None
         self._rewind_restorer: RewindRestorer | None = None
         self._rewind_task: asyncio.Task | None = None
         self._rewind_token: CancelToken | None = None
-        self._review_active = False
         self._review_id: str | None = None
         self._review_snapshot: ReviewSnapshot | None = None
         self._review_token: CancelToken | None = None
@@ -342,10 +343,8 @@ class ApplicationSession:
         self._model_configuration: ModelConfigurationPort | None = None
         if model_route is not None and isinstance(model_route.binding.model, ModelConfigurationPort):
             self._model_configuration = model_route.binding.model
-        self._model_in_flight = False
         self._model_done: asyncio.Future | None = None
         self._model_task: asyncio.Task | None = None
-        self._session_in_flight = False
         self._session_done: asyncio.Future | None = None
         self._session_task: asyncio.Task | None = None
         self._session_token: CancelToken | None = None
@@ -354,7 +353,6 @@ class ApplicationSession:
         self._login_environment = login_environment
         self._login_store: UserConfigStore | None = None
         self._login_view: LoginView | None = None
-        self._login_in_flight = False
         self._login_task: asyncio.Task | None = None
         self._login_save_task: asyncio.Task | None = None
         self._login_cancel_requested = False
@@ -422,15 +420,10 @@ class ApplicationSession:
         self._cancel_token: CancelToken | None = None
         self._active_done: asyncio.Future | None = None
         self._clear_done: asyncio.Future | None = None  # 清空生产者完成标记 (close 监督对象)
-        self._clearing = False  # 持久清空进行中: 与 execute 互斥 (契约 §3)
         # 02: 手动压缩生产者 (D6/PA05); close 封住未接受提交并协作取消生成
-        self._compacting = False
         self._compact_done: asyncio.Future | None = None
         self._compact_token: CancelToken | None = None
         self._compact_sealed = False
-        # 阶段收口审查 STG-F1: execute 的 begin 等待窗内 _state 仍为 idle,
-        # 同步旗标把压缩/清空/新请求互斥补齐到该窗 (不依赖 UI 屏障)
-        self._begin_in_flight = False
         self._process_uncertain = False
         self._closing = False
         self._closed = False
@@ -443,19 +436,29 @@ class ApplicationSession:
 
     # --- 只读快照 ------------------------------------------------------------------
 
+    def _in_flight_workers(self) -> tuple[asyncio.Future, ...]:
+        """令牌已让出、但真实 IO/提交尚未落定的生产者.
+
+        与所有权是两件事: 事务可以在 finally 里归还令牌, 而线程里的事务还没
+        结束; 开新页面/导出要求两者都静默。
+        """
+        return tuple(
+            worker for worker in (
+                self._active_done, self._clear_done, self._compact_done, self._model_done,
+                self._login_task, self._login_save_task, self._review_task,
+                self._rewind_task, *self._undead_tasks,
+            ) if worker is not None and not worker.done()
+        )
+
     @property
     def rewind_active(self) -> bool:
-        return self._rewind_active
+        return self._ownership.holds("rewind")
 
     async def open_rewind(self) -> RewindListView:
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task,
-                     self._rewind_task, *self._undead_tasks)
-        if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
-                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
-                or self._session_in_flight or self.catalog_active or self.review_active
-                or (self.rewind_active and self._rewind_reader is None)
-                or any(task is not None and not task.done() for task in producers)):
+        if (self._closing or self._closed or self._state != "idle"
+                or self._ownership.owner not in (None, "rewind")
+                or self._in_flight_workers()
+                or (self.rewind_active and self._rewind_reader is None)):
             raise RewindError("busy", "查看还原点需要空闲会话，等当前操作实际结束后再打开。")
         if self._store is None:
             raise RewindError("unavailable", "还原点查看需要持久会话。")
@@ -464,7 +467,8 @@ class ApplicationSession:
             Path(self._config.workspace), data_dir=_runtime_dir(self._config))
         workspace = self._app.runtime.capability("coding.workspace")
         reader = RewindReader(store, workspace, self._store.session_id, self._epoch_id)
-        self._rewind_active = True
+        if not self.rewind_active:
+            self._ownership.claim("rewind")
         self._rewind_reader = reader
         self._rewind_restorer = RewindRestorer(reader)
         try:
@@ -542,7 +546,7 @@ class ApplicationSession:
         if self._rewind_task is task:
             self._rewind_token = None
             if self._rewind_reader is None:
-                self._rewind_active = False
+                self._ownership.release("rewind")
 
     def cancel_rewind(self) -> None:
         self._rewind_reader = None
@@ -550,29 +554,26 @@ class ApplicationSession:
         if self._rewind_token is not None:
             self._rewind_token.cancel()
         if self._rewind_task is None or self._rewind_task.done():
-            self._rewind_active = False
+            self._ownership.release("rewind")
 
     @property
     def review_active(self) -> bool:
-        return self._review_active
+        return self._ownership.holds("review")
 
     @property
     def catalog_active(self) -> bool:
-        return self._catalog_task is not None
+        return self._ownership.holds("catalog")
 
     async def observe_session_catalog(self, cancel: CancelToken) -> SessionCatalogSnapshot:
         if self._closing or self._closed:
             raise SessionManagementError("closing", "应用正在关闭。")
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
-        if (self._state != "idle" or self._begin_in_flight or self._clearing or self._compacting
-                or self._model_in_flight or self._login_in_flight or self._session_in_flight or self.catalog_active
-                or self.review_active or self.rewind_active
-                or any(task is not None and not task.done() for task in producers)):
+        if (self._state != "idle" or self._ownership.owner is not None
+                or self._in_flight_workers()):
             raise SessionManagementError("busy", "会话目录需要空闲会话。")
         if self._catalog_reader is None:
             raise SessionManagementError("unavailable", "当前组合没有会话目录能力。")
         cancel.throw_if_cancelled()
+        self._ownership.claim("catalog")
         async def observe_after_files():
             for query_token in self._file_queries.values():
                 query_token.cancel()
@@ -601,6 +602,7 @@ class ApplicationSession:
             if self._catalog_task is task:
                 self._catalog_task = None
                 self._catalog_token = None
+            self._ownership.release("catalog")
 
     async def complete_files(self, query: str, cancel: CancelToken) -> FileCompletionResult:
         """只读文件候选出口 (C3): 不创建模型消息、ToolCall/ToolResult 或读取依据。
@@ -608,7 +610,7 @@ class ApplicationSession:
         closing/closed 先拒绝新调用; 进行中的编码请求不阻止候选查询。未装配
         coding.file_completion 的组合 (旧直接构造) 返回 capability_unavailable。
         """
-        if self._closing or self._closed or self._session_in_flight:
+        if self._closing or self._closed or self._ownership.holds("session"):
             return FileCompletionResult((), "unavailable", reason="session_closed")
         try:
             port = self._app.runtime.capability(FILE_COMPLETION_CAPABILITY)
@@ -626,14 +628,11 @@ class ApplicationSession:
             self._file_queries.pop(task, None)
 
     def _check_review_admission(self) -> None:
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
-        if (self._closing or self._closed or self._state != "idle" or self._begin_in_flight
-                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
-                or self._session_in_flight or self.catalog_active or self.rewind_active
-                or any(task is not None and not task.done() for task in producers)):
+        if (self._closing or self._closed or self._state != "idle"
+                or self._ownership.owner not in (None, "review")
+                or self._in_flight_workers()):
             raise ReviewError("busy", "审阅需要空闲会话，等当前操作实际结束后再打开。")
-        if self._review_active and self._review_id is None:
+        if self.review_active and self._review_id is None:
             raise ReviewError("busy", "审阅正在取消清理。")
         if self._review_reader is None:
             raise ReviewError("unavailable", "当前组合没有审阅能力。")
@@ -641,7 +640,8 @@ class ApplicationSession:
     async def open_review(self) -> ReviewSnapshot:
         """同步准入、占住页面 lease 后派发一个受拥有读取；刷新不排队。"""
         self._check_review_admission()
-        self._review_active = True
+        if not self.review_active:
+            self._ownership.claim("review")
         self._review_targets = {}
         review_id = uuid.uuid4().hex
         self._review_id = review_id
@@ -679,7 +679,7 @@ class ApplicationSession:
 
     async def read_review(self, review_id: str, target_id: str) -> ReviewPreview | ReviewCheckDetails:
         snapshot = self._review_snapshot
-        if not self._review_active or self._review_id != review_id or snapshot is None:
+        if not self.review_active or self._review_id != review_id or snapshot is None:
             raise ReviewError("inactive", "审阅观察已失效，请刷新。")
         target = self._review_targets.get(target_id)
         if target is None and not any(item.item_id == target_id for item in snapshot.items):
@@ -805,7 +805,7 @@ class ApplicationSession:
         if self._review_task is task:
             self._review_token = None
             if self._review_id is None:
-                self._review_active = False
+                self._ownership.release("review")
 
     def cancel_review(self) -> None:
         self._review_id = None
@@ -814,7 +814,7 @@ class ApplicationSession:
         if self._review_token is not None:
             self._review_token.cancel()
         if self._review_task is None or self._review_task.done():
-            self._review_active = False
+            self._ownership.release("review")
 
     @property
     def state(self) -> SessionStateName:
@@ -835,6 +835,14 @@ class ApplicationSession:
 
     def has_process_uncertain(self) -> bool:
         return self._process_uncertain
+
+    @property
+    def busy_operation(self) -> str | None:
+        """当前持有会话独占权的事务 (P0-3); None = 没有事务在途.
+
+        这是"谁在改会话"的唯一答案; UI 能否提交仍以 state 与自身闸门为准。
+        """
+        return self._ownership.owner
 
     @property
     def persistence(self) -> PersistenceState | None:
@@ -865,7 +873,7 @@ class ApplicationSession:
 
     @property
     def session_management_active(self) -> bool:
-        return self._session_in_flight
+        return self._ownership.holds("session")
 
     @property
     def session_cleanup_failed(self) -> str | None:
@@ -884,16 +892,12 @@ class ApplicationSession:
             raise SessionManagementError("closing", "应用正在关闭。")
         if self._store is None:
             raise SessionManagementError("unavailable", "当前会话未启用保存，无法持久命名。")
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
-        if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
-                or self._clearing or self._compacting or self._model_in_flight
-                or self._login_in_flight or self.review_active or self.rewind_active
-                or any(task is not None and not task.done() for task in producers)):
+        if (self._state != "idle" or self._ownership.owner is not None
+                or self._in_flight_workers()):
             raise SessionManagementError("busy", "命名需要空闲会话。")
         store, epoch_id = self._store, self._epoch_id or ""
         loop = asyncio.get_running_loop()
-        self._session_in_flight = True
+        self._ownership.claim("session")
         self._session_done = loop.create_future()
         token = CancelToken()
         self._session_token = token
@@ -924,19 +928,15 @@ class ApplicationSession:
         factory = self._new_store_factory if operation == "new" else self._resume_store_factory
         if not isinstance(self._store, SessionStoreRoute) or factory is None:
             raise SessionManagementError("unavailable", "当前会话没有保存路由，无法切换会话。")
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, self._review_task, self._rewind_task, *self._undead_tasks)
-        if (self._state != "idle" or self._session_in_flight or self.catalog_active or self._begin_in_flight
-                or self._clearing or self._compacting or self._model_in_flight
-                or self._login_in_flight or self.review_active or self.rewind_active
-                or any(task is not None and not task.done() for task in producers)):
+        if (self._state != "idle" or self._ownership.owner is not None
+                or self._in_flight_workers()):
             raise SessionManagementError("busy", "切换需要空闲会话。")
         reason = (self._session_cleanup_failed or self._storage_failed or self._view_only_reason
                   or ("process_uncertain" if self.has_process_uncertain() else None))
         if reason is not None and not (operation == "resume" and session_id == self._store.session_id):
             raise SessionManagementError("blocked", "切换被阻断：" + reason)
         loop = asyncio.get_running_loop()
-        self._session_in_flight = True
+        self._ownership.claim("session")
         self._session_done = loop.create_future()
         token = CancelToken()
         self._session_token = token
@@ -1077,7 +1077,7 @@ class ApplicationSession:
                         self._session_cleanup_failed = str(exc)
                         raise SessionManagementError("cleanup-failed", "准备档关闭失败：" + str(exc)) from exc
             finally:
-                self._session_in_flight = False
+                self._ownership.release("session")
                 self._session_token = None
                 if self._session_done is not None and not self._session_done.done():
                     self._session_done.set_result(None)
@@ -1103,7 +1103,7 @@ class ApplicationSession:
             self._notify(SessionNameChanged(store.session_id, saved_name, self.session_generation))
             return SessionManagementResult("name", store.session_id, self.session_generation, True)
         finally:
-            self._session_in_flight = False
+            self._ownership.release("session")
             self._session_token = None
             if self._session_done is not None and not self._session_done.done():
                 self._session_done.set_result(None)
@@ -1181,13 +1181,9 @@ class ApplicationSession:
 
     def export_diagnostics(self, path: Path) -> Path:
         """空闲或可靠关闭后同步写一次有界元数据，不建后台生产者。"""
-        producers = (self._active_done, self._clear_done, self._compact_done, self._model_done,
-                     self._login_task, self._login_save_task, *self._undead_tasks)
         if (self._state not in ('idle', 'closed') or (self._closing and not self._closed)
-                or self._begin_in_flight or self._session_in_flight
-                or self._clearing or self._compacting or self._model_in_flight or self._login_in_flight
-                or self.review_active or self.rewind_active or self.catalog_active
-                or any(task is not None and not task.done() for task in producers)):
+                or self._ownership.owner is not None
+                or self._in_flight_workers()):
             raise ReportError('diagnostic export requires a settled session')
         destination = self._config.workspace.expanduser().resolve() / path.expanduser()
         write_report(destination, self.diagnostics_report())
@@ -1330,13 +1326,14 @@ class ApplicationSession:
 
     def _check_model_transaction_admission(self, blocked: str) -> None:
         """select_model 与 set_reasoning_effort 共用的独占事务准入 (C6)."""
-        if self.review_active or self.rewind_active:
+        owner = self._ownership.owner
+        if owner in ("review", "rewind"):
             raise ModelSelectionError("review is in progress")
-        if self._login_in_flight:
+        if owner == "login":
             raise ModelSelectionError("login configuration is in progress")
         if self._closing or self._closed or self._state != "idle":
             raise ModelSelectionError(f"{blocked} requires an idle, open session")
-        if self._session_in_flight or self.catalog_active or self._model_in_flight or self._begin_in_flight or self._clearing or self._compacting:
+        if owner is not None:
             raise ModelSelectionError("another operation is in progress")
         if self._view_only_reason or self._storage_failed or self._process_uncertain:
             raise ModelSelectionError(f"{blocked} is blocked by the session state")
@@ -1387,7 +1384,7 @@ class ApplicationSession:
         previous_effort: ReasoningEffortState | None = None,
     ) -> None:
         """两种模型变更共用的提交/取消/发布流程；prepare 同步且无 I/O。"""
-        self._model_in_flight = True
+        self._ownership.claim("model")
         self._model_done = asyncio.get_running_loop().create_future()
         try:
             try:
@@ -1461,7 +1458,7 @@ class ApplicationSession:
             if cancelled:
                 raise asyncio.CancelledError()
         finally:
-            self._model_in_flight = False
+            self._ownership.release("model")
             if self._model_done is not None and not self._model_done.done():
                 self._model_done.set_result(None)
 
@@ -1513,16 +1510,20 @@ class ApplicationSession:
             if isinstance(binding.model, ModelConfigurationPort) else None)
 
     async def execute(self, prompt: str) -> RequestOutcome:
+        """唯一编码请求入口: 准入即占住会话所有权, 直到提交与发布结束 (P0-3)."""
+        self._admit_request(prompt)
+        try:
+            return await self._run_request(prompt)
+        finally:
+            self._ownership.release("request")
+
+    def _admit_request(self, prompt: str) -> None:
+        """请求准入; 所有拒绝都在占槽之前, 通过后请求持有所有权到收尾."""
         if self._session_cleanup_failed is not None:
             raise RuntimeError("session cleanup failed: " + self._session_cleanup_failed)
-        if self._session_in_flight or self.catalog_active:
-            raise RuntimeError("session management is in progress; execute is refused")
-        if self.review_active or self.rewind_active:
-            raise RuntimeError("review is in progress; execute is refused")
-        if self._login_in_flight:
-            raise RuntimeError("login configuration is in progress; execute is refused")
-        if self._model_in_flight:
-            raise RuntimeError("model selection is in progress; execute is refused")
+        owner = self._ownership.owner
+        if owner in FOREIGN_OWNERS:
+            raise RuntimeError(busy_refusal(owner, "execute"))
         if self._closing or self._closed:
             raise RuntimeError(f"application is {self._state}; execute rejected before start")
         if self._state != "idle":
@@ -1538,30 +1539,32 @@ class ApplicationSession:
             raise RuntimeError(
                 "process_uncertain: new coding requests are refused; only status, clear or exit remain"
             )
-        if self._store is not None:
+        if owner == "request":
+            # 前一请求仍在 begin 等待窗 (state 尚为 idle); 非持久会话同样适用
+            raise RuntimeError(
+                "a previous request is still being started; "
+                "new requests are refused until it settles"
+            )
+        if owner == "clear":
+            raise RuntimeError(
+                "a persistent clear is in progress; new requests are refused until it settles"
+            )
+        if owner == "compaction":
+            # 02/PA05: execute/clear/compact 三向互斥 (应用层, 不依赖 UI 屏障);
+            # 压缩在途时新请求必须等待, 否则其提交会与摘要切换交错
+            raise RuntimeError(
+                "a compaction is in progress; new requests are refused until it settles"
+            )
+        if self._store is not None and self._storage_failed is not None:
             # 可靠提交请求开始 intent; 失败零模型调用并锁存 storage_failed (D2)。
             # 等待受拥有: 外层取消不把已派发事务当作未发生, 取得明确结果后才收尾
-            if self._storage_failed is not None:
-                raise RuntimeError(
-                    f"storage_failed: earlier session save failed ({self._storage_failed}); "
-                    "new coding requests are refused"
-                )
-            if self._clearing:
-                raise RuntimeError(
-                    "a persistent clear is in progress; new requests are refused until it settles"
-                )
-            if self._compacting:
-                # 02/PA05: execute/clear/compact 三向互斥 (应用层, 不依赖 UI 屏障);
-                # 压缩在途时新请求必须等待, 否则其提交会与摘要切换交错
-                raise RuntimeError(
-                    "a compaction is in progress; new requests are refused until it settles"
-                )
-            if self._begin_in_flight:
-                # 阶段收口审查 STG-F1: 前一请求仍在 begin 等待窗 (state 尚为 idle)
-                raise RuntimeError(
-                    "a previous request is still being started; "
-                    "new requests are refused until it settles"
-                )
+            raise RuntimeError(
+                f"storage_failed: earlier session save failed ({self._storage_failed}); "
+                "new coding requests are refused"
+            )
+        self._ownership.claim("request")
+
+    async def _run_request(self, prompt: str) -> RequestOutcome:
         # 请求边界接缝 (D1/PA02): 准入通过后、首次预算预估之前调用一次,
         # 建立本次 execute 尝试的预算状态范围; begin 不再调用或清零
         if self._budget_policy is not None:
@@ -1570,59 +1573,54 @@ class ApplicationSession:
         # 即取消本次尝试 (零 begin/零模型调用); begin 后取消语义不变
         token = CancelToken()
         self._cancel_token = token
-        # 阶段收口审查 STG-F1: 从首次预估到 begin 落定期间同步占住互斥
-        # (预估内自动压缩另由 _compacting 覆盖); 失败/取消/完成均经 finally 释放
-        self._begin_in_flight = True
+        # 所有权已由 execute 占住: 预估/自动压缩/begin 窗都算请求在途
         self._request_store = self._store.capture() if isinstance(self._store, SessionStoreRoute) else self._store
         self._request_epoch = self._epoch_id
         self._request_generation = self.session_generation
         self._request_receipts_before = frozenset(
             receipt.receipt_id for receipt in self._service.receipts
         ) if self._service is not None and self._request_store is not None else frozenset()
-        try:
-            # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
-            # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
-            await self._refuse_overbudget_or_auto_compact(prompt)
-            if self._budget_policy is not None:
-                self._budget_policy.validate_request(ModelRequest(
-                    messages=(*self._context_projection.project(self._history), UserMessage(prompt)),
-                    tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
-                ))
-            if self._store is not None:
-                begin_task = asyncio.ensure_future(
-                    self._request_store.begin_request(self._request_epoch or "", prompt)
-                )
-                begin_error: PersistenceError | None = None
-                begin_cancelled = False
-                while True:
-                    try:
-                        self._request_id = await asyncio.shield(begin_task)
-                        break
-                    except asyncio.CancelledError:
-                        begin_cancelled = True
-                    except PersistenceError as exc:
-                        begin_error = exc
-                        break
-                if begin_cancelled:
-                    # 已取得事务明确结果后的取消属程序性终止: 与执行期异常一样进入 closing
-                    if self._state != "closed":
-                        self._state = "closing"
-                        self._closing = True
-                    raise asyncio.CancelledError()
-                if begin_error is not None:
-                    # 落盘故障 (不可用/写失败/越限) 才锁存 storage_failed; 关系冲突
-                    # (pending 已存在/epoch 不符) 是状态问题, 存储健康, 不得误锁存
-                    if isinstance(begin_error, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
-                        self._latch_storage_failed(str(begin_error))
-                        raise RuntimeError(
-                            f"session save failed before the request started; "
-                            f"no model call or tool execution was made: {begin_error}"
-                        ) from begin_error
+        # 请求前预估 (D7 上道口): 超限先尝试本次 execute 至多一次的自动压缩,
+        # 再对有效投影重估; 仍超限零 begin/零模型调用, 不锁存 storage_failed
+        await self._refuse_overbudget_or_auto_compact(prompt)
+        if self._budget_policy is not None:
+            self._budget_policy.validate_request(ModelRequest(
+                messages=(*self._context_projection.project(self._history), UserMessage(prompt)),
+                tools=self._request_tool_specs(), system_prompt=self._config.system_prompt,
+            ))
+        if self._store is not None:
+            begin_task = asyncio.ensure_future(
+                self._request_store.begin_request(self._request_epoch or "", prompt)
+            )
+            begin_error: PersistenceError | None = None
+            begin_cancelled = False
+            while True:
+                try:
+                    self._request_id = await asyncio.shield(begin_task)
+                    break
+                except asyncio.CancelledError:
+                    begin_cancelled = True
+                except PersistenceError as exc:
+                    begin_error = exc
+                    break
+            if begin_cancelled:
+                # 已取得事务明确结果后的取消属程序性终止: 与执行期异常一样进入 closing
+                if self._state != "closed":
+                    self._state = "closing"
+                    self._closing = True
+                raise asyncio.CancelledError()
+            if begin_error is not None:
+                # 落盘故障 (不可用/写失败/越限) 才锁存 storage_failed; 关系冲突
+                # (pending 已存在/epoch 不符) 是状态问题, 存储健康, 不得误锁存
+                if isinstance(begin_error, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
+                    self._latch_storage_failed(str(begin_error))
                     raise RuntimeError(
-                        f"cannot start a persisted request: {begin_error}"
+                        f"session save failed before the request started; "
+                        f"no model call or tool execution was made: {begin_error}"
                     ) from begin_error
-        finally:
-            self._begin_in_flight = False
+                raise RuntimeError(
+                    f"cannot start a persisted request: {begin_error}"
+                ) from begin_error
         # 非持久会话无 begin: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用
         # (D9); 自动压缩需持久会话, 回调内判定后原样拒绝
         loop = asyncio.get_running_loop()
@@ -2051,14 +2049,9 @@ class ApplicationSession:
 
         持久会话拒绝同步入口: 清空边界必须经 clear_context() 可靠提交.
         """
-        if self._session_in_flight or self.catalog_active:
-            raise RuntimeError("session management is in progress; clear is refused")
-        if self.review_active or self.rewind_active:
-            raise RuntimeError("review is in progress; clear is refused")
-        if self._login_in_flight:
-            raise RuntimeError("login configuration is in progress; clear is refused")
-        if self._model_in_flight:
-            raise RuntimeError("model selection is in progress; clear is refused")
+        owner = self._ownership.owner
+        if owner in FOREIGN_OWNERS:
+            raise RuntimeError(busy_refusal(owner, "clear"))
         if self._store is not None:
             raise RuntimeError(
                 "persistent sessions must use clear_context(); the synchronous entry is refused "
@@ -2066,6 +2059,9 @@ class ApplicationSession:
             )
         if self._closing or self._closed or self._state != "idle":
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
+        if owner is not None:
+            # 请求 begin 等待窗: state 仍是 idle, 但请求已经占住互斥
+            raise RuntimeError(busy_refusal(owner, "clear"))
         self._history.clear()
         if self._budget_policy is not None:
             self._budget_policy.invalidate()
@@ -2075,34 +2071,28 @@ class ApplicationSession:
         """持久清空: 先可靠提交清空边界, 成功后才清内存历史; 失败内存不变.
 
         无持久化模式委托旧同步入口; storage_failed 不阻止清空尝试, 失败如实报错.
-        清空进行中 (_clearing) 与 execute 互斥, 双向拒绝 (契约 §3).
+        清空进行中 (owner=clear) 与 execute 互斥, 双向拒绝 (契约 §3).
         """
-        if self._session_in_flight or self.catalog_active:
-            raise RuntimeError("session management is in progress; clear is refused")
-        if self.review_active or self.rewind_active:
-            raise RuntimeError("review is in progress; clear is refused")
-        if self._login_in_flight:
-            raise RuntimeError("login configuration is in progress; clear is refused")
-        if self._model_in_flight:
-            raise RuntimeError("model selection is in progress; clear is refused")
+        owner = self._ownership.owner
+        if owner in FOREIGN_OWNERS:
+            raise RuntimeError(busy_refusal(owner, "clear"))
         if self._store is None:
             self.clear_history()
             return
         if self._closing or self._closed or self._state != "idle":
             raise RuntimeError(f"history can only be cleared while idle and open (state={self._state})")
-        if self._clearing:
+        if owner == "clear":
             raise RuntimeError("a persistent clear is already in progress")
-        if self._compacting:
+        if owner == "compaction":
             # 02: 压缩在途时清空被拒——clear 推进代次会让在途摘要提交撞关系校验,
             # 且其失败会被误归存储故障; 等压缩落定后再清 (三向互斥, 审查 02-F8)
             raise RuntimeError("a compaction is in progress; clear is refused until it settles")
-        if self._begin_in_flight:
-            # 阶段收口审查 STG-F1: 请求 begin 等待窗内 state 仍为 idle, 同步旗标
-            # 补齐互斥 (该窗缺口的 clear 变体在基线已存在)
+        if owner == "request":
+            # 请求 begin 等待窗内 state 仍为 idle; 该窗缺口的 clear 变体在基线已存在
             raise RuntimeError(
                 "a request start is being persisted; clear is refused until it settles"
             )
-        self._clearing = True
+        self._ownership.claim("clear")
         self._clear_done = asyncio.get_running_loop().create_future()
         self._notify(OperationBusy(operation="clear"))
         try:
@@ -2142,7 +2132,7 @@ class ApplicationSession:
             if clear_cancelled:
                 raise asyncio.CancelledError()
         finally:
-            self._clearing = False
+            self._ownership.release("clear")
             if self._clear_done is not None and not self._clear_done.done():
                 self._clear_done.set_result(None)
 
@@ -2157,14 +2147,9 @@ class ApplicationSession:
         切换投影 + 事件。派发前取消零写入; store 接受后取消不取消事务, 成功
         先切换再传播外层 CancelledError, 失败保留旧投影并锁存存储故障。
         """
-        if self._session_in_flight or self.catalog_active:
-            raise RuntimeError("session management is in progress; compact is refused")
-        if self.review_active or self.rewind_active:
-            raise RuntimeError("review is in progress; compact is refused")
-        if self._login_in_flight:
-            raise RuntimeError("login configuration is in progress; compact is refused")
-        if self._model_in_flight:
-            raise RuntimeError("model selection is in progress; compact is refused")
+        owner = self._ownership.owner
+        if owner in FOREIGN_OWNERS:
+            raise RuntimeError(busy_refusal(owner, "compact"))
         if self._store is None:
             raise RuntimeError(
                 "compaction requires a persistent session (start with --save-session, "
@@ -2191,25 +2176,24 @@ class ApplicationSession:
                 "compaction requires an enabled budget with a summary channel "
                 "(a persistent session with a real model provider)"
             )
-        if self._compacting:
+        if owner == "compaction":
             raise RuntimeError("a compaction is already in progress")
-        if self._clearing:
+        if owner == "clear":
             # 三向互斥 (审查 02-F8): 清空在途时压缩拒绝, 与 execute/clear 同一面
             raise RuntimeError(
                 "a persistent clear is in progress; compaction is refused until it settles"
             )
-        if self._begin_in_flight:
-            # 阶段收口审查 STG-F1: 请求 begin 等待窗内 state 仍为 idle, 同步旗标
-            # 补齐互斥 (不依赖 UI 屏障), 否则压缩可与在途请求交错
+        if owner == "request":
+            # 请求 begin 等待窗内 state 仍为 idle; 否则压缩可与在途请求交错
             raise RuntimeError(
                 "a request start is being persisted; compaction is refused until it settles"
             )
         if self._compact_sealed:
             raise RuntimeError("application is closing; compaction is sealed")
-        # 可压缩区间与摘要输入预算在置位屏障前判定: 拒绝不留下 busy/屏障 (D1)
+        # 可压缩区间与摘要输入预算在占槽前判定: 拒绝不留下 busy/屏障 (D1)
         token = CancelToken()
         plan = self._compaction_plan(token)
-        self._compacting = True
+        self._ownership.claim("compaction")
         self._compact_done = asyncio.get_running_loop().create_future()
         self._compact_token = token
         self._notify(OperationBusy(operation="compact"))
@@ -2218,7 +2202,7 @@ class ApplicationSession:
                 plan, reason="manual", cancel_token=self._compact_token
             )
         finally:
-            self._compacting = False
+            self._ownership.release("compaction")
             self._compact_token = None
             if self._compact_done is not None and not self._compact_done.done():
                 self._compact_done.set_result(None)
@@ -2369,7 +2353,7 @@ class ApplicationSession:
             return False
         if self._closing or self._closed or self._compact_sealed:
             return False
-        if self._compacting or self._clearing:
+        if self._ownership.holds("compaction") or self._ownership.holds("clear"):
             return False
         if self._view_only_reason is not None:
             # 两种锁存状态下零摘要调用 (D9): view-only 不把历史发往模型
@@ -2385,7 +2369,8 @@ class ApplicationSession:
             return False
         if not policy.try_consume_admission_auto_attempt():
             return False
-        self._compacting = True
+        # 请求内部的子阶段: 临时占住压缩槽, 让 clear/新请求看到"压缩在途"
+        self._ownership.claim("compaction", inside="request")
         self._compact_done = asyncio.get_running_loop().create_future()
         self._compact_token = token
         try:
@@ -2395,7 +2380,7 @@ class ApplicationSession:
             # 摘要失败/提交失败: 投影不变; 真实落盘故障已在 _run_compaction 锁存
             return False
         finally:
-            self._compacting = False
+            self._ownership.release("compaction")
             self._compact_token = None
             if self._compact_done is not None and not self._compact_done.done():
                 self._compact_done.set_result(None)
@@ -2473,7 +2458,7 @@ class ApplicationSession:
 
     @property
     def login_busy(self) -> bool:
-        return self._login_in_flight
+        return self._ownership.holds("login")
 
     @property
     def login_status(self) -> tuple[str, ...]:
@@ -2490,18 +2475,19 @@ class ApplicationSession:
         return lines
 
     def _check_login_admission(self) -> None:
-        if (self._session_in_flight or self.catalog_active or self.review_active or self.rewind_active or self._closing or self._closed or self._state != 'idle' or
-                self._begin_in_flight or self._clearing or self._compacting or self._model_in_flight):
+        """login 编辑窗是唯一允许在 owner=login 时继续的入口 (保存/应用)."""
+        if (self._ownership.owner not in (None, "login")
+                or self._closing or self._closed or self._state != 'idle'):
             raise UserConfigError('login', 'operation-in-progress')
 
     def login_view(self, provider_id: str | None = None) -> LoginView:
         """同步占住编辑窗口后才观察；失败释放，关闭/取消不改变任何会话事实。"""
         self._check_login_admission()
-        if self._login_in_flight:
+        if self._ownership.holds("login"):
             raise UserConfigError('login', 'operation-in-progress')
         if self._login_store_factory is None:
             raise UserConfigError('login', 'unavailable')
-        self._login_in_flight = True
+        self._ownership.claim("login")
         try:
             if self._login_store is None:
                 self._login_store = self._login_store_factory()
@@ -2540,20 +2526,20 @@ class ApplicationSession:
             self._notify(OperationBusy('login'))
             return view
         except BaseException:
-            self._login_in_flight = False
+            self._ownership.release("login")
             raise
 
     def cancel_login(self) -> None:
         """编辑取消；保存接受后由生产者发布真实结果。"""
         if self._login_task is not None and not self._login_task.done():
             return
-        if self._login_in_flight:
-            self._login_in_flight = False
+        if self._ownership.holds("login"):
+            self._ownership.release("login")
             self._notify(LoginCompleted(None))
 
     async def configure_login(self, submission: LoginSubmission) -> LoginResult:
         self._check_login_admission()
-        if (not self._login_in_flight or self._login_view is None or self._login_store is None or
+        if (not self._ownership.holds("login") or self._login_view is None or self._login_store is None or
                 submission.revision != self._login_view.revision or
                 (self._login_task is not None and not self._login_task.done())):
             raise UserConfigError('login', 'operation-in-progress')
@@ -2602,7 +2588,7 @@ class ApplicationSession:
             return result
         finally:
             self._login_save_task = None
-            self._login_in_flight = False
+            self._ownership.release("login")
             self._notify(LoginCompleted(result))
 
     async def _apply_login_configuration(

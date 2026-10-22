@@ -90,12 +90,12 @@ async def test_same_level_noop_unknown_level_and_unsupported_provider(tmp_path):
         with pytest.raises(ModelSelectionError, match="unknown reasoning effort"):
             await session.set_reasoning_effort("ultra")
         # 与 select_model 共用的独占事务准入: 在途/锁定状态拒绝
-        session._begin_in_flight = True
+        session._ownership.claim("request")
         try:
             with pytest.raises(ModelSelectionError, match="progress"):
                 await session.set_reasoning_effort("low")
         finally:
-            session._begin_in_flight = False
+            session._ownership.release("request")
     finally:
         await session.aclose()
     # 无能力 provider: 状态 enabled=False, 应用拒绝
@@ -149,7 +149,7 @@ async def test_thinking_tool_history_rejects_enable_and_keeps_off(tmp_path):
         with pytest.raises(ModelSelectionError, match="rejected by configuration or history"):
             await session.set_reasoning_effort("low")
         assert changes == [] and session.reasoning_effort.current is None
-        assert session._model_in_flight is False
+        assert session.busy_operation is None
     finally:
         await session.aclose()
 
@@ -171,7 +171,7 @@ async def test_before_acceptance_cancel_zero_commit(tmp_path):
         with pytest.raises(asyncio.CancelledError):
             await task
         assert calls == [] and session.reasoning_effort.current == "high"
-        assert session._model_in_flight is False
+        assert session.busy_operation is None
         await session.set_reasoning_effort("max")  # 取消不锁存, 可重试
         assert session.reasoning_effort.current == "max"
     finally:

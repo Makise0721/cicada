@@ -53,7 +53,7 @@ async def test_selection_summary_restart_preserves_effective_projection(tmp_path
         assert session.config.persistence.identity.model == "deepseek-v4-pro"
         assert session.budget.anchor is None and session.budget.report is None
         assert isinstance(updates[-1], ModelChanged)
-        assert not session._model_in_flight
+        assert session.busy_operation is None
         await session.compact_context()
         summary = bodies[-1]
         assert summary["model"] == "deepseek-v4-pro"
@@ -115,8 +115,7 @@ async def test_same_option_no_io_and_ephemeral_selection(tmp_path, monkeypatch, 
         await session.aclose()
 
 
-@pytest.mark.parametrize("lock", ["_process_uncertain", "_storage_failed", "_view_only_reason",
-                                      "_begin_in_flight", "_clearing", "_compacting"])
+@pytest.mark.parametrize("lock", ["_process_uncertain", "_storage_failed", "_view_only_reason"])
 async def test_session_locks_refuse_selection(tmp_path, lock):
     session = await open_application(config(_repo(tmp_path), transport([])))
     try:
@@ -127,6 +126,25 @@ async def test_session_locks_refuse_selection(tmp_path, lock):
         assert getattr(session, lock) is True
     finally:
         setattr(session, lock, False)
+        await session.aclose()
+
+
+@pytest.mark.parametrize("operation", ["request", "clear", "compaction", "model", "session",
+                                       "login", "review", "rewind", "catalog"])
+async def test_busy_operation_refuses_selection(tmp_path, operation):
+    """P0-3: 任一独占事务在途都拒绝模型变更, 不靠入口手查布尔."""
+    session = await open_application(config(_repo(tmp_path), transport([])))
+    try:
+        session._ownership.claim(operation)
+        try:
+            with pytest.raises(ModelSelectionError):
+                await session.select_model("deepseek-v4-pro")
+            assert session.config.model_label == "deepseek-flash"
+            assert session.busy_operation == operation
+        finally:
+            session._ownership.release(operation)
+        assert session.busy_operation is None
+    finally:
         await session.aclose()
 
 

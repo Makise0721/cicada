@@ -682,7 +682,7 @@ async def test_compact_refused_during_begin_window(tmp_path):
         await _two_committed_requests(session)
         task, release = await _begin_gated_execute(session, store, "第三问")
         assert session.state == "idle"
-        assert not session._compacting and not session._clearing
+        assert session.busy_operation == "request"
         try:
             await session.compact_context()
             raise AssertionError("begin 窗内的压缩必须被拒绝")
