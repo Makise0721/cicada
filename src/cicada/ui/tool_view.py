@@ -38,6 +38,7 @@ from cicada.core.events import (
     ToolStarted,
     TurnStarted,
 )
+from cicada.tool_outcomes import mutation_facts
 from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.checks import artifact_line as _artifact_line_from_details
@@ -204,7 +205,7 @@ class _ToolCard:
         self.cancelled = False
         self.content = ""
         self.artifact: str | None = None
-        self.mutation_state: str | None = None  # 结构化 details["mutation"]["state"]
+        self.mutation_state: str | None = None  # 结果契约里的 mutation.state
         self.expanded: bool | None = None  # None = 收起 (子项默认不开详情)
         self.budget = INITIAL_OUTPUT_LINES  # 输出物理行预算 (打开/组重开时重置)
 
@@ -855,14 +856,9 @@ def card_scope(card: _ToolCard) -> str:
 
 
 def _mutation_state_of(details: dict | None) -> str | None:
-    """结构化文件修改事实 (C2): 只读 details["mutation"]["state"], 不认文字推断。"""
-    if not isinstance(details, dict):
-        return None
-    mutation = details.get("mutation")
-    if not isinstance(mutation, dict):
-        return None
-    state = mutation.get("state")
-    return state if isinstance(state, str) else None
+    """结构化文件修改事实 (C2): 只读契约里的 mutation.state, 不认文字推断。"""
+    facts = mutation_facts(details)
+    return facts.state if facts is not None else None
 
 
 def _status_suffix(card: _ToolCard, category: str) -> tuple[str, str]:

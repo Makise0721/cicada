@@ -15,6 +15,7 @@ from cicada.core.ports import ToolContext, ToolSpec
 from cicada.plugins.coding.file_access import STATE_COMMITTED, MutationOutcome
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginDefinition
+from cicada.tool_outcomes import mutation_details
 
 if TYPE_CHECKING:
     from cicada.runtime.plugin import PluginContext
@@ -80,7 +81,7 @@ class WriteTool:
             "retained_paths": list(outcome.retained_paths),
             "cleanup_warning": outcome.cleanup_warning,
         }
-        details: dict[str, Any] = {"mutation": mutation}
+        details: dict[str, Any] = mutation_details(mutation)
 
         if outcome.state != STATE_COMMITTED:
             parts = [f"[mutation={outcome.state}] {outcome.message or outcome.reason}"]

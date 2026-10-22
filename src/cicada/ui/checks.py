@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cicada.core.events import Event, ToolCompleted
+from cicada.tool_outcomes import process_facts
 
 if TYPE_CHECKING:
     from cicada.application import ApplicationSession, RequestOutcome
@@ -82,14 +83,11 @@ def truncation_note(
 
 def artifact_line(details: dict | None) -> str | None:
     """回执引用的输出工件: 只显示路径与 hash, 不读入内容. (旧 presenter 移植)"""
-    if not isinstance(details, dict):
+    facts = process_facts(details)
+    if facts is None or not facts.output_artifact_path:
         return None
-    path = details.get("output_artifact_path")
-    if not isinstance(path, str) or not path:
-        return None
-    sha = details.get("output_artifact_sha256")
-    sha_text = sha if isinstance(sha, str) and sha else "unverified"
-    return f"输出工件: {path} sha256={sha_text}"
+    sha_text = facts.output_artifact_sha256 or "unverified"
+    return f"输出工件: {facts.output_artifact_path} sha256={sha_text}"
 
 
 def delivery_lines(
@@ -165,9 +163,9 @@ class CheckProjection:
             and event.result.name == CHECK_TOOL_NAME
             and event.result.details
         ):
-            receipt_id = event.result.details.get("receipt_id")
-            if isinstance(receipt_id, str) and receipt_id:
-                self._receipts_this_request.add(receipt_id)
+            facts = process_facts(event.result.details)
+            if facts is not None and facts.receipt_id:
+                self._receipts_this_request.add(facts.receipt_id)
 
     def on_request_completed(self, outcome: "RequestOutcome") -> list[str] | None:
         """检查模式返回结论行, 正常模式返回 None (安静)。

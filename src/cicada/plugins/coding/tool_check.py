@@ -12,6 +12,7 @@ from cicada.core.messages import ToolResult
 from cicada.core.ports import ToolContext, ToolSpec
 from cicada.plugins.coding.verification import Verifier, VerificationError
 from cicada.runtime.plugin import PluginDefinition
+from cicada.tool_outcomes import check_status_details, process_details
 
 if TYPE_CHECKING:
     from cicada.runtime.plugin import PluginContext
@@ -77,7 +78,7 @@ class CheckTool:
             name=TOOL_NAME,
             content=self._service.render_receipt_content(receipt, freshness, view),
             is_error=False,
-            details=details,
+            details=process_details(details),
         )
 
     async def _status(self, ctx: ToolContext) -> ToolResult:
@@ -88,7 +89,7 @@ class CheckTool:
             name=TOOL_NAME,
             content=self._service.render_status_content(view, engagement),
             is_error=False,
-            details={
+            details=check_status_details({
                 "action": "status",
                 "verification_run_id": view.verification_run_id,
                 "snapshot_ref": view.snapshot_ref,
@@ -107,7 +108,7 @@ class CheckTool:
                     for state in view.checks
                 ],
                 "receipt_ids": [receipt.receipt_id for receipt in view.receipts],
-            },
+            }),
         )
 
     @staticmethod

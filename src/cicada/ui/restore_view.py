@@ -20,6 +20,7 @@ import time
 
 from cicada.core.messages import AssistantMessage, ToolCall, ToolResult, ToolResultMessage, UserMessage
 from cicada.persistence.contracts import InterruptedRequest, RestoredRequest, SummaryRecord
+from cicada.tool_outcomes import process_facts
 from cicada.ui.tool_view import ToolDocument, ToolGroupEntry
 from cicada.ui.transcript import Transcript
 
@@ -157,13 +158,12 @@ def _add_tool_card(
         display_name = name
         unconfirmed = True
     artifact = None
-    if display_name == "check" and isinstance(details, dict):
-        receipt_id = details.get("receipt_id")
-        verification_run_id = details.get("verification_run_id")
-        if isinstance(receipt_id, str) and receipt_id:
+    if display_name == "check":
+        facts = process_facts(details)
+        if facts is not None and facts.receipt_id:
             artifact = _HISTORICAL_CHECK_NOTE.format(
-                receipt=receipt_id,
-                run=(verification_run_id if isinstance(verification_run_id, str) and verification_run_id else "不可得"),
+                receipt=facts.receipt_id,
+                run=(facts.verification_run_id or "不可得"),
             )
     index, created = tools.add_completed_card(
         run_id=key,

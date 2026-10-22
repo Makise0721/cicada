@@ -42,6 +42,7 @@ from cicada.plugins.coding.verification_contracts import (
     VerificationService,
     VerificationView,
 )
+from cicada.tool_outcomes import process_facts
 
 REQUEST_CONTEXT_MAX_BYTES = 8192
 IDENTIFIER_MAX_BYTES = 128
@@ -192,11 +193,8 @@ class HistoricalPrefixProof:
                     raise PrefixViolation(
                         f"restored prefix message {index} lost its receipt identity"
                     )
-                details = (
-                    message.result.details
-                    if isinstance(message.result.details, dict) else {}
-                )
-                if details.get("receipt_id") != entry.receipt_id:
+                facts = process_facts(message.result.details)
+                if facts is None or facts.receipt_id != entry.receipt_id:
                     raise PrefixViolation(
                         f"restored prefix message {index} carries a different receipt"
                     )
@@ -390,7 +388,8 @@ def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
         return None
     details = result.details if isinstance(result.details, dict) else None
     error_text = result.content if result.is_error else ""
-    if details is None:
+    facts = process_facts(details) if details is not None else None
+    if facts is None:
         return _ToolFacts(
             tool=result.name,
             is_error=result.is_error,
@@ -402,18 +401,15 @@ def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
             exit_code=None,
             error_text=error_text,
         )
-    receipt_id = details.get("receipt_id")
-    output_complete = details.get("output_complete")
-    exit_code = details.get("exit_code")
     return _ToolFacts(
         tool=result.name,
         is_error=result.is_error,
         has_details=True,
-        receipt_id=receipt_id if isinstance(receipt_id, str) and receipt_id else None,
-        output_complete=output_complete if isinstance(output_complete, bool) else None,
-        timed_out=details.get("timed_out") is True,
-        cancelled=details.get("cancelled") is True,
-        exit_code=exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None,
+        receipt_id=facts.receipt_id,
+        output_complete=facts.output_complete,
+        timed_out=facts.timed_out is True,
+        cancelled=facts.cancelled is True,
+        exit_code=facts.exit_code,
         error_text=error_text,
     )
 

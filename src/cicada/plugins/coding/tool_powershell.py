@@ -9,6 +9,7 @@ from cicada.core.ports import ToolContext, ToolSpec
 from cicada.plugins.coding.process import BoundedText, PowerShellRunner
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginDefinition
+from cicada.tool_outcomes import process_details
 
 if TYPE_CHECKING:
     from cicada.runtime.plugin import PluginContext
@@ -151,7 +152,7 @@ class PowerShellTool:
             name="powershell",
             content=content,
             is_error=is_error,
-            details={
+            details=process_details({
                 "exit_code": result.exit_code,
                 "timed_out": result.timed_out,
                 "cancelled": result.cancelled,
@@ -161,7 +162,7 @@ class PowerShellTool:
                 "artifact_truncated": bounded.artifact_truncated,
                 "artifact_error": bounded.artifact_error,
                 "output_complete": result.output_complete,
-            },
+            }),
         )
 
     @staticmethod

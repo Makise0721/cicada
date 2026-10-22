@@ -16,6 +16,7 @@ from cicada.persistence.contracts import (
     receipt_terminal_trustworthy,
 )
 from cicada.run_policy import HistoricalPrefixProof, HistoricalProjection, PrefixEntry
+from cicada.tool_outcomes import process_facts
 
 from .contracts import (
     ApplicationOpenError,
@@ -67,15 +68,14 @@ def _receipt_facts_mismatch(receipt: StoredReceipt, details: dict) -> str | None
     契约 §5「事实不匹配……属于恢复格式/关系错误」: 缺键不比 (None 容忍),
     显式事实冲突 (exit_code/timed_out/cancelled/output_complete) 拒绝恢复.
     """
-    exit_code = details.get("exit_code")
-    if (
-        isinstance(exit_code, int) and not isinstance(exit_code, bool)
-        and receipt.exit_code != exit_code
-    ):
-        return f"exit_code {exit_code} but the receipt records {receipt.exit_code}"
+    facts = process_facts(details)
+    if facts is None:
+        return None
+    if facts.exit_code is not None and receipt.exit_code != facts.exit_code:
+        return f"exit_code {facts.exit_code} but the receipt records {receipt.exit_code}"
     for key in ("timed_out", "cancelled", "output_complete"):
-        value = details.get(key)
-        if isinstance(value, bool) and getattr(receipt, key) != value:
+        value = getattr(facts, key)
+        if value is not None and getattr(receipt, key) != value:
             return f"{key} is {value} but the receipt records {getattr(receipt, key)}"
     return None
 
@@ -94,8 +94,9 @@ def _build_prefix_proof(snapshot: RecoverySnapshot) -> HistoricalProjection:
                 details = (
                     message.result.details if isinstance(message.result.details, dict) else {}
                 )
-                candidate = details.get("receipt_id")
-                if isinstance(candidate, str) and candidate:
+                facts = process_facts(details)
+                candidate = facts.receipt_id if facts is not None else None
+                if candidate is not None:
                     receipt = receipts_by_id.get(candidate)
                     if receipt is None:
                         raise ApplicationOpenError(

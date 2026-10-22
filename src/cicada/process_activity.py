@@ -25,6 +25,7 @@ from cicada.persistence.contracts import (
 )
 from cicada.run_policy import LAUNCH_FAILURE_MARKERS, PRE_EXECUTION_MARKERS
 from cicada.persistence.routing import SessionStoreRoute
+from cicada.tool_outcomes import process_facts
 
 # powershell 全部登记; check 仅 action=run (status 查询不登记为进程启动, 契约 §4.2);
 # read/edit/write/glob/grep 不是进程工具.
@@ -52,18 +53,19 @@ def classify_terminal(result: ToolResult) -> ProcessTerminalFacts:
     if content.startswith(PRE_EXECUTION_MARKERS) or content.startswith(LAUNCH_FAILURE_MARKERS):
         return ProcessTerminalFacts(kind="not_started", reason=content[:_REASON_MAX_CHARS])
     details = result.details if isinstance(result.details, dict) else None
-    timed_out = details is not None and details.get("timed_out") is True
-    cancelled = details is not None and details.get("cancelled") is True
-    raw_exit = details.get("exit_code") if details is not None else None
-    exit_code = raw_exit if isinstance(raw_exit, int) and not isinstance(raw_exit, bool) else None
-    raw_complete = details.get("output_complete") if details is not None else None
-    output_complete = raw_complete if isinstance(raw_complete, bool) else None
-    raw_receipt = details.get("receipt_id") if details is not None else None
-    receipt_id = raw_receipt if isinstance(raw_receipt, str) and raw_receipt else None
+    if details is None:
+        return ProcessTerminalFacts(kind="unproven_terminal", reason="no structured terminal details")
+    facts = process_facts(details)
+    if facts is None:
+        return ProcessTerminalFacts(kind="unproven_terminal", reason="no trustworthy terminal fact")
+    timed_out = facts.timed_out is True
+    cancelled = facts.cancelled is True
+    exit_code = facts.exit_code
+    output_complete = facts.output_complete
     if exit_code is not None and output_complete is True and not timed_out and not cancelled:
         return ProcessTerminalFacts(
             kind="proven_terminal", exit_code=exit_code, output_complete=True,
-            receipt_id=receipt_id,
+            receipt_id=facts.receipt_id,
         )
     if timed_out:
         reason = "timed out before EOF"
@@ -71,13 +73,11 @@ def classify_terminal(result: ToolResult) -> ProcessTerminalFacts:
         reason = "cancelled; process termination unproven"
     elif output_complete is False:
         reason = "ended without reaching EOF"
-    elif details is None:
-        reason = "no structured terminal details"
     else:
         reason = "no trustworthy terminal fact"
     return ProcessTerminalFacts(
         kind="unproven_terminal", exit_code=exit_code, output_complete=output_complete,
-        timed_out=timed_out, cancelled=cancelled, receipt_id=receipt_id, reason=reason,
+        timed_out=timed_out, cancelled=cancelled, receipt_id=facts.receipt_id, reason=reason,
     )
 
 

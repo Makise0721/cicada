@@ -20,6 +20,7 @@ from cicada.plugins.coding.file_access import (
 )
 from cicada.plugins.coding.workspace import Workspace
 from cicada.runtime.plugin import PluginDefinition
+from cicada.tool_outcomes import mutation_details
 
 if TYPE_CHECKING:
     from cicada.runtime.plugin import PluginContext
@@ -100,7 +101,9 @@ class EditTool:
                 call_id=ctx.call_id, name="edit", content=content,
                 is_error=outcome.state != STATE_COMMITTED or outcome.current_matches is not True
                          or outcome.reason == "conflict_at_commit",
-                details={"mutation": mutation, "presentation_warning": type(exc).__name__},
+                details=mutation_details(mutation, extras={
+                    "presentation_warning": type(exc).__name__,
+                }),
             )
 
     # ---- 纯字节转换 (队列内核对依据后调用; 可预期失败抛 MutationRejected) ----
@@ -182,7 +185,7 @@ class EditTool:
             "retained_paths": list(outcome.retained_paths),
             "cleanup_warning": outcome.cleanup_warning,
         }
-        details: dict[str, Any] = {"mutation": mutation}
+        details: dict[str, Any] = mutation_details(mutation)
 
         if outcome.state != STATE_COMMITTED:
             parts = [f"[mutation={outcome.state}] {outcome.message or outcome.reason}"]
