@@ -35,6 +35,28 @@ FORBIDDEN = {
     },
 }
 
+# 私有实现与兼容入口属于同一应用层，不能绕过原有应用导入限制。
+for banned in FORBIDDEN.values():
+    if "cicada.application" in banned:
+        banned.add("cicada._application")
+
+FORBIDDEN.update({
+    "_application/contracts": {
+        "cicada.application", "cicada._application.recovery",
+        "cicada._application.session", "cicada._application.startup",
+    },
+    "_application/recovery": {
+        "cicada.application", "cicada._application.session", "cicada._application.startup",
+    },
+    "_application/session": {"cicada.application", "cicada._application.startup"},
+    "_application/startup": {"cicada.application"},
+    "_application/__init__": {
+        "cicada.application", "cicada._application.contracts",
+        "cicada._application.recovery", "cicada._application.session",
+        "cicada._application.startup",
+    },
+})
+
 
 def module_imports(source: str, package: tuple[str, ...]) -> set[str]:
     """解析 source 的全部导入并归一为绝对模块名.
@@ -51,15 +73,12 @@ def module_imports(source: str, package: tuple[str, ...]) -> set[str]:
             if node.level == 0:
                 if node.module:
                     modules.add(node.module)
-                if node.module == "cicada":
-                    modules.update(f"cicada.{alias.name}" for alias in node.names)
+                    modules.update(f"{node.module}.{alias.name}" for alias in node.names)
             else:
                 base = package[: len(package) - (node.level - 1)]
                 target = (*base, *(node.module.split(".") if node.module else ()))
-                if node.module:
-                    modules.add(".".join(target))
-                else:
-                    modules.update(".".join((*target, alias.name)) for alias in node.names)
+                modules.add(".".join(target))
+                modules.update(".".join((*target, alias.name)) for alias in node.names)
     return modules
 
 
@@ -83,13 +102,21 @@ def layer_violations() -> list[str]:
     for layer, banned in FORBIDDEN.items():
         for file in _layer_files(layer):
             for module in imports_of(file):
-                root = ".".join(module.split(".")[:2])
-                if root in banned:
+                if any(module == prefix or module.startswith(prefix + ".") for prefix in banned):
                     offenders.append(f"{file.name} imports {module}")
     return offenders
 
 
 def test_import_resolution_catches_relative_and_package_aliases():
+    assert "cicada._application.startup" in module_imports(
+        "from cicada._application import startup", ("cicada", "_application")
+    )
+    assert "cicada._application.startup" in module_imports(
+        "from . import startup", ("cicada", "_application")
+    )
+    assert "cicada._application.startup" in module_imports(
+        "from .._application import startup", ("cicada", "_application")
+    )
     # 相对导入不得绕过边界
     assert "cicada.runtime.runtime" in module_imports(
         "from ..runtime.runtime import X", ("cicada", "core")

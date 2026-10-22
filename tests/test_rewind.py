@@ -134,7 +134,7 @@ async def test_rewind_relations_history_unknown_and_blob_boundaries(tmp_path):
 
 @pytest.mark.parametrize("timeout", [False, True])
 async def test_rewind_cancel_or_timeout_retains_lease_until_worker_settles(tmp_path, monkeypatch, timeout):
-    import cicada.application as module
+    import cicada._application.session as module
     root = repo(tmp_path)
     session = await open_application(_config(root, script(), session_id=None))
     entered, release = threading.Event(), threading.Event()

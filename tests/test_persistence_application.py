@@ -385,7 +385,7 @@ async def test_cancel_during_restore_capture_waits_for_owned_worker(tmp_path, mo
 @pytest.mark.parametrize("cross_deadline", [False, True])
 async def test_close_tracks_restore_cleanup_until_actual_settlement(tmp_path, monkeypatch, cross_deadline):
     """收尾线程属于请求；关闭监督超时只作诊断，不冒称实际释放。"""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
     root = _repo(tmp_path)
     session = await open_application(_config(root, _script(
         {"tool_calls": [{"id": "write", "name": "write", "arguments": {
@@ -733,7 +733,7 @@ async def test_resume_with_tool_fingerprint_mismatch_refused_and_lease_released(
     session_id = session.persistence.session_id
     await session.aclose()
 
-    import cicada.application as app_module
+    import cicada._application.recovery as app_module
 
     monkeypatch.setattr(app_module, "_tool_fingerprint", lambda app: "fingerprint-changed")
     with pytest.raises(ApplicationOpenError, match="tool_fingerprint"):
@@ -860,7 +860,7 @@ async def test_resume_adopt_current_config_adopts_changed_tool_fingerprint(
     session_id = session.persistence.session_id
     await session.aclose()
 
-    import cicada.application as app_module
+    import cicada._application.recovery as app_module
 
     monkeypatch.setattr(app_module, "_tool_fingerprint", lambda app: "fingerprint-changed")
     config = dc_replace(
@@ -898,7 +898,7 @@ def _recording_model_plugin(order: list, script: list):
 
 async def test_persistent_topology_cleans_resources_before_store(tmp_path, monkeypatch):
     """A14: 显式 requires 的真实 open_application 装配 —— 模型先清理, store 最后释放."""
-    import cicada.application as app_module
+    import cicada._application.startup as app_module
 
     root = _repo(tmp_path)
     order: list[str] = []
@@ -993,7 +993,7 @@ async def _manual_persistent_session(tmp_path, script: list, tool, *, store, coo
 
 async def test_close_supervision_expiry_keeps_store_until_inflight_end_settles(tmp_path, monkeypatch):
     """A14 反例: 监督到期时 end 事务仍在 worker 在途 —— lease/连接不提前释放."""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     coordinator = ActivityCoordinator()
@@ -1054,7 +1054,7 @@ async def test_close_supervision_expiry_keeps_store_until_inflight_end_settles(t
 
 async def test_sealed_store_gives_late_writes_definitive_results(tmp_path, monkeypatch):
     """A14: 队列暂空即封店释放后, 迟到的 end/commit 得到明确拒绝, 不挂起不丢结果."""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     store = open_session_store(directory=tmp_path, session_id=None, workspace=tmp_path)
     coordinator = ActivityCoordinator()

@@ -301,7 +301,7 @@ async def test_config_rejects_invalid_max_turns(tmp_path):
 
 
 async def test_open_failure_maps_boot_error(tmp_path, monkeypatch):
-    import cicada.application as app_module
+    import cicada._application.startup as app_module
     from cicada.boot import BootError
 
     async def broken_bootstrap(*args, **kwargs):
@@ -562,7 +562,7 @@ async def test_late_completion_during_close_keeps_closing_state(tmp_path):
 
 
 async def test_close_supervision_deadline_records_problem(tmp_path, monkeypatch):
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.2)
     root = _repo(tmp_path)
@@ -599,7 +599,7 @@ async def test_close_supervision_deadline_records_problem(tmp_path, monkeypatch)
 
 async def test_finalization_supervision_deadline_returns_nondeliverable(tmp_path, monkeypatch):
     """T11 应用部分: 请求收尾监督到点 -> 不可交付 outcome, 任务已终结才回 idle."""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "REQUEST_FINALIZE_SUPERVISION_S", 0.1)
     root = _repo(tmp_path)
@@ -627,7 +627,7 @@ async def test_late_completion_after_close_deadline_keeps_closed_terminal_state(
     tmp_path, monkeypatch
 ):
     """02-R-F1 回归: close 监督超时后的迟到完成不得把 closed 终态改回 closing."""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.2)
     root = _repo(tmp_path)
@@ -662,7 +662,7 @@ async def test_late_completion_after_close_deadline_keeps_closed_terminal_state(
 
 async def test_close_deadline_bounds_request_finalization(tmp_path, monkeypatch):
     """02-R-F6: closing 锁存后, 请求收尾窗口与 close 截止时间取较早值."""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.3)
     root = _repo(tmp_path)
@@ -836,7 +836,7 @@ async def test_subscribe_observer_errors_recorded_not_fatal(tmp_path):
 async def test_active_close_owns_native_file_worker_until_actual_finish(tmp_path, monkeypatch, cross_deadline):
     """文件发布跨关闭监督时直接核对 worker/锁, 不把 close 当成 completion 保存."""
     import threading
-    import cicada.application as app_module
+    import cicada._application.session as app_module
     from cicada.core.messages import ToolResultMessage
     from cicada.plugins.coding import file_commit_windows as native
     from cicada.plugins.coding.tool_read import ReadTool

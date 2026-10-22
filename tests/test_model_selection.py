@@ -193,7 +193,7 @@ async def test_accepted_commit_blocks_operations_until_publication(tmp_path, mon
             assert not task.done()
         elif action in ("close", "close-timeout"):
             if action == "close-timeout":
-                monkeypatch.setattr("cicada.application.CLOSE_SUPERVISION_S", 0.02)
+                monkeypatch.setattr("cicada._application.session.CLOSE_SUPERVISION_S", 0.02)
             close = asyncio.create_task(session.aclose())
             await asyncio.sleep(0)
             await asyncio.sleep(0)

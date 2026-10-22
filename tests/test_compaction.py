@@ -482,7 +482,7 @@ async def test_close_seal_with_late_valid_text_zero_commit(tmp_path):
 
 async def test_close_waits_for_accepted_summary_commit_before_store_release(tmp_path, monkeypatch):
     """事务已被 store 接受但 completion 未送达时 close: 生产者屏障等明确结果。"""
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 5.0)
     store = open_session_store(
@@ -535,7 +535,7 @@ async def test_close_waits_for_accepted_summary_commit_before_store_release(tmp_
 
 
 async def test_close_supervision_timeout_records_problem_and_does_not_fake_done(tmp_path, monkeypatch):
-    import cicada.application as app_module
+    import cicada._application.session as app_module
 
     monkeypatch.setattr(app_module, "CLOSE_SUPERVISION_S", 0.2)
     channel = _GatedSummary(ignore_cancel=True)  # 持续在途且忽略取消
