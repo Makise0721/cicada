@@ -45,13 +45,15 @@ def profile_identity(provider: ProviderProfile, model: ModelProfile) -> SafeMode
     from cicada.plugins.openai_chat import ChatConfig
 
     config_type = ChatConfig
+    settings = {}
     if is_opencode_go_endpoint(provider.base_url):
         from cicada.plugins.openai_chat.opencode_go import GoConfig
         config_type = GoConfig
+        settings = dict(think=model.think, reasoning_effort=model.reasoning_effort)
     return config_type(provider=provider.id, model_key=model.key, model=model.model_id,
         base_url=provider.base_url, num_ctx=model.context_window,
         max_tokens=model.max_output_tokens, stream_usage=model.stream_usage,
-        output_token_field=model.output_token_field).identity
+        output_token_field=model.output_token_field, **settings).identity
 
 
 class ModelCatalog:
@@ -179,14 +181,16 @@ class ModelCatalog:
 
             config_type, model_type = ChatConfig, ChatModel
             extra = {}
+            settings = {}
             if is_opencode_go_endpoint(provider.base_url):
                 from cicada.plugins.openai_chat.opencode_go import GoConfig, GoModel
                 config_type, model_type = GoConfig, GoModel
+                settings = dict(think=model.think, reasoning_effort=model.reasoning_effort)
                 extra['session_id_provider'] = lambda: self._session_id_provider()
             config = config_type(provider=provider.id, model_key=model.key, model=model.model_id,
                 base_url=provider.base_url, num_ctx=model.context_window,
                 max_tokens=model.max_output_tokens, stream_usage=model.stream_usage,
-                output_token_field=model.output_token_field)
+                output_token_field=model.output_token_field, **settings)
             adapter = model_type(client, config, secret.reveal() if secret else None,
                 cost_control=self._cost_control, **extra)
         return self._decorate(adapter.initial_binding, provider, model)

@@ -181,9 +181,11 @@ class ProviderWizard:
         if self.step == 'model_settings':
             keys = [('key', '本地标识'), ('model_id', '远端模型 ID'), ('name', '显示名称'),
                     ('context_window', '上下文窗口'), ('max_output_tokens', '输出上限'), ('tools', '工具调用')]
-            if self._provider['protocol'] == 'deepseek-chat':
+            from cicada.user_config import supports_thinking
+
+            if supports_thinking(self._provider['protocol'], self._provider['base_url'], self._model['model_id']):
                 keys += [('think', '思考'), ('reasoning_effort', '思考强度')]
-            else:
+            if self._provider['protocol'] != 'deepseek-chat':
                 keys += [('stream_usage', '流式 usage'), ('output_token_field', '输出限制字段')]
             return [(key, label + '：' + str(self._model[key])) for key, label in keys] + [('back', '保存模型并返回')]
         if self.step == 'credential':

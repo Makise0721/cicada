@@ -143,10 +143,18 @@ class ProviderProfile:
                            for model in self.models)):
                 raise UserConfigError('config', 'invalid-provider-settings')
             object.__setattr__(self, 'base_url', self.base_url.rstrip('/'))
-        elif any(model.think for model in self.models):
+        elif any(model.think and not supports_thinking(self.protocol, self.base_url, model.model_id)
+                 for model in self.models):
             raise UserConfigError('config', 'unsupported-thinking')
         if self.auth == 'none' and (self.api_key_env is not None or self.credential_ref is not None):
             raise UserConfigError('config', 'invalid-provider-settings')
+
+
+def supports_thinking(protocol: str, base_url: str, model_id: str) -> bool:
+    return protocol == 'deepseek-chat' or (
+        protocol == 'openai-chat-completions'
+        and base_url.rstrip('/') == 'https://opencode.ai/inference/go/openai/v1'
+        and model_id == 'deepseek-v4.1-flash')
 
 
 @dataclass(frozen=True)

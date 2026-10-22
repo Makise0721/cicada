@@ -433,7 +433,10 @@ async def _prepare_catalog_launch(args, store, saved_launch, prompt_info, plan, 
             stream_usage=values.get('stream_usage', True),
             output_token_field=values.get('output_token_field', 'max_tokens'))
     else:
-        if provider.protocol == 'openai-chat-completions' and (args.think is True or args.reasoning_effort is not None):
+        from cicada.user_config import supports_thinking
+
+        if (not supports_thinking(provider.protocol, provider.base_url, model.model_id)
+                and (args.think is True or args.reasoning_effort is not None)):
             raise UserConfigError('config', 'unsupported-thinking')
         model = replace(model,
             context_window=args.num_ctx if args.num_ctx is not None else model.context_window,

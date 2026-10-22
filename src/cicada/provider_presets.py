@@ -13,6 +13,6 @@ def is_opencode_go_endpoint(base_url: str) -> bool:
 
 def opencode_go_profile() -> ProviderProfile:
     model = ModelProfile(OPENCODE_GO_MODEL, OPENCODE_GO_MODEL, name='DeepSeek V4.1 Flash',
-                         context_window=OPENCODE_GO_CONTEXT_WINDOW, max_output_tokens=32768)
+                         context_window=OPENCODE_GO_CONTEXT_WINDOW, max_output_tokens=32768, think=True)
     return ProviderProfile('opencode-go', 'OpenCode Go', 'openai-chat-completions',
                            OPENCODE_GO_BASE_URL, (model,), model.key)

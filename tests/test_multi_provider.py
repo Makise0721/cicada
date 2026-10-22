@@ -456,9 +456,24 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
     seen = []
     def handle(request):
         seen.append((request, json.loads(request.content)))
-        return httpx.Response(200, content=response(None, 'offline'))
+        body = seen[-1][1]
+        calls = (('go-read', 'read', {'path': 'a.txt'}),) if len(seen) == 1 else ()
+        return httpx.Response(200, content=response(
+            'go thought' if body['thinking']['type'] == 'enabled' else None, 'offline', calls=calls))
     transport = httpx.MockTransport(handle)
     selected = 'opencode-go/' + OPENCODE_GO_MODEL
+    legacy_model = replace(provider.models[0], key='kimi-k2.6', model_id='kimi-k2.6',
+                           think=False, context_window=262144)
+    legacy_provider = replace(provider, models=(legacy_model,), default_model=legacy_model.key)
+    legacy_root = tmp_path / 'legacy'
+    legacy_root.mkdir()
+    legacy_session = await open_application(application_config(
+        _repo(legacy_root), transport, (legacy_provider,), 'opencode-go/kimi-k2.6'))
+    try:
+        assert not legacy_session.reasoning_effort.enabled
+        assert seen == []
+    finally:
+        await legacy_session.aclose()
     prepared = application_config(root, transport, (provider,), selected)
     plugin = model_catalog_plugin((provider,), selected, transport=transport,
         credential=lambda pid, key: store.load(provider_id=pid, model_key=key))
@@ -466,7 +481,14 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
     session = await open_application(prepared)
     try:
         original = session.persistence.session_id
+        assert session.reasoning_effort.current == 'high'
         await session.execute('first')
+        assert session.reasoning_effort.levels == ('low', 'high', 'max')
+        assert next(m for m in seen[1][1]['messages'] if m.get('tool_calls'))['reasoning_content'] == 'go thought'
+        for effort in ('low', 'high', 'max'):
+            await session.set_reasoning_effort(effort)
+            await session.execute('effort ' + effort)
+            assert seen[-1][1]['reasoning_effort'] == effort
         await session.execute('second')
         await session.compact_context()
         assert seen[-1][1]['max_tokens'] == 2048 and 'tools' not in seen[-1][1]
@@ -476,23 +498,31 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
         await session.execute('new conversation')
         assert fresh != original and seen[-1][0].headers['x-opencode-session'] == fresh
         await session.submit_resume_session(original).wait()
+        assert session.reasoning_effort.current == 'max'
         await session.execute('resumed conversation')
         assert seen[-1][0].headers['x-opencode-session'] == original
         for request, body in seen:
             assert str(request.url) == OPENCODE_GO_BASE_URL + '/chat/completions'
             assert request.headers['authorization'] == 'Bearer offline-go-key'
             assert request.headers['user-agent'].startswith('cicada/')
-            assert body['model'] == OPENCODE_GO_MODEL and body['thinking'] == {'type': 'disabled'}
+            assert body['model'] == OPENCODE_GO_MODEL and body['thinking'] == {'type': 'enabled' if 'tools' in body else 'disabled'}
             assert body['stream_options'] == {'include_usage': True}
         assert dict(session.config.persistence.identity.options)['compatibility_profile'] == 'opencode-go-v1'
     finally:
         await session.aclose()
     stored = read_session_identity(directory=root / '.cicada' / 'sessions', session_id=original, workspace=root)
-    restored_config = replace(prepared, persistence=replace(prepared.persistence,
-        identity=stored.launch, session_id=original))
+    restored_model = replace(provider.models[0], think=stored.launch.think,
+                             reasoning_effort=stored.launch.options.get('reasoning_effort', 'high'))
+    restored_provider = replace(provider, models=(restored_model,))
+    restored_plugin = model_catalog_plugin((restored_provider,), selected, transport=transport,
+        credential=lambda pid, key: store.load(provider_id=pid, model_key=key))
+    restored_config = replace(prepared, model_plugin=restored_plugin,
+        persistence=replace(prepared.persistence, identity=stored.launch, session_id=original))
     restored = await open_application(restored_config)
     try:
+        assert restored.reasoning_effort.current == 'max'
         await restored.execute('process restart')
+        assert any(m.get('reasoning_content') == 'go thought' for m in seen[-1][1]['messages'])
         assert seen[-1][0].headers['x-opencode-session'] == original
     finally:
         await restored.aclose()
@@ -529,7 +559,9 @@ def test_cli_go_key_only_startup_wizard_and_resume(monkeypatch, tmp_path):
             await session.aclose()
     def handle(request):
         seen.append(request)
-        return httpx.Response(200, content=response(None))
+        body = json.loads(request.content)
+        return httpx.Response(200, content=response(
+            'cli thought' if body['thinking']['type'] == 'enabled' else None))
     original = cli.model_catalog_plugin
     monkeypatch.setattr(cicada.ui, 'run_tui_session', tui)
     monkeypatch.setattr(cli, 'model_catalog_plugin', lambda *a, **kw: original(

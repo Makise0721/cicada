@@ -1619,7 +1619,8 @@ class ApplicationSession:
             return ReasoningEffortState((), None, enabled=False)
         identity = self._model_route.binding.identity
         current = dict(identity.options).get("reasoning_effort") if identity.think is True else None
-        return ReasoningEffortState(tuple(capability.reasoning_efforts), current, enabled=True)
+        levels = tuple(capability.reasoning_efforts)
+        return ReasoningEffortState(levels, current, enabled=bool(levels))
 
     def _check_model_transaction_admission(self, blocked: str) -> None:
         """select_model 与 set_reasoning_effort 共用的独占事务准入 (C6)."""
