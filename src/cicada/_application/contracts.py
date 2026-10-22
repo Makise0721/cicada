@@ -289,6 +289,13 @@ class ApprovalRequested:
 
 
 @dataclass(frozen=True)
+class ExecutionModeChanged:
+    """执行档已在会话内切换 (P0-1 v2); mode 为 read-only/approval/full."""
+
+    mode: str
+
+
+@dataclass(frozen=True)
 class ApplicationClosed:
     """关闭完成或明确清理失败; error 非空不代表所有资源均已成功释放."""
 
@@ -300,7 +307,7 @@ ApplicationUpdate = (
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
     | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
     | SessionNameChanged | SessionChanged
-    | RewindRestoreCompleted | ApprovalRequested
+    | RewindRestoreCompleted | ApprovalRequested | ExecutionModeChanged
 )
 
 

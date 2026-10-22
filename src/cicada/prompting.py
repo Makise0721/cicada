@@ -31,7 +31,6 @@ PROMPT_VERSION = "builtin:p4-v1"
 MAX_INSTRUCTIONS_BYTES = 16 * 1024
 
 DEFAULT_TOOLS = ("read", "edit", "write", "powershell", "glob", "grep")
-READ_ONLY_TOOLS = ("read", "glob", "grep")
 CHECK_TOOL = "check"
 
 # project-context-v1 C1: 启动层指令来源选择的固定 mode 词表; 仅供显示,
@@ -136,19 +135,15 @@ def _resolve_instructions_mode(instructions_path: str | None, mode: str | None) 
 
 def build_builtin_prompt(
     workspace: Path,
-    tools: tuple[str, ...] | None = None,
+    tools: tuple[str, ...] = DEFAULT_TOOLS,
     checks: tuple[CheckPrompt, ...] = (),
-    *,
-    read_only: bool = False,
 ) -> str:
     """内置默认提示; 简洁英文, 含实际 workspace 与实际注册工具, 无时间/动态状态.
 
     指定检查模式下 `checks` 非空: 工具名单应包含 check, 各声明的 check_id/命令/timeout
     原样列出; 检查的当前状态不在此处 (由运行时逐轮投影), 这里只声明固定契约.
-    `read_only` 声明只读档: 工具名单默认收窄为 read/glob/grep, 并明确禁止声称改动.
+    执行档可在会话内切换, 因此提示不声明当前档位; 被拒绝的调用由工具结果告知.
     """
-    if tools is None:
-        tools = READ_ONLY_TOOLS if read_only else DEFAULT_TOOLS
     root = workspace.resolve()
     tool_lines = "\n".join(f"- {name}" for name in tools)
     lines = [
@@ -170,12 +165,6 @@ def build_builtin_prompt(
         "- Report what you actually did and observed; do not claim success without evidence.",
         "- Respond in the user's language.",
     ]
-    if read_only:
-        lines.append("")
-        lines.append(
-            "Read-only mode is active: only the listed tools are available. You cannot modify "
-            "files or run commands; do not attempt or claim changes."
-        )
     if checks:
         lines.append("")
         lines.append("Required checks (declared by the launcher; you cannot change them):")
@@ -228,12 +217,11 @@ def compose_system_prompt(
     workspace: Path,
     instructions_path: str | None = None,
     *,
-    tools: tuple[str, ...] | None = None,
+    tools: tuple[str, ...] = DEFAULT_TOOLS,
     checks: tuple[CheckPrompt, ...] = (),
     skills: SkillCatalogSnapshot | None = None,
     instructions_mode: str | None = None,
     instruction_sources: tuple[tuple[str, str], ...] | None = None,
-    read_only: bool = False,
 ) -> tuple[str, PromptInfo]:
     """组装系统提示: 内置提示在前, Skills 目录段紧随, 项目指令以明确来源标记追加在后.
 
@@ -246,7 +234,7 @@ def compose_system_prompt(
     explicit/automatic) 在组装前拒绝。None 按旧约定推导 (有路径=explicit)。
     """
     mode = _resolve_instructions_mode(instructions_path, instructions_mode)
-    prompt = build_builtin_prompt(workspace, tools, checks, read_only=read_only)
+    prompt = build_builtin_prompt(workspace, tools, checks)
     version = PROMPT_VERSION
     if skills is not None:
         prompt += "\n" + catalog_prompt_section(skills)

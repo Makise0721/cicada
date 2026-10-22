@@ -1,4 +1,4 @@
-"""审批档最小回归: broker 决定语义、取消/关闭收敛、包装器未批准不执行."""
+"""执行档与审批的最小回归: broker 决定语义、取消/关闭收敛、分派闸门与运行时切换."""
 
 from __future__ import annotations
 
@@ -6,22 +6,23 @@ import asyncio
 
 import pytest
 
-from cicada.approval import DENIED_CONTENT, ApprovalBroker, ApprovalTool
+from cicada.approval import DENIED_CONTENT, ApprovalBroker
 from cicada.core.cancel import CancelToken
 from cicada.core.messages import ToolResult
 from cicada.core.ports import ToolContext, ToolSpec
+from cicada.execution_mode import ExecutionModeController, ExecutionModeTool
 
 
 class RecordingTool:
-    def __init__(self) -> None:
+    def __init__(self, name: str = "powershell") -> None:
         self.calls: list[dict] = []
-        self.spec = ToolSpec(name="powershell", description="pwsh", parameters={
+        self.spec = ToolSpec(name=name, description=name, parameters={
             "type": "object", "properties": {}, "additionalProperties": False,
         })
 
     async def execute(self, arguments, ctx):
         self.calls.append(arguments)
-        return ToolResult(call_id=ctx.call_id, name="powershell", content="ok",
+        return ToolResult(call_id=ctx.call_id, name=self.spec.name, content="ok",
                           details={"exit_code": 0, "output_complete": True})
 
 
@@ -86,11 +87,32 @@ async def test_close_denies_pending():
     assert await broker.request("powershell", "echo hi", CancelToken()) == "deny"
 
 
-async def test_tool_wrapper_denies_before_running_inner():
+async def test_approval_mode_denies_without_ui():
     inner = RecordingTool()
-    tool = ApprovalTool(inner, ApprovalBroker())
+    tool = ExecutionModeTool(inner, ExecutionModeController("approval"))
     ctx = ToolContext(call_id="c1", cancel=CancelToken())
     result = await tool.execute({"command": "echo hi"}, ctx)
     assert result.is_error and result.content == DENIED_CONTENT
     assert inner.calls == []
     assert tool.spec.name == "powershell"
+
+
+async def test_read_only_denies_write_until_mode_switches():
+    inner = RecordingTool("write")
+    controller = ExecutionModeController("read-only")
+    tool = ExecutionModeTool(inner, controller)
+    ctx = ToolContext(call_id="c1", cancel=CancelToken())
+    denied = await tool.execute({}, ctx)
+    assert denied.is_error and "read-only mode" in denied.content
+    assert inner.calls == []
+    assert controller.set_mode("full") is True
+    allowed = await tool.execute({}, ctx)
+    assert not allowed.is_error and inner.calls == [{}]
+
+
+def test_invalid_mode_is_rejected_without_change():
+    controller = ExecutionModeController("full")
+    with pytest.raises(ValueError):
+        controller.set_mode("root")
+    assert controller.mode == "full"
+    assert controller.set_mode("full") is False

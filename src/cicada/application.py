@@ -24,6 +24,7 @@ from ._application.contracts import (
     ContextCompacted,
     RewindRestoreCompleted,
     ApprovalRequested,
+    ExecutionModeChanged,
     ApplicationClosed,
     ApplicationUpdate,
     ApplicationOpenError,

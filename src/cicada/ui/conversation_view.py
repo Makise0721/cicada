@@ -74,6 +74,7 @@ from cicada.application import (
     ApprovalRequested,
     ConfigurationChanged,
     ContextCompacted,
+    ExecutionModeChanged,
     HistoryCleared,
     RewindRestoreCompleted,
     ModelChanged,
@@ -251,13 +252,8 @@ class ConversationView:
         )
 
     def _mode_label(self) -> str | None:
-        """P0-1: 执行档在底栏可观察; 默认 unrestricted 不占段."""
-        config = self._session.config
-        if config.read_only:
-            return "只读"
-        if config.approval:
-            return "审批"
-        return None
+        """P0-1 v2: 非完全档在底栏可观察; full 是默认, 不占段."""
+        return {"read-only": "只读", "approval": "审批"}.get(self._session.execution_mode)
 
     def _resolve_approval(self, request: ApprovalRequested, decision: str) -> None:
         """审批框决定 -> 应用层待决请求; 幂等关闭框, 再通知渲染."""
@@ -333,6 +329,10 @@ class ConversationView:
                 self.on_session_changed()
         elif isinstance(update, ApprovalRequested):
             self.approval_modal.open(update)
+            if self._on_update:
+                self._on_update()
+        elif isinstance(update, ExecutionModeChanged):
+            self.footer.set_mode(self._mode_label())
             if self._on_update:
                 self._on_update()
         elif isinstance(update, AgentEventReceived):
@@ -861,6 +861,8 @@ class ConversationView:
         if is_enter_barrier(self._session, self._gate):
             return False
         command = text.strip()
+        if command == "/mode" or command.startswith("/mode "):
+            return self._handle_mode_command(command[5:].strip())
         if command == '/cost':
             cost = self._session.cost
             self.transcript.append_information('费用控制', [('',
@@ -967,6 +969,32 @@ class ConversationView:
             return self._handle_skill_command(text.lstrip())
         self.transcript.append_system(f"未知命令: {command}（输入 / 查看可用命令）")
         return False  # 未知命令提示且草稿保留
+
+    def _handle_mode_command(self, argument: str) -> bool:
+        """执行档切换: 无参数按 只读→审批→完全 循环, 有参数直接设置."""
+        order = ("read-only", "approval", "full")
+        labels = {"read-only": "只读", "approval": "审批", "full": "完全"}
+        aliases = {
+            "read-only": "read-only", "readonly": "read-only", "只读": "read-only",
+            "approval": "approval", "审批": "approval",
+            "full": "full", "完全": "full",
+        }
+        if argument:
+            target = aliases.get(argument.lower())
+            if target is None:
+                self.transcript.append_system(
+                    "用法：/mode [read-only|approval|full]；无参数循环切换"
+                )
+                return True
+        else:
+            current = self._session.execution_mode
+            target = order[(order.index(current) + 1) % len(order)]
+        changed = self._session.set_execution_mode(target)
+        mode = self._session.execution_mode
+        self.transcript.append_system(
+            f"执行档：{labels[mode]}" + ("" if changed else "（未变化）")
+        )
+        return True
 
     def _handle_name_command(self, text: str) -> bool:
         if text == "/name":

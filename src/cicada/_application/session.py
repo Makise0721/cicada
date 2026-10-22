@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Callable, Literal
 
 from cicada.boot import App
-from cicada.approval import ApprovalBroker, ApprovalRequest, Decision
+from cicada.approval import ApprovalRequest, Decision
+from cicada.execution_mode import ExecutionModeController
 from cicada.budget import (
     BudgetSnapshot,
     ComponentEstimate,
@@ -119,6 +120,7 @@ from .contracts import (
     CompactionSealedError,
     ConfigurationChanged,
     ContextCompacted,
+    ExecutionModeChanged,
     HistoryCleared,
     LoginCompleted,
     ModelChanged,
@@ -305,13 +307,13 @@ class ApplicationSession:
         resume_store_factory: Callable[[str], SessionStorePort] | None = None,
         restore_store: RestoreStore | None = None,
         restore_warnings: tuple[str, ...] = (),
-        approval_broker: ApprovalBroker | None = None,
+        mode_controller: ExecutionModeController | None = None,
     ) -> None:
         self._app = app
         self._config = config
         self._service = service
         self._policy = policy
-        self._approval = approval_broker
+        self._mode_controller = mode_controller or ExecutionModeController()
         self._budget_policy = budget_policy
         self._model_selection = model_selection
         self._model_route = model_route
@@ -1257,12 +1259,22 @@ class ApplicationSession:
             # 内核结束 != 应用空闲; 收尾由 execute 的 finalizing 段完成
             self._notify(RequestPhaseChanged(event.run_id, "finalizing"))
 
-    # --- 审批 (P0-1) --------------------------------------------------------------
+    # --- 审批与执行档 (P0-1) ------------------------------------------------------
+
+    @property
+    def execution_mode(self) -> str:
+        return self._mode_controller.mode
+
+    def set_execution_mode(self, mode: str) -> bool:
+        """会话内切换执行档; 返回是否变化. 只影响本进程, 不写存档."""
+        changed = self._mode_controller.set_mode(mode)
+        if changed:
+            self._notify(ExecutionModeChanged(self._mode_controller.mode))
+        return changed
 
     def enable_approval_ui(self) -> None:
         """TUI 组合层打开会话后绑定审批 UI; 未绑定时审批档一律 deny."""
-        if self._approval is not None:
-            self._approval.enable(self._publish_approval)
+        self._mode_controller.broker.enable(self._publish_approval)
 
     def _publish_approval(self, request: ApprovalRequest) -> None:
         self._notify(ApprovalRequested(
@@ -1273,10 +1285,7 @@ class ApplicationSession:
 
     def resolve_approval(self, request_id: str, decision: Decision) -> bool:
         """UI 决定回传; 无待决请求或身份不符返回 False."""
-        return (
-            self._approval.resolve(request_id, decision)
-            if self._approval is not None else False
-        )
+        return self._mode_controller.broker.resolve(request_id, decision)
 
     # --- 执行 ----------------------------------------------------------------------
 
@@ -2747,8 +2756,7 @@ class ApplicationSession:
     async def _close(self) -> None:
         # 关闭意图已锁存 (调用方 UI 应先行恢复其输入/光标模式); closing 不可逆
         self._closing = True
-        if self._approval is not None:
-            self._approval.close()
+        self._mode_controller.broker.close()
         if self._state == "idle":
             self._state = "closing"
         deadline = time.monotonic() + CLOSE_SUPERVISION_S

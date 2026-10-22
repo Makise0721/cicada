@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from cicada.boot import App, BootError, bootstrap
-from cicada.approval import ApprovalBroker, ApprovalTool
+from cicada.execution_mode import ExecutionModeController, ExecutionModeTool
 from cicada.context_policy import BudgetPolicy, ContextProjection
 from cicada.core.cancel import CancelToken
 from cicada.costs import CostControlPort
@@ -78,10 +78,6 @@ TOOL_CAPABILITIES = (
 
 
 CHECK_TOOL_CAPABILITIES = TOOL_CAPABILITIES + ("tool.check",)
-
-# 执行安全边界 P0-1: 只读档只暴露检查类工具; load_skill 只读取本地提示, 不授予动作
-READ_ONLY_TOOL_CAPABILITIES = ("tool.read", "tool.glob", "tool.grep")
-READ_ONLY_TOOL_NAMES = frozenset({"read", "glob", "grep", LOAD_SKILL_TOOL_NAME})
 
 
 def make_session_catalog_reader(
@@ -184,21 +180,6 @@ def _verify_skills_assembly(app: App, config: "ApplicationConfig") -> None:
     if LOAD_SKILL_TOOL_NAME not in tools:
         raise ApplicationOpenError(
             f"the {LOAD_SKILL_TOOL_NAME} tool is not registered while skills are enabled"
-        )
-
-
-def _verify_read_only_assembly(app: App, config: "ApplicationConfig") -> None:
-    """只读档装配核对: 实际注册工具必须全部在只读名单内 (含 load_skill).
-
-    注册名单已经收窄; 这里再核对 bootstrap 之后的真实工具表, 防止组合层把写入或
-    任意命令能力重新带回只读会话。
-    """
-    if not config.read_only:
-        return
-    unexpected = sorted(set(getattr(app.agent, "_tools", {})) - READ_ONLY_TOOL_NAMES)
-    if unexpected:
-        raise ApplicationOpenError(
-            f"read-only assembly exposed non-read-only tools: {unexpected}"
         )
 
 
@@ -372,27 +353,26 @@ async def open_application(
     if store is not None and plan is not None:
         history_projection = HistoricalProjection()
 
+    # 执行档 (P0-1 v2): 三档运行时可切, 工具表保持完整; 分派闸门按当前档执行
+    initial_mode = (
+        "read-only" if config.read_only else "approval" if config.approval else "full"
+    )
+    mode_controller = ExecutionModeController(initial_mode)
+
     # 活动包装器经 tool_policy 装入; 协调器在会话构造后绑定 (契约 §3)
     coordinator = ActivityCoordinator()
-    approval_broker = ApprovalBroker() if config.approval else None
-    tool_policy = None
-    if store is not None or approval_broker is not None:
 
-        def tool_policy(tool, runtime, _store=store, _coordinator=coordinator,
-                        _approval=approval_broker):
-            wrapped = tool
-            if _store is not None:
-                wrapped = ProcessActivityWrapper(wrapped, _store, _coordinator)
-            if _approval is not None and tool.spec.name == "powershell":
-                # 审批在进程登记/启动之外层: 未批准不登记活动, 也不启动进程
-                wrapped = ApprovalTool(wrapped, _approval)
-            return wrapped
+    def tool_policy(tool, runtime, _store=store, _coordinator=coordinator,
+                    _mode=mode_controller):
+        wrapped = tool
+        if _store is not None:
+            wrapped = ProcessActivityWrapper(wrapped, _store, _coordinator)
+        return ExecutionModeTool(wrapped, _mode)
 
     # 02: Skills 启用时实际注册工具在既有名单上追加 load_skill
-    if config.read_only:
-        tool_capabilities: tuple[str, ...] = READ_ONLY_TOOL_CAPABILITIES
-    else:
-        tool_capabilities = CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES
+    tool_capabilities: tuple[str, ...] = (
+        CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES
+    )
     if config.skills is not None:
         tool_capabilities = tool_capabilities + ("tool.load_skill",)
 
@@ -457,11 +437,6 @@ async def open_application(
         except ApplicationOpenError:
             await app.aclose()
             raise
-    try:
-        _verify_read_only_assembly(app, config)
-    except ApplicationOpenError:
-        await app.aclose()
-        raise
 
     if store is not None and snapshot is not None and config.persistence is not None:
         # 指纹核对/启动代次/会话构造的每条失败路径都必须释放 app (store 随 runtime 清理)
@@ -557,7 +532,7 @@ async def open_application(
                 resume_store_factory=lambda session_id: _open_switch_store(config, session_id),
                 restore_store=restore_store,
                 restore_warnings=restore_warnings,
-                approval_broker=approval_broker,
+                mode_controller=mode_controller,
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
@@ -586,7 +561,7 @@ async def open_application(
             context_projection=context_projection,
             login_store_factory=login_store_factory, login_environment=login_environment,
                 review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
-                approval_broker=approval_broker,
+                mode_controller=mode_controller,
         )
     if plan is None:
         return session

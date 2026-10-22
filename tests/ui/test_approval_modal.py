@@ -11,6 +11,7 @@ from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.keys import Keys
 
 from cicada.ui.approval_modal import ApprovalModal, ModalRouter
+from cicada.ui.conversation_view import ConversationView
 from cicada.ui.theme import FooterComponent
 
 
@@ -85,3 +86,35 @@ def test_footer_shows_mode_only_when_selected():
     assert "只读" not in plain and "审批" not in plain
     approval = FooterComponent("C:/repo", "flash", metrics, mode="审批").render(120, 1)[0]
     assert "审批" in approval
+
+
+class _SessionStub:
+    execution_mode = "read-only"
+
+    def set_execution_mode(self, mode: str) -> bool:
+        changed = mode != self.execution_mode
+        self.execution_mode = mode
+        return changed
+
+
+class _TranscriptStub:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def append_system(self, text: str) -> None:
+        self.lines.append(text)
+
+
+def test_mode_command_cycles_and_sets():
+    view = ConversationView.__new__(ConversationView)
+    view._session = _SessionStub()
+    view.transcript = _TranscriptStub()
+    assert view._handle_mode_command("") is True
+    assert view._session.execution_mode == "approval"
+    assert "审批" in view.transcript.lines[-1]
+    view._handle_mode_command("full")
+    assert view._session.execution_mode == "full"
+    assert "完全" in view.transcript.lines[-1]
+    view._handle_mode_command("bogus")
+    assert "用法" in view.transcript.lines[-1]
+    assert view._session.execution_mode == "full"

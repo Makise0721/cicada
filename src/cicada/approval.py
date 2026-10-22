@@ -1,4 +1,4 @@
-"""Shell 审批档 (P0-1): 应用持有审批事实, 工具包装器在进程启动前等待决定.
+"""Shell 审批 (P0-1): 应用持有审批事实, 执行档包装器在进程启动前等待决定.
 
 决定只有三种: allow_once / allow_session / deny. 没有 UI 监听 (单次 CLI、fake 剧本)
 时一律 deny, 不读 stdin. allow_session 只在当前进程内有效, 不写存档.
@@ -9,12 +9,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Literal
 
 from cicada.core.cancel import CancelToken
-from cicada.core.messages import ToolResult
-from cicada.core.ports import Tool, ToolContext, ToolSpec
 
 Decision = Literal["allow_once", "allow_session", "deny"]
 DECISIONS: tuple[Decision, ...] = ("allow_once", "allow_session", "deny")
@@ -97,34 +95,6 @@ class ApprovalBroker:
         future, self._pending = self._pending, None
         if future is not None and not future.done():
             future.set_result(decision)
-
-
-class ApprovalTool:
-    """Tool 装饰器: powershell 在进入内层 (进程登记/执行) 之前等待审批."""
-
-    def __init__(self, inner: Tool, broker: ApprovalBroker) -> None:
-        self._inner = inner
-        self._broker = broker
-
-    @property
-    def spec(self) -> ToolSpec:
-        return self._inner.spec
-
-    async def execute(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        name = self._inner.spec.name
-        decision = await self._broker.request(name, str(arguments.get("command", "")), ctx.cancel)
-        if decision == "deny":
-            return ToolResult(
-                call_id=ctx.call_id,
-                name=name,
-                content=DENIED_CONTENT,
-                is_error=True,
-                details={"approval": "deny"},
-            )
-        result = await self._inner.execute(arguments, ctx)
-        details = dict(result.details) if isinstance(result.details, dict) else {}
-        details["approval"] = decision
-        return replace(result, details=details)
 
 
 def _preview(command: str) -> str:

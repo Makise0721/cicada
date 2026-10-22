@@ -119,7 +119,6 @@ from cicada.user_config import (
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
-    READ_ONLY_TOOLS,
     InstructionsError,
     PromptInfo,
     compose_system_prompt,
@@ -566,9 +565,12 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         CheckPrompt(check.check_id, check.command, check.timeout_s) for check in checks
     )
     if args.read_only:
-        prompt_tools = READ_ONLY_TOOLS
+        initial_mode = "read-only"
+    elif args.approval:
+        initial_mode = "approval"
     else:
-        prompt_tools = (DEFAULT_TOOLS + ("check",)) if checks else DEFAULT_TOOLS
+        initial_mode = "full"
+    prompt_tools = (DEFAULT_TOOLS + ("check",)) if checks else DEFAULT_TOOLS
     if skills_snapshot is not None:
         prompt_tools = prompt_tools + ("load_skill",)
     try:
@@ -587,7 +589,6 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             skills=skills_snapshot,
             instructions_mode=selection.mode,
             instruction_sources=selection.sources if selection.mode == "automatic" else None,
-            read_only=args.read_only,
         )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
@@ -605,10 +606,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 print(f"[skills diagnostic: {diagnostic}]")
     if not args.tui:  # TUI 静默: 启动身份不打印 (P12; 原 /status 页已删除)
         _print_prompt_info(prompt_info)
-    if args.read_only and not args.tui:
-        print("[read_only tools=read,glob,grep]")
-    if args.approval and not args.tui:
-        print("[approval tool=powershell]")
+    if initial_mode != "full" and not args.tui:
+        print(f"[execution_mode={initial_mode}]")
     plan: VerificationPlan | None = None
     if checks:
         root = Path(os.path.realpath(Path(workspace).expanduser()))
@@ -1101,15 +1100,15 @@ v1仅适用于DeepSeek官方，输入上界1,100,000；其他实例必须使用�
     parser.add_argument(
         "--read-only", action="store_true",
         help=(
-            "只读档: 仅注册 read/glob/grep, 不提供写入或任意命令; "
-            "不能与 --check-command 组合"
+            "以只读档启动: 拒绝写入与任意命令 (read/glob/grep 可用); "
+            "会话内可用 /mode 切换; 不能与 --check-command 组合"
         ),
     )
     parser.add_argument(
         "--approval", action="store_true",
         help=(
-            "审批档: powershell 在启动进程前等待确认; 仅交互终端可确认, "
-            "单次模式默认拒绝; 与 --read-only 互斥"
+            "以审批档启动: powershell 在启动进程前等待确认; 仅交互终端可确认, "
+            "单次模式默认拒绝; 会话内可用 /mode 切换; 与 --read-only 互斥"
         ),
     )
     parser.add_argument(

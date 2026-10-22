@@ -441,8 +441,8 @@ def test_read_only_hides_write_and_keeps_workspace_unchanged(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / "new.txt").exists()
-    assert "unknown tool: write" in proc.stdout
-    assert "[read_only tools=read,glob,grep]" in proc.stdout
+    assert "read-only mode: tool 'write' is unavailable" in proc.stdout
+    assert "[execution_mode=read-only]" in proc.stdout
 
 
 def test_read_only_rejects_approval_mode(tmp_path):
@@ -470,7 +470,7 @@ def test_approval_mode_denies_shell_in_single_shot(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / "marker.txt").exists()
     assert "denied by user" in proc.stdout
-    assert "[approval tool=powershell]" in proc.stdout
+    assert "[execution_mode=approval]" in proc.stdout
 
 
 def test_check_command_count_limit_rejected(tmp_path):

@@ -57,6 +57,7 @@ CONTEXT_CLOSE_TAG = "</cicada-verification-context>"
 PRE_EXECUTION_MARKERS = (
     "cancelled before execution",
     "denied by user",
+    "read-only mode:",
     "unknown tool:",
     "invalid arguments JSON:",
     "arguments must be a JSON object",
