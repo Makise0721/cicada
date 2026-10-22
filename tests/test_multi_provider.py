@@ -420,3 +420,121 @@ def test_declared_tools_capability_blocks_initial_official_provider(monkeypatch,
         transport=httpx.MockTransport(lambda request: sent.append(request))))
     code, _, _ = invoke(monkeypatch, ['--workspace', str(tmp_path), 'must reject'], store.root)
     assert code == 2 and not sent
+
+
+async def test_opencode_go_key_only_routes_main_summary_new_and_restored_sessions(tmp_path):
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from cicada.ui.login_wizard import make_login_wizard
+    from cicada.provider_presets import OPENCODE_GO_BASE_URL, OPENCODE_GO_MODEL
+    from cicada.plugins.openai_chat.opencode_go import GoConfig
+
+    root = _repo(tmp_path)
+    store = FileUserConfigStore(tmp_path / 'user')
+    wizard = make_login_wizard(store.read_view(), initial_set_default=True)
+    wizard.handle(KeyPress(Keys.BracketedPaste, 'OpenCode Go'))
+    wizard.handle(KeyPress(Keys.ControlM, '\r'))
+    assert wizard.step == 'edit' and wizard._edit_field == 'api_key'
+    wizard.handle(KeyPress(Keys.BracketedPaste, 'offline-go-key'))
+    assert 'offline-go-key' not in ''.join(wizard.render_lines(80, 24))
+    assert wizard.handle(KeyPress(Keys.ControlM, '\r')) == 'submit'
+    submission = wizard.submission()
+    assert submission.defaults.model == OPENCODE_GO_MODEL and submission.set_default
+    assert (await store.save(submission)).defaults_saved
+    wizard.clear_secret()
+    provider = next(p for p in store.read_profiles() if p.id == 'opencode-go')
+    assert provider.base_url == OPENCODE_GO_BASE_URL
+    assert store.load().credential.reveal() == 'offline-go-key'
+    with pytest.raises(ValueError, match='unsupported'):
+        GoConfig('opencode-go', 'bad', 'kimi-k3', OPENCODE_GO_BASE_URL, 262144, 32768)
+    seen = []
+    def handle(request):
+        seen.append((request, json.loads(request.content)))
+        return httpx.Response(200, content=response(None, 'offline'))
+    transport = httpx.MockTransport(handle)
+    selected = 'opencode-go/' + OPENCODE_GO_MODEL
+    prepared = application_config(root, transport, (provider,), selected)
+    plugin = model_catalog_plugin((provider,), selected, transport=transport,
+        credential=lambda pid, key: store.load(provider_id=pid, model_key=key))
+    prepared = replace(prepared, model_plugin=plugin)
+    session = await open_application(prepared)
+    try:
+        original = session.persistence.session_id
+        await session.execute('first')
+        await session.execute('second')
+        await session.compact_context()
+        assert seen[-1][1]['max_tokens'] == 2048 and 'tools' not in seen[-1][1]
+        assert all(req.headers['x-opencode-session'] == original for req, _ in seen)
+        await session.submit_new_session().wait()
+        fresh = session.persistence.session_id
+        await session.execute('new conversation')
+        assert fresh != original and seen[-1][0].headers['x-opencode-session'] == fresh
+        await session.submit_resume_session(original).wait()
+        await session.execute('resumed conversation')
+        assert seen[-1][0].headers['x-opencode-session'] == original
+        for request, body in seen:
+            assert str(request.url) == OPENCODE_GO_BASE_URL + '/chat/completions'
+            assert request.headers['authorization'] == 'Bearer offline-go-key'
+            assert request.headers['user-agent'].startswith('cicada/')
+            assert body['model'] == OPENCODE_GO_MODEL and body['thinking'] == {'type': 'disabled'}
+            assert body['stream_options'] == {'include_usage': True}
+        assert dict(session.config.persistence.identity.options)['compatibility_profile'] == 'opencode-go-v1'
+    finally:
+        await session.aclose()
+    stored = read_session_identity(directory=root / '.cicada' / 'sessions', session_id=original, workspace=root)
+    restored_config = replace(prepared, persistence=replace(prepared.persistence,
+        identity=stored.launch, session_id=original))
+    restored = await open_application(restored_config)
+    try:
+        await restored.execute('process restart')
+        assert seen[-1][0].headers['x-opencode-session'] == original
+    finally:
+        await restored.aclose()
+
+
+def test_cli_go_key_only_startup_wizard_and_resume(monkeypatch, tmp_path):
+    import asyncio
+    import cicada.ui
+    from cicada import __main__ as cli
+    from cicada.ui import terminal_io
+    from prompt_toolkit.key_binding.key_processor import KeyPress
+    from prompt_toolkit.keys import Keys
+    from test_cli import _CaptureStream
+    from test_user_config_startup import invoke
+
+    monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+    monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
+    monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
+    entered = []
+    class StartupTerminal(terminal_io.FakeTerminal):
+        def start(self, *args):
+            super().start(*args)
+            entered.append(self)
+            asyncio.get_running_loop().call_soon(self.emit, [
+                KeyPress(Keys.BracketedPaste, 'OpenCode Go'), KeyPress(Keys.ControlM, '\r'),
+                KeyPress(Keys.BracketedPaste, 'offline-cli-go-key'), KeyPress(Keys.ControlM, '\r')])
+    monkeypatch.setattr(terminal_io, 'PromptToolkitTerminal', StartupTerminal)
+    ids, seen = [], []
+    async def tui(session, *, initial_prompt):
+        ids.append(session.persistence.session_id)
+        try:
+            return (await session.execute(initial_prompt)).exit_code
+        finally:
+            await session.aclose()
+    def handle(request):
+        seen.append(request)
+        return httpx.Response(200, content=response(None))
+    original = cli.model_catalog_plugin
+    monkeypatch.setattr(cicada.ui, 'run_tui_session', tui)
+    monkeypatch.setattr(cli, 'model_catalog_plugin', lambda *a, **kw: original(
+        *a, **kw, transport=httpx.MockTransport(handle)))
+    user = tmp_path / 'user'
+    code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', 'first'], user)
+    assert code == 0, out + err
+    code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '--resume', ids[0], 'second'], user)
+    assert code == 0, out + err
+    assert len(entered) == 1 and entered[0].stopped
+    assert 'offline-cli-go-key' not in entered[0].output_text + out + err
+    assert ids[0] == ids[1]
+    assert all(request.headers['x-opencode-session'] == ids[0] for request in seen)
+    assert all(request.headers['authorization'] == 'Bearer offline-cli-go-key' for request in seen)

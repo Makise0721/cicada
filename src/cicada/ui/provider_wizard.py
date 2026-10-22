@@ -11,6 +11,7 @@ from cicada.ui import theme
 from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
+from cicada.provider_presets import is_opencode_go_endpoint, opencode_go_profile
 from cicada.user_config import (
     LoginSubmission, LoginView, ModelProfile, ProviderProfile, SecretValue,
     UserConfigError, UserDefaults,
@@ -54,6 +55,7 @@ class ProviderWizard:
         self._selected_model_key = ''
         self._initial_provider_id: str | None = None
         self._custom_form = False
+        self._quick_connect = False
         self._model_settings_return = 'settings'
         if view.credentials_only:
             existing = next((item for item in view.providers if item.id == view.provider), view.providers[0])
@@ -69,10 +71,13 @@ class ProviderWizard:
         self.clear_secret()
         self.credential_action = 'keep'
         self._initial_provider_id = provider.id
+        self._quick_connect = (provider.protocol == 'openai-chat-completions'
+                               and is_opencode_go_endpoint(provider.base_url))
         self._custom_form = not (
             (provider.id == 'deepseek' and provider.protocol == 'deepseek-chat')
             or (provider.id == 'openai' and provider.protocol == 'openai-chat-completions'
-                and provider.base_url.rstrip('/') == 'https://api.openai.com/v1'))
+                and provider.base_url.rstrip('/') == 'https://api.openai.com/v1')
+            or self._quick_connect)
         self._provider = {key: getattr(provider, key) for key in
                           ('id', 'name', 'protocol', 'base_url', 'default_model', 'auth', 'api_key_env')}
         self._models = list(provider.models)
@@ -85,6 +90,7 @@ class ProviderWizard:
         self.credential_action = 'keep'
         self._initial_provider_id = None
         self._custom_form = kind == 'custom'
+        self._quick_connect = kind == 'opencode-go'
         if kind == 'deepseek':
             self._provider = dict(id='deepseek', name='DeepSeek', protocol='deepseek-chat',
                                   base_url='https://api.deepseek.com', default_model='deepseek-flash',
@@ -92,6 +98,11 @@ class ProviderWizard:
             self._models = [ModelProfile(key=model, model_id=model, name=model,
                                         max_output_tokens=32768, think=True)
                             for model in ('deepseek-flash', 'deepseek-v4-pro')]
+        elif kind == 'opencode-go':
+            preset = opencode_go_profile()
+            self._provider = {key: getattr(preset, key) for key in
+                              ('id', 'name', 'protocol', 'base_url', 'default_model', 'auth', 'api_key_env')}
+            self._models = list(preset.models)
         else:
             self._provider = dict(id='openai' if kind == 'openai' else 'custom',
                                   name='OpenAI' if kind == 'openai' else '自定义供应商',
@@ -125,6 +136,8 @@ class ProviderWizard:
                     kind == 'deepseek' or item.base_url.rstrip('/') == 'https://api.openai.com/v1')
                     for item in self.view.providers)
                 choices.append(('+' + kind, name + ('（新连接）' if exists else '') + ' · 未配置'))
+            exists = any(is_opencode_go_endpoint(item.base_url) for item in self.view.providers)
+            choices.append(('+opencode-go', 'OpenCode Go' + ('（新连接）' if exists else '') + ' · 未配置'))
             query = self.query.casefold()
             return [(key, label) for key, label in choices if query in (key + ' ' + label).casefold()]
         if self.step == 'custom':
@@ -309,7 +322,7 @@ class ProviderWizard:
             if key.key not in (Keys.ControlM, Keys.Enter):
                 return None
             try:
-                self._accept_text()
+                return self._accept_text()
             except (ValueError, StopIteration):
                 self.error = '输入无效，请检查格式与限制'
             return None
@@ -330,13 +343,19 @@ class ProviderWizard:
             self.error = '请先配置有效的连接与模型'
         return None
 
-    def _accept_text(self) -> None:
+    def _accept_text(self) -> str | None:
         field, value = self._edit_field, self._text.strip()
         if field == 'api_key':
             self._credential = SecretValue(value)
             self.credential_action = 'replace'
             self._provider.update(auth='bearer', api_key_env=None)
             self._text = ''
+            if self._quick_connect:
+                self._build()
+                self.target = ('save-and-apply' if 'save-and-apply' in self.view.actions
+                               and not self.view.credentials_only else 'defaults-only')
+                self.submitting = True
+                return 'submit'
             self.step, self.selection = (('confirm', 0) if self.view.credentials_only else
                                         (self._settings_step(), 4 if self._custom_form else 2))
         elif field == 'api_key_env':

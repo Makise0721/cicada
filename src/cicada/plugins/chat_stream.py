@@ -74,6 +74,7 @@ async def stream_chat(
     deadline_seconds: float, label: str,
     cost_control: CostLedger | None = None,
     before_send: Callable[[ModelRequest, dict], None] | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> AsyncIterator[StreamEvent]:
     """完整 finish + DONE + EOF + 成功关闭之后才交付可执行工具。"""
     # 延迟读取已有中立 framing 实现，避免 DeepSeek 包导出初始化形成环。
@@ -91,7 +92,7 @@ async def stream_chat(
     deadline = time.monotonic() + deadline_seconds
     try:
         body = build_body(request)
-        headers = {"Accept-Encoding": "identity", "Content-Type": "application/json"}
+        headers = {"Accept-Encoding": "identity", "Content-Type": "application/json", **(request_headers or {})}
         if api_key is not None:
             headers["Authorization"] = "Bearer " + api_key
         built = client.build_request("POST", endpoint, json=body, headers=headers, timeout=timeout)

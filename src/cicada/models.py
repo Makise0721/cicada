@@ -52,7 +52,7 @@ class SafeModelIdentity:
             key, value = pair
             if key not in (
                 "num_ctx", "num_predict", "max_tokens", "reasoning_effort", "protocol",
-                "model_key", "profile_version", "stream_usage", "output_token_field",
+                "model_key", "profile_version", "stream_usage", "output_token_field", "compatibility_profile",
             ) or key in seen:
                 raise ValueError("SafeModelIdentity.options has unknown or duplicate key")
             seen.add(key)
@@ -74,6 +74,9 @@ class SafeModelIdentity:
             elif key == "output_token_field":
                 if value not in ("max_tokens", "max_completion_tokens"):
                     raise ValueError("SafeModelIdentity.output_token_field is invalid")
+            elif key == "compatibility_profile":
+                if value != "opencode-go-v1":
+                    raise ValueError("SafeModelIdentity.compatibility_profile is invalid")
             elif type(value) is not int or value <= 0:
                 raise ValueError(f"SafeModelIdentity.{key} must be positive int")
 
@@ -135,6 +138,13 @@ class ModelSelectionPort(Protocol):
     def options(self) -> tuple[ModelOption, ...]: ...
 
     def prepare_model(self, option_id: str) -> ModelBinding: ...
+
+
+@runtime_checkable
+class ModelSessionRoutingPort(Protocol):
+    """应用提供当前对话的运行时路由标识，不授予模型历史或存储控制权。"""
+
+    def set_session_id_provider(self, provider: Callable[[], str]) -> None: ...
 
 
 @dataclass(frozen=True)

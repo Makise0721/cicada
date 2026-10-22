@@ -63,7 +63,7 @@ from cicada.costs import CostControlPort, CostError, CostLedger, CostSnapshot
 from cicada.diagnostic_export import ReportError, build_report, write_report
 from cicada.models import (
     CacheDiagnosticsPort, CacheRequestObservation, ConfigurationRequest, ModelBinding,
-    ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ReasoningEffortPort,
+    ModelConfigurationPort, ModelOption, ModelRoute, ModelSelectionPort, ModelSessionRoutingPort, ReasoningEffortPort,
     ReasoningEffortState, SafeModelIdentity,
 )
 from cicada.user_config import LoginResult, LoginSubmission, LoginView, UserDefaults, UserConfigError, UserConfigStore
@@ -685,6 +685,10 @@ class ApplicationSession:
         self._context_projection = context_projection if context_projection is not None else ContextProjection()
         self._history: list[Message] = [isolate_message(m) for m in restored_history]
         self._store = store
+        if isinstance(self._model_selection, ModelSessionRoutingPort):
+            transient_session_id = str(uuid.uuid4())
+            self._model_selection.set_session_id_provider(
+                lambda: self._store.session_id if self._store is not None else transient_session_id)
         self._new_store_factory = new_store_factory
         self._resume_store_factory = resume_store_factory
         # 请求级快照与撤回 01: 捕获汇 (仅持久会话 + restore_capture 开启时非 None);

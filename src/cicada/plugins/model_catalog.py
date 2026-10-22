@@ -11,6 +11,7 @@ from uuid import uuid4
 import httpx
 
 from cicada.models import ModelBinding, ModelOption, SafeModelIdentity
+from cicada.provider_presets import is_opencode_go_endpoint
 from cicada.runtime.plugin import PluginDefinition
 from cicada.user_config import ModelProfile, ProviderProfile, SecretValue, UserConfigError, UserConfigSnapshot
 
@@ -43,7 +44,11 @@ def profile_identity(provider: ProviderProfile, model: ModelProfile) -> SafeMode
             ('protocol', provider.protocol), ('model_key', model.key), ('profile_version', 1)))
     from cicada.plugins.openai_chat import ChatConfig
 
-    return ChatConfig(provider=provider.id, model_key=model.key, model=model.model_id,
+    config_type = ChatConfig
+    if is_opencode_go_endpoint(provider.base_url):
+        from cicada.plugins.openai_chat.opencode_go import GoConfig
+        config_type = GoConfig
+    return config_type(provider=provider.id, model_key=model.key, model=model.model_id,
         base_url=provider.base_url, num_ctx=model.context_window,
         max_tokens=model.max_output_tokens, stream_usage=model.stream_usage,
         output_token_field=model.output_token_field).identity
@@ -69,6 +74,8 @@ class ModelCatalog:
         self._transport = transport
         self._clients: dict[tuple[str, str, str], httpx.AsyncClient] = {}
         self._cost_control = None
+        self._session_id_provider = lambda: self._transient_session_id
+        self._transient_session_id = str(uuid4())
         if initial_model is not None and hasattr(initial_model, 'client'):
             provider, _ = self.lookup(selected)
             initial_model.client.cookies.clear()
@@ -81,6 +88,9 @@ class ModelCatalog:
                 if option_id(provider.id, model.key) == selected:
                     return provider, model
         raise UserConfigError('config', 'unknown-model')
+
+    def set_session_id_provider(self, provider: Callable[[], str]) -> None:
+        self._session_id_provider = provider
 
     @property
     def options(self) -> tuple[ModelOption, ...]:
@@ -167,12 +177,18 @@ class ModelCatalog:
         else:
             from cicada.plugins.openai_chat import ChatConfig, ChatModel
 
-            config = ChatConfig(provider=provider.id, model_key=model.key, model=model.model_id,
+            config_type, model_type = ChatConfig, ChatModel
+            extra = {}
+            if is_opencode_go_endpoint(provider.base_url):
+                from cicada.plugins.openai_chat.opencode_go import GoConfig, GoModel
+                config_type, model_type = GoConfig, GoModel
+                extra['session_id_provider'] = lambda: self._session_id_provider()
+            config = config_type(provider=provider.id, model_key=model.key, model=model.model_id,
                 base_url=provider.base_url, num_ctx=model.context_window,
                 max_tokens=model.max_output_tokens, stream_usage=model.stream_usage,
                 output_token_field=model.output_token_field)
-            adapter = ChatModel(client, config, secret.reveal() if secret else None,
-                cost_control=self._cost_control)
+            adapter = model_type(client, config, secret.reveal() if secret else None,
+                cost_control=self._cost_control, **extra)
         return self._decorate(adapter.initial_binding, provider, model)
 
     async def stream(self, request, cancel):
