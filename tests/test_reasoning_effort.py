@@ -209,6 +209,9 @@ async def test_accepted_commit_waits_real_result_then_publishes(tmp_path, action
             task.cancel()
             await asyncio.sleep(0)
             assert not task.done()  # 已接受事务不被调用方取消丢弃
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()  # 重复取消仍不能提前释放事务。
         else:
             close = asyncio.create_task(session.aclose())
             await asyncio.sleep(0)

@@ -191,6 +191,9 @@ async def test_accepted_commit_blocks_operations_until_publication(tmp_path, mon
             task.cancel()
             await asyncio.sleep(0)
             assert not task.done()
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()  # 重复取消也必须等待已接受的事务和发布。
         elif action in ("close", "close-timeout"):
             if action == "close-timeout":
                 monkeypatch.setattr("cicada._application.session.CLOSE_SUPERVISION_S", 0.02)
