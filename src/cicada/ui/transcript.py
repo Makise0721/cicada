@@ -258,7 +258,7 @@ class AssistantEntry:
     def layout(
         self, width: int, selected: DisplayAction | None = None, display_id: int = 0
     ) -> EntryLayout:
-        """同源布局 (票据 01): 思考标题行持 toggle 命中, 锚点区分思考/答案。"""
+        """同源布局 (票据 01): 思考首行持 toggle 命中, 锚点区分思考/答案。"""
         reasoning_action = DisplayAction(ACTION_TOGGLE, (TARGET_REASONING, self.run_id, self.turn_index))
         reasoning_lines = self.reasoning.render(width, selected=selected == reasoning_action)
         cleaned = sanitize_display(self.text)
@@ -271,12 +271,14 @@ class AssistantEntry:
                 lines = theme.assistant_markdown_lines(cleaned, width)
                 self._render_cache = (cleaned, width, style, list(lines))
         elif not self.finalized:
-            lines = [STREAM_PLACEHOLDER]  # 已建条目尚未收到任何增量
+            lines = [] if reasoning_lines else [STREAM_PLACEHOLDER]
         elif reasoning_lines:
             lines = []  # 完成无正文但有思考: 空行 + 思考块
         else:
             return EntryLayout((), (), ())  # 完成但无正文: 事实由错误/取消条目表达
         # 统一前导空行; 思考块在答案前 (票据 01: 思考、答案、终结标注)
+        if reasoning_lines and cleaned:
+            reasoning_lines.append("")
         result = ["", *reasoning_lines, *lines]
         assistant_rows = len(lines)
         if self.finalized and self.stop_reason == "length":
@@ -341,7 +343,7 @@ class Transcript:
     expand_getter (local-skills-v1 票据 03): 只读展开标志 getter, 生产组合注入
     工具文档的全局展开状态 (Ctrl+O 同时影响工具输出与 Skill 正文); 未注入时
     SkillRequestEntry 完整显示正文。
-    思考展开 (票据 01): 本文档唯一 bool, 初始 false (文档默认收起; 04 用户
+    思考展开 (票据 01): 本文档唯一 bool, 初始 true (文档默认展开; 04 用户
     裁决移除 Ctrl+T 统一切换后不再变化, 逐项覆盖由点击维护); /clear 保留
     显示文档因此保留该状态, 新建/恢复文档自然重置。
     """
@@ -352,7 +354,7 @@ class Transcript:
         self._next_display_id = 0
         self._assistant_index: dict[tuple[str, int], AssistantEntry] = {}
         self._expand_getter = expand_getter
-        self._reasoning_expanded = False
+        self._reasoning_expanded = True
         # 票据 02: 已终结运行的 run_id 集合 (与显示文档同生命周期);
         # 终结运行的迟到思考增量被忽略, 不新建终结运行的新预览
         self._finished_runs: set[str] = set()
@@ -371,7 +373,7 @@ class Transcript:
         self._entries.clear()
         self._entry_ids.clear()
         self._assistant_index.clear()
-        self._reasoning_expanded = False
+        self._reasoning_expanded = True
         self._finished_runs.clear()
 
     def _add(self, entry: TranscriptEntry) -> None:

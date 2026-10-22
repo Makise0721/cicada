@@ -33,7 +33,7 @@
   ModelChanged 刷新底栏有效模型并追加确认条目, 失败有界成条, closing 不重开。
   思考正文不进入普通答案 (transcript 只渲染 message.text 为答案)。
 - thinking-budget-visibility 票据 01: 完成／恢复 message.reasoning 经
-  ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认收起); 04 用户
+  ui/reasoning_view 进入答案前的独立思考块 (缺失省略, 默认展开直出); 04 用户
   裁决移除 Ctrl+T 切换, 点击/文档焦点为唯一展开入口。
 - thinking-budget-visibility 票据 02: AssistantReasoningDelta 进有界思考
   预览 (transcript.stream_reasoning_delta); 状态行按真实事件区分等待模型/

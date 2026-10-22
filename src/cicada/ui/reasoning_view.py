@@ -1,21 +1,7 @@
-"""独立思考块 (票据 01/02): 完成／恢复记录与流中预览的折叠显示与排版.
+"""思考正文的显示投影：默认灰色斜体直出，独立于答案和工具卡。
 
-职责 (规格 D2 / D3 / 契约 C2):
-- ReasoningBlock 是 AssistantEntry 内部对 immutable message.reasoning 的显示
-  引用, 不是规范消息: 缺失记录 (None) 完全省略块; 完整空/完整正文/未完成
-  各有清晰状态。流中预览 (票据 02): AssistantReasoningDelta 进入有界预览,
-  完成事件按权威记录原位替换 (None 撤块), 无完成记录的终止封存为未完成。
-- 预览最多 8192 UTF-8 bytes, 从增量只编码/取保留前缀 (decode 忽略残缺尾
-  字节, 天然按码点截断), 不重扫此前预览, 不长期保留超限原文; 上限不限制
-  规范记录。截断标注"预览已截断", 完整记录不受限。
-- 展开状态只属于当前显示文档: Transcript 持有唯一 bool (初始 false), 块经
-  只读 getter 获取, 区别于工具/Skill 的 expand_getter; /clear 保留显示文档
-  因此保持展开状态。
-- 渲染先 sanitize_display 再换行, 保持原始段落, 不解释 Markdown, 不把正文
-  与答案拼接; 渲染缓存含宽度/样式/展开/内容版本, 不复用失效颜色或旧正文。
-- 标题按 14/6/2/1 列四级降级, 状态字符 = 规范完整(含空)、! 未完成或已封存、
-  ~ 进行中预览; 完整空与非空在极窄标题中合并为完整状态。完整性由记录决定,
-  不靠防御截断碰巧选择; 收起始终只占标题行。
+流中预览保留有界前缀，完成后由规范记录替换；未完成和截断仍明确标注。
+展开正文不带标题或缩进，逐项收起时保留状态标题。所有文本先净化再排版。
 """
 
 from __future__ import annotations
@@ -28,9 +14,8 @@ from cicada.ui.display_style import DisplayStyle, current_style
 from cicada.ui.main_screen import truncate_to_width, visible_width, wrap_text_ansi
 from cicada.ui.rendering import sanitize_display
 
-_BODY_INDENT = "  "
 _PREVIEW_MAX_BYTES = 8192
-_PREVIEW_NOTE = "预览已截断；完成后可展开完整记录"
+_PREVIEW_NOTE = "预览已截断；完成后显示完整记录"
 _PREVIEW_NOTE_SEALED = "预览已截断"
 
 
@@ -39,9 +24,9 @@ class ReasoningBlock:
 
     expand_getter 返回当前显示文档的思考展开默认值; 未注入时恒为展开
     (与工具/Skill 正文同一约定, 避免无展开手段的调用者看不到内容),
-    生产组合 (transcript) 恒注入, 初始收起。
-    票据 01 (契约 C2): 逐项展开覆盖 (_override) 优先于文档默认值; 选中态只改
-    标题标记 (> 一列)。04 用户裁决移除 Ctrl+T 统一切换, 点击/文档焦点为唯一入口。
+    生产组合 (transcript) 恒注入, 默认展开。
+    逐项展开覆盖 (_override) 优先于文档默认值；收起时用状态标题提供展开入口。
+    点击/文档焦点沿用逐项切换，不影响工具卡。
     """
 
     def __init__(self, *, expand_getter: Callable[[], bool] | None = None) -> None:
@@ -132,18 +117,23 @@ class ReasoningBlock:
             return [title]  # 收起只占标题行 (规格 D2)
         cleaned = sanitize_display(self._text or "")
         if not cleaned.strip():
-            return [title]  # 空正文/纯空白: 事实在标题状态里, 不补空壳
+            return [] if self._preview_active or self._complete else [title]
         body: list[str] = []
-        indent = _BODY_INDENT[:max(0, width - 2)]
-        content_width = max(1, width - visible_width(indent))
         for logical in cleaned.split("\n"):
-            for chunk in wrap_text_ansi(logical, content_width):
-                body.append(theme.fg(theme.MUTED_GRAY, indent + truncate_to_width(chunk, content_width)))
+            for chunk in wrap_text_ansi(logical, width):
+                body.append(self._body_line(truncate_to_width(chunk, width)))
         if self._preview_capped:
             note = _PREVIEW_NOTE if self._preview_active else _PREVIEW_NOTE_SEALED
-            for chunk in wrap_text_ansi(note, content_width):
-                body.append(theme.fg(theme.MUTED_GRAY, indent + truncate_to_width(chunk, content_width)))
-        return [title, *body]
+            for chunk in wrap_text_ansi(note, width):
+                body.append(self._body_line(truncate_to_width(chunk, width)))
+        if not self._preview_active and not self._complete:
+            body.append(title)
+        return body
+
+    @staticmethod
+    def _body_line(text: str) -> str:
+        style = current_style()
+        return theme.fg_open(theme.MUTED_GRAY) + style.sgr("3") + text + style.sgr("0")
 
     def _title(self, width: int, expanded: bool, selected: bool) -> str:
         """四级标题降级 (D2): >=14 完整文字, 6-13 "思考 X", 2-5 "RX", 1 列 "X"。
