@@ -28,7 +28,8 @@ class ProviderWizard:
         self.display_style = display_style or current_style()
         self.explicit = dict(explicit or {})
         self.step = 'provider'
-        self.selection = next((i for i, item in enumerate(view.providers) if item.id == view.provider), 0)
+        self.selection = 0
+        self.query = ''
         self.error: str | None = None
         self.submitting = False
         self.cancelled = False
@@ -104,9 +105,20 @@ class ProviderWizard:
 
     def _choices(self) -> list[tuple[str, str]]:
         if self.step == 'provider':
-            return [(item.id, item.name) for item in self.view.providers] + [
-                ('+deepseek', '添加 DeepSeek 连接'), ('+openai', '添加 OpenAI Chat 连接'),
-                ('+custom', '添加自定义连接')]
+            choices = [('+custom', '自定义供应商')]
+            for item in self.view.providers:
+                status = ('已配置' if self.view.credential_present else '未配置') if item.id == self.view.provider else '已添加'
+                choices.append((item.id, item.name + ' · ' + status))
+            for kind, name, protocol in (
+                ('deepseek', 'DeepSeek', 'deepseek-chat'),
+                ('openai', 'OpenAI Chat', 'openai-chat-completions'),
+            ):
+                exists = any(item.protocol == protocol and (
+                    kind == 'deepseek' or item.base_url.rstrip('/') == 'https://api.openai.com/v1')
+                    for item in self.view.providers)
+                choices.append(('+' + kind, name + ('（新连接）' if exists else '') + ' · 未配置'))
+            query = self.query.casefold()
+            return [(key, label) for key, label in choices if query in (key + ' ' + label).casefold()]
         if self.step == 'settings':
             rows = [('model', '模型：' + (self._selected_model_key or '尚未配置')),
                     ('connection', '连接：' + str(self._provider['name'])),
@@ -201,8 +213,25 @@ class ProviderWizard:
                          if self.view.credentials_only else 'provider' if self.step == 'settings'
                          else 'settings' if self._provider else 'provider')
             self.selection = 0
+            if self.step == 'provider':
+                self.query = ''
             self.error = None
             return None
+        if self.step == 'provider':
+            if key.key in (Keys.ControlH, Keys.Backspace):
+                self.query = self.query[:-1]
+            elif key.key == Keys.ControlU:
+                self.query = ''
+            elif key.key == Keys.BracketedPaste or not isinstance(key.key, Keys):
+                value = key.data if key.key == Keys.BracketedPaste else self.query + key.data
+                if len(value) <= 256 and not any(unicodedata.category(char).startswith('C') for char in value):
+                    self.query = value
+                else:
+                    return None
+            if key.key in (Keys.ControlH, Keys.Backspace, Keys.ControlU, Keys.BracketedPaste) or not isinstance(key.key, Keys):
+                self.selection = 0
+                self.error = None
+                return None
         if self.step == 'edit':
             if key.key in (Keys.ControlH, Keys.Backspace):
                 self._text = self._text[:-1]
@@ -268,6 +297,8 @@ class ProviderWizard:
             else:
                 self._load_provider(next(item for item in self.view.providers if item.id == action))
             self.step, self.selection = 'settings', 0
+            if action != '+custom' and self._provider['auth'] != 'none':
+                self._edit('api_key', '', 'settings')
         elif self.step == 'settings':
             if action == 'default':
                 self.set_default = not self.set_default
@@ -337,11 +368,15 @@ class ProviderWizard:
     def render_lines(self, columns: int, rows: int | None = None) -> list[str]:
         self._viewport = columns, rows
         width = max(1, columns)
-        pad = '  ' if width >= 24 else ''
-        content = max(1, width - len(pad) * 2)
+        pad = '  ' if width >= 24 and self.step != 'provider' else ''
+        content = max(1, width - len(pad))
         with self.display_style.use():
-            lines = [theme.fg(theme.EDITOR_BORDER, '─' * width),
-                     pad + theme.fg(theme.EDITOR_BORDER, truncate_to_width(self.title, content))]
+            name = str(self._provider.get('name', '供应商'))
+            editing_key = self.step == 'edit' and self._edit_field == 'api_key'
+            title = ('选择要配置的供应商：' if self.step == 'provider' else
+                     '登录 ' + name if editing_key else '配置 ' + name)
+            heading = self.display_style.sgr('1') + theme.fg(theme.MD_CODE, truncate_to_width(title, content))
+            lines = [pad + heading, '']
             body: list[str] = []
 
             def row(text: str, color=theme.ASSISTANT_TEXT):
@@ -349,17 +384,24 @@ class ProviderWizard:
                     body.append(pad + theme.fg(color, truncate_to_width(part, content)))
 
             if self.submitting:
-                row('正在可靠保存，请等待…')
+                row('正在保存…', theme.MUTED_GRAY)
             elif self.step == 'edit':
-                names = {'api_key': 'API key', 'api_key_env': '环境变量名', 'id': '实例 ID',
-                         'base_url': 'API 根地址', 'model_id': '远端模型 ID'}
-                row(names.get(self._edit_field, self._edit_field))
-                text = '*' * min(32, len(self._text)) if self._edit_field == 'api_key' else self._text
-                row(text or '输入或粘贴单行内容', theme.MD_LINK)
-                row('Enter 保存此项 · Ctrl+U 清空 · Tab 返回', theme.MUTED_GRAY)
+                names = {'api_key_env': '环境变量名', 'id': '实例 ID', 'name': '名称',
+                         'base_url': 'API 根地址', 'model_id': '远端模型 ID',
+                         'key': '本地标识', 'context_window': '上下文窗口',
+                         'max_output_tokens': '输出上限'}
+                row('请输入 ' + name + ' API Key' if editing_key else names.get(self._edit_field, self._edit_field))
+                value = '*' * min(32, len(self._text)) if editing_key else self._text
+                prompt_width = max(0, content - 2)
+                prompt = truncate_to_width(value, max(0, prompt_width - 1)) + ('█' if prompt_width else '')
+                row('> ' + prompt)
+                row('(Esc/Ctrl+C 取消，Enter 确认，Tab 返回设置)', theme.MUTED_GRAY)
             else:
+                if self.step == 'provider':
+                    prompt = '> ' + truncate_to_width(self.query, max(0, content - 3))
+                    lines.extend([theme.fg(theme.ASSISTANT_TEXT, truncate_to_width(prompt + '█', width)), ''])
                 if self.step == 'confirm':
-                    row('供应商：' + str(self._provider['name']))
+                    row('供应商：' + name)
                     row('协议：' + str(self._provider['protocol']))
                     row('地址：' + str(self._provider['base_url']))
                     model = next((item for item in self._models if item.key == self._selected_model_key), None)
@@ -375,31 +417,36 @@ class ProviderWizard:
                     row('仅补凭据，存档配置保持' if self.view.credentials_only else self.view.effect,
                         theme.MUTED_GRAY)
                 choices = self._choices()
-                required_count = len(body)
-                available = max(1, (rows or 30) - len(lines) - 2)
-                visible = min(len(choices), max(1, available - (required_count if self.step == 'confirm' else 0)))
+                reserve = 3 if self.step == 'provider' else 4
+                available = max(1, (rows or 30) - len(lines) - len(body) - reserve)
+                visible = min(len(choices), 8, available)
                 start = max(0, min(self.selection - visible // 2, len(choices) - visible))
                 for index in range(start, start + visible):
                     selected = index == self.selection
-                    label = ('→ ' if selected else '  ') + choices[index][1]
-                    label = truncate_to_width(sanitize_display(label), content)
-                    if selected:
-                        body.append(theme.bg_open(theme.MENU_SEL_BG) + pad + theme.fg_open(theme.MD_LINK)
-                                    + label + ' ' * max(0, width - len(pad) - visible_width(label))
-                                    + self.display_style.sgr('0'))
+                    label, separator, status = choices[index][1].partition(' · ') if self.step == 'provider' else (choices[index][1], '', '')
+                    prefix = '→ ' if selected else '  '
+                    label = truncate_to_width(sanitize_display(prefix + label), content)
+                    suffix = truncate_to_width(separator + status, max(0, content - visible_width(label)))
+                    body.append(pad + theme.fg(theme.MD_CODE if selected else theme.ASSISTANT_TEXT, label)
+                                + theme.fg(theme.MUTED_GRAY, suffix))
+                if self.step == 'provider':
+                    if choices:
+                        row(f'  ({self.selection + 1}/{len(choices)})', theme.MUTED_GRAY)
                     else:
-                        body.append(pad + theme.fg(theme.ASSISTANT_TEXT, label))
+                        row('没有匹配的供应商', theme.MUTED_GRAY)
             if self.error:
                 row(self.error, theme.DIFF_REMOVED)
+            footer = ['', theme.fg(theme.MD_LINK, '─' * width)]
+            if self.step not in ('provider', 'edit') and not self.submitting:
+                footer.insert(0, pad + theme.fg(theme.MUTED_GRAY, truncate_to_width(
+                    '↑↓ 选择 · Enter 确认 · Tab 返回 · Esc 取消', content)))
             self._confirm_blocked = (self.step == 'confirm' and not self.submitting
-                                     and (width < 18 or (rows is not None and len(lines) + len(body) + 2 > rows)))
+                                     and (width < 18 or (rows is not None and len(lines) + len(body) + len(footer) > rows)))
             if self._confirm_blocked:
                 row('窗口太小，请放大后确认', theme.DIFF_REMOVED)
-            footer = pad + theme.fg(theme.MUTED_GRAY, truncate_to_width(
-                '↑↓ 选择 · Enter 确认 · Tab 返回 · Esc 取消', content))
             if rows is not None:
-                budget = max(0, rows - len(lines) - 1)
+                budget = max(0, rows - len(lines) - len(footer))
                 if len(body) > budget:
                     body = body[:max(0, budget - 1)] + body[-1:] if budget else []
-            result = [*lines, *body, footer]
+            result = [*lines, *body, *footer]
             return result[:max(1, rows)] if rows is not None else result

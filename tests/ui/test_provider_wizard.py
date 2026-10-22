@@ -35,8 +35,10 @@ async def test_provider_key_replace_is_masked_and_keeps_default_and_other_models
     view = store.read_view(provider_id='work')
     wizard = make_login_wizard(view, title='Cicada · 登录配置')
     assert isinstance(wizard, ProviderWizard)
+    assert wizard._choices()[0][0] == '+custom'
     # 保留 coder，并通过菜单增加第二个远端模型；不覆盖同实例原模型。
-    for key in (ENTER, ENTER, DOWN, ENTER, DOWN, ENTER):
+    for key in (KeyPress(Keys.BracketedPaste, '工作'), ENTER, KeyPress(Keys.ControlI, '\t'),
+                ENTER, DOWN, ENTER, DOWN, ENTER):
         wizard.handle(key)
     wizard.handle(KeyPress(Keys.BracketedPaste, 'org/second-model'))
     wizard.handle(ENTER)
@@ -71,7 +73,7 @@ async def test_provider_confirmation_blocks_hidden_connection_and_cancel_discard
     store = await _configured(tmp_path)
     view = replace(store.read_view(provider_id='work'), actions=('save-and-apply', 'defaults-only'))
     wizard = ProviderWizard(view, title='Cicada · 登录配置')
-    for key in (ENTER, DOWN, DOWN, ENTER, DOWN, ENTER):
+    for key in (KeyPress(Keys.BracketedPaste, '工作'), ENTER):
         wizard.handle(key)
     wizard.handle(KeyPress(Keys.BracketedPaste, 'invalid\nsecret'))
     assert 'invalid' not in '\n'.join(wizard.render_lines(80, 24))
