@@ -11,15 +11,17 @@ from cicada.models import ModelBinding
 from cicada.plugins.chat_stream import stream_chat
 from cicada.plugins.openai_chat.model import ChatCompletion, ChatModel, DEFAULT_TIMEOUT, CALL_DEADLINE_S
 from cicada.plugins.openai_chat.protocol import ChatConfig, build_request
-from cicada.provider_presets import OPENCODE_GO_MODEL, is_opencode_go_endpoint
+from cicada.provider_presets import OPENCODE_GO_MODEL, OPENCODE_GO_CONTEXT_WINDOW, is_opencode_go_endpoint
 
 
 @dataclass(frozen=True)
 class GoConfig(ChatConfig):
     def __post_init__(self):
         super().__post_init__()
-        if (not is_opencode_go_endpoint(self.base_url) or self.model != OPENCODE_GO_MODEL
-                or self.num_ctx > 262144 or self.max_tokens > 32768
+        # 旧Kimi配置仍可恢复；新建内置连接仅使用新的默认模型。
+        context_limit = {OPENCODE_GO_MODEL: OPENCODE_GO_CONTEXT_WINDOW, 'kimi-k2.6': 262144}.get(self.model)
+        if (not is_opencode_go_endpoint(self.base_url) or context_limit is None
+                or self.num_ctx > context_limit or self.max_tokens > 32768
                 or self.output_token_field != 'max_tokens'):
             raise ValueError('unsupported OpenCode Go model or limits')
 

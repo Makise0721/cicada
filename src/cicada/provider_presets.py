@@ -3,7 +3,8 @@
 from cicada.user_config import ModelProfile, ProviderProfile
 
 OPENCODE_GO_BASE_URL = 'https://opencode.ai/inference/go/openai/v1'
-OPENCODE_GO_MODEL = 'kimi-k2.6'
+OPENCODE_GO_MODEL = 'deepseek-v4.1-flash'
+OPENCODE_GO_CONTEXT_WINDOW = 1000000
 
 
 def is_opencode_go_endpoint(base_url: str) -> bool:
@@ -11,7 +12,7 @@ def is_opencode_go_endpoint(base_url: str) -> bool:
 
 
 def opencode_go_profile() -> ProviderProfile:
-    model = ModelProfile(OPENCODE_GO_MODEL, OPENCODE_GO_MODEL, name='Kimi K2.6',
-                         context_window=262144, max_output_tokens=32768)
+    model = ModelProfile(OPENCODE_GO_MODEL, OPENCODE_GO_MODEL, name='DeepSeek V4.1 Flash',
+                         context_window=OPENCODE_GO_CONTEXT_WINDOW, max_output_tokens=32768)
     return ProviderProfile('opencode-go', 'OpenCode Go', 'openai-chat-completions',
                            OPENCODE_GO_BASE_URL, (model,), model.key)

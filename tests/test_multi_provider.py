@@ -440,6 +440,8 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
     assert wizard.handle(KeyPress(Keys.ControlM, '\r')) == 'submit'
     submission = wizard.submission()
     assert submission.defaults.model == OPENCODE_GO_MODEL and submission.set_default
+    assert submission.defaults.model == 'deepseek-v4.1-flash'
+    assert submission.defaults.num_ctx == 1000000 and submission.defaults.max_output_tokens == 32768
     assert (await store.save(submission)).defaults_saved
     wizard.clear_secret()
     provider = next(p for p in store.read_profiles() if p.id == 'opencode-go')
@@ -447,6 +449,10 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
     assert store.load().credential.reveal() == 'offline-go-key'
     with pytest.raises(ValueError, match='unsupported'):
         GoConfig('opencode-go', 'bad', 'kimi-k3', OPENCODE_GO_BASE_URL, 262144, 32768)
+    with pytest.raises(ValueError, match='unsupported'):
+        GoConfig('opencode-go', OPENCODE_GO_MODEL, OPENCODE_GO_MODEL, OPENCODE_GO_BASE_URL, 1000001, 32768)
+    legacy = GoConfig('opencode-go', 'kimi-k2.6', 'kimi-k2.6', OPENCODE_GO_BASE_URL, 262144, 32768)
+    assert legacy.identity.model == 'kimi-k2.6'
     seen = []
     def handle(request):
         seen.append((request, json.loads(request.content)))

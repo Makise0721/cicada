@@ -42,7 +42,7 @@ cicada --list-sessions
 
 在目标工作区运行 `cicada` 进入 TUI；首次缺凭据时显示遮蔽输入向导。也可预先设置 `$env:DEEPSEEK_API_KEY`。用户配置位于 `~/.cicada/config.toml`，真实模型启动时若缺失会生成默认文件；凭据单独存放，登录不验证账号。
 
-源码分支中，`/login` 可添加供应商地址、凭据来源和多个模型；内置 OpenCode Go 只需 API Key，预设 Kimi K2.6（256K窗口、32K输出、非思考模式）。`/model` 输入搜索并切换当前对话，设置下次默认值是独立操作。CLI 用 `--provider <实例ID> --model <模型key>`；兼容范围与配置示例见 `--help`，目录和选择不会发网络请求。
+源码分支中，`/login` 可添加供应商地址、凭据来源和多个模型；内置 OpenCode Go 只需 API Key，预设 DeepSeek V4.1 Flash（1,000,000窗口、32K输出、非思考模式）。`/model` 输入搜索并切换当前对话，设置下次默认值是独立操作。CLI 用 `--provider <实例ID> --model <模型key>`；兼容范围与配置示例见 `--help`，目录和选择不会发网络请求。
 
 启动自动加载 `~/.cicada/AGENTS.md`、工作区根 `AGENTS.md`，以及 `~/.cicada/skills/`、工作区 `.agents/skills/` 下的 Skill。项目同名 Skill 优先；`--instructions-file` 和 `--skills-dir` 分别替换自动来源，`--no-auto-instructions`、`--no-auto-skills` 可关闭自动读取。普通恢复会核对资源是否变化。
 
