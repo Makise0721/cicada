@@ -338,6 +338,7 @@ class FooterComponent:
         *,
         budget: Callable[[], BudgetSnapshot | None] | None = None,
         effort: Callable[[], tuple[str | None, str | None] | None] | None = None,
+        mode: str | None = None,
         display_style: DisplayStyle | None = None,
     ) -> None:
         self.display_style = display_style if display_style is not None else current_style()
@@ -346,11 +347,16 @@ class FooterComponent:
         self._metrics = metrics
         self._budget = budget
         self._effort = effort
+        self._mode = mode
         self.badge_spans: tuple[tuple[int, int, int], ...] = ()
 
     def set_model_label(self, label: str | None) -> None:
         """模型选择发布后更新底栏为有效配置 (DeepSeek 04/契约 C7); 启动诊断不受影响。"""
         self._model_label = label
+
+    def set_mode(self, mode: str | None) -> None:
+        """执行档变化时更新底栏 (P0-1); None = 不显示档位段."""
+        self._mode = mode
 
     def _stats_left(self) -> str:
         input_total, input_unknown, output_total, output_unknown = self._metrics()
@@ -389,6 +395,7 @@ class FooterComponent:
         model = self._model_label or "不可得"
         return {
             "brand": (self._BRAND, FOOTER_BRAND, 0),
+            "mode": (self._mode or "", FOOTER_PATH, 0),
             "model": (f"{badge} {model}" if badge else model, FOOTER_ACCENT, len(badge)),
             "workspace": (format_workspace(self._workspace), FOOTER_PATH, 0),
             "stats": (self._stats_left(), FOOTER_TEXT, 0),
@@ -435,15 +442,16 @@ class FooterComponent:
         # 常看, 只在极窄时缩写为 [off]/[high] 之外的形式并最终省略)。每级整段
         # 保留或整段消失, 段内不截半个数值, 也不退化成没有数值的空标签 ("ctx:")。
         candidates: list[tuple[tuple[str, ...], int]] = [
-            (("brand", "model", "workspace", "ctx", "stats"), 0),
-            (("brand", "model", "workspace", "ctx"), 0),
-            (("brand", "model", "workspace", "ctx"), 1),
-            (("brand", "model", "workspace", "ctx"), 2),
-            (("brand", "model", "workspace"), -1),
-            (("brand", "model", "ctx"), 0),
-            (("brand", "model", "ctx"), 1),
-            (("brand", "model", "ctx"), 2),
-            (("brand", "model"), -1),
+            (("brand", "mode", "model", "workspace", "ctx", "stats"), 0),
+            (("brand", "mode", "model", "workspace", "ctx"), 0),
+            (("brand", "mode", "model", "workspace", "ctx"), 1),
+            (("brand", "mode", "model", "workspace", "ctx"), 2),
+            (("brand", "mode", "model", "workspace"), -1),
+            (("brand", "mode", "model", "ctx"), 0),
+            (("brand", "mode", "model", "ctx"), 1),
+            (("brand", "mode", "model", "ctx"), 2),
+            (("brand", "mode", "model"), -1),
+            (("brand", "mode"), -1),
             (("brand",), -1),
         ]
         for kinds, index in candidates:

@@ -50,6 +50,8 @@ async def run_tui_session(
     """
     if terminal is None:
         terminal = PromptToolkitTerminal()
+    # P0-1: 只有真实 TUI 绑定审批 UI; 单次模式未绑定, 审批档默认 deny
+    session.enable_approval_ui()
 
     refs: dict[str, MainScreenFrontend] = {}
 
@@ -105,7 +107,7 @@ async def run_tui_session(
         model_menu=view.model_menu,
         on_model_confirm=view.confirm_model_selection,
         on_model_action=view.handle_model_action,
-        modal=view.login_modal,
+        modal=view.modal,
         review=view.review_view,
         rewind=view.rewind_view,
         session_modal=view.session_modal,

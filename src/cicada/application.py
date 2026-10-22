@@ -23,6 +23,7 @@ from ._application.contracts import (
     ModelSelectionError,
     ContextCompacted,
     RewindRestoreCompleted,
+    ApprovalRequested,
     ApplicationClosed,
     ApplicationUpdate,
     ApplicationOpenError,

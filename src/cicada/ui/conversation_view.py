@@ -71,6 +71,7 @@ from cicada.application import (
     ApplicationClosed,
     ApplicationSession,
     ApplicationUpdate,
+    ApprovalRequested,
     ConfigurationChanged,
     ContextCompacted,
     HistoryCleared,
@@ -115,6 +116,7 @@ from cicada.ui.editor import Editor, EditorStyle
 from cicada.ui import theme
 from cicada.ui.main_screen import truncate_to_width
 from cicada.ui.model_menu import ModelMenu
+from cicada.ui.approval_modal import ApprovalModal, ModalRouter
 from cicada.ui.login_wizard import LoginModal
 from cicada.user_config import LoginSubmission, UserConfigError
 from cicada.ui.restore_view import project_restored_history
@@ -200,6 +202,8 @@ class ConversationView:
         self.model_menu = ModelMenu()
         self.login_modal = LoginModal(self._cancel_login, self._submit_login,
                                       display_style=self.display_style)
+        self.approval_modal = ApprovalModal(self._resolve_approval)
+        self.modal = ModalRouter(self.login_modal, self.approval_modal)
         self._login_task: asyncio.Task | None = None
         # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停
         self._clock = clock if clock is not None else time.monotonic
@@ -242,8 +246,25 @@ class ConversationView:
             self.transcript.metrics_fact,
             budget=lambda: self._session.budget,
             effort=self._effort_badge_facts,
+            mode=self._mode_label(),
             display_style=self.display_style,
         )
+
+    def _mode_label(self) -> str | None:
+        """P0-1: 执行档在底栏可观察; 默认 unrestricted 不占段."""
+        config = self._session.config
+        if config.read_only:
+            return "只读"
+        if config.approval:
+            return "审批"
+        return None
+
+    def _resolve_approval(self, request: ApprovalRequested, decision: str) -> None:
+        """审批框决定 -> 应用层待决请求; 幂等关闭框, 再通知渲染."""
+        self.approval_modal.dismiss()
+        self._session.resolve_approval(request.request_id, decision)
+        if self._on_update:
+            self._on_update()
 
     # --- 生命周期 -----------------------------------------------------------------
 
@@ -275,6 +296,7 @@ class ConversationView:
             self._name_submission.cancel()
         self._unsubscribe()
         self.login_modal.dismiss()
+        self.approval_modal.dismiss()
         self._session.cancel_login()
         if self._spinner_task is not None:  # 防御: 宿主"关 view 不关 session"时不泄漏
             self._spinner_task.cancel()
@@ -309,6 +331,10 @@ class ConversationView:
                 self.transcript.append_system("恢复为查看状态（新请求被拒绝）：" + self._session.view_only_reason)
             if self.on_session_changed is not None:
                 self.on_session_changed()
+        elif isinstance(update, ApprovalRequested):
+            self.approval_modal.open(update)
+            if self._on_update:
+                self._on_update()
         elif isinstance(update, AgentEventReceived):
             self._project_agent_event(update.event)
         elif isinstance(update, RequestPhaseChanged):
@@ -1276,7 +1302,7 @@ def build(
         "on_model_action": view.handle_model_action,
         "on_shift_tab": view.handle_shift_tab,  # 票据 03: 思考强度循环 (C6)
         "footer_badge_spans": lambda: view.footer.badge_spans,  # 03: 徽标命中列
-        "modal": view.login_modal,
+        "modal": view.modal,
         "review": view.review_view,
         "rewind": view.rewind_view,
         "session_modal": view.session_modal,

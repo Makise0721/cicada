@@ -445,6 +445,34 @@ def test_read_only_hides_write_and_keeps_workspace_unchanged(tmp_path):
     assert "[read_only tools=read,glob,grep]" in proc.stdout
 
 
+def test_read_only_rejects_approval_mode(tmp_path):
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+        "--read-only", "--approval", "任务",
+    )
+    assert proc.returncode == 2
+    assert "--read-only 不能与 --approval 组合" in proc.stderr
+
+
+def test_approval_mode_denies_shell_in_single_shot(tmp_path):
+    script = tmp_path / "approval-script.json"
+    script.write_text(
+        json.dumps([
+            {"tool_calls": [{"id": "c1", "name": "powershell",
+                             "arguments": {"command": "New-Item -ItemType File marker.txt"}}]},
+            {"text": "无法执行", "stop": True},
+        ], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script), "--approval", "执行命令"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "marker.txt").exists()
+    assert "denied by user" in proc.stdout
+    assert "[approval tool=powershell]" in proc.stdout
+
+
 def test_check_command_count_limit_rejected(tmp_path):
     commands = [part for i in range(9) for part in ("--check-command", f"exit {i}")]
     proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)), *commands, "任务")

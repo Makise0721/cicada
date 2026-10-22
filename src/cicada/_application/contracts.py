@@ -61,6 +61,8 @@ class ApplicationConfig:
     restore_capture: bool = True
     # 执行安全边界 P0-1: 只读档只注册 read/glob/grep, 不提供写入或任意命令
     read_only: bool = False
+    # P0-1 审批档: 仅 powershell 在启动进程前等待用户决定; 默认仍为 unrestricted
+    approval: bool = False
     cost_control: CostLedger | None = None
     runtime_dir: Path | None = None
 
@@ -77,8 +79,12 @@ class ApplicationConfig:
             raise ValueError("restore_capture must be a bool")
         if not isinstance(self.read_only, bool):
             raise ValueError("read_only must be a bool")
+        if not isinstance(self.approval, bool):
+            raise ValueError("approval must be a bool")
         if self.read_only and self.plan is not None:
             raise ValueError("read_only cannot be combined with a verification plan")
+        if self.read_only and self.approval:
+            raise ValueError("read_only cannot be combined with approval mode")
         if self.cost_control is not None and not isinstance(self.cost_control, CostLedger):
             raise ValueError('cost_control must be a CostLedger or None')
         if self.runtime_dir is not None and not isinstance(self.runtime_dir, Path):
@@ -271,6 +277,18 @@ class RewindRestoreCompleted:
 
 
 @dataclass(frozen=True)
+class ApprovalRequested:
+    """审批档待决命令 (P0-1); 决定经 ApplicationSession.resolve_approval 回传.
+
+    command 是有界预览, 不是执行依据; 同一时刻至多一个待决请求。
+    """
+
+    request_id: str
+    tool_name: str
+    command: str
+
+
+@dataclass(frozen=True)
 class ApplicationClosed:
     """关闭完成或明确清理失败; error 非空不代表所有资源均已成功释放."""
 
@@ -282,7 +300,7 @@ ApplicationUpdate = (
     | OperationBusy | ContextCompacted | ModelChanged | ConfigurationChanged
     | ReasoningEffortChanged | LoginCompleted | ApplicationClosed
     | SessionNameChanged | SessionChanged
-    | RewindRestoreCompleted
+    | RewindRestoreCompleted | ApprovalRequested
 )
 
 

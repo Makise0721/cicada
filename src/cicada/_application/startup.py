@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable
 
 from cicada.boot import App, BootError, bootstrap
+from cicada.approval import ApprovalBroker, ApprovalTool
 from cicada.context_policy import BudgetPolicy, ContextProjection
 from cicada.core.cancel import CancelToken
 from cicada.costs import CostControlPort
@@ -373,12 +374,19 @@ async def open_application(
 
     # 活动包装器经 tool_policy 装入; 协调器在会话构造后绑定 (契约 §3)
     coordinator = ActivityCoordinator()
+    approval_broker = ApprovalBroker() if config.approval else None
     tool_policy = None
-    if store is not None:
-        assert store is not None
+    if store is not None or approval_broker is not None:
 
-        def tool_policy(tool, runtime, _store=store, _coordinator=coordinator):
-            return ProcessActivityWrapper(tool, _store, _coordinator)
+        def tool_policy(tool, runtime, _store=store, _coordinator=coordinator,
+                        _approval=approval_broker):
+            wrapped = tool
+            if _store is not None:
+                wrapped = ProcessActivityWrapper(wrapped, _store, _coordinator)
+            if _approval is not None and tool.spec.name == "powershell":
+                # 审批在进程登记/启动之外层: 未批准不登记活动, 也不启动进程
+                wrapped = ApprovalTool(wrapped, _approval)
+            return wrapped
 
     # 02: Skills 启用时实际注册工具在既有名单上追加 load_skill
     if config.read_only:
@@ -437,6 +445,7 @@ async def open_application(
                 tool_capabilities=tool_capabilities,
                 system_prompt=config.system_prompt,
                 model_policy=model_policy,
+                tool_policy=tool_policy,
                 max_turns=config.max_turns,
             )
         except BootError as exc:
@@ -548,6 +557,7 @@ async def open_application(
                 resume_store_factory=lambda session_id: _open_switch_store(config, session_id),
                 restore_store=restore_store,
                 restore_warnings=restore_warnings,
+                approval_broker=approval_broker,
             )
             # 03/D7: 自动压缩回调在会话构造后绑定 (回调是会话的边界方法);
             # 仅持久会话接线 (D9), 非持久 auto_compact 保持 None=无自动行为
@@ -576,6 +586,7 @@ async def open_application(
             context_projection=context_projection,
             login_store_factory=login_store_factory, login_environment=login_environment,
                 review_reader=app.runtime.capability(CHANGE_REVIEW_CAPABILITY),
+                approval_broker=approval_broker,
         )
     if plan is None:
         return session

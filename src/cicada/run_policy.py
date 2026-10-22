@@ -56,6 +56,7 @@ CONTEXT_CLOSE_TAG = "</cicada-verification-context>"
 # 程序自己写的哨兵: 内核在调用工具**之前**就拒绝, 进程不可能起来.
 PRE_EXECUTION_MARKERS = (
     "cancelled before execution",
+    "denied by user",
     "unknown tool:",
     "invalid arguments JSON:",
     "arguments must be a JSON object",

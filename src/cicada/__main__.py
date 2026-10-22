@@ -518,6 +518,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if args.read_only and checks:
         print("--read-only 不能与 --check-command 组合", file=sys.stderr)
         return 2
+    if args.read_only and args.approval:
+        print("--read-only 不能与 --approval 组合", file=sys.stderr)
+        return 2
     workspace = Path(args.workspace)
     if not workspace.expanduser().is_dir():
         print('workspace 必须为存在的目录', file=sys.stderr)
@@ -604,6 +607,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         _print_prompt_info(prompt_info)
     if args.read_only and not args.tui:
         print("[read_only tools=read,glob,grep]")
+    if args.approval and not args.tui:
+        print("[approval tool=powershell]")
     plan: VerificationPlan | None = None
     if checks:
         root = Path(os.path.realpath(Path(workspace).expanduser()))
@@ -863,6 +868,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         skills=skills_snapshot,
         restore_capture=not args.no_restore_capture,
         read_only=args.read_only,
+        approval=args.approval,
         cost_control=cost_control,
         runtime_dir=workspace_state_dir(workspace),
     )
@@ -1097,6 +1103,13 @@ v1仅适用于DeepSeek官方，输入上界1,100,000；其他实例必须使用�
         help=(
             "只读档: 仅注册 read/glob/grep, 不提供写入或任意命令; "
             "不能与 --check-command 组合"
+        ),
+    )
+    parser.add_argument(
+        "--approval", action="store_true",
+        help=(
+            "审批档: powershell 在启动进程前等待确认; 仅交互终端可确认, "
+            "单次模式默认拒绝; 与 --read-only 互斥"
         ),
     )
     parser.add_argument(
