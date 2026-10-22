@@ -50,8 +50,8 @@ class ProcessFacts:
     timed_out: bool | None = None
     cancelled: bool | None = None
     output_complete: bool | None = None
-    output_artifact_path: str | None = None
-    output_artifact_sha256: str | None = None
+    artifact_path: str | None = None
+    artifact_sha256: str | None = None
     legacy: bool = False
 
     @property
@@ -77,6 +77,7 @@ class MutationFacts:
     winerror: int | None = None
     retained_paths: tuple[str, ...] = ()
     cleanup_warning: str | None = None
+    artifact_path: str | None = None
     legacy: bool = False
 
 
@@ -95,8 +96,8 @@ def process_details(
     _optional_bool(payload, "timed_out")
     _optional_bool(payload, "cancelled")
     _optional_bool(payload, "output_complete")
-    for key in ("receipt_id", "verification_run_id",
-                "output_artifact_path", "output_artifact_sha256"):
+    for key in ("receipt_id", "verification_run_id", "artifact_path", "artifact_sha256",
+                "output_artifact_path", "output_artifact_sha256", "full_output_path"):
         _optional_str(payload, key)
     return _labeled(KIND_PROCESS, payload, extras)
 
@@ -143,8 +144,8 @@ def process_facts(details: Any) -> ProcessFacts | None:
         timed_out=_bool_or_none(details.get("timed_out")),
         cancelled=_bool_or_none(details.get("cancelled")),
         output_complete=_bool_or_none(details.get("output_complete")),
-        output_artifact_path=_str_or_none(details.get("output_artifact_path")),
-        output_artifact_sha256=_str_or_none(details.get("output_artifact_sha256")),
+        artifact_path=_first_str(details, ("artifact_path", "output_artifact_path", "full_output_path")),
+        artifact_sha256=_first_str(details, ("artifact_sha256", "output_artifact_sha256")),
         legacy=legacy,
     )
 
@@ -173,6 +174,7 @@ def mutation_facts(details: Any) -> MutationFacts | None:
         retained_paths=tuple(item for item in retained if isinstance(item, str))
         if isinstance(retained, (list, tuple)) else (),
         cleanup_warning=_str_or_none(mutation.get("cleanup_warning")),
+        artifact_path=_first_str(details, ("artifact_path", "full_diff_path")),
         legacy=legacy,
     )
 
@@ -232,6 +234,15 @@ def _optional_int(payload: Mapping[str, Any], key: str) -> None:
 
 def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _first_str(details: Mapping[str, Any], keys: tuple[str, ...]) -> str | None:
+    """按顺序取第一个非空字符串: 规范键优先, 兼容旧工具键."""
+    for key in keys:
+        value = _str_or_none(details.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _bool_or_none(value: Any) -> bool | None:

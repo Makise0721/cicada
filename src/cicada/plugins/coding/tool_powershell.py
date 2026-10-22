@@ -157,7 +157,7 @@ class PowerShellTool:
                 "timed_out": result.timed_out,
                 "cancelled": result.cancelled,
                 "truncated": bounded.truncated,
-                "full_output_path": artifact,
+                "artifact_path": artifact,
                 "full_output_bytes": bounded.total_bytes,
                 "artifact_truncated": bounded.artifact_truncated,
                 "artifact_error": bounded.artifact_error,

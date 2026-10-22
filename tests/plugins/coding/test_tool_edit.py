@@ -74,7 +74,7 @@ async def test_single_replacement(tmp_path):
     assert r.details["diff_truncated"] is False
     assert r.details["mutation"]["state"] == "committed"
     assert r.details["mutation"]["reason"] == "applied"
-    assert "full_diff_path" not in r.details
+    assert "artifact_path" not in r.details
     assert "-two" in r.details["diff"]
     assert "+TWO" in r.details["diff"]
     assert apply_hunks("one\ntwo\nthree\n", r.details["diff"]) == "one\nTWO\nthree\n"
@@ -250,7 +250,7 @@ async def test_large_diff_spills_to_artifact_and_is_readable(tmp_path):
     assert r.details["diff_truncated"] is True
     diff_bytes = len(r.details["diff"].encode("utf-8"))
     assert diff_bytes > MAX_CONTENT_BYTES
-    artifact = Path(r.details["full_diff_path"])
+    artifact = Path(r.details["artifact_path"])
     assert artifact.parent == ws.output_dir
     assert artifact.exists()
     full = artifact.read_text(encoding="utf-8")
@@ -294,7 +294,7 @@ async def test_artifact_write_failure_still_reports_applied(tmp_path, monkeypatc
     assert len(r.content.encode("utf-8")) <= MAX_CONTENT_BYTES
     assert r.details["diff_truncated"] is True
     assert "artifact_error" in r.details
-    assert "full_diff_path" not in r.details  # 不提供假路径
+    assert "artifact_path" not in r.details  # 不提供假路径
     # 确实没有 artifact 残留
     assert list(ws.output_dir.iterdir()) == []
 
@@ -320,7 +320,7 @@ async def test_spilled_artifact_paths_are_unique(tmp_path):
     # 反向再改一次, 同样产生超大 diff
     revert = [{"old_text": e["new_text"], "new_text": e["old_text"]} for e in edits]
     second = await run(tool, path="big.txt", edits=revert)
-    assert first.details["full_diff_path"] != second.details["full_diff_path"]
+    assert first.details["artifact_path"] != second.details["artifact_path"]
     assert len(list(ws.output_dir.iterdir())) == 2
 
 
@@ -338,7 +338,7 @@ async def test_long_header_keeps_success_content_bounded_and_artifact_readable(t
     assert result.details["metadata_truncated"] is True
     assert long_name in result.details["full_result_content"]
     assert "edit applied" in result.content and "metadata_truncated=true" in result.content
-    artifact = Path(result.details["full_diff_path"])
+    artifact = Path(result.details["artifact_path"])
     assert artifact.read_text(encoding="utf-8") == result.details["diff"]
     assert json.dumps(str(artifact), ensure_ascii=False) in result.content
     back = await ReadTool(ws).execute(
@@ -364,7 +364,7 @@ async def test_long_artifact_error_is_bounded_after_edit_applied(tmp_path, monke
     assert "edit applied" in result.content and "full diff unavailable" in result.content
     assert result.details["metadata_truncated"] is True
     assert result.details["artifact_error"] == error_text
-    assert "full_diff_path" not in result.details
+    assert "artifact_path" not in result.details
     assert list(ws.output_dir.iterdir()) == []
 
 

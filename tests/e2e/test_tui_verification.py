@@ -241,7 +241,7 @@ def _check_artifact_from_history(session) -> tuple[Path, str]:
         for m in session.history
         if getattr(m, "result", None) is not None and m.result.name == "check"
     )
-    return Path(details["output_artifact_path"]), details["output_artifact_sha256"]
+    return Path(details["artifact_path"]), details["output_artifact_sha256"]
 
 
 @pytest.mark.parametrize("mode", ["tamper", "missing"])

@@ -131,11 +131,15 @@ def test_clip_lines_single_huge_line_clips_at_byte_bound():
 
 
 def test_artifact_line_from_check_details():
-    details = {"output_artifact_path": "artifacts/x.md", "output_artifact_sha256": "abc123"}
-    assert artifact_line(details) == "输出工件: artifacts/x.md sha256=abc123"
-    assert artifact_line({"output_artifact_path": "p"}) == "输出工件: p sha256=unverified"
+    details = {"artifact_path": "artifacts/x.md", "artifact_sha256": "abc123"}
+    assert artifact_line(details) == "工件: artifacts/x.md sha256=abc123"
+    assert artifact_line({"artifact_path": "p"}) == "工件: p"
     assert artifact_line(None) is None
     assert artifact_line({"other": 1}) is None
+    # 旧记录键仍可解码 (无标记 = legacy)
+    assert artifact_line({"output_artifact_path": "old", "output_artifact_sha256": "h"}) == (
+        "工件: old sha256=h"
+    )
 
 
 # --- 来源四分类 (delivery_lines) -----------------------------------------------------------------

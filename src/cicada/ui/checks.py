@@ -82,12 +82,13 @@ def truncation_note(
 
 
 def artifact_line(details: dict | None) -> str | None:
-    """回执引用的输出工件: 只显示路径与 hash, 不读入内容. (旧 presenter 移植)"""
+    """结果工件: 只显示路径与可得的 hash, 不读入内容. (旧 presenter 移植)"""
     facts = process_facts(details)
-    if facts is None or not facts.output_artifact_path:
+    if facts is None or not facts.artifact_path:
         return None
-    sha_text = facts.output_artifact_sha256 or "unverified"
-    return f"输出工件: {facts.output_artifact_path} sha256={sha_text}"
+    if facts.artifact_sha256:
+        return f"工件: {facts.artifact_path} sha256={facts.artifact_sha256}"
+    return f"工件: {facts.artifact_path}"
 
 
 def delivery_lines(

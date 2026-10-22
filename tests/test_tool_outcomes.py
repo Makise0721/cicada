@@ -21,7 +21,8 @@ from cicada.tool_outcomes import (
 def test_process_details_roundtrip_preserves_exhibition_fields() -> None:
     details = process_details(
         {"exit_code": 0, "output_complete": True, "timed_out": False, "cancelled": False,
-         "receipt_id": "r-1", "verification_run_id": "v-1"},
+         "receipt_id": "r-1", "verification_run_id": "v-1",
+         "artifact_path": "out.txt", "artifact_sha256": "sha"},
         extras={"truncated": False},
     )
     assert details["contract"] == CONTRACT and details["contract_version"] == CONTRACT_VERSION
@@ -29,6 +30,14 @@ def test_process_details_roundtrip_preserves_exhibition_fields() -> None:
     facts = process_facts(details)
     assert facts is not None and facts.legacy is False
     assert facts.receipt_id == "r-1" and facts.termination_known
+    assert facts.artifact_path == "out.txt" and facts.artifact_sha256 == "sha"
+
+
+def test_legacy_artifact_keys_decode() -> None:
+    facts = process_facts({"output_artifact_path": "old", "output_artifact_sha256": "h"})
+    assert facts is not None and facts.artifact_path == "old" and facts.artifact_sha256 == "h"
+    mutation = mutation_facts({"mutation": {"state": "committed"}, "full_diff_path": "d.diff"})
+    assert mutation is not None and mutation.artifact_path == "d.diff"
 
 
 def test_legacy_details_still_decode() -> None:

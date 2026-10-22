@@ -297,7 +297,7 @@ class EditTool:
             parts = [header, preview, marker] if preview else [header, marker]
             return self._success_result(
                 ctx, "\n".join(parts),
-                {**details, "diff_truncated": True, "full_diff_path": str(artifact)},
+                {**details, "diff_truncated": True, "artifact_path": str(artifact)},
             )
         # 文件已改但 artifact 写失败: 不回滚、不谎称未改, 明确告知 full diff 不可得
         marker = (
@@ -322,9 +322,9 @@ class EditTool:
                 "[mutation=committed] edit applied; "
                 "metadata_truncated=true; full metadata retained in details."
             ]
-            if details.get("full_diff_path") is not None:
-                artifact_path = json.dumps(details["full_diff_path"], ensure_ascii=False)
-                marker = f"[diff_truncated=true full_diff_path={artifact_path}; read it with the read tool]"
+            if details.get("artifact_path") is not None:
+                artifact_path = json.dumps(details["artifact_path"], ensure_ascii=False)
+                marker = f"[diff_truncated=true artifact_path={artifact_path}; read it with the read tool]"
                 if len((parts[0] + "\n" + marker).encode("utf-8")) <= MAX_CONTENT_BYTES:
                     parts.append(marker)
                 else:

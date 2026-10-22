@@ -50,7 +50,7 @@ async def test_multibyte_across_chunks_not_corrupted(tmp_path):
     r = await run(tool, command=command)
     assert not r.is_error
     assert r.details["truncated"] is True
-    full_path = Path(r.details["full_output_path"])
+    full_path = Path(r.details["artifact_path"])
     assert full_path.parent == ws.output_dir
     full_lines = full_path.read_text(encoding="utf-8").splitlines()
     assert len(full_lines) == 400
@@ -149,7 +149,7 @@ async def test_truncation_writes_full_output(tmp_path):
     r = await run(tool, command="1..1200 | ForEach-Object { Write-Output ('x' * 100) }")
     assert not r.is_error
     assert r.details["truncated"] is True
-    full_path = Path(r.details["full_output_path"])
+    full_path = Path(r.details["artifact_path"])
     assert full_path.parent == ws.output_dir
     full_lines = full_path.read_text(encoding="utf-8").splitlines()
     assert len(full_lines) == 1200
@@ -168,7 +168,7 @@ async def test_trailing_newline_not_overcounted(tmp_path):
         "done\n"
         "[exit_code=0 timed_out=False cancelled=False truncated=False "
         "output_complete=True artifact_truncated=False]\n"
-        f"[full output: {r.details['full_output_path']}]"
+        f"[full output: {r.details['artifact_path']}]"
     )
 
 
@@ -191,7 +191,7 @@ async def test_single_60kb_line_stays_within_50kib(tmp_path):
     assert r.details["truncated"] is True
     assert r.details["output_complete"] is True
     assert r.details["full_output_bytes"] > 60000
-    full = Path(r.details["full_output_path"]).read_text(encoding="utf-8")
+    full = Path(r.details["artifact_path"]).read_text(encoding="utf-8")
     assert full.strip() == "x" * 60000
     assert "raw total" in r.content
 
@@ -208,7 +208,7 @@ async def test_multiline_unicode_and_escapes_stay_within_cap(tmp_path):
     assert content.decode("utf-8") == r.content  # 边界裁剪不产生半个字符
     assert "\ufffd" not in r.content
     assert "exit_code=0" in r.content  # 状态行没有被裁掉
-    full_lines = Path(r.details["full_output_path"]).read_text(encoding="utf-8").splitlines()
+    full_lines = Path(r.details["artifact_path"]).read_text(encoding="utf-8").splitlines()
     assert len(full_lines) == 900
     assert all(item == line for item in full_lines)
 
@@ -232,7 +232,7 @@ async def test_artifact_write_failure_is_reported_not_silent(tmp_path):
     r = await run(tool, command="1..50 | ForEach-Object { Write-Output ('line' * 200) }")
     # 工件写失败不是命令执行失败: exit_code 与终结事实照旧, 但完整性必须如实报告
     assert r.details["exit_code"] == 0
-    assert r.details["full_output_path"] is None
+    assert r.details["artifact_path"] is None
     assert "cannot open output artifact" in r.details["artifact_error"]
     assert r.details["output_complete"] is True
     assert r.details["artifact_truncated"] is False

@@ -76,7 +76,7 @@ async def test_run_returns_structured_receipt_identity_and_bounded_content(repo)
     assert details["command"] == passing().command
     assert details["command_sha256"] == hashlib.sha256(passing().command.encode()).hexdigest()
     assert details["process_uncertain"] is False and details["blocking_reasons"] == []
-    assert details["output_artifact_path"] and details["output_artifact_sha256"]
+    assert details["artifact_path"] and details["artifact_sha256"]
     assert f"receipt_id={details['receipt_id']}" in result.content
     assert "freshness" in tool.spec.description
 
@@ -197,7 +197,7 @@ async def test_nonzero_check_diagnostics_are_visible_in_public_tool_content(repo
     assert "[output artifact:" in result.content
     assert 'command_preview="' in result.content and "cwd_sha256=" in result.content
     # 完整输出仍在工件里, 预览只是模型可见副本。
-    artifact = Path(result.details["output_artifact_path"]).read_text(encoding="utf-8")
+    artifact = Path(result.details["artifact_path"]).read_text(encoding="utf-8")
     assert "DIAG" in artifact
     assert result.details["cwd_sha256"] == hashlib.sha256(
         str(result.details["cwd"]).encode()).hexdigest()
@@ -240,7 +240,7 @@ async def test_launch_failure_returns_a_blocked_receipt_through_the_public_tool(
     assert details["execution_status"] == "launch_failed"
     assert details["failure_kind"] == "launch_failed"
     assert details["exit_code"] is None
-    assert details["output_artifact_path"] is None
+    assert details["artifact_path"] is None
     assert details["freshness"] == "current"
     assert details["process_uncertain"] is False
     assert details["receipt_id"].startswith("chk-")

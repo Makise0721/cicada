@@ -525,9 +525,9 @@ class Verifier:
             "output_truncated": receipt.output_truncated,
             "artifact_truncated": receipt.artifact_truncated,
             "artifact_error": receipt.artifact_error,
-            "output_artifact_path": (
+            "artifact_path": (
                 str(receipt.output_artifact_path) if receipt.output_artifact_path else None),
-            "output_artifact_sha256": receipt.output_artifact_sha256,
+            "artifact_sha256": receipt.output_artifact_sha256,
             "schema_version": receipt.schema_version,
         }
 
