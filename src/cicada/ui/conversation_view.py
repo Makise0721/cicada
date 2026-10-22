@@ -252,8 +252,12 @@ class ConversationView:
         )
 
     def _mode_label(self) -> str | None:
-        """P0-1 v2: 非完全档在底栏可观察; full 是默认, 不占段."""
-        return {"read-only": "只读", "approval": "审批"}.get(self._session.execution_mode)
+        """P0-1 v2: 三档都显示; 完全档不再省略 (2026-10-22 用户裁决)."""
+        return {
+            "read-only": "只读",
+            "approval": "审批",
+            "full": "完全",
+        }[self._session.execution_mode]
 
     def _resolve_approval(self, request: ApprovalRequested, decision: str) -> None:
         """审批框决定 -> 应用层待决请求; 幂等关闭框, 再通知渲染."""

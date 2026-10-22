@@ -80,12 +80,13 @@ def test_router_prefers_approval_then_falls_back_to_login():
     assert approval.is_open is False
 
 
-def test_footer_shows_mode_only_when_selected():
+def test_footer_shows_mode_segment():
     metrics = lambda: (None, False, None, False)
     plain = FooterComponent("C:/repo", "flash", metrics).render(120, 1)[0]
-    assert "只读" not in plain and "审批" not in plain
-    approval = FooterComponent("C:/repo", "flash", metrics, mode="审批").render(120, 1)[0]
-    assert "审批" in approval
+    assert "只读" not in plain and "审批" not in plain and "完全" not in plain
+    for label in ("只读", "审批", "完全"):
+        line = FooterComponent("C:/repo", "flash", metrics, mode=label).render(120, 1)[0]
+        assert label in line
 
 
 class _SessionStub:

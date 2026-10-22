@@ -113,12 +113,12 @@ async def test_badge_click_cycles_once_model_name_and_draft_untouched(tmp_path):
     session.subscribe(lambda u: changes.append(u) if isinstance(u, ReasoningEffortChanged) else None)
     try:
         await h.start()
-        brand_row = h.vt.find_row("cicada · [high]")
+        brand_row = h.vt.find_row("cicada · 完全 · [high]")
         assert brand_row is not None, h.vt.screen_text()
         row = brand_row  # 单行底栏: 档位徽标与模型同一行 (2026-10-19 裁决)
         h.view.editor.insert_text("草稿")
         history_before = session.history
-        h.click(12, row)  # "[high]" 区间: 品牌 "cicada" 后两列分隔, 徽标起第 9 列
+        h.click(18, row)  # "[high]" 区间: 品牌 + 档位段("完全") + 分隔后第 17 列起
         assert await h.wait_idle()
         await h.settle()  # 节流渲染落屏后再核对屏幕事实
         assert session.reasoning_effort.current == "max"  # 循环 high → max
