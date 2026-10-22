@@ -78,6 +78,10 @@ TOOL_CAPABILITIES = (
 
 CHECK_TOOL_CAPABILITIES = TOOL_CAPABILITIES + ("tool.check",)
 
+# 执行安全边界 P0-1: 只读档只暴露检查类工具; load_skill 只读取本地提示, 不授予动作
+READ_ONLY_TOOL_CAPABILITIES = ("tool.read", "tool.glob", "tool.grep")
+READ_ONLY_TOOL_NAMES = frozenset({"read", "glob", "grep", LOAD_SKILL_TOOL_NAME})
+
 
 def make_session_catalog_reader(
     *, directory: Path, workspace: str | None = None, legacy_directory: Path | None = None,
@@ -179,6 +183,21 @@ def _verify_skills_assembly(app: App, config: "ApplicationConfig") -> None:
     if LOAD_SKILL_TOOL_NAME not in tools:
         raise ApplicationOpenError(
             f"the {LOAD_SKILL_TOOL_NAME} tool is not registered while skills are enabled"
+        )
+
+
+def _verify_read_only_assembly(app: App, config: "ApplicationConfig") -> None:
+    """只读档装配核对: 实际注册工具必须全部在只读名单内 (含 load_skill).
+
+    注册名单已经收窄; 这里再核对 bootstrap 之后的真实工具表, 防止组合层把写入或
+    任意命令能力重新带回只读会话。
+    """
+    if not config.read_only:
+        return
+    unexpected = sorted(set(getattr(app.agent, "_tools", {})) - READ_ONLY_TOOL_NAMES)
+    if unexpected:
+        raise ApplicationOpenError(
+            f"read-only assembly exposed non-read-only tools: {unexpected}"
         )
 
 
@@ -362,9 +381,10 @@ async def open_application(
             return ProcessActivityWrapper(tool, _store, _coordinator)
 
     # 02: Skills 启用时实际注册工具在既有名单上追加 load_skill
-    tool_capabilities: tuple[str, ...] = (
-        CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES
-    )
+    if config.read_only:
+        tool_capabilities: tuple[str, ...] = READ_ONLY_TOOL_CAPABILITIES
+    else:
+        tool_capabilities = CHECK_TOOL_CAPABILITIES if plan is not None else TOOL_CAPABILITIES
     if config.skills is not None:
         tool_capabilities = tool_capabilities + ("tool.load_skill",)
 
@@ -428,6 +448,11 @@ async def open_application(
         except ApplicationOpenError:
             await app.aclose()
             raise
+    try:
+        _verify_read_only_assembly(app, config)
+    except ApplicationOpenError:
+        await app.aclose()
+        raise
 
     if store is not None and snapshot is not None and config.persistence is not None:
         # 指纹核对/启动代次/会话构造的每条失败路径都必须释放 app (store 随 runtime 清理)

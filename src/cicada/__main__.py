@@ -119,6 +119,7 @@ from cicada.user_config import (
 from cicada.prompting import (
     CheckPrompt,
     DEFAULT_TOOLS,
+    READ_ONLY_TOOLS,
     InstructionsError,
     PromptInfo,
     compose_system_prompt,
@@ -514,6 +515,9 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if argument_error is not None:
         print(argument_error, file=sys.stderr)
         return 2
+    if args.read_only and checks:
+        print("--read-only 不能与 --check-command 组合", file=sys.stderr)
+        return 2
     workspace = Path(args.workspace)
     if not workspace.expanduser().is_dir():
         print('workspace 必须为存在的目录', file=sys.stderr)
@@ -558,7 +562,10 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     check_prompts = tuple(
         CheckPrompt(check.check_id, check.command, check.timeout_s) for check in checks
     )
-    prompt_tools = (DEFAULT_TOOLS + ("check",)) if checks else DEFAULT_TOOLS
+    if args.read_only:
+        prompt_tools = READ_ONLY_TOOLS
+    else:
+        prompt_tools = (DEFAULT_TOOLS + ("check",)) if checks else DEFAULT_TOOLS
     if skills_snapshot is not None:
         prompt_tools = prompt_tools + ("load_skill",)
     try:
@@ -577,6 +584,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
             skills=skills_snapshot,
             instructions_mode=selection.mode,
             instruction_sources=selection.sources if selection.mode == "automatic" else None,
+            read_only=args.read_only,
         )
     except InstructionsError as exc:
         print(f"invalid instructions file: {exc}", file=sys.stderr)
@@ -594,6 +602,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
                 print(f"[skills diagnostic: {diagnostic}]")
     if not args.tui:  # TUI 静默: 启动身份不打印 (P12; 原 /status 页已删除)
         _print_prompt_info(prompt_info)
+    if args.read_only and not args.tui:
+        print("[read_only tools=read,glob,grep]")
     plan: VerificationPlan | None = None
     if checks:
         root = Path(os.path.realpath(Path(workspace).expanduser()))
@@ -852,6 +862,7 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
         budget=budget_config,
         skills=skills_snapshot,
         restore_capture=not args.no_restore_capture,
+        read_only=args.read_only,
         cost_control=cost_control,
         runtime_dir=workspace_state_dir(workspace),
     )
@@ -1079,6 +1090,13 @@ v1仅适用于DeepSeek官方，输入上界1,100,000；其他实例必须使用�
         help=(
             "关闭请求还原点捕获 (默认开启): 关闭后 edit/write 照常执行, "
             "但本会话不产生新还原点; 仅持久会话 (--tui/--save-session/--resume) 受影响"
+        ),
+    )
+    parser.add_argument(
+        "--read-only", action="store_true",
+        help=(
+            "只读档: 仅注册 read/glob/grep, 不提供写入或任意命令; "
+            "不能与 --check-command 组合"
         ),
     )
     parser.add_argument(

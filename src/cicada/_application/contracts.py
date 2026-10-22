@@ -59,6 +59,8 @@ class ApplicationConfig:
     # 请求级快照与撤回 01 (C2): restore_capture 默认开启; 关闭时不安装捕获汇,
     # 编辑照常工作且不产生还原点 (受限环境出口)
     restore_capture: bool = True
+    # 执行安全边界 P0-1: 只读档只注册 read/glob/grep, 不提供写入或任意命令
+    read_only: bool = False
     cost_control: CostLedger | None = None
     runtime_dir: Path | None = None
 
@@ -73,6 +75,10 @@ class ApplicationConfig:
             raise ValueError("plan must be a VerificationPlan or None")
         if not isinstance(self.restore_capture, bool):
             raise ValueError("restore_capture must be a bool")
+        if not isinstance(self.read_only, bool):
+            raise ValueError("read_only must be a bool")
+        if self.read_only and self.plan is not None:
+            raise ValueError("read_only cannot be combined with a verification plan")
         if self.cost_control is not None and not isinstance(self.cost_control, CostLedger):
             raise ValueError('cost_control must be a CostLedger or None')
         if self.runtime_dir is not None and not isinstance(self.runtime_dir, Path):

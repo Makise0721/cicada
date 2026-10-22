@@ -417,6 +417,34 @@ def test_check_timeout_without_check_command_rejected(tmp_path):
     assert "--check-timeout 只能与 --check-command 一起使用" in proc.stderr
 
 
+def test_read_only_rejects_check_command(tmp_path):
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(_script(tmp_path)),
+        "--read-only", "--check-command", "exit 0", "任务",
+    )
+    assert proc.returncode == 2
+    assert "--read-only 不能与 --check-command 组合" in proc.stderr
+
+
+def test_read_only_hides_write_and_keeps_workspace_unchanged(tmp_path):
+    script = tmp_path / "ro-script.json"
+    script.write_text(
+        json.dumps([
+            {"tool_calls": [{"id": "c1", "name": "write",
+                             "arguments": {"path": "new.txt", "content": "x"}}]},
+            {"text": "没有写入能力", "stop": True},
+        ], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    proc = run_cli(
+        "--workspace", str(tmp_path), "--script", str(script), "--read-only", "写文件"
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "new.txt").exists()
+    assert "unknown tool: write" in proc.stdout
+    assert "[read_only tools=read,glob,grep]" in proc.stdout
+
+
 def test_check_command_count_limit_rejected(tmp_path):
     commands = [part for i in range(9) for part in ("--check-command", f"exit {i}")]
     proc = run_cli("--workspace", str(tmp_path), "--script", str(_script(tmp_path)), *commands, "任务")

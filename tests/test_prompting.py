@@ -31,6 +31,17 @@ def test_builtin_prompt_shape(tmp_path):
     assert prompt == build_builtin_prompt(tmp_path)
 
 
+def test_read_only_prompt_scopes_tools_and_rules(tmp_path):
+    prompt = build_builtin_prompt(tmp_path, read_only=True)
+    for tool in ("read", "glob", "grep"):
+        assert f"- {tool}" in prompt
+    for tool in ("write", "edit", "powershell"):
+        assert f"- {tool}" not in prompt
+    assert "Read-only mode is active" in prompt
+    # 只读声明只影响只读档: 默认提示仍列出写入与命令工具
+    assert "- write" in build_builtin_prompt(tmp_path)
+
+
 def test_compose_without_instructions(tmp_path):
     prompt, info = compose_system_prompt(tmp_path)
     assert prompt == build_builtin_prompt(tmp_path)
