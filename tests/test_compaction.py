@@ -354,7 +354,7 @@ async def test_cancel_before_dispatch_leaves_zero_writes(tmp_path):
         # 零写入、旧投影、屏障落定、无 storage_failed
         assert store.recovery_snapshot().summaries == ()
         assert session._context_projection.blocks == ()
-        assert session._compact_done is not None and session._compact_done.done()
+        assert session.busy_operation is None
         assert session.persistence.storage_failed is None
         assert not any(isinstance(e, ContextCompacted) for e in observer_events)
         # 下一次压缩重新建立并成功
@@ -418,7 +418,7 @@ async def test_cancel_after_store_accept_settles_then_switches_and_propagates(tm
         )
         assert len(store.recovery_snapshot().summaries) == 1
         assert len(session._context_projection.blocks) == 1
-        assert session._compact_done.done()
+        assert session.busy_operation is None
         assert session.persistence.storage_failed is None
     finally:
         release.set()
@@ -554,7 +554,7 @@ async def test_close_supervision_timeout_records_problem_and_does_not_fake_done(
         assert session.state == "closed"
         closed = next(e for e in closed_updates if type(e).__name__ == "ApplicationClosed")
         assert closed.error is not None and "close supervision deadline" in closed.error
-        assert not session._compact_done.done(), "不伪造 _compact_done 完成"
+        assert session.busy_operation == "compaction", "不伪造压缩屏障完成"
         # 迟到生成任务保持强引用 (本测试持有 compact_task); 释放后归关闭取消
         channel.gate.set()
         result = await asyncio.wait_for(compact_task, timeout=5)

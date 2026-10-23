@@ -415,14 +415,14 @@ async def test_close_tracks_restore_cleanup_until_actual_settlement(tmp_path, mo
         else:
             await asyncio.sleep(0)
             assert not close.done()
-        assert not task.done() and not session._active_done.done()
+        assert not task.done() and session.busy_operation == "request"
         assert store._context is not None
     finally:
         release.set()
     outcome = await asyncio.wait_for(task, 10)
     await asyncio.wait_for(close, 5)
     assert outcome.persistence.saved and store._context is None
-    assert session._active_done.done() and session.state == "closed"
+    assert session.busy_operation is None and session.state == "closed"
 
 
 # --- 默认不落盘 / 保存 / 恢复续写 (A01) -------------------------------------------------------

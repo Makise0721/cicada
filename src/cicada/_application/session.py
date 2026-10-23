@@ -343,9 +343,7 @@ class ApplicationSession:
         self._model_configuration: ModelConfigurationPort | None = None
         if model_route is not None and isinstance(model_route.binding.model, ModelConfigurationPort):
             self._model_configuration = model_route.binding.model
-        self._model_done: asyncio.Future | None = None
         self._model_task: asyncio.Task | None = None
-        self._session_done: asyncio.Future | None = None
         self._session_task: asyncio.Task | None = None
         self._session_token: CancelToken | None = None
         self._session_generation = 0
@@ -418,10 +416,7 @@ class ApplicationSession:
         self._observers: list[Callable[[ApplicationUpdate], None]] = []
         self.observer_errors: list[BaseException] = []
         self._cancel_token: CancelToken | None = None
-        self._active_done: asyncio.Future | None = None
-        self._clear_done: asyncio.Future | None = None  # 清空生产者完成标记 (close 监督对象)
         # 02: 手动压缩生产者 (D6/PA05); close 封住未接受提交并协作取消生成
-        self._compact_done: asyncio.Future | None = None
         self._compact_token: CancelToken | None = None
         self._compact_sealed = False
         self._process_uncertain = False
@@ -437,14 +432,14 @@ class ApplicationSession:
     # --- 只读快照 ------------------------------------------------------------------
 
     def _in_flight_workers(self) -> tuple[asyncio.Future, ...]:
-        """令牌已让出、但真实 IO/提交尚未落定的生产者.
+        """租约已结束、但应用仍持有的后台任务 (页面读取、登录保存、跨关闭任务).
 
-        与所有权是两件事: 事务可以在 finally 里归还令牌, 而线程里的事务还没
-        结束; 开新页面/导出要求两者都静默。
+        与所有权分开: 事务在 finally 归还令牌, 而页面读取任务可能还在线程里;
+        开新页面/导出要求两者都静默。页面租约本身不算 worker——刷新同一页时
+        租约仍由原页面持有。
         """
         return tuple(
             worker for worker in (
-                self._active_done, self._clear_done, self._compact_done, self._model_done,
                 self._login_task, self._login_save_task, self._review_task,
                 self._rewind_task, *self._undead_tasks,
             ) if worker is not None and not worker.done()
@@ -898,7 +893,6 @@ class ApplicationSession:
         store, epoch_id = self._store, self._epoch_id or ""
         loop = asyncio.get_running_loop()
         self._ownership.claim("session")
-        self._session_done = loop.create_future()
         token = CancelToken()
         self._session_token = token
         task = loop.create_task(self._set_session_name(store, epoch_id, name, token))
@@ -937,7 +931,6 @@ class ApplicationSession:
             raise SessionManagementError("blocked", "切换被阻断：" + reason)
         loop = asyncio.get_running_loop()
         self._ownership.claim("session")
-        self._session_done = loop.create_future()
         token = CancelToken()
         self._session_token = token
         task = loop.create_task(self._switch_session(
@@ -1079,8 +1072,6 @@ class ApplicationSession:
             finally:
                 self._ownership.release("session")
                 self._session_token = None
-                if self._session_done is not None and not self._session_done.done():
-                    self._session_done.set_result(None)
 
     async def _set_session_name(
         self, store: SessionStorePort, epoch_id: str, name: str | None, token: CancelToken,
@@ -1105,8 +1096,6 @@ class ApplicationSession:
         finally:
             self._ownership.release("session")
             self._session_token = None
-            if self._session_done is not None and not self._session_done.done():
-                self._session_done.set_result(None)
 
     @property
     def restored_requests(self) -> tuple[RestoredRequest, ...]:
@@ -1385,7 +1374,6 @@ class ApplicationSession:
     ) -> None:
         """两种模型变更共用的提交/取消/发布流程；prepare 同步且无 I/O。"""
         self._ownership.claim("model")
-        self._model_done = asyncio.get_running_loop().create_future()
         try:
             try:
                 binding = prepare()
@@ -1459,8 +1447,6 @@ class ApplicationSession:
                 raise asyncio.CancelledError()
         finally:
             self._ownership.release("model")
-            if self._model_done is not None and not self._model_done.done():
-                self._model_done.set_result(None)
 
     async def _finish_model_change(
         self, binding: ModelBinding, config: ApplicationConfig,
@@ -1623,11 +1609,10 @@ class ApplicationSession:
                 ) from begin_error
         # 非持久会话无 begin: 接缝同为首次预估前 (准入通过后), 预算拒绝零副作用
         # (D9); 自动压缩需持久会话, 回调内判定后原样拒绝
-        loop = asyncio.get_running_loop()
         self._state = "executing"
         self._run_id = None
-        # token 已在接缝处建立 (03): 覆盖预估/自动压缩/begin/全部轮次
-        self._active_done = loop.create_future()
+        # token 已在接缝处建立 (03): 覆盖预估/自动压缩/begin/全部轮次;
+        # 请求的落定信号由令牌持有, execute 归还所有权时一并落定
         self._notify(RequestPhaseChanged(None, "executing"))
         restore_opened = False
         try:
@@ -1647,15 +1632,12 @@ class ApplicationSession:
             if self._state != "closed":
                 self._state = "closing"
                 self._closing = True
-            if self._active_done is not None and not self._active_done.done():
-                self._active_done.set_result(None)
             raise
         # 先更新隔离的 state/history, 再通知订阅者; 应用把后缀追加一次
         # 捕获上下文在 commit 收尾后清除 (C2): note_commit 已在上一步取到真实 seq;
         # 提交未成功 (落盘故障) 时按中断如实标注来源, 已捕获部分仍可还原。放 finally:
         # 提交路径自身抛错也不能让上下文跨请求残留 (残留会让下一请求被误拒)。
         interrupted = True
-        completion_failed = True
         try:
             if self._store is not None:
                 # 完成提交成功先于 saved/idle/RequestCompleted; 失败锁存且退出码置 1。
@@ -1684,11 +1666,8 @@ class ApplicationSession:
                             len(self._history) + len(result.messages),
                         )
                     )
-            completion_failed = False
         finally:
             await self._close_restore_capture(restore_opened, interrupted=interrupted)
-            if completion_failed and self._active_done is not None and not self._active_done.done():
-                self._active_done.set_result(None)
         self._history.extend(isolate_message(m) for m in result.messages)
         if outcome.view is not None and outcome.view.process_uncertain:
             self._process_uncertain = True
@@ -1705,9 +1684,6 @@ class ApplicationSession:
         self._last_outcome = _isolate_outcome(outcome)
         self._last_request_model = self._config.model_label
         self._notify(RequestCompleted(outcome))
-        # 请求拥有持久提交、seq补记和捕获收尾的真实IO；内核结束不释放此信号。
-        if self._active_done is not None and not self._active_done.done():
-            self._active_done.set_result(None)
         return outcome
 
     def _open_restore_capture(self) -> bool:
@@ -2093,7 +2069,6 @@ class ApplicationSession:
                 "a request start is being persisted; clear is refused until it settles"
             )
         self._ownership.claim("clear")
-        self._clear_done = asyncio.get_running_loop().create_future()
         self._notify(OperationBusy(operation="clear"))
         try:
             # 清空事务的 completion 受拥有: 外层取消先等明确结果; 成功则先完成内存
@@ -2133,8 +2108,6 @@ class ApplicationSession:
                 raise asyncio.CancelledError()
         finally:
             self._ownership.release("clear")
-            if self._clear_done is not None and not self._clear_done.done():
-                self._clear_done.set_result(None)
 
     # --- 手动压缩 (02, D4-D6) ---------------------------------------------------------
 
@@ -2194,7 +2167,6 @@ class ApplicationSession:
         token = CancelToken()
         plan = self._compaction_plan(token)
         self._ownership.claim("compaction")
-        self._compact_done = asyncio.get_running_loop().create_future()
         self._compact_token = token
         self._notify(OperationBusy(operation="compact"))
         try:
@@ -2204,8 +2176,6 @@ class ApplicationSession:
         finally:
             self._ownership.release("compaction")
             self._compact_token = None
-            if self._compact_done is not None and not self._compact_done.done():
-                self._compact_done.set_result(None)
 
     async def _run_compaction(
         self, plan: _CompactionPlan, *, reason: str, cancel_token: CancelToken
@@ -2371,7 +2341,6 @@ class ApplicationSession:
             return False
         # 请求内部的子阶段: 临时占住压缩槽, 让 clear/新请求看到"压缩在途"
         self._ownership.claim("compaction", inside="request")
-        self._compact_done = asyncio.get_running_loop().create_future()
         self._compact_token = token
         try:
             compacted = await self._run_compaction(plan, reason="auto", cancel_token=token)
@@ -2382,8 +2351,6 @@ class ApplicationSession:
         finally:
             self._ownership.release("compaction")
             self._compact_token = None
-            if self._compact_done is not None and not self._compact_done.done():
-                self._compact_done.set_result(None)
 
     def _check_summary_admission(self, cancel_token: CancelToken | None) -> None:
         if self._compact_sealed or self._closing or self._closed or (cancel_token is not None and cancel_token.cancelled):
@@ -2764,8 +2731,9 @@ class ApplicationSession:
         # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
         # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
         producers = [
-            done for done in (self._active_done, self._clear_done, self._compact_done, self._model_done, self._review_task, self._rewind_task)
-            if done is not None and not done.done()
+            *self._ownership.completions("request", "clear", "compaction", "model"),
+            *(task for task in (self._review_task, self._rewind_task)
+              if task is not None and not task.done()),
         ]
         if producers and self._cancel_token is not None:
             self._cancel_token.cancel()
@@ -2789,12 +2757,11 @@ class ApplicationSession:
                     raise
                 self._close_problems.append("review reading failed during close")
         # 配置接受后不能在 COMMIT 与内存发布之间释放 store/client 或观察者。
-        # 监督超时记录诊断, 不能替代事务明确结果; model 生产者仍受拥有。
-        if self._model_done is not None and not self._model_done.done():
-            await asyncio.shield(self._model_done)
-        # 命名提交已接受时，取得真实结果并发布后才清理存储和观察者。
-        if self._session_done is not None and not self._session_done.done():
-            await asyncio.shield(self._session_done)
+        # 监督超时记录诊断, 不能替代事务明确结果; 已接受事务仍受拥有, 无限期等落定。
+        for operation in ("model", "session"):
+            completion = self._ownership.completion(operation)
+            if completion is not None:
+                await asyncio.shield(completion)
         # 解除核心到应用的订阅; 应用 observer 保留到 ApplicationClosed 送达后
         self._unsubscribe_core()
         stop_error: str | None = None

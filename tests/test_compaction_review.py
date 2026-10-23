@@ -111,7 +111,7 @@ async def test_summary_failure_never_persists_or_switches(tmp_path):
         assert "error" in str(exc_info.value)
         assert store.recovery_snapshot().summaries == (), "无摘要记录落库"
         assert session._context_projection.blocks == (), "投影不变"
-        assert session._compact_done.done(), "屏障落定"
+        assert session.busy_operation is None, "屏障落定"
         assert session.persistence.storage_failed is None, "失败分类不是存储故障"
     finally:
         await session.aclose()

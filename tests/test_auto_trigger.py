@@ -655,7 +655,7 @@ async def test_close_during_pre_estimate_auto_compaction_seals_and_settles(tmp_p
 
 
 async def test_close_during_per_turn_compaction_supervises_auto_barrier(tmp_path):
-    """close 组合 (begin 后窗口): 自动压缩屏障 (_compact_done) 纳入监督, 请求以
+    """close 组合 (begin 后窗口): 自动压缩的落定信号纳入监督, 请求以
     aborted 收尾并完成提交, close 干净完成。"""
     config_seed, req1, req2 = _window_config_per_turn()
     channel = _GatedSummary()
