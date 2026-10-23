@@ -43,6 +43,7 @@ from cicada.plugins.coding.workspace import Workspace
 from cicada.plugins.fake_model import FakeModel, fake_model_plugin
 from cicada.plugins.fake_tools import EchoTool, fake_tools_plugin
 from cicada.plugins.deepseek import DeepSeekModel, DeepSeekConfig
+from cicada.tool_outcomes import check_status_details, process_details
 from cicada.run_policy import (
     CONTEXT_CLOSE_TAG,
     CONTEXT_OPEN_TAG,
@@ -563,6 +564,22 @@ async def test_projection_is_idempotent_for_repeated_view():
 
 
 # --- 终结点事实与保守锁存 -------------------------------------------------------
+
+
+@pytest.mark.parametrize("marker,value", [("contract_version", 2), ("contract", "future.tool-outcome")])
+async def test_unknown_contract_latches_without_misclassifying_status_or_legacy(marker, value):
+    service = FakeVerificationService(make_view())
+    details = process_details({"exit_code": 0, "output_complete": True})
+    details[marker] = value
+    messages = (
+        ToolResultMessage(ToolResult("status", "check", "status", details=check_status_details({}))),
+        ToolResultMessage(ToolResult("legacy", "powershell", "ok", details={"exit_code": 0, "output_complete": True})),
+        ToolResultMessage(ToolResult("unknown", "powershell", "ok", details=details)),
+    )
+    request, _ = await projected_request(service, messages)
+    assert len(service.uncertain_reasons) == 1
+    assert "unknown tool outcome contract" in service.uncertain_reasons[0]
+    assert parse_tail(request)["process_uncertain"] is True
 
 
 async def test_timeout_and_cancel_results_latch_process_uncertain():

@@ -27,8 +27,10 @@ OPTIONS: tuple[tuple[str, str], ...] = (
 class ApprovalModal:
     """一次只显示一个待决请求; Esc 等同拒绝."""
 
-    def __init__(self, on_decision: Callable[[Any, str], None]) -> None:
+    def __init__(self, on_decision: Callable[[Any, str], None], *,
+                 on_cancel: Callable[[], None] | None = None) -> None:
         self._on_decision = on_decision
+        self._on_cancel = on_cancel
         self.request: Any | None = None
         self.selected = 0
 
@@ -46,7 +48,11 @@ class ApprovalModal:
     def handle(self, key: KeyPress) -> None:
         if self.request is None:
             return
-        if key.key is Keys.Up:
+        if key.key is Keys.ControlC or key.data == "\x03":
+            self.dismiss()
+            if self._on_cancel is not None:
+                self._on_cancel()
+        elif key.key is Keys.Up:
             self.selected = (self.selected - 1) % len(OPTIONS)
         elif key.key is Keys.Down:
             self.selected = (self.selected + 1) % len(OPTIONS)

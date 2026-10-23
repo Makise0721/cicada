@@ -130,6 +130,11 @@ def check_status_details(payload: Mapping[str, Any]) -> dict[str, Any]:
 # --- 消费者入口 ---------------------------------------------------------------------------
 
 
+def is_check_status(details: Any) -> bool:
+    """仅识别当前版本的检查观察载荷; 它没有启动进程."""
+    return isinstance(details, Mapping) and _is_legacy(details, KIND_CHECK_STATUS) is False
+
+
 def process_facts(details: Any) -> ProcessFacts | None:
     """解码进程类事实; 无标记旧记录按字段推断, 未知契约/版本/kind 返回 None."""
     if not isinstance(details, Mapping):

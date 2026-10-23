@@ -203,7 +203,7 @@ class ConversationView:
         self.model_menu = ModelMenu()
         self.login_modal = LoginModal(self._cancel_login, self._submit_login,
                                       display_style=self.display_style)
-        self.approval_modal = ApprovalModal(self._resolve_approval)
+        self.approval_modal = ApprovalModal(self._resolve_approval, on_cancel=self.handle_ctrl_c)
         self.modal = ModalRouter(self.login_modal, self.approval_modal)
         self._login_task: asyncio.Task | None = None
         # 状态行 (规格 §F): spinner 帧时钟与动画任务; 忙时驱动 on_update, 转闲即停

@@ -42,7 +42,7 @@ from cicada.plugins.coding.verification_contracts import (
     VerificationService,
     VerificationView,
 )
-from cicada.tool_outcomes import process_facts
+from cicada.tool_outcomes import is_check_status, process_facts
 
 REQUEST_CONTEXT_MAX_BYTES = 8192
 IDENTIFIER_MAX_BYTES = 128
@@ -104,6 +104,7 @@ class _ToolFacts:
     cancelled: bool
     exit_code: int | None
     error_text: str
+    unknown_contract: bool
 
     @property
     def termination_known(self) -> bool:
@@ -402,6 +403,9 @@ def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
             cancelled=False,
             exit_code=None,
             error_text=error_text,
+            unknown_contract=details is not None and not (
+                result.name == CHECK_TOOL_NAME and is_check_status(details)
+            ),
         )
     return _ToolFacts(
         tool=result.name,
@@ -413,6 +417,7 @@ def _tool_facts(message: ToolResultMessage) -> _ToolFacts | None:
         cancelled=facts.cancelled is True,
         exit_code=facts.exit_code,
         error_text=error_text,
+        unknown_contract=False,
     )
 
 
@@ -437,6 +442,8 @@ def _uncertain_reason(facts: _ToolFacts) -> str | None:
         return f"{facts.tool} was cancelled; process termination unproven"
     if facts.process_not_started:
         return None  # 程序自证的执行前/启动失败: 与进程终结无关
+    if facts.unknown_contract:
+        return f"{facts.tool} result has an unknown tool outcome contract; termination unproven"
     if facts.execution_failure:
         return f"{facts.tool} result reports a termination failure"
     if not facts.has_details:

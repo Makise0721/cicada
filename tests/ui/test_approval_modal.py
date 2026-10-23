@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 from prompt_toolkit.key_binding.key_processor import KeyPress
@@ -13,6 +15,13 @@ from prompt_toolkit.keys import Keys
 from cicada.ui.approval_modal import ApprovalModal, ModalRouter
 from cicada.ui.conversation_view import ConversationView
 from cicada.ui.theme import FooterComponent
+from cicada.application import RequestCompleted, open_application
+from cicada.plugins.fake_model import FakeModel, fake_model_plugin
+from cicada.ui import run_tui_session
+from cicada.ui.terminal_io import FakeTerminal
+from test_application import _config
+from tests.support.app import script
+from tests.ui.test_frontend_headless import CTRL_C, CTRL_D
 
 
 def _request() -> SimpleNamespace:
@@ -65,6 +74,60 @@ def test_escape_denies_and_closes():
     modal.handle(KeyPress(Keys.Escape, "\x1b"))
     assert shown == [(request, "deny")]
     assert not modal.is_open
+
+
+async def test_ctrl_c_during_approval_cancels_request_before_shell_runs(tmp_path, monkeypatch):
+    model = FakeModel(script(
+        {"tool_calls": [{"id": "shell", "name": "powershell", "arguments": {
+            "command": "Set-Content should-not-exist.txt executed"}}]},
+        {"text": "should not continue", "stop": True},
+    ))
+    session = await open_application(replace(
+        _config(tmp_path, script=[]), model_plugin=fake_model_plugin(model), approval=True,
+        runtime_dir=tmp_path / "runtime",
+    ))
+    terminal = FakeTerminal()
+    views = []
+    original_view = ConversationView
+
+    def capture_view(*args, **kwargs):
+        view = original_view(*args, **kwargs)
+        views.append(view)
+        return view
+
+    monkeypatch.setattr("cicada.ui.ConversationView", capture_view)
+    completed = asyncio.Event()
+    outcomes = []
+
+    def observe(update):
+        if isinstance(update, RequestCompleted):
+            outcomes.append(update.outcome)
+            completed.set()
+
+    unsubscribe = session.subscribe(observe)
+    runner = asyncio.create_task(run_tui_session(session, terminal=terminal, initial_prompt="request shell"))
+    try:
+        async with asyncio.timeout(3):
+            while not views or not views[0].approval_modal.is_open:
+                await asyncio.sleep(0)
+        terminal.emit([CTRL_C])
+        await asyncio.wait_for(completed.wait(), 3)
+        assert outcomes[0].result.stop_reason == "aborted"
+        assert len(model.requests) == 1
+        assert not (tmp_path / "should-not-exist.txt").exists()
+        assert not views[0].approval_modal.is_open
+        async with asyncio.timeout(3):
+            while views[0]._gate.busy():
+                await asyncio.sleep(0)
+        terminal.emit([CTRL_D])
+        await asyncio.wait_for(runner, 3)
+    finally:
+        unsubscribe()
+        if not runner.done():
+            session.cancel()
+            runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        await session.aclose()
 
 
 def test_router_prefers_approval_then_falls_back_to_login():
