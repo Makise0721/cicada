@@ -2,6 +2,8 @@ import asyncio
 import time
 from pathlib import Path
 
+import pytest
+
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ToolContext
 from cicada.plugins.coding.process import BoundedText
