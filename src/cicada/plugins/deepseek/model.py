@@ -222,7 +222,7 @@ class DeepSeekModel:
             request, cancel, client=self.client, endpoint=BASE_URL + "/chat/completions",
             api_key=self._api_key, identity=self.identity,
             build_body=lambda value: build_request(value, self.config),
-            completion=Completion(think=self.config.think),
+            completion_factory=lambda: Completion(think=self.config.think),
             max_request_bytes=self.config.max_request_bytes, max_tokens=self.config.max_tokens,
             timeout=DEFAULT_TIMEOUT, deadline_seconds=CALL_DEADLINE_S, label="deepseek",
             cost_control=self._cost_control, before_send=self._record_observation,

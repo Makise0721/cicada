@@ -86,7 +86,7 @@ class ChatModel:
         async for event in stream_chat(
             request, cancel, client=self.client, endpoint=self.config.endpoint,
             api_key=self._api_key, identity=self.config.identity,
-            build_body=lambda value: build_request(value, self.config), completion=ChatCompletion(),
+            build_body=lambda value: build_request(value, self.config), completion_factory=ChatCompletion,
             max_request_bytes=self.config.max_request_bytes, max_tokens=self.config.max_tokens,
             timeout=DEFAULT_TIMEOUT, deadline_seconds=CALL_DEADLINE_S, label="chat",
             cost_control=self._cost_control,

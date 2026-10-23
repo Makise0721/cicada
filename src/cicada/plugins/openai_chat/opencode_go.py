@@ -132,7 +132,7 @@ class GoModel(ChatModel):
         headers = {'User-Agent': 'cicada/' + client_version}
         async for event in stream_chat(request, cancel, client=self.client, endpoint=self.config.endpoint,
             api_key=self._api_key, identity=self.config.identity, build_body=checked_body,
-            completion=GoCompletion(think=True) if self.config.think else ChatCompletion(),
+            completion_factory=(lambda: GoCompletion(think=True)) if self.config.think else ChatCompletion,
             max_request_bytes=self.config.max_request_bytes,
             max_tokens=self.config.max_tokens, timeout=DEFAULT_TIMEOUT, deadline_seconds=CALL_DEADLINE_S,
             label='OpenCode Go', cost_control=self._cost_control, request_headers=headers):
