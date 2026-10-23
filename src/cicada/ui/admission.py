@@ -13,6 +13,11 @@
   不带到下次请求。不触碰独立 finalize token。
 - execute 的异常 (如 process_uncertain 拒绝、内核异常) 经 on_error 回调如实
   成条; 抛出不被吞没成"成功"。
+
+"谁在改会话"不在这里回答 (P0-3): 事务所有权归 `session.busy_operation`。闸门只
+保留会话不可能知道的三件事——请求 reservation 的同步窗口、同批输入余下的静默、
+以及打开中的会话模态页; 已提交但尚未占槽的清空/压缩/模型选择另有一个同步槽位
+(`_submitted`), 它们由命令处置时置位、事件落定时清除。
 """
 
 from __future__ import annotations
@@ -21,6 +26,9 @@ import asyncio
 from typing import Callable
 
 from cicada.application import ApplicationSession, RequestOutcome
+
+#: 命令处置时同步占位、事件落定时清除的提交槽位; 三者互斥 (命令在屏障内不排队)。
+_SUBMITTED_OPERATIONS = frozenset({"clear", "compaction", "model"})
 
 
 class AdmissionGate:
@@ -31,17 +39,10 @@ class AdmissionGate:
         self._task: asyncio.Task | None = None
         self._reservation_open = False
         self._pending_cancel = False
-        # 票据 05: 持久清空提交中 (OperationBusy("clear") -> HistoryCleared/失败落定);
-        # 期间 Enter/斜线命令/退出屏障, 草稿保持可编辑
-        self._clearing = False
-        # 票据 02: 持久压缩提交中 (OperationBusy("compact") -> ContextCompacted/
-        # 失败落定); 屏障语义与清空同型
-        self._compacting = False
-        # DeepSeek 阶段票据 04: 模型选择提交中 (OperationBusy("model") ->
-        # ModelChanged/失败落定); 屏障语义与清空/压缩同型, 菜单确认时同步置位
-        self._model_selecting = False
-        self._login_active = False
-        self._review_active = False
+        # 已提交、但会话尚未占槽的提交 (清空/压缩/模型选择): 命令处置时同步置位,
+        # 落定事件或等待任务释放; 只有一个槽位, 因为屏障内命令不排队
+        self._submitted: str | None = None
+        # 会话模态页打开或会话切换/命名在途: 前者是纯 UI 页, 后者会话侧也有租约
         self._session_managing = False
         self._session_rejected_in_batch = False
         # 宿主注入: execute 异常 (如 process_uncertain 拒绝) 的如实记录出口
@@ -56,17 +57,27 @@ class AdmissionGate:
     @property
     def clearing(self) -> bool:
         """持久清空提交进行中 (输入屏障; 与请求 reservation 独立)。"""
-        return self._clearing
+        return self._submitted == "clear"
 
     @property
     def compacting(self) -> bool:
         """持久压缩提交进行中 (输入屏障; 与请求 reservation 独立)。"""
-        return self._compacting
+        return self._submitted == "compaction"
 
     @property
     def model_selecting(self) -> bool:
         """模型选择提交进行中 (输入屏障; 与请求 reservation 独立, 04)。"""
-        return self._model_selecting
+        return self._submitted == "model"
+
+    @property
+    def login_active(self) -> bool:
+        """登录编辑窗打开或保存中: 会话持有 login 租约 (同步占槽)。"""
+        return self._session.busy_operation == "login"
+
+    @property
+    def submitting(self) -> bool:
+        """命令已提交、会话尚未占槽 (清空/压缩/模型选择的同步窗口)。"""
+        return self._submitted is not None
 
     def busy(self) -> bool:
         """reservation 存在即忙 (含 execute 任务尚未起跑的同步窗口)。"""
@@ -97,17 +108,28 @@ class AdmissionGate:
 
     # --- 准入 ----------------------------------------------------------------------
 
+    def other_transaction_active(self) -> bool:
+        """会话里有本闸门之外的独占事务在途.
+
+        请求的屏障由 reservation 回答 (该任务归闸门所有); 清空/压缩/模型/登录/
+        审阅/还原点/目录直接问会话的所有权令牌, 不再各自镜像。
+        """
+        return self._session.busy_operation not in (None, "request")
+
     def try_admit(self, prompt: str) -> asyncio.Task | None:
         """同步准入: 可执行则先占 reservation 再创建任务, 返回任务; 否则 None。
 
-        拒绝条件: 已有 reservation / 持久清空/压缩提交中 / 模型选择提交中 /
-        session 非 idle (含 closing/closed) / 空提示。返回 None 表示拒绝, 调用方不得伪造用户条目。
+        拒绝条件: 已有 reservation / 同批已被拒 / 会话模态或切换在途 / 会话里另有
+        独占事务 / 已提交未占槽的提交 / session 非 idle (含 closing/closed) /
+        空提示。返回 None 表示拒绝, 调用方不得伪造用户条目。
         """
         if self._reservation_open:
             return None
-        if self._session_rejected_in_batch or self._session_managing or getattr(self._session, "session_management_active", False):
+        if self._session_rejected_in_batch or self._session_managing:
             return None
-        if self._clearing or self._compacting or self._model_selecting or self._login_active or self._review_active or (getattr(self._session, "review_active", False) or getattr(self._session, "rewind_active", False)):
+        if self.other_transaction_active():
+            return None
+        if self._submitted is not None:
             return None
         if self._session.state != "idle":
             return None
@@ -153,53 +175,35 @@ class AdmissionGate:
         """RequestCompleted 后核对释放条件 (正常路径 state 已回 idle)。"""
         self._release_if_idle()
 
-    # --- 持久清空屏障 (票据 05) ---------------------------------------------------------
+    # --- 提交槽位 (清空 / 压缩 / 模型选择) ----------------------------------------------
+
+    def _reserve(self, operation: str) -> None:
+        """命令处置时同步占位, 先于任务起跑窗口."""
+        assert operation in _SUBMITTED_OPERATIONS
+        self._submitted = operation
+
+    def _release(self, operation: str) -> None:
+        """落定 (成功事件或等待任务终结) 后释放; 幂等."""
+        if self._submitted == operation:
+            self._submitted = None
 
     def note_clear_started(self) -> None:
-        """清空提交开始 (命令处置时同步置位, 先于任务起跑窗口); 幂等。"""
-        self._clearing = True
+        self._reserve("clear")
 
     def note_clear_settled(self) -> None:
-        """清空提交落定 (成功由 HistoryCleared 投影, 失败由等待任务释放); 幂等。"""
-        self._clearing = False
+        self._release("clear")
 
     def note_compact_started(self) -> None:
-        """压缩提交开始 (命令处置时同步置位, 先于任务起跑窗口); 幂等 (02)。"""
-        self._compacting = True
+        self._reserve("compaction")
 
     def note_compact_settled(self) -> None:
-        """压缩提交落定 (成功由 ContextCompacted 投影, 失败/放弃由等待任务释放); 幂等。"""
-        self._compacting = False
-
-    # --- 模型选择屏障 (DeepSeek 阶段票据 04) -------------------------------------------
+        self._release("compaction")
 
     def note_model_started(self) -> None:
-        """模型选择提交开始 (菜单确认时同步置位, 先于任务创建); 幂等。"""
-        self._model_selecting = True
-
-    @property
-    def login_active(self) -> bool:
-        return self._login_active
-
-    def note_login_started(self) -> None:
-        self._login_active = True
-
-    def note_login_settled(self) -> None:
-        self._login_active = False
-
-    @property
-    def review_active(self) -> bool:
-        return self._review_active
-
-    def note_review_started(self) -> None:
-        self._review_active = True
-
-    def note_review_settled(self) -> None:
-        self._review_active = False
+        self._reserve("model")
 
     def note_model_settled(self) -> None:
-        """模型选择落定 (成功由 ModelChanged 投影, 失败/取消由等待任务释放); 幂等。"""
-        self._model_selecting = False
+        self._release("model")
 
     def note_phase(self, phase: str) -> None:
         """阶段通知: reservation 窗口记录的取消意图在任务实际执行时交给公共 cancel。"""
@@ -215,10 +219,7 @@ class AdmissionGate:
         self._session_rejected_in_batch = False
         self._reservation_open = False
         self._task = None
-        self._clearing = False
-        self._compacting = False
-        self._model_selecting = False
-        self._login_active = False
+        self._submitted = None
 
     # --- 取消意图 ----------------------------------------------------------------------
 
@@ -241,14 +242,17 @@ def cancel_if_active(session: ApplicationSession) -> bool:
 def is_enter_barrier(session: ApplicationSession, gate: AdmissionGate) -> bool:
     """Enter 屏障: 屏障内 Enter 无动作 (不排队、不执行命令、不提示)。
 
-    覆盖 reservation 未起跑窗口、持久清空提交 (05)、持久压缩提交 (02)、
-    模型选择提交 (DeepSeek 04) 与 executing/cancelling/finalizing/closing/closed。
+    覆盖 reservation 未起跑窗口、同批已拒输入、会话模态/切换、任一事务持有
+    所有权 (清空/压缩/模型/登录/审阅/还原点/目录) 与 executing/cancelling/
+    finalizing/closing/closed。
     """
     if gate.busy():
         return True
-    if gate.session_rejected_in_batch or gate.session_managing or getattr(session, "session_management_active", False):
+    if gate.session_rejected_in_batch or gate.session_managing:
         return True
-    if gate.clearing or gate.compacting or gate.model_selecting or gate.login_active or gate.review_active or (getattr(session, "review_active", False) or getattr(session, "rewind_active", False)):
+    if gate.submitting:
+        return True
+    if gate.other_transaction_active():
         return True
     return session.state in (
         "executing",

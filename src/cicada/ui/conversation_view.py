@@ -277,10 +277,7 @@ class ConversationView:
             self._on_update()
 
     def _review_updated(self) -> None:
-        if (self.review_view.active or self.rewind_view.active):
-            self._gate.note_review_started()
-        else:
-            self._gate.note_review_settled()
+        # 审阅/还原点页的会话租约由 session.busy_operation 回答, 闸门不再镜像。
         if self._on_update:
             self._on_update()
 
@@ -373,13 +370,12 @@ class ConversationView:
             elif update.operation == "clear":
                 self._gate.note_clear_started()
                 self.transcript.append_system("正在提交清空（显示记录与验证状态保留）…")
-            elif update.operation == 'login':
-                self._gate.note_login_started()
-            elif update.operation == 'session':
+            elif update.operation == "session":
                 self._gate.note_session_started()
-            else:
-                # model: 屏障在菜单确认时已同步置位, 此处兜底; 进度由状态行表达
+            elif update.operation == "model":
+                # 屏障在菜单确认时已同步置位, 此处兜底; 进度由状态行表达
                 self._gate.note_model_started()
+            # login 不设镜像: login_view 同步占住会话租约, 闸门直接问 busy_operation
         elif isinstance(update, SessionNameChanged):
             if update.session_generation == self._session.session_generation:
                 self.transcript.append_system(
@@ -1064,17 +1060,15 @@ class ConversationView:
                 self._on_update()
 
     def _open_login(self, provider_id: str | None = None) -> bool:
-        self._gate.note_login_started()  # 同步屏障先于读取/任务创建。
+        # login_view 同步占住会话租约 (busy_operation == "login"), 无需另设屏障。
         self.model_menu.dismiss()
         try:
             view = self._session.login_view(provider_id) if provider_id is not None else self._session.login_view()
             self._login_profiles_active = bool(view.providers)
             self.login_modal.open(view)
         except UserConfigError as exc:
-            self._gate.note_login_settled()
             self.transcript.append_error('登录配置不可用：' + exc.error_code)
         except Exception:
-            self._gate.note_login_settled()
             self._session.cancel_login()
             self.transcript.append_error('登录配置不可用：read-failed')
         if self._on_update:
@@ -1083,7 +1077,6 @@ class ConversationView:
 
     def _settle_login(self) -> None:
         self.login_modal.dismiss()
-        self._gate.note_login_settled()
 
     def _cancel_login(self) -> None:
         self._session.cancel_login()
