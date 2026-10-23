@@ -94,3 +94,26 @@ def test_duplicate_routes_and_too_small_input_bound_are_rejected(tmp_path):
     with pytest.raises(CostError, match='input bound'):
         ledger.reserve(_identity(), 4096)
     assert ledger.snapshot.calls == 0 and not ledger.path.exists()
+
+def test_count_only_ledger_releases_failed_attempt_and_keeps_calls(tmp_path, monkeypatch):
+    calls = CostLedger(tmp_path / 'calls', max_calls=2)
+    first = calls.reserve(_identity(), 4096)
+    calls.finish_failed_attempt(first, reason='http-429')
+    assert calls.snapshot.calls == 1 and calls.snapshot.sealed_reason is None
+    record = json.loads(calls.path.read_text(encoding='utf-8'))
+    assert record['calls'] == 1 and record['pending_upper_cny'] is None
+    second = calls.reserve(_identity(), 4096)
+    assert calls.snapshot.calls == 2
+    with pytest.raises(CostError, match='does not match'):
+        calls.finish_failed_attempt(first, reason='http-429')
+    with pytest.raises(CostError, match='count-only'):
+        CostLedger(tmp_path / 'money', limit=Decimal('10'), profile=_profile(tmp_path)).finish_failed_attempt(
+            second, reason='http-429')
+    flaky = CostLedger(tmp_path / 'flaky', max_calls=1)
+    reservation = flaky.reserve(_identity(), 4096)
+    monkeypatch.setattr(flaky, '_persist',
+                        lambda: (_ for _ in ()).throw(CostError('cost ledger write failed')))
+    with pytest.raises(CostError, match='write failed'):
+        flaky.finish_failed_attempt(reservation, reason='http-503')
+    assert flaky._pending is reservation
+    assert flaky.snapshot.sealed_reason == 'cost ledger write failed'

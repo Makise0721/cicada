@@ -294,6 +294,28 @@ class CostLedger:
         self._persist()
         return reservation
 
+    def finish_failed_attempt(self, reservation: _Reservation, *, reason: str) -> None:
+        """受限结束一次可重试失败尝试：仅次数额度账本、匹配预留、未封口。
+
+        次数占用不回退，金额保持 None；持久化失败保持 pending 并封口。
+        取消/协议/关闭/存储故障不走本操作，仍由 finish(complete=False) 封口。
+        """
+        if self.profile is not None or self.limit is not None or self.max_calls is None:
+            raise CostError('failed attempt completion requires a count-only allowance')
+        if self._pending is not reservation:
+            raise CostError('failed attempt does not match the pending reservation')
+        if self._sealed is not None:
+            raise CostError(self._sealed)
+        if not isinstance(reason, str) or not reason:
+            raise CostError('failed attempt completion requires a fixed reason')
+        self._pending = None
+        try:
+            self._persist()
+        except CostError:
+            self._pending = reservation
+            self._sealed = 'cost ledger write failed'
+            raise
+
     def finish(self, reservation: _Reservation, metrics: ModelMetrics | None, *, complete: bool) -> None:
         if self._pending is not reservation:
             raise CostError('model cost reservation is not current')
