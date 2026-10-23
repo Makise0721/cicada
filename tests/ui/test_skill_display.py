@@ -226,7 +226,8 @@ async def test_auto_skill_catalog_shows_effective_source(tmp_path):
         text = "\n".join(h.lines())
         assert "user:" in text and "project:" in text
         assert "/skill shared" in text and "[project]" in text
-        assert "overrides user source" in text
+        # 长临时路径可将来源提示折到多行，断言保留完整语义而不依赖换行位置。
+        assert "overrides user source" in " ".join(text.split())
     finally:
         h.view.close()
         await session.aclose()

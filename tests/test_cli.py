@@ -14,6 +14,17 @@ from cicada.state_paths import workspace_state_dir
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
+_NO_UI_DEPENDENCIES = """
+import importlib.abc
+import sys
+class NoUiDependencies(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in ('rich', 'prompt_toolkit'):
+            raise ImportError('UI dependency unavailable in CLI probe: ' + fullname)
+        return None
+sys.meta_path.insert(0, NoUiDependencies())
+"""
+
 
 def _runtime(workspace: Path, *, home: Path | None = None) -> Path:
     user_home = home if home is not None else workspace / "test-user-home"
@@ -584,11 +595,11 @@ def test_tui_missing_ui_dependency_exits_cleanly(tmp_path):
 
 
 def test_plain_mode_has_zero_ui_imports(tmp_path):
-    # T14: 普通单次模式全程不导入 UI 可选依赖 (prompt_toolkit / rich)。
+    # T14: 缺少 UI 可选依赖时仍可完整运行；httpx 的可选 CLI 可能尝试导入 rich。
     # 运行完整 main() (fake 剧本, 零网络) 而非仅模块导入, 覆盖 _run 共享段。
     script = tmp_path / "script.json"
     script.write_text(json.dumps([{"text": "hi", "stop": True}]), encoding="utf-8")
-    code = (
+    code = _NO_UI_DEPENDENCIES + (
         "import sys; "
         f"sys.argv = ['cicada', '--workspace', r'{tmp_path}', '--script', r'{script}', '任务']; "
         "import cicada.__main__ as m; "
@@ -1400,7 +1411,7 @@ def test_list_sessions_no_model_probes_and_no_ui_imports(tmp_path):
     proc = run_cli("--workspace", str(tmp_path), "--list-sessions")
     assert proc.returncode == 0, proc.stderr
 
-    code = (
+    code = _NO_UI_DEPENDENCIES + (
         "import sys; "
         f"sys.argv = ['cicada', '--workspace', r'{tmp_path}', '--list-sessions']; "
         "import cicada.__main__ as m; "

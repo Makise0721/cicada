@@ -15,6 +15,18 @@ from test_user_config_startup import invoke, requests, write_config
 
 ENTER = KeyPress(Keys.ControlM, '\r')
 PASTE = KeyPress(Keys.BracketedPaste, 'startup-sentinel')
+DOWN = KeyPress(Keys.Down, '')
+UP = KeyPress(Keys.Up, '')
+DEEPSEEK = KeyPress(Keys.BracketedPaste, 'DeepSeek')
+
+
+def startup_keys():
+    # 搜索现有 DeepSeek，输入凭据，再经设置页与确认页保存。
+    return [DEEPSEEK, ENTER, PASTE, ENTER, DOWN, DOWN, ENTER, ENTER]
+
+
+def credentials_only_keys():
+    return [DOWN, ENTER, PASTE, ENTER, ENTER]
 
 
 class ScriptTerminal(FakeTerminal):
@@ -22,21 +34,32 @@ class ScriptTerminal(FakeTerminal):
         super().__init__()
         self.keys = keys
         self.starts = self.stops = 0
+        self.driver = None
+        self.timed_out = False
 
     def start(self, on_input, on_resize):
         self.starts += 1
         super().start(on_input, on_resize)
-        asyncio.get_running_loop().call_soon(self.emit, self.keys)
+        self.driver = asyncio.create_task(self._drive())
+
+    async def _drive(self):
+        await asyncio.sleep(0)
+        self.emit(self.keys)
+        await asyncio.sleep(5)
+        self.timed_out = True
+        self.emit([KeyPress(Keys.Escape, '\x1b')])
 
     def stop(self):
         self.stops += 1
+        if self.driver is not None:
+            self.driver.cancel()
         return super().stop()
 
 
 @pytest.fixture
 def interactive(monkeypatch):
     import cicada.ui
-    terminal = ScriptTerminal([ENTER, PASTE, ENTER, ENTER, ENTER, ENTER])
+    terminal = ScriptTerminal(startup_keys())
     monkeypatch.setattr('cicada.ui.terminal_io.PromptToolkitTerminal', lambda: terminal)
     monkeypatch.setattr(cli.sys.stdin, 'isatty', lambda: True)
     monkeypatch.setattr(_CaptureStream, 'isatty', lambda self: True, raising=False)
@@ -53,7 +76,8 @@ def interactive(monkeypatch):
             await session.aclose()
 
     monkeypatch.setattr(cicada.ui, 'run_tui_session', tui)
-    return terminal, sessions
+    yield terminal, sessions
+    assert not terminal.timed_out, "当前向导按键脚本未在限时内完成"
 
 
 def test_first_run_saves_before_open_and_initial_prompt_once(monkeypatch, tmp_path, requests, interactive):
@@ -67,7 +91,8 @@ def test_first_run_saves_before_open_and_initial_prompt_once(monkeypatch, tmp_pa
     assert FileUserConfigStore(root).load().credential.reveal() == 'startup-sentinel'
     archive = next((_runtime(tmp_path) / 'sessions').glob('*.sqlite3'))
     identity = read_session_identity(directory=archive.parent, session_id=archive.stem, workspace=tmp_path)
-    assert identity.launch.sources['model'] == 'user'
+    assert identity.launch.sources['model'] == 'cli'  # 向导选择用于本次启动
+    assert identity.launch.provider == 'deepseek' and identity.launch.model == 'deepseek-flash'
     for needle in ('startup-sentinel', FileUserConfigStore(root).load().defaults.credential_ref):
         assert needle not in out + err + terminal.output_text + repr(sessions[0].history)
         assert needle.encode() not in archive.read_bytes()
@@ -75,7 +100,7 @@ def test_first_run_saves_before_open_and_initial_prompt_once(monkeypatch, tmp_pa
 
 def test_wizard_cancel_keeps_default_config_without_application_or_epoch(monkeypatch, tmp_path, requests, interactive):
     terminal, sessions = interactive
-    terminal.keys = [ENTER, PASTE, KeyPress(Keys.Escape, '\x1b')]
+    terminal.keys = [DEEPSEEK, ENTER, PASTE, KeyPress(Keys.Escape, '\x1b')]
     root = tmp_path / 'user'
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '首问'], root)
     assert code == 0 and sessions == [] and requests == [], err
@@ -97,7 +122,11 @@ def test_saved_defaults_remain_when_application_open_fails(monkeypatch, tmp_path
 
 def test_explicit_think_overrides_saved_choice_and_preserves_limits(monkeypatch, tmp_path, requests, interactive):
     terminal, _ = interactive
-    terminal.keys = [ENTER, PASTE, ENTER, KeyPress(Keys.Up, ''), KeyPress(Keys.Up, ''), ENTER, ENTER]
+    terminal.keys = [DEEPSEEK, ENTER, PASTE, ENTER, UP, UP, ENTER, DOWN, ENTER,
+        *([DOWN] * 3), ENTER, KeyPress(Keys.BracketedPaste, '65536'), ENTER,
+        *([DOWN] * 4), ENTER, KeyPress(Keys.BracketedPaste, '4096'), ENTER,
+        *([DOWN] * 6), ENTER, DOWN, DOWN, ENTER,
+        *([DOWN] * 4), ENTER, ENTER]
     root = tmp_path / 'user'
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '--think',
         '--model', 'deepseek-v4-pro', '--num-ctx', '65536', '--max-output-tokens', '4096', '首问'], root)
@@ -105,7 +134,7 @@ def test_explicit_think_overrides_saved_choice_and_preserves_limits(monkeypatch,
     saved = FileUserConfigStore(root).load().defaults
     assert not saved.think and saved.num_ctx == 65536 and saved.max_output_tokens == 4096
     assert saved.model == 'deepseek-v4-pro' and requests[0][1]['thinking']['type'] == 'enabled'
-    assert '本次 CLI 覆盖' in terminal.output_text and '65536/4096' in terminal.output_text
+    assert '本次启动仍按显式 CLI 参数覆盖' in terminal.output_text and '65536/4096' in terminal.output_text
 
 
 @pytest.mark.parametrize('adopt', [False, True])
@@ -118,6 +147,7 @@ def test_resume_missing_key_preserves_archive_or_explicitly_adopts(monkeypatch, 
     session_id = out.split('[session id=')[1].split(' ')[0]
     (root / 'config.toml').write_text('version = 1\n[defaults]\nreasoning_effort = "max"\n', encoding='utf-8')
     (root / 'credentials.json').unlink()
+    interactive[0].keys = startup_keys() if adopt else credentials_only_keys()
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--resume', session_id, '--tui',
         *(['--resume-with-current-config'] if adopt else []), '续问'], root)
     assert code == 0, err
@@ -129,7 +159,7 @@ def test_resume_missing_key_preserves_archive_or_explicitly_adopts(monkeypatch, 
         assert body['model'] == 'deepseek-flash' and body['thinking']['type'] == 'enabled'
     else:
         assert body['model'] == 'deepseek-v4-pro' and body['thinking']['type'] == 'disabled'
-        assert body['max_tokens'] == 4096 and '存档只读' in interactive[0].output_text
+        assert body['max_tokens'] == 4096 and '仅补凭据，存档配置保持' in interactive[0].output_text
 
 
 @pytest.mark.parametrize('flags', [
@@ -196,6 +226,7 @@ def test_credentials_only_resume_keeps_recovery_block(monkeypatch, tmp_path, req
     (root / 'config.toml').unlink()
     (root / 'credentials.json').unlink()
     before = len(requests)
+    interactive[0].keys = startup_keys() if adopt else credentials_only_keys()
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--resume', session_id, '--tui',
         *(['--resume-with-current-config'] if adopt else [])], root)
     assert code == 3 and len(requests) == before, err
@@ -250,6 +281,7 @@ def test_selector_then_wizard_then_main_screen_sequence(monkeypatch, tmp_path, r
         events.append('selector-stop')
         return picked
 
+    terminal.keys = credentials_only_keys()
     monkeypatch.setattr(cli, '_launch_session_selector', selector)
     code, _, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '--resume'], root)
     assert code == 0, err

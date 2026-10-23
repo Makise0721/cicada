@@ -4,7 +4,7 @@
 SlashCommandMenu + FakeTerminal + VtScreen): 菜单整行高亮/宽度/光标位置、
 默认选当前、箭头循环、Enter 经应用选择、Esc 收起、编辑不丢字符、busy/
 选择中屏障静默、失败有界、closing 不重开; 真实 ApplicationSession + mock
-HTTP 证明确认后继请求使用新模型, 思考不进入普通显示。组合层语义
+HTTP 证明确认后继请求使用新模型, 思考默认进入显示。组合层语义
 (屏障/事件/失败) 另有不带渲染的聚焦用例。
 """
 
@@ -201,7 +201,9 @@ def test_slash_menu_discovers_model_command():
     assert any(item.command == "/model" for item in SLASH_COMMANDS)
     menu = SlashCommandMenu()
     menu.sync("/m", at_end=True)
-    assert menu.selected is not None and menu.selected.command == "/model"
+    assert menu.selected is not None and menu.selected.command == "/mode"
+    menu.move(1)
+    assert menu.selected.command == "/model"
 
 
 # --- 生产前端 VT: 打开/键位/收起/宽度/光标 ------------------------------------------------------
@@ -241,7 +243,7 @@ async def test_model_menu_opens_highlights_and_confirms_through_vt(tmp_path):
         footer_row = h.screen()[model_rows[-1]]
         assert model_rows[-1] >= len(h.screen()) - 2  # 底栏区 (末尾两行内)
         # 单行底栏 (2026-10-19 裁决): 品牌打头, 模型与工作区/ctx 同一行
-        assert footer_row.startswith("cicada · [high] deepseek-v4-pro")
+        assert footer_row.startswith("cicada · 完全 · [high] deepseek-v4-pro")
         assert h.find("已切换模型")
         assert session.config.model_label == "deepseek-v4-pro"
         # 确认后继请求使用新模型 (A13): 经前端键位提交, mock HTTP 体核对
@@ -249,8 +251,8 @@ async def test_model_menu_opens_highlights_and_confirms_through_vt(tmp_path):
         assert await _wait_until(lambda: session.state == "idle" and not h.view._gate.busy())
         await h.settle()  # 完成事件已落显示文档, 等节流渲染上屏
         assert bodies[-1]["model"] == "deepseek-v4-pro"
-        # 思考不进入屏幕; 答案正文照常
-        assert not h.find("思考一")
+        # 思考默认展开上屏; 答案正文照常
+        assert h.find("思考一")
         assert h.find("第一答")
         assert h.frontend.ui_failures == []
     finally:
@@ -337,6 +339,9 @@ async def test_slash_menu_enter_on_model_opens_menu(tmp_path):
     try:
         await h.start()
         h.terminal.emit(text_keys("/m"))
+        await h.settle()
+        assert h.find("→ mode")
+        h.terminal.emit([DOWN])
         await h.settle()
         assert h.find("→ model")
         h.terminal.emit([ENTER])
@@ -432,9 +437,9 @@ async def test_selection_submits_only_option_id_without_request_or_history(tmp_p
         assert bodies[-1]["model"] == "deepseek-v4-pro"
         assistants = [m for m in bodies[-1]["messages"] if m["role"] == "assistant"]
         assert assistants[0]["reasoning_content"] == "思考一"
-        # 思考不进入普通显示; 答案正文照常
+        # 思考默认进入显示; 答案正文照常
         rendered = chr(10).join(h.lines(80))
-        assert "思考一" not in rendered and "思考二" not in rendered
+        assert "思考一" in rendered and "思考二" in rendered
         assert "第二答" in rendered
     finally:
         h.close()
@@ -568,8 +573,8 @@ async def test_model_command_and_confirm_after_close_never_reopen(tmp_path):
         h.close()
 
 
-async def test_restored_reasoning_not_in_restore_projection(tmp_path):
-    """恢复显示不含思考正文 (A13/D2): restore_view 与 transcript 只渲染 message.text."""
+async def test_restored_reasoning_visible_in_restore_projection(tmp_path):
+    """恢复默认显示思考正文，且保留原始 reasoning 完整性事实。"""
     bodies: list = []
     answers = iter([ds_response("恢复前思考", "恢复前答案")])
     root = _repo(tmp_path)
@@ -586,7 +591,7 @@ async def test_restored_reasoning_not_in_restore_projection(tmp_path):
         h = ViewHarness(restored)
         try:
             rendered = chr(10).join(h.lines(80))
-            assert "恢复前思考" not in rendered, "思考正文不得进入恢复显示"
+            assert "恢复前思考" in rendered, "恢复思考默认展开显示"
             assert "恢复前答案" in rendered
         finally:
             h.close()

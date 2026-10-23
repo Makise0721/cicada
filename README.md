@@ -54,6 +54,8 @@ cicada --max-model-calls 5 '阅读这个项目，说明入口和运行方法，�
 
 Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export` 导出 HTML，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
 
+源码分支可在空闲时用 `/mode [read-only|approval|full]` 切换执行档，默认 `full`；只读档拒绝写入和命令，审批档在 PowerShell 前确认，Ctrl+C 取消整轮请求。
+
 ## 检查、费用与恢复
 
 - 使用 `--check-command 'python check.py'` 固定验收命令，工作区须为 Git 工作树根目录；退出码 `0` 才表示指定交付条件满足，模型声称完成不构成通过。

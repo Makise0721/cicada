@@ -7,6 +7,7 @@ import threading
 import pytest
 
 from cicada.core.cancel import CancelToken
+from cicada.persistence.contracts import SESSION_SCHEMA_VERSION
 from cicada.plugins.session_store import SessionCatalogReader, open_session_store
 
 
@@ -124,7 +125,7 @@ async def test_catalog_numeric_fields_never_transfer_unbounded_blob(tmp_path, mo
             entry, = (await reader.observe(CancelToken())).entries
             assert entry.error
             with sqlite3.connect(path) as db:
-                db.execute('UPDATE session SET schema_version=4, created_at=1')
+                db.execute('UPDATE session SET schema_version=?, created_at=1', (SESSION_SCHEMA_VERSION,))
         with sqlite3.connect(path) as db:
             # 坏档视图模拟时间列，预算 SQL 不得把聚合 BLOB 搬入 Python。
             db.execute('DROP TABLE records')

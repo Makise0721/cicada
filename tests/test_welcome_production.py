@@ -22,6 +22,7 @@ from cicada.plugins.user_config import FileUserConfigStore
 from cicada.ui.main_screen import strip_terminal_sequences
 from cicada.ui.terminal_io import FakeTerminal
 from test_cli import _CaptureStream, _runtime
+from test_first_run_startup import startup_keys
 from test_user_config_startup import invoke, requests, write_config
 from tests.ui.vt_screen import VtScreen
 
@@ -152,14 +153,25 @@ class WizardProbeTerminal(FakeTerminal):
         self._keys = keys
         self._events = events
         self._tag = tag
+        self._driver = None
+        self.timed_out = False
 
     def start(self, on_input, on_resize):
         super().start(on_input, on_resize)
         self._events.append(f'{self._tag}-start')
-        asyncio.get_running_loop().call_soon(self.emit, list(self._keys))
+        self._driver = asyncio.create_task(self._drive())
+
+    async def _drive(self):
+        await asyncio.sleep(0)
+        self.emit(list(self._keys))
+        await asyncio.sleep(5)
+        self.timed_out = True
+        self.emit([KeyPress(Keys.Escape, '\x1b')])
 
     def stop(self):
         self._events.append(f'{self._tag}-stop')
+        if self._driver is not None:
+            self._driver.cancel()
         return super().stop()
 
 
@@ -255,7 +267,7 @@ def test_resumed_session_welcome_has_no_logo_and_replies_again(monkeypatch, tmp_
     assert events == ['main-start', 'main-stop']
     welcome = main.notes.get('welcome_text')
     assert welcome is not None, '主屏未出现恢复欢迎'
-    for needle in ('恢复会话 · 启动快照', '启动模型: deepseek-flash', '输入 / 查看命令'):
+    for needle in ('恢复会话 · 启动快照', '启动模型: DeepSeek / deepseek-flash', '输入 / 查看命令'):
         assert needle in welcome
     assert not any(mark in welcome for mark in _LOGO_CHARS), '恢复短欢迎无标志'
     assert main.notes.get('restored_seen'), '恢复投影的旧记录不可见'
@@ -271,17 +283,19 @@ def test_first_run_wizard_hands_terminal_to_main_screen_in_order(monkeypatch, tm
     _force_color_env(monkeypatch)
     root = tmp_path / 'user'
     events: list[str] = []
-    wizard = WizardProbeTerminal([ENTER, PASTE, ENTER, ENTER, ENTER, ENTER], events)
+    wizard = WizardProbeTerminal(startup_keys(), events)
     main = MainProbeTerminal(_initial_prompt_script, events)
     factory = _OrderedTerminalFactory(wizard, main)
     monkeypatch.setattr('cicada.ui.terminal_io.PromptToolkitTerminal', factory)
     monkeypatch.setattr(cicada.ui, 'PromptToolkitTerminal', factory)
     code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui', '首问'], root)
     assert code == 0, err
+    assert not wizard.timed_out
     assert factory.calls == [wizard, main], '工厂恰好被调用 2 次且顺序为向导→主屏'
     assert events == ['wizard-start', 'wizard-stop', 'main-start', 'main-stop']
     assert events.index('wizard-stop') < events.index('main-start')
-    assert '首次配置' in wizard.output_text and '*' in wizard.output_text
+    assert '选择要配置的供应商' in wizard.output_text
+    assert '登录 DeepSeek' in wizard.output_text and '*' in wizard.output_text
     assert main.notes.get('welcome_seen'), '主屏未出现新会话欢迎'
     assert main.notes.get('answer_seen'), '首问回答未上屏'
     assert len(requests) == 1

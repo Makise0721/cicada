@@ -227,22 +227,37 @@ async def test_menus_and_login_roundtrip(style, tmp_path, monkeypatch):
         # Fake不保存登录配置；注入安全read_view，走真实弹窗按键/渲染，取消后无文件保存。
         store = FileUserConfigStore(tmp_path / "synthetic-user")
         h.view.login_modal.open(store.read_view())
-        for page in ("provider", "credential", "thinking", "confirm"):
-            wizard = h.view.login_modal.wizard
+        # 当前 ProviderWizard: provider → 隐藏凭据编辑 → settings → models → model_settings → confirm。
+        wizard = h.view.login_modal.wizard
+        def choose(action):
+            choices = wizard._choices()
+            target = next(i for i, (key, _) in enumerate(choices) if key == action)
+            h.stage.emit([DOWN] * ((target - wizard.selection) % len(choices)) + [ENTER])
+
+        for page in ("provider", "edit", "settings", "models", "model_settings", "confirm"):
             assert wizard.step == page
             for width, rows in SIZES:
                 await h.resize(width, rows, editor=False)
                 assert wizard.step == page
                 assert h.view.editor.get_text() == draft
                 assert (h.view.editor.state.cursor_line, h.view.editor.state.cursor_col) == position
-            if page == "credential":
+            if page == "provider":
+                h.stage.emit([KeyPress(Keys.BracketedPaste, "DeepSeek"), ENTER])
+            elif page == "edit":
+                assert wizard._edit_field == "api_key"
                 h.stage.emit([KeyPress(Keys.BracketedPaste, "synthetic-resize-key")])
                 for width, rows in reversed(SIZES):
                     await h.resize(width, rows, editor=False)
                     assert "synthetic-resize-key" not in h.stage.terminal.output_text
-                    assert "API key: " + "*" * 20 in "\n".join(h.stage.vt.screen_text())
-            if page != "confirm":
+                    assert "*" * 20 in "\n".join(h.stage.vt.screen_text())
                 h.stage.emit([ENTER])
+            elif page == "settings":
+                choose("model")
+            elif page == "models":
+                choose("deepseek-flash")
+            elif page == "model_settings":
+                choose("back")
+                choose("confirm")
         h.stage.emit([DOWN])
         selected = wizard.selection
         for width, rows in SIZES:

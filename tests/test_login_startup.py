@@ -24,10 +24,14 @@ def test_login_saved_defaults_reach_next_real_cli_request(monkeypatch, tmp_path,
     class ScriptTerminal(FakeTerminal):
         def start(self, on_input, on_resize):
             super().start(on_input, on_resize)
+            down = KeyPress(Keys.Down, '')
+            up = KeyPress(Keys.Up, '')
+            # DeepSeek → 新凭据 → pro 模型参数 low → 设为下次默认 → 只保存。
             asyncio.get_running_loop().call_soon(self.emit, text_keys('/login') + [
-                ENTER, ENTER, KeyPress(Keys.Down, '\x1b[B'),
-                KeyPress(Keys.BracketedPaste, 'next-start-sentinel'),
-                ENTER, KeyPress(Keys.Up, '\x1b[A'), ENTER, ENTER, ENTER])
+                ENTER, KeyPress(Keys.BracketedPaste, 'DeepSeek'), ENTER,
+                KeyPress(Keys.BracketedPaste, 'next-start-sentinel'), ENTER,
+                up, up, ENTER, down, ENTER, *([down] * 7), ENTER, ENTER, down, ENTER,
+                *([down] * 3), ENTER, down, ENTER, down, ENTER])
 
     terminal = ScriptTerminal()
     async def tui(session, *, initial_prompt):
@@ -52,7 +56,7 @@ def test_login_saved_defaults_reach_next_real_cli_request(monkeypatch, tmp_path,
     monkeypatch.setattr('cicada.ui.run_tui_session', tui)
     code, out, err = invoke(monkeypatch, ['--workspace', str(tmp_path), '--tui'], root)
     assert code == 0 and requests == [], err
-    assert sessions[0].history == () and sessions[0].config.model_label == 'deepseek-v4-pro'
+    assert sessions[0].history == () and sessions[0].config.model_label == 'DeepSeek / deepseek-v4-pro'
     assert sessions[0].config.persistence.identity.think is True
     loaded = FileUserConfigStore(root).load()
     assert loaded.defaults.reasoning_effort == 'low'
