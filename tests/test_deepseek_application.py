@@ -113,11 +113,11 @@ async def test_tools_new_user_restart_and_nonthinking_summary_use_real_bindings(
         await restored.compact_context()
         summary_body = bodies[-1]
         assert summary_body["thinking"] == {"type": "disabled"}
-        assert summary_body["max_tokens"] == 2048 and "tools" not in summary_body
+        assert summary_body["max_tokens"] == 4096 and "tools" not in summary_body
         assert "reasoning_effort" not in summary_body
         record = restored.summary_records[-1]
         assert record.call_identity.think is False
-        assert dict(record.call_identity.options)["max_tokens"] == 2048
+        assert dict(record.call_identity.options)["max_tokens"] == 4096
         assert record.provider == "deepseek" and record.model == "deepseek-flash"
         assert restored.config.budget.effective_output_reserve == 32768
     finally:

@@ -13,6 +13,7 @@ from cicada.core.ports import ModelRequest, StreamEvent
 from cicada.costs import CostError, CostLedger
 from cicada.models import (
     CacheRequestObservation, ConfigurationRequest, ModelBinding, ModelOption, SafeModelIdentity,
+    SUMMARY_OUTPUT_TOKENS,
 )
 from cicada.plugins.deepseek.protocol import (
     BASE_URL, MODEL_IDS, REASONING_EFFORTS, REQUEST_LIMIT, DeepSeekConfig, build_request, request_body_bytes,
@@ -121,7 +122,7 @@ class DeepSeekModel:
 
     @property
     def initial_binding(self) -> ModelBinding:
-        summary_config = replace(self.config, think=False, max_tokens=2048)
+        summary_config = replace(self.config, think=False, max_tokens=min(SUMMARY_OUTPUT_TOKENS, self.config.max_tokens))
         summary = DeepSeekModel(self.client, summary_config, self._api_key, cost_control=self._cost_control,
                                 identity_override=self._identity_for(summary_config))
         return ModelBinding(self, summary, self.identity, summary.identity,

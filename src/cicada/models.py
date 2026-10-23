@@ -81,6 +81,11 @@ class SafeModelIdentity:
                 raise ValueError(f"SafeModelIdentity.{key} must be positive int")
 
 
+# 摘要通道的输出上限；普通通道沿用配置的 max_tokens，摘要取两者较小值。
+# 与 SUMMARY_TEXT_MAX_BYTES (16 KiB) 配合：提示同时要求正文控制在 3000 字内。
+SUMMARY_OUTPUT_TOKENS = 4096
+
+
 @dataclass(frozen=True)
 class ModelOption:
     id: str

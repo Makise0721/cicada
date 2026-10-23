@@ -491,7 +491,7 @@ async def test_opencode_go_key_only_routes_main_summary_new_and_restored_session
             assert seen[-1][1]['reasoning_effort'] == effort
         await session.execute('second')
         await session.compact_context()
-        assert seen[-1][1]['max_tokens'] == 2048 and 'tools' not in seen[-1][1]
+        assert seen[-1][1]['max_tokens'] == 4096 and 'tools' not in seen[-1][1]
         assert all(req.headers['x-opencode-session'] == original for req, _ in seen)
         await session.submit_new_session().wait()
         fresh = session.persistence.session_id

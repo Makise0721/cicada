@@ -58,7 +58,7 @@ async def test_selection_summary_restart_preserves_effective_projection(tmp_path
         summary = bodies[-1]
         assert summary["model"] == "deepseek-v4-pro"
         assert summary["thinking"] == {"type": "disabled"}
-        assert "tools" not in summary and summary["max_tokens"] == 2048
+        assert "tools" not in summary and summary["max_tokens"] == 4096
         quoted = summary["messages"][1]["content"].split("\n", 1)[1]
         assert json.loads(quoted) == json.loads(encode_messages(before[:2]))
         assert session.history == before
@@ -361,7 +361,7 @@ async def test_selection_keeps_current_check_receipt_baseline_and_summary(tmp_pa
         assert last.evidence.baseline_snapshot_ref == first.evidence.baseline_snapshot_ref
         assert bodies[-1]["model"] == "deepseek-v4-pro" and bodies[-1]["max_tokens"] == 8192
         assert session.budget.report.output_reserve == 8192
-        assert session._budget_policy.summary_budget.effective_output_reserve == 2048
+        assert session._budget_policy.summary_budget.effective_output_reserve == 4096
     finally:
         await session.aclose()
 

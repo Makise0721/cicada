@@ -28,7 +28,7 @@ EXECUTION_BUDGET_CNY = Decimal("4.50")
 INPUT_CNY_PER_M = Decimal("2")
 OUTPUT_CNY_PER_M = Decimal("8")
 SERVER_INPUT_TOKEN_BOUND = 1_100_000
-# 冻结的请求 cap (spec D3): 普通 8192; 意外摘要 2048。
+# 冻结的请求 cap (spec D3): 普通 8192; 摘要 2048（harness 独立基准，不是产品默认）。
 NORMAL_OUTPUT_CAP = 8192
 SUMMARY_OUTPUT_CAP = 2048
 # 修订 2026-10-15 (amendment-proposal-20261015 提案A): 12 -> 24;

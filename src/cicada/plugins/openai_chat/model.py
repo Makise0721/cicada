@@ -9,7 +9,7 @@ from cicada.budget import BudgetConfig
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ModelMetrics, ModelRequest, ReasoningDelta
 from cicada.costs import CostError, CostLedger
-from cicada.models import ConfigurationRequest, ModelBinding
+from cicada.models import ConfigurationRequest, ModelBinding, SUMMARY_OUTPUT_TOKENS
 from cicada.plugins.chat_stream import stream_chat
 from cicada.plugins.deepseek.sse import Completion, ProtocolError
 from cicada.plugins.openai_chat.protocol import ChatConfig, build_request, is_loopback
@@ -56,7 +56,7 @@ class ChatModel:
 
     @property
     def initial_binding(self) -> ModelBinding:
-        summary_config = replace(self.config, max_tokens=min(2048, self.config.max_tokens))
+        summary_config = replace(self.config, max_tokens=min(SUMMARY_OUTPUT_TOKENS, self.config.max_tokens))
         summary = ChatModel(self.client, summary_config, self._api_key,
                             cost_control=self._cost_control)
         return ModelBinding(

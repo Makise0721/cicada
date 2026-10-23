@@ -7,7 +7,7 @@ from typing import Callable
 from uuid import uuid4
 
 from cicada.budget import BudgetConfig
-from cicada.models import ModelBinding
+from cicada.models import ModelBinding, SUMMARY_OUTPUT_TOKENS
 from cicada.core.ports import ModelMetrics
 from cicada.plugins.chat_stream import stream_chat
 from cicada.plugins.deepseek.protocol import DeepSeekConfig, REASONING_EFFORTS, build_request as build_thinking_request
@@ -71,7 +71,7 @@ class GoModel(ChatModel):
 
     @property
     def initial_binding(self):
-        summary_config = replace(self.config, think=False, max_tokens=min(2048, self.config.max_tokens))
+        summary_config = replace(self.config, think=False, max_tokens=min(SUMMARY_OUTPUT_TOKENS, self.config.max_tokens))
         summary = GoModel(self.client, summary_config, self._api_key, cost_control=self._cost_control,
                           session_id_provider=self._session_id_provider)
         return ModelBinding(self, summary, self.config.identity, summary_config.identity,

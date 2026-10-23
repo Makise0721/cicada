@@ -83,11 +83,11 @@ async def test_endpoint_authentication_usage_and_summary_follow_configured_insta
             assert events[-1].metrics.cache_hit_input_tokens is None
         assert binding.identity.provider == binding.summary_identity.provider == "work"
         assert binding.identity.model == "org/model"
-        assert dict(binding.summary_identity.options)["max_tokens"] == 2048
+        assert dict(binding.summary_identity.options)["max_tokens"] == 4096
     assert all(stream.closed for stream in streams)
     assert all(str(request.url) == "https://gateway.example/v1/chat/completions" for request in captured)
     assert all(request.headers["authorization"] == "Bearer " + KEY for request in captured)
-    assert [json.loads(request.content)["max_tokens"] for request in captured] == [4096, 2048]
+    assert [json.loads(request.content)["max_tokens"] for request in captured] == [4096, 4096]
 
 
 @pytest.mark.parametrize("tail", ["missing-done", "length", "bad-arguments", "private-reasoning"])
@@ -158,7 +158,7 @@ async def test_deepseek_identity_override_survives_summary_and_reconfiguration()
         assert dict(binding.identity.options)["model_key"] == "reasoner"
         assert dict(binding.identity.options)["reasoning_effort"] == "low"
         assert binding.summary_identity.think is False
-        assert dict(binding.summary_identity.options)["max_tokens"] == 2048
+        assert dict(binding.summary_identity.options)["max_tokens"] == 4096
         updated = binding.model.prepare_configuration(ConfigurationRequest(binding.identity, "replace", SecretValue("new-key")))
         assert updated.identity == binding.identity
         assert updated.model._api_key == "new-key"

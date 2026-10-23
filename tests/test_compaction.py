@@ -118,7 +118,7 @@ async def test_manual_compaction_happy_path_switches_projection_and_persists(tmp
         record = snapshot.summaries[0]
         assert record.reason == "manual"
         assert record.metrics is not None and record.metrics.input_tokens == 9
-        assert record.prompt_version == "3" and len(record.prompt_sha256) == 64
+        assert record.prompt_version == "4" and len(record.prompt_sha256) == 64
         # 摘要请求整形 (05 收口修正): 末尾是固定 user 指令, 不以 assistant 结尾;
         # 覆盖范围仍只数规范历史消息, 追加的整形消息不入档
         summary_request = summary_channel.requests[-1]

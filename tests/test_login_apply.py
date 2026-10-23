@@ -61,7 +61,7 @@ def test_prepare_configuration_is_local_shares_client_and_keeps_old_binding():
     assert old.config.think and old._api_key == 'old-sentinel'  # 旧对象不变
     assert binding.identity.think is False and dict(binding.identity.options)['num_ctx'] == 65536
     summary_options = dict(binding.summary_identity.options)
-    assert binding.summary_identity.think is False and summary_options['max_tokens'] == 2048
+    assert binding.summary_identity.think is False and summary_options['max_tokens'] == 4096
     assert summary_options['num_ctx'] == 65536  # 隐藏窗口不重置
     assert binding.model._api_key == 'new-sentinel' and binding.summary_model._api_key == 'new-sentinel'
     kept = old.prepare_configuration(ConfigurationRequest(before.identity, 'keep'))
@@ -109,7 +109,7 @@ async def test_apply_replaces_key_and_thinking_across_requests_summary_model_and
         await session.compact_context()
         authorization, summary = recorded[-1]
         assert authorization == 'Bearer new-sentinel'
-        assert summary['thinking'] == {'type': 'disabled'} and summary['max_tokens'] == 2048
+        assert summary['thinking'] == {'type': 'disabled'} and summary['max_tokens'] == 4096
         # 后继 /model 从最新接受绑定准备, 不恢复启动 key/think/effort
         await session.select_model('deepseek-v4-pro')
         await session.execute('选择后请求')
