@@ -42,13 +42,14 @@ from ._application.recovery import (
     _admit_persistent_resume,
 )
 
+from ._application.compaction import CompactionPlan as _CompactionPlan
+
 from ._application.session import (
     REQUEST_FINALIZE_SUPERVISION_S,
     CLOSE_SUPERVISION_S,
     _UNDEAD_GRACE_S,
     _sha256_file,
     verify_receipt_artifacts,
-    _CompactionPlan,
     _isolate_event,
     _isolate_outcome,
     _isolate_update,

@@ -20,6 +20,7 @@ from cicada.application import (
     PersistenceConfig,
     open_application,
 )
+from cicada._application.compaction import plan_compaction, run_compaction
 from cicada.boot import bootstrap
 from cicada.budget import BudgetConfig
 from cicada.context_policy import (
@@ -263,7 +264,7 @@ async def test_compaction_refuses_when_oldest_single_request_does_not_fit(tmp_pa
         session._committed_spans.append((1, 0, 1))
         session._committed_spans.append((2, 1, 2))
         with pytest.raises(RuntimeError, match="does not fit"):
-            session._compaction_plan()
+            plan_compaction(session._compaction_state())
     finally:
         await session.aclose()
         await store.aclose()
@@ -306,18 +307,19 @@ async def test_summary_counts_whole_candidates_and_rechecks_dispatch(tmp_path, d
         policy.summary_budget = _budget(3000)
         policy.summary_token_counter = counter
         before_budget = session.budget
-        plan = session._compaction_plan(token)
+        state = session._compaction_state()
+        plan = plan_compaction(state, token)
         assert plan.end_index == 4
         expected = summary_input_messages(history[:4])
         assert counter.requests[-1].messages == expected
         assert plan.request is counter.requests[-1]
         if dispatch == "send":
-            await session._run_compaction(plan, reason="manual", cancel_token=token)
+            await run_compaction(state, plan, reason="manual", cancel_token=token)
             assert channel.requests == [plan.request]
             assert len(store.recovery_snapshot().summaries) == 1
         else:
             with pytest.raises(RuntimeError, match="aborted" if dispatch == "cancel" else "exceeds limit"):
-                await session._run_compaction(plan, reason="manual", cancel_token=token)
+                await run_compaction(state, plan, reason="manual", cancel_token=token)
             assert channel.requests == [] and store.recovery_snapshot().summaries == ()
             assert session._context_projection.blocks == ()
             assert session.budget == before_budget
@@ -329,7 +331,7 @@ async def test_summary_counts_whole_candidates_and_rechecks_dispatch(tmp_path, d
         # 已取消时, 候选计数不能再开始。
         token.cancel()
         with pytest.raises(RuntimeError, match="aborted"):
-            session._compaction_plan(token)
+            plan_compaction(session._compaction_state(), token)
         assert len(counter.requests) == 3
     finally:
         await session.aclose()

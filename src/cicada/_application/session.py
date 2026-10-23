@@ -22,17 +22,9 @@ from cicada.budget import (
     estimate_input_components,
 )
 from cicada.context_policy import (
-    SUMMARY_PROMPT_SHA256,
-    SUMMARY_PROMPT_VERSION,
     BudgetPolicy,
     ContextProjection,
-    SummaryBlock,
     SummaryOutcome,
-    canonical_prefix_sha256,
-    generate_summary,
-    build_summary_request,
-    summary_block_message,
-    summary_input_messages,
 )
 from cicada.core.agent import RunResult
 from cicada.core.cancel import CancelToken
@@ -117,7 +109,6 @@ from .contracts import (
     ApplicationConfig,
     ApplicationUpdate,
     ApprovalRequested,
-    CompactionSealedError,
     ConfigurationChanged,
     ContextCompacted,
     ExecutionModeChanged,
@@ -141,6 +132,7 @@ from .contracts import (
     _runtime_dir,
 )
 from . import recovery
+from .compaction import CompactionState, plan_compaction, run_compaction
 from .ownership import FOREIGN_OWNERS, OperationLedger, busy_refusal
 
 
@@ -183,18 +175,6 @@ def verify_receipt_artifacts(view: VerificationView) -> tuple[str, ...]:
                 f"check {state.check_id} output artifact no longer matches the hash recorded "
                 f"when it was written ({path})")
     return tuple(problems)
-
-
-@dataclass(frozen=True)
-class _CompactionPlan:
-    """一次手动压缩的切点计划 (D4): 覆盖区间与保留边界."""
-
-    request: ModelRequest             # 完整摘要输入: 原始历史区间及固定最后 user
-    first_request_seq: int
-    last_request_seq: int
-    message_count: int                # 本块覆盖消息数 (end - start)
-    start_index: int                  # 覆盖起点 (= 投影保留起点)
-    end_index: int                    # 覆盖前缀终点 = 保留边界
 
 
 def _isolate_event(event: Event) -> Event:
@@ -2165,146 +2145,16 @@ class ApplicationSession:
             raise RuntimeError("application is closing; compaction is sealed")
         # 可压缩区间与摘要输入预算在占槽前判定: 拒绝不留下 busy/屏障 (D1)
         token = CancelToken()
-        plan = self._compaction_plan(token)
+        state = self._compaction_state()
+        plan = plan_compaction(state, token)
         self._ownership.claim("compaction")
         self._compact_token = token
         self._notify(OperationBusy(operation="compact"))
         try:
-            return await self._run_compaction(
-                plan, reason="manual", cancel_token=self._compact_token
-            )
+            return await run_compaction(state, plan, reason="manual", cancel_token=token)
         finally:
             self._ownership.release("compaction")
             self._compact_token = None
-
-    async def _run_compaction(
-        self, plan: _CompactionPlan, *, reason: str, cancel_token: CancelToken
-    ) -> ContextCompacted | None:
-        """压缩核心协议 (D4-D6, PA03/PA05): 手动与自动共用同一实现 (03).
-
-        摘要生成 → 响应校验 → 封口核对且未取消 → store 接受 → 明确成功 →
-        切换投影 + ContextCompacted 事件。close 封口先于接受时返回 None
-        (归关闭取消, 零写入, 旧投影不变); 摘要失败/提交失败抛 RuntimeError
-        (投影不变; 锁存按 begin 同一白名单); store 接受后取消不取消事务,
-        成功先切换再传播外层 CancelledError。
-        """
-        channel = self._budget_policy.summarize_channel
-        if self._compact_sealed:
-            return None
-        self._check_summary_admission(cancel_token)
-        report = self._budget_policy.assess_summary(plan.request)
-        self._check_summary_admission(cancel_token)
-        if report.total_estimate > report.limit:
-            raise RuntimeError("compaction unavailable: " + budget_exceeded_text(report))
-        try:
-            outcome = await generate_summary(channel, plan.request, cancel_token)
-        except asyncio.CancelledError:
-            self._process_summary_calls.append(SummaryOutcome(ok=False, failure="aborted"))
-            raise
-        self._process_summary_calls.append(outcome)
-        if not outcome.ok:
-            if outcome.failure == "aborted" and self._compact_sealed:
-                # PA05: close 封口协作取消 → 归关闭取消, 静默放弃 (旧投影不变)
-                return None
-            # D5/PA03: 摘要失败不派发提交, 投影不变, 无摘要记录落库
-            raise RuntimeError(
-                f"summary generation failed ({outcome.failure}); the model projection "
-                "is unchanged" + (f": {outcome.detail}" if outcome.detail else "")
-            )
-        # D6: 摘要模型身份取启动层有效身份 (PersistenceConfig.identity 本就是
-        # LaunchIdentity; 审查修复: 此前误取 .launch 使真实持久组合的压缩必失败)
-        identity_launch = self._config.persistence.identity if self._config.persistence is not None else None
-        summary_identity = self._budget_policy.summary_identity
-        record = SummaryRecord(
-            summary_id=str(uuid.uuid4()),
-            epoch_id=self._epoch_id or "",
-            context_generation=self._context_generation,
-            first_request_seq=plan.first_request_seq,
-            last_request_seq=plan.last_request_seq,
-            message_count=plan.message_count,
-            end_message_index=plan.end_index,
-            prefix_sha256=canonical_prefix_sha256(self._history[: plan.end_index]),
-            text=outcome.text,
-            provider=(
-                summary_identity.provider if summary_identity is not None else (
-                identity_launch.provider
-                if identity_launch is not None
-                else (self._config.model_label or "unknown")
-                )
-            ),
-            model=(
-                summary_identity.model if summary_identity is not None else (
-                identity_launch.model
-                if identity_launch is not None
-                else (self._config.model_label or "unknown")
-                )
-            ),
-            prompt_version=SUMMARY_PROMPT_VERSION,
-            prompt_sha256=SUMMARY_PROMPT_SHA256,
-            metrics=outcome.metrics,
-            reason=reason,
-            created_at=time.time(),
-            call_identity=summary_identity,
-            previous_projection_identity=canonical_prefix_sha256(
-                self._context_projection.project(self._history)
-            ),
-        )
-        commit_task = asyncio.ensure_future(self._commit_summary_dispatch(record))
-        commit_cancelled = False
-        while True:
-            try:
-                await asyncio.shield(commit_task)
-                break
-            except asyncio.CancelledError:
-                # PA03: 派发后取消不取消事务; 重复取消也等明确结果
-                commit_cancelled = True
-            except CompactionSealedError:
-                # PA05: 封口先于接受 → 零写入; 归关闭取消, 旧投影不变,
-                # 不锁存 storage_failed, 迟到响应丢弃
-                return None
-            except PersistenceError as exc:
-                # 提交失败: 旧投影不变。锁存面与 begin 路径同一白名单 (审查
-                # 02-F12): 真实落盘故障才锁存 storage_failed; 关系冲突
-                # (代次/seq/重复) 是状态问题, 存储健康, 误锁存会不可逆拒绝
-                # 本进程后续请求
-                if isinstance(exc, (StorageUnavailableError, StorageWriteError, ArchiveLimitError)):
-                    self._latch_storage_failed(str(exc))
-                raise RuntimeError(
-                    "compaction failed to persist; the model projection is unchanged: "
-                    f"{exc}"
-                ) from exc
-        # 明确成功 → 切换投影 + 事件; 已被取消时先落定再传播 (PA03)
-        # 04: store 已接受即已提交摘要事实, 进入只读出口 (摘要计量/压缩次数取数)
-        self._summary_records.append(record)
-        block = SummaryBlock(
-            message=summary_block_message(
-                first_request_seq=plan.first_request_seq,
-                last_request_seq=plan.last_request_seq,
-                message_count=plan.message_count,
-                text=record.text,
-            ),
-            end_message_index=plan.end_index,
-            first_request_seq=plan.first_request_seq,
-            last_request_seq=plan.last_request_seq,
-            message_count=plan.message_count,
-            prefix_sha256=record.prefix_sha256,
-        )
-        self._context_projection.apply_summary(
-            block, canonical_length=len(self._history)
-        )
-        self._budget_policy.invalidate()
-        compacted = ContextCompacted(
-            summary_id=record.summary_id,
-            first_request_seq=record.first_request_seq,
-            last_request_seq=record.last_request_seq,
-            message_count=record.message_count,
-            end_message_index=record.end_message_index,
-            reason=reason,
-        )
-        self._notify(compacted)
-        if commit_cancelled:
-            raise asyncio.CancelledError()
-        return compacted
 
     async def _auto_compact_for_request(self) -> bool:
         """自动压缩回调 (D7, 03): 发送前准入自动压缩的应用侧实现.
@@ -2333,8 +2183,9 @@ class ApplicationSession:
             return False
         token = self._cancel_token
         assert token is not None, "auto compaction belongs to an execute attempt"
+        state = self._compaction_state()
         try:
-            plan = self._compaction_plan(token)
+            plan = plan_compaction(state, token)
         except RuntimeError:
             return False
         if not policy.try_consume_admission_auto_attempt():
@@ -2343,83 +2194,34 @@ class ApplicationSession:
         self._ownership.claim("compaction", inside="request")
         self._compact_token = token
         try:
-            compacted = await self._run_compaction(plan, reason="auto", cancel_token=token)
+            compacted = await run_compaction(state, plan, reason="auto", cancel_token=token)
             return compacted is not None
         except RuntimeError:
-            # 摘要失败/提交失败: 投影不变; 真实落盘故障已在 _run_compaction 锁存
+            # 摘要失败/提交失败: 投影不变; 真实落盘故障已在 run_compaction 锁存
             return False
         finally:
             self._ownership.release("compaction")
             self._compact_token = None
 
-    def _check_summary_admission(self, cancel_token: CancelToken | None) -> None:
-        if self._compact_sealed or self._closing or self._closed or (cancel_token is not None and cancel_token.cancelled):
-            raise RuntimeError("summary generation failed (aborted); the model projection is unchanged")
-
-    def _compaction_plan(self, cancel_token: CancelToken | None = None) -> _CompactionPlan:
-        """D4: 当前代次、已提交完整请求、保留最近 1 个; 摘要输入自身须满足预算.
-
-        覆盖起点 = 当前投影保留起点 (再次压缩只追加新区间, 不重写旧摘要);
-        区间按请求边界收缩 (最长最旧前缀), 最旧单个请求也装不下时明确拒绝。
-        摘要输入是原始规范历史 (D5: 不经 RunPolicy/BudgetPolicy 投影)。
-        """
-        config = self._budget_policy.summary_budget
-        assert config is not None
-        spans = self._committed_spans
-        if len(spans) < 2:
-            raise RuntimeError(
-                "nothing to compact: at least two committed full requests are required "
-                "(the most recent one is always retained)"
-            )
-        start = self._context_projection.retained_start
-        eligible = [span for span in spans[:-1] if span[2] > start]
-        if not eligible:
-            raise RuntimeError(
-                "nothing to compact: the committed requests before the retained "
-                "boundary are already summarized"
-            )
-        for span in eligible:
-            if span[1] < start:
-                raise RuntimeError(
-                    "compaction bookkeeping is inconsistent with the projection"
-                )
-        chosen_span: tuple[int, int, int] | None = None
-        for span in reversed(eligible):
-            self._check_summary_admission(cancel_token)
-            request = build_summary_request(summary_input_messages(
-                tuple(self._history[start : span[2]])
-            ))
-            report = self._budget_policy.assess_summary(request)
-            self._check_summary_admission(cancel_token)
-            if report.total_estimate <= config.num_ctx:
-                chosen_span = span
-                break
-        if chosen_span is None:
-            raise RuntimeError(
-                "compaction unavailable: even the oldest single request does not fit "
-                "the summary request budget"
-            )
-        return _CompactionPlan(
-            request=request,
-            first_request_seq=eligible[0][0],
-            last_request_seq=chosen_span[0],
-            message_count=chosen_span[2] - start,
-            start_index=start,
-            end_index=chosen_span[2],
+    def _compaction_state(self) -> CompactionState:
+        """压缩协议的状态快照; 调用方保证压缩期间这些引用不变 (持有独占槽)."""
+        assert self._store is not None and self._budget_policy is not None
+        return CompactionState(
+            budget=self._budget_policy,
+            store=self._store,
+            config=self._config,
+            epoch_id=self._epoch_id,
+            context_generation=self._context_generation,
+            history=tuple(self._history),
+            projection=self._context_projection,
+            spans=tuple(self._committed_spans),
+            summary_records=self._summary_records,
+            summary_calls=self._process_summary_calls,
+            sealed=lambda: self._compact_sealed,
+            closed=lambda: self._closing or self._closed,
+            notify=self._notify,
+            latch_storage_failed=self._latch_storage_failed,
         )
-
-    async def _commit_summary_dispatch(self, record: SummaryRecord) -> None:
-        """PA05 接受落定点: 封口核对与 store 派发之间无 await, 不可交错.
-
-        store._dispatch 的 closing 检查与入队同为同步前缀, 因此"封口先 → 零
-        写入 / 接受先 → 等明确结果"在本协程首个执行块内一次判定;
-        create_task 不越过核对 (任务未起跑时封口先生效即零提交)。
-        """
-        if self._compact_sealed:
-            raise CompactionSealedError(
-                "compaction is sealed by close; the summary commit was not sent"
-            )
-        await self._store.commit_summary(record)
 
     # --- 用户默认配置 ---------------------------------------------------------------
 
