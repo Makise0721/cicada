@@ -520,6 +520,26 @@ async def test_cancel_returns_outcome_and_session_reusable(tmp_path):
     await session.aclose()
 
 
+def test_close_barrier_classifies_every_ownership_operation():
+    """05-F2 (A): close 等待面必须覆盖账本里每一类独占事务.
+
+    漏一类的后果不是立刻报错, 而是某个关闭交错下提前释放 store/client;
+    因此把「归类齐全」做成断言: 新增事务却忘记归位时, 这里先失败。
+    """
+    from cicada._application.ownership import OWNER_PHRASES
+    from cicada._application.session import (
+        CLOSE_FINAL_OWNERS,
+        CLOSE_SUPERVISED_OWNERS,
+        CLOSE_TASK_OWNERS,
+    )
+
+    classified = set(CLOSE_SUPERVISED_OWNERS) | set(CLOSE_FINAL_OWNERS) | set(CLOSE_TASK_OWNERS)
+    assert classified == set(OWNER_PHRASES), (
+        "close 等待面与账本事务名单不一致: 新增事务时在 session.py 的 "
+        "CLOSE_{SUPERVISED,FINAL,TASK}_OWNERS 归类"
+    )
+
+
 async def test_close_reentry_shares_one_close_and_rejects_execute(tmp_path):
     root = _repo(tmp_path)
     session = await open_application(_config(root, script=[]))

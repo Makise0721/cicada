@@ -141,6 +141,14 @@ REQUEST_FINALIZE_SUPERVISION_S = 90.0
 
 CLOSE_SUPERVISION_S = 15.0
 
+# 05-F2: close 的等待面必须覆盖账本里的每一类事务 (OWNER_PHRASES)。三类等待的
+# 策略不同——共享监督截止、无截止等落定、以 task 引用等待——但归类必须齐:
+# 新增事务时先在下面归位, 覆盖由 tests/test_application.py 的断言守着。漏一类
+# 在正常时序里不会立刻失败, 只会在某个关闭交错里提前释放 store/client。
+CLOSE_SUPERVISED_OWNERS = ("request", "clear", "compaction", "model")
+CLOSE_FINAL_OWNERS = ("model", "session")
+CLOSE_TASK_OWNERS = ("catalog", "login", "review", "rewind")
+
 
 _UNDEAD_GRACE_S = 2.0
 
@@ -2532,8 +2540,10 @@ class ApplicationSession:
             self._compact_token.cancel()
         # 取消活动请求并等待现有请求/清空/压缩生产者终结 (含持久提交与活动写入),
         # 共享同一截止时间; execute/clear/compact 互斥, 至多一个在途
+        # catalog/login/review/rewind 在 CLOSE_TASK_OWNERS 里, 以 task 引用等待;
+        # 其余独占事务走账本的落定信号 (见 CLOSE_SUPERVISED_OWNERS / CLOSE_FINAL_OWNERS)。
         producers = [
-            *self._ownership.completions("request", "clear", "compaction", "model"),
+            *self._ownership.completions(*CLOSE_SUPERVISED_OWNERS),
             *(task for task in (self._review_task, self._rewind_task)
               if task is not None and not task.done()),
         ]
@@ -2560,7 +2570,7 @@ class ApplicationSession:
                 self._close_problems.append("review reading failed during close")
         # 配置接受后不能在 COMMIT 与内存发布之间释放 store/client 或观察者。
         # 监督超时记录诊断, 不能替代事务明确结果; 已接受事务仍受拥有, 无限期等落定。
-        for operation in ("model", "session"):
+        for operation in CLOSE_FINAL_OWNERS:
             completion = self._ownership.completion(operation)
             if completion is not None:
                 await asyncio.shield(completion)
