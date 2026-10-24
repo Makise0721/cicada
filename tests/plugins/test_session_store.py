@@ -507,6 +507,26 @@ async def test_missing_table_and_corrupt_payload_rejected(store, tmp_path):
         open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
 
 
+async def test_restore_rejects_payload_deeper_than_parser_limit(store, tmp_path):
+    """手改存档塞入超深嵌套: 解析器递归上限也须归 ArchiveFormatError, 不泄漏 RecursionError."""
+    session_id = store.session_id
+    await _populate(store)
+    await store.aclose()
+
+    deep = "[" * 5000 + "]" * 5000
+    connection = sqlite3.connect(str(tmp_path / f"{session_id}.sqlite3"))
+    seq = connection.execute("SELECT seq FROM records WHERE kind = 'request'").fetchone()[0]
+    connection.execute(
+        "UPDATE records SET payload_json = ?, payload_sha256 = ? WHERE seq = ?",
+        (deep, hashlib.sha256(deep.encode("utf-8")).hexdigest(), seq),
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ArchiveFormatError, match="corrupt"):
+        open_session_store(directory=tmp_path, session_id=session_id, workspace=tmp_path)
+
+
 async def test_inconsistent_intent_relation_rejected(store, tmp_path):
     session_id = store.session_id
     await _populate(store)
@@ -1356,7 +1376,9 @@ async def test_list_sessions_proven_activity_and_trusted_receipt_not_blocked(tmp
     assert entry.unproven_activities == 0 and entry.untrusted_receipts == 0
 
 
-@pytest.mark.parametrize("payload", ["not-json", '{"execution_status": "nonsense"}'])
+@pytest.mark.parametrize("payload", [
+    "not-json", '{"execution_status": "nonsense"}', "[" * 5000 + "]" * 5000,
+])
 async def test_list_sessions_corrupt_json_rows_count_conservatively(tmp_path, payload):
     """06 审查 F7: 列表侧坏行按 CodecError 保守计数, 整档不标坏档."""
     from cicada.plugins.session_store import list_sessions

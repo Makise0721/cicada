@@ -158,7 +158,7 @@ def _decode_row(raw: bytes) -> dict | None:
     """严格解析一行索引; 结构不符/截断行返回 None (调用方如实降级, 不猜内容)."""
     try:
         row = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, ValueError):
+    except (UnicodeError, ValueError, RecursionError):
         return None
     if not isinstance(row, dict) or row.get("version") != INDEX_VERSION:
         return None

@@ -80,7 +80,7 @@ def _copy_restore_material(source: Path, destination: Path, session_id: str) -> 
     for line in rows.splitlines():
         try:
             record = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue  # 原始索引仍复制；还原引擎按既有规则报告损坏。
         if not isinstance(record, dict) or not isinstance(record.get("entries"), list):
             continue

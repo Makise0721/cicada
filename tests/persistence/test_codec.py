@@ -93,6 +93,9 @@ def test_decode_rejects_excess_depth():
     too_deep = '{"a": ' * 33 + "1" + "}" * 33
     with pytest.raises(CodecError, match="depth"):
         strict_load(too_deep)
+    # 更深的输入先撞 json.loads 自身递归上限, 早于深度核对: 仍须归 CodecError
+    with pytest.raises(CodecError, match="depth"):
+        strict_load("[" * 5000 + "]" * 5000)
 
 
 def test_decode_rejects_unknown_keys_roles_and_wrong_types():

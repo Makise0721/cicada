@@ -64,6 +64,10 @@ def strict_load(raw: str) -> Any:
         parsed = json.loads(raw, parse_constant=_reject_constant, object_pairs_hook=_no_duplicate_keys)
     except CodecError:
         raise
+    except RecursionError as exc:
+        # 超深嵌套会在 json.loads 自身递归上限处先失败, 早于深度核对:
+        # 统一归 CodecError, 不把解析器的 RecursionError 漏给调用方。
+        raise CodecError(f"JSON nesting exceeds the depth limit ({MAX_JSON_DEPTH})") from exc
     except ValueError as exc:
         raise CodecError(f"invalid JSON: {exc}") from exc
     _ensure_depth(parsed, 0)
