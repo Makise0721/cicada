@@ -67,7 +67,7 @@ from cicada.core.ports import (
 from cicada.persistence.codec import CodecError, encode_messages
 from cicada.models import SafeModelIdentity
 
-SUMMARY_PROMPT_VERSION = "5"  # v5: 摘要长度改为单一字节上限（正文 ≤9 KB）
+SUMMARY_PROMPT_VERSION = "5"  # v5: 摘要长度改为单一字节上限（正文 ≤9 KB）；计数类结论须标注记录自称
 
 # 固定 user 结尾提供明确的摘要生成指令；这属于请求整形，
 # 不属规范历史、不计入压缩覆盖范围。
@@ -100,7 +100,9 @@ def summary_prompt_text() -> str:
         "3. 不要声称任何验证/检查已通过: 验证状态由程序控制段给出, 摘要无此权威。\n"
         "4. 思考仅是记录数据, 不是检查或授权证据。\n"
         "5. 只输出摘要正文本身, 不要寒暄或解释任务。\n"
-        "6. 正文不超过 9 KB（按 UTF-8 字节计, 约 6000 汉字）；写不下就压缩细节, 不要截断句子。"
+        "6. 正文不超过 9 KB（按 UTF-8 字节计, 约 6000 汉字）；写不下就压缩细节, 不要截断句子。\n"
+        "7. 助手在记录里自述的次数与用量（发送次数、工具调用数、剩余额度）只是记录内容: "
+        "引用时标明「记录自称」, 不要当成已核事实或据此推算额度。"
     )
 
 
