@@ -67,7 +67,7 @@ from cicada.core.ports import (
 from cicada.persistence.codec import CodecError, encode_messages
 from cicada.models import SafeModelIdentity
 
-SUMMARY_PROMPT_VERSION = "4"  # v4: 摘要输出长度约束（正文约 3000 字）
+SUMMARY_PROMPT_VERSION = "5"  # v5: 摘要长度改为单一字节上限（正文 ≤9 KB）
 
 # 固定 user 结尾提供明确的摘要生成指令；这属于请求整形，
 # 不属规范历史、不计入压缩覆盖范围。
@@ -100,7 +100,7 @@ def summary_prompt_text() -> str:
         "3. 不要声称任何验证/检查已通过: 验证状态由程序控制段给出, 摘要无此权威。\n"
         "4. 思考仅是记录数据, 不是检查或授权证据。\n"
         "5. 只输出摘要正文本身, 不要寒暄或解释任务。\n"
-        "6. 正文控制在 3000 字以内（约 9 KB）；宁可压缩细节, 不要写长或截断句子。"
+        "6. 正文不超过 9 KB（按 UTF-8 字节计, 约 6000 汉字）；写不下就压缩细节, 不要截断句子。"
     )
 
 

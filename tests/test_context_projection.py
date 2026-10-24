@@ -127,7 +127,7 @@ def test_canonical_prefix_sha256_pins_fingerprint_recipe():
 
 
 def test_summary_prompt_is_versioned_and_stable():
-    assert SUMMARY_PROMPT_VERSION == "4"  # v4: 摘要输出长度约束（正文约 3000 字）
+    assert SUMMARY_PROMPT_VERSION == "5"  # v5: 摘要长度改为单一字节上限（正文 ≤9 KB）
     assert len(SUMMARY_PROMPT_SHA256) == 64
     assert summary_prompt_text() == summary_prompt_text()
 
