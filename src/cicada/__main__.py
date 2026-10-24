@@ -928,6 +928,8 @@ async def _run(args: argparse.Namespace, *, user_config_store: UserConfigStore |
     if outcome.persistence is not None:
         facts = outcome.persistence
         if facts.saved:
+            # seq 是存档级记录序号 (request_begin/request/clear 共用一个递增序列),
+            # 不是请求计数: 恢复后从存档最大值续号, 不按进程重开 (2026-10-24 裁决)。
             print(f"[session saved request_id={facts.request_id} seq={facts.seq}]")
         else:
             print(f"[session save failed: {facts.error}]", file=sys.stderr)
