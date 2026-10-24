@@ -36,8 +36,8 @@ def retry_after_delay(headers, fallback: float) -> float:
     value = (headers.get('retry-after') or '').strip()
     if not value:
         return fallback
-    if value.isdigit():
-        return max(fallback, float(int(value)))
+    if value.isascii() and value.isdigit():
+        return max(fallback, float(value))
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError, OverflowError):
@@ -137,6 +137,7 @@ async def stream_chat(
     deadline = time.monotonic() + deadline_seconds
     limit = MAX_ATTEMPTS if count_only_ledger(cost_control) else 1
     attempt = 0
+    send_attempts = 0
     prior_failure = None
     while True:
         attempt += 1
@@ -153,9 +154,15 @@ async def stream_chat(
         reservation = None
         send_failed = False
         close_failed = False
+        stop_detail = 'not eligible for retry'
 
         async def send_request():
-            nonlocal send_failed
+            nonlocal send_failed, send_attempts
+            if cancel.cancelled:
+                raise asyncio.CancelledError
+            if time.monotonic() >= deadline:
+                raise TimeoutError
+            send_attempts += 1
             try:
                 return await client.send(built, stream=True, follow_redirects=False)
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
@@ -207,6 +214,7 @@ async def stream_chat(
             calls = []
         except TimeoutError:
             terminal = StreamDone("error", f"{label} call timed out", completion.metrics)
+            stop_detail = 'deadline exceeded'
             calls = []
         except ProtocolError as exc:
             terminal = StreamDone("error", f"{label} protocol error: {exc}", completion.metrics)
@@ -220,6 +228,7 @@ async def stream_chat(
         except CostError as exc:
             detail = f"{prior_failure}; {exc}" if prior_failure else str(exc)
             terminal = StreamDone("error", detail, completion.metrics)
+            stop_detail = 'admission refused'
             calls = []
         except Exception:
             terminal = StreamDone("error", f"{label} request or stream failed", completion.metrics)
@@ -233,6 +242,7 @@ async def stream_chat(
                         calls = []
                 except Exception:
                     close_failed = True
+                    stop_detail = 'response close failed'
                     terminal = StreamDone("error", f"{label} response close failed", completion.metrics)
                     calls = []
             if chunks is not None:
@@ -250,16 +260,20 @@ async def stream_chat(
                             calls = []
                 except Exception:
                     close_failed = True
+                    stop_detail = 'stream close failed'
                     terminal = StreamDone("error", f"{label} stream close failed", completion.metrics)
                     calls = []
             retryable_failure = (limit > 1 and retry_reason is not None and not accepted
                                  and not close_failed and not task_cancelled and not cancel.cancelled)
             retry_candidate = retryable_failure and attempt < limit
+            if retryable_failure and not retry_candidate:
+                stop_detail = 'attempt limit reached'
             if reservation is not None:
                 if retryable_failure:
                     try:
                         cost_control.finish_failed_attempt(reservation, reason=retry_reason)
                     except CostError:
+                        stop_detail = 'cost ledger failed'
                         terminal = StreamDone("error", f"{label} cost ledger failed",
                                               completion.metrics)
                         calls = []
@@ -277,7 +291,11 @@ async def stream_chat(
             terminal = StreamDone("aborted", metrics=completion.metrics)
             calls = []
         if retry_candidate:
-            if retry_delay <= RETRY_WAIT_LIMIT and time.monotonic() + retry_delay < deadline:
+            if retry_delay > RETRY_WAIT_LIMIT:
+                stop_detail = 'retry wait exceeds limit'
+            elif time.monotonic() + retry_delay >= deadline:
+                stop_detail = 'retry wait exceeds remaining deadline'
+            else:
                 if not await sleep_with_cancel(retry_delay, cancel):
                     yield StreamDone("aborted", metrics=completion.metrics)
                     return
@@ -285,15 +303,16 @@ async def stream_chat(
                     yield StreamDone("aborted", metrics=completion.metrics)
                     return
                 if time.monotonic() >= deadline:
-                    yield StreamDone("error", f"{label} call timed out", completion.metrics)
-                    return
-                prior_failure = retry_reason
-                continue
+                    terminal = StreamDone("error", f"{label} call timed out", completion.metrics)
+                    stop_detail = 'deadline exceeded'
+                else:
+                    prior_failure = retry_reason
+                    continue
         for call in calls:
             yield call
-        if attempt > 1 and terminal.error:
+        if limit > 1 and terminal.error:
             terminal = StreamDone(terminal.stop_reason,
-                                  f"{terminal.error} (attempt {attempt}/{limit})",
+                                  f"{terminal.error} (attempt {send_attempts}/{limit}; stopped: {stop_detail})",
                                   terminal.metrics)
         yield terminal
         if task_cancelled:

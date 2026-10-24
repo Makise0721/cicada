@@ -128,6 +128,7 @@ async def test_call_limit_one_keeps_first_http_class(tmp_path):
         events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
     assert len(calls) == 1 and events[-1].stop_reason == 'error'
     assert 'HTTP 429' in events[-1].error and 'call limit' in events[-1].error
+    assert 'attempt 1/3' in events[-1].error and 'admission refused' in events[-1].error
     assert ledger.snapshot.calls == 1
 
 
@@ -174,6 +175,7 @@ async def test_retry_after_over_limit_and_cancel_during_backoff(tmp_path, monkey
         events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
     assert len(calls) == 1 and events[-1].stop_reason == 'error'
     assert 'HTTP 429' in events[-1].error
+    assert 'attempt 1/3' in events[-1].error and 'retry wait exceeds limit' in events[-1].error
 
     cancelled = []
     token = CancelToken()
@@ -241,7 +243,8 @@ async def test_retryable_response_close_failure_keeps_pending_and_stops(tmp_path
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
     assert len(requests) == ledger.snapshot.calls == 1
-    assert events == [StreamDone('error', 'chat response close failed')]
+    assert len(events) == 1 and events[0].stop_reason == 'error'
+    assert events[0].error.startswith('chat response close failed (attempt 1/3;')
     assert ledger._pending is not None and ledger.snapshot.sealed_reason is not None
 
 
@@ -326,7 +329,8 @@ async def test_failed_attempt_persistence_fault_stops_send(tmp_path, monkeypatch
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
     assert len(sent) == ledger.snapshot.calls == 1
-    assert events == [StreamDone('error', 'chat cost ledger failed')]
+    assert len(events) == 1 and events[0].stop_reason == 'error'
+    assert events[0].error.startswith('chat cost ledger failed (attempt 1/3;')
     assert ledger._pending is not None and ledger.snapshot.sealed_reason == 'cost ledger write failed'
     assert json.loads(ledger.path.read_text(encoding='utf-8'))['calls'] == 1
 
@@ -385,6 +389,51 @@ async def test_retry_attempts_share_one_total_deadline(tmp_path, monkeypatch):
     assert len(sent) == ledger.snapshot.calls == 2 and waits == [0.5]
     assert len(events) == 1 and events[0].stop_reason == 'error'
     assert 'HTTP 503' in events[0].error
+    assert 'attempt 2/3' in events[0].error and 'remaining deadline' in events[0].error
+    assert ledger._pending is None and ledger.snapshot.sealed_reason is None
+
+
+async def test_deadline_during_observer_prevents_second_send(tmp_path, monkeypatch):
+    from cicada.plugins import chat_stream
+    from cicada.plugins.deepseek import model as deepseek_model
+
+    clock, sent, observed = [100.0], [], []
+    monkeypatch.setattr(chat_stream, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(deepseek_model, 'CALL_DEADLINE_S', 1.0)
+    async def wait(seconds, cancel):
+        return True
+    monkeypatch.setattr(chat_stream, 'sleep_with_cancel', wait)
+    def observer(self, request, body):
+        observed.append(request)
+        if len(observed) == 2:
+            clock[0] += 2
+    monkeypatch.setattr(DeepSeekModel, '_record_observation', observer)
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(503) if len(sent) == 1 else httpx.Response(200, content=_frame('late'))
+
+    ledger = CostLedger(tmp_path / 'cost', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(think=False), 'k', cost_control=ledger)
+        events = await _collect(model)
+    assert len(sent) == 1 and ledger.snapshot.calls == len(observed) == 2
+    assert events[-1].stop_reason == 'error' and 'deadline' in events[-1].error
+    assert 'attempt 1/3' in events[-1].error
+    assert ledger._pending is not None and ledger.snapshot.sealed_reason is not None
+
+
+async def test_oversized_retry_after_never_shortens_server_wait(tmp_path):
+    sent = []
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(429, headers={'retry-after': '9' * 400})
+
+    ledger = CostLedger(tmp_path / 'cost', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
+    assert len(sent) == ledger.snapshot.calls == 1
+    assert events[-1].stop_reason == 'error' and 'HTTP 429' in events[-1].error
+    assert 'retry wait exceeds limit' in events[-1].error
     assert ledger._pending is None and ledger.snapshot.sealed_reason is None
 
 
