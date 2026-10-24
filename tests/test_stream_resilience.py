@@ -171,3 +171,86 @@ async def test_deepseek_adapter_shares_the_same_retry_boundary(tmp_path):
         events = await _collect(model)
     assert len(calls) == 2 and events[-1].stop_reason == 'stop'
     assert ledger.snapshot.calls == 2
+
+
+async def test_retryable_response_close_failure_keeps_pending_and_stops(tmp_path):
+    class FailedClose(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b''
+
+        async def aclose(self):
+            raise RuntimeError('synthetic close failure')
+
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(429, stream=FailedClose())
+
+    ledger = CostLedger(tmp_path / 'cost', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
+    assert len(requests) == ledger.snapshot.calls == 1
+    assert events == [StreamDone('error', 'chat response close failed')]
+    assert ledger._pending is not None and ledger.snapshot.sealed_reason is not None
+
+
+async def test_connect_failure_retries_only_during_send(tmp_path, monkeypatch):
+    # A real transport connection failure before receiving a response is eligible.
+    sent = []
+    def reconnect(request):
+        sent.append(request)
+        if len(sent) == 1:
+            raise httpx.ConnectError('synthetic connection failure', request=request)
+        return httpx.Response(200, content=_frame('ok'))
+
+    ledger = CostLedger(tmp_path / 'connect', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reconnect)) as client:
+        events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
+    assert len(sent) == ledger.snapshot.calls == 2 and events[-1].stop_reason == 'stop'
+    assert ledger._pending is None and ledger.snapshot.sealed_reason is None
+
+    # An observer failure occurs before any send and must retain its reservation.
+    observed = []
+    def failed_observer(self, request, body):
+        observed.append(request)
+        raise httpx.ConnectError('synthetic observer failure')
+
+    monkeypatch.setattr(DeepSeekModel, '_record_observation', failed_observer)
+    ledger = CostLedger(tmp_path / 'observer', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(reconnect)) as client:
+        model = DeepSeekModel(client, DeepSeekConfig(think=False), 'k', cost_control=ledger)
+        events = await _collect(model)
+    assert len(observed) == ledger.snapshot.calls == 1 and len(sent) == 2
+    assert events[-1].stop_reason == 'error'
+    assert ledger._pending is not None and ledger.snapshot.sealed_reason is not None
+
+
+async def test_tool_fragment_then_connect_failure_never_replays(tmp_path):
+    from cicada.core.ports import ToolCallEvent
+
+    class PartialTool(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            fragment = {'choices': [{'index': 0, 'delta': {'tool_calls': [
+                {'index': 0, 'id': 'call-1', 'type': 'function',
+                 'function': {'name': 'read', 'arguments': '{'}}]}}]}
+            yield b'data: ' + json.dumps(fragment).encode() + b'\n\n'
+            raise httpx.ConnectError('synthetic failure after response')
+
+        async def aclose(self):
+            self.closed = True
+
+    stream = PartialTool()
+    sent = []
+    def handler(request):
+        sent.append(request)
+        return httpx.Response(200, stream=stream)
+
+    ledger = CostLedger(tmp_path / 'cost', max_calls=3)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = await _collect(ChatModel(client, _config(), 'k', cost_control=ledger))
+    assert len(sent) == ledger.snapshot.calls == 1 and stream.closed
+    assert events[-1].stop_reason == 'error'
+    assert not any(isinstance(event, ToolCallEvent) for event in events)
+    assert ledger._pending is not None and ledger.snapshot.sealed_reason is not None

@@ -151,6 +151,17 @@ async def stream_chat(
         calls = []
         task_cancelled = False
         reservation = None
+        send_failed = False
+        close_failed = False
+
+        async def send_request():
+            nonlocal send_failed
+            try:
+                return await client.send(built, stream=True, follow_redirects=False)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                send_failed = True
+                raise
+
         try:
             body = build_body(request)
             headers = {"Accept-Encoding": "identity", "Content-Type": "application/json", **(request_headers or {})}
@@ -165,8 +176,7 @@ async def stream_chat(
                 reservation = cost_control.reserve(identity, max_tokens)
             if before_send is not None:
                 before_send(request, body)
-            response = await wait_operation(
-                client.send(built, stream=True, follow_redirects=False), cancel, deadline)
+            response = await wait_operation(send_request(), cancel, deadline)
             if not response.is_success:
                 terminal = StreamDone("error", f"{label} HTTP {response.status_code}")
                 if response.status_code in RETRY_STATUSES:
@@ -186,9 +196,8 @@ async def stream_chat(
                             break
                         raise ProtocolError("stream ended without DONE") from None
                     for frame in decoder.feed(chunk):
+                        accepted = True
                         for event in completion.consume(frame):
-                            if not accepted:
-                                accepted = True
                             yield event
                 calls, reason, error = completion.terminal()
                 terminal = StreamDone(reason, error, completion.metrics)
@@ -205,7 +214,7 @@ async def stream_chat(
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             terminal = StreamDone("error", f"{label} connection failed", completion.metrics)
             calls = []
-            if not accepted:
+            if send_failed and response is None and not accepted:
                 retry_reason = f"{label} connection failed"
                 retry_delay = local_delay(attempt)
         except CostError as exc:
@@ -223,6 +232,7 @@ async def stream_chat(
                         terminal = StreamDone("aborted", metrics=completion.metrics)
                         calls = []
                 except Exception:
+                    close_failed = True
                     terminal = StreamDone("error", f"{label} response close failed", completion.metrics)
                     calls = []
             if chunks is not None:
@@ -239,10 +249,11 @@ async def stream_chat(
                             terminal = StreamDone("aborted", metrics=completion.metrics)
                             calls = []
                 except Exception:
+                    close_failed = True
                     terminal = StreamDone("error", f"{label} stream close failed", completion.metrics)
                     calls = []
             retryable_failure = (limit > 1 and retry_reason is not None and not accepted
-                                 and not task_cancelled and not cancel.cancelled)
+                                 and not close_failed and not task_cancelled and not cancel.cancelled)
             retry_candidate = retryable_failure and attempt < limit
             if reservation is not None:
                 if retryable_failure:
