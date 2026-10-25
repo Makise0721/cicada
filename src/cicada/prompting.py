@@ -27,7 +27,7 @@ from cicada.skills import (
     catalog_prompt_section,
 )
 
-PROMPT_VERSION = "builtin:p4-v1"
+PROMPT_VERSION = "builtin:p4-v2"
 MAX_INSTRUCTIONS_BYTES = 16 * 1024
 
 DEFAULT_TOOLS = ("read", "edit", "write", "powershell", "glob", "grep")
@@ -158,7 +158,8 @@ def build_builtin_prompt(
         "the given next_offset (or the suggested command for a partially read long line) instead of "
         "assuming you saw the whole file.",
         "- Use edit with exact, unique old_text matches; keep changes minimal and precise.",
-        "- Use glob to find files by name pattern and grep to search literal text (not regex); "
+        "- Use glob to find files by name pattern and grep to search literal text by default; "
+        "set regex=true for line-based regular expressions. "
         "their results report real paths and line numbers you can pass to read.",
         "- Use the powershell tool for shell commands (Windows, PowerShell 7 syntax).",
         "- After changing files, verify the result (re-read the file or run a check) before reporting.",

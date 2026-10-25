@@ -276,7 +276,7 @@ def test_instructions_file_in_real_mode_displayed(tmp_path, monkeypatch):
     mock = _ApiMock(monkeypatch)
     proc = mock.run("--workspace", str(tmp_path), "--instructions-file", "RULES.md", "任务")
     assert proc.returncode == 0, proc.stderr
-    assert "[prompt version=builtin:p4-v1" in proc.stdout
+    assert "[prompt version=builtin:p4-v2" in proc.stdout
     assert "instructions=" in proc.stdout and "RULES.md" in proc.stdout
     assert "instructions_sha256=" in proc.stdout and "prompt_sha256=" in proc.stdout
     assert "先跑测试再汇报" not in proc.stdout
@@ -290,7 +290,7 @@ def test_script_mode_uses_builtin_prompt_and_prints_summary(tmp_path):
         "--instructions-file", "NOTE.md", "任务",
     )
     assert proc.returncode == 0, proc.stderr
-    assert "[prompt version=builtin:p4-v1" in proc.stdout
+    assert "[prompt version=builtin:p4-v2" in proc.stdout
     assert "instructions=" in proc.stdout
     assert "=== finished: stop" in proc.stdout
     assert "[run_summary run_id=run-1 stop_reason=stop model_calls=1 tools=0 tool_errors=0]" in proc.stdout

@@ -1,4 +1,4 @@
-"""grep 工具: 在 Git 可见清单内做字面量子串搜索 (无 regex 开关)."""
+"""grep 工具: 在 Git 可见清单内做字面量或显式逐行正则搜索."""
 
 from __future__ import annotations
 
@@ -33,11 +33,13 @@ class GrepTool:
         return ToolSpec(
             name=TOOL_NAME,
             description=(
-                "在 Git 可见清单内的文本文件中做字面量子串搜索, 输出含绝对路径与 1 起始行号, "
-                "可直接交给 read (不支持正则). include 为限定 glob: 不含 '/' 时按文件名匹配 "
+                "在 Git 可见清单内的文本文件中默认做字面量子串搜索; regex=true 启用逐行 "
+                "regex VERSION1 正则 (不跨行), 无效模式或超时返回错误. 输出含绝对路径与 "
+                "1 起始行号, 可直接交给 read. include 为限定 glob: 不含 '/' 时按文件名匹配 "
                 "任意深度 (include=\"*.py\" 等于 \"**/*.py\"), 含 '/' 时相对 path 整体匹配; "
                 "context 给出上下文行; "
-                "ignore_case 用 Unicode casefold. 每条匹配行算一个命中, shown 数匹配行; "
+                "ignore_case 用 Unicode casefold (正则启用 IGNORECASE/full casefold). "
+                "每条匹配行算一个命中, shown 数匹配行; "
                 "content 严格不超过 8192 UTF-8 bytes, 放不下时标记 truncated 并要求收窄查询."
             ),
             parameters={
@@ -47,6 +49,7 @@ class GrepTool:
                     "path": {"type": "string", "minLength": 1},
                     "include": {"type": "string", "minLength": 1},
                     "ignore_case": {"type": "boolean"},
+                    "regex": {"type": "boolean"},
                     "context": {
                         "type": "integer",
                         "minimum": 0,
@@ -72,6 +75,7 @@ class GrepTool:
                 raw_path=arguments.get("path", "."),
                 include=arguments.get("include", "**/*"),
                 ignore_case=arguments.get("ignore_case", False),
+                regex=arguments.get("regex", False),
                 context=arguments.get("context", 0),
                 limit=arguments.get("limit", GREP_DEFAULT_LIMIT),
                 cancel=ctx.cancel,

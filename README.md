@@ -67,7 +67,7 @@ Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默�
 
 先退出 Cicada，保留当前 wheel 和配套依赖清单。在目标版本下载目录重复安装步骤，将安装命令加上 `--force --reinstall`；回退使用先前保留版本的 wheel 和配套清单。不要只替换 wheel 而沿用另一版本的依赖清单。
 
-升级前保留旧档副本。a1 存档的工具声明已变，恢复需 `--resume <ID> --resume-with-current-config` 显式采用当前配置；a2 存档可直接恢复。`uv tool uninstall cicada` 保留会话、用户配置和费用账本。
+升级前保留旧档副本。a3 发布包可直接恢复 a2 存档，a1 需显式采用当前配置。当前源码后继新增 grep 的 `regex=true` 逐行正则参数，工具声明和提示已变，恢复旧声明会话需 `--resume <ID> --resume-with-current-config`。`uv tool uninstall cicada` 保留会话、用户配置和费用账本。
 
 a3 保存会话时把档从 v4 升为 v5，多供应商配置首次保存升为 v2；a2 读不了这些新格式，回退到 a2 前须同时恢复备份。回退到 a1 读取工作区旧档，a2/a3 的新增记录不自动回写，两版本交替续写会形成不同历史。
 

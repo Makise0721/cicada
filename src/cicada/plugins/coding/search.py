@@ -1,4 +1,4 @@
-"""文件发现与字面量内容搜索: 限定 glob、Git 清单、reparse 事实、有界结果.
+"""文件发现与内容搜索: 限定 glob、Git 清单、reparse 事实、有界结果.
 
 范围口径: 只用 Git 清单给候选 (tracked + nonignored untracked), 匹配与读取都在 Python
 内完成; 解引用前先看清单原始路径上的 lstat/reparse 事实, 不先 realpath 再猜。
@@ -15,6 +15,8 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+import regex as regex_engine
 
 from cicada.core.cancel import CancelToken
 from cicada.plugins.coding.inventory import FileInventory, GitInventory, InventoryError
@@ -390,9 +392,18 @@ async def run_grep(
     context: int,
     limit: int,
     cancel: CancelToken,
+    regex: bool = False,
 ) -> tuple[Rendered, dict[str, int]]:
     started = time.monotonic()
-    needle = _prepare_needle(pattern, ignore_case)
+    needle = _prepare_needle(pattern, ignore_case and not regex)
+    expression = None
+    if regex:
+        try:
+            expression = regex_engine.compile(
+                needle, regex_engine.VERSION1 | (regex_engine.IGNORECASE if ignore_case else 0)
+            )
+        except regex_engine.error as exc:
+            raise SearchError("invalid_pattern", f"invalid regular expression: {exc}") from exc
     include_glob = (parse_include_glob(include),)
     record = await _list_inventory(inventory, cancel, started)
     scope = resolve_scope(workspace, record, raw_path)
@@ -433,7 +444,18 @@ async def run_grep(
         if text is None:
             skipped["non_text"] += 1
             continue
-        hits = _match_lines(text, needle, ignore_case)
+        if expression is None:
+            hits = _match_lines(text, needle, ignore_case)
+        else:
+            hits = []
+            for number, line in enumerate(text.splitlines(), 1):
+                await _yield_and_check(cancel, started)
+                remaining = max(0.0, QUERY_TIMEOUT_S - (time.monotonic() - started))
+                try:
+                    if expression.search(line, timeout=remaining) is not None:
+                        hits.append(number)
+                except TimeoutError as exc:
+                    raise SearchError("timeout", "search query deadline exceeded") from exc
         if not hits:
             continue
         remaining = limit - shown
@@ -451,6 +473,7 @@ async def run_grep(
     _checkpoint(cancel, started)  # 渲染前仍验证截止, 不把超时扫描当完整结果
     header = (
         f"[grep pattern={_json(pattern)} path={_json(raw_path)} include={_json(include)} "
+        f"{'regex=true ' if regex else ''}"
         f"ignore_case={str(ignore_case).lower()} context={context} limit={limit} "
         f"files={len(scope.files)} policy={record.policy_id} "
         f"excluded={record.excluded_count}]"

@@ -408,7 +408,7 @@ def test_compose_system_prompt_skills_enabled_and_unchanged_disabled(tmp_path):
     # 未启用: 输出与不传 kwarg 逐位一致, 版本不变
     base_prompt, base_info = compose_system_prompt(tmp_path)
     none_prompt, none_info = compose_system_prompt(tmp_path, skills=None)
-    assert none_prompt == base_prompt and none_info.version == base_info.version == "builtin:p4-v1"
+    assert none_prompt == base_prompt and none_info.version == base_info.version == "builtin:p4-v2"
 
 
 async def test_load_skill_tool_success_errors_and_details(tmp_path, monkeypatch):

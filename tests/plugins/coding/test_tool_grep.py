@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 
 import jsonschema
@@ -13,6 +14,7 @@ import pytest
 from cicada.core.cancel import CancelToken
 from cicada.core.ports import ToolContext
 from cicada.plugins.coding.inventory import GitInventory
+from cicada.plugins.coding import search
 from cicada.plugins.coding.search import MAX_CONTENT_BYTES
 from cicada.plugins.coding.tool_grep import GrepTool, grep_plugin
 from cicada.plugins.coding.workspace import Workspace
@@ -66,7 +68,7 @@ def test_spec_schema_matches_declared_parameters(workspace):
         jsonschema.validate({"pattern": "x", "context": 3}, spec.parameters)
     jsonschema.validate({"pattern": "x"}, spec.parameters)
     jsonschema.validate(
-        {"pattern": "x", "path": "src", "include": "**/*.py", "ignore_case": True,
+        {"pattern": "x", "path": "src", "include": "**/*.py", "ignore_case": True, "regex": True,
          "context": 2, "limit": 10},
         spec.parameters,
     )
@@ -241,7 +243,8 @@ async def test_grep_then_read_through_bootstrap_multiturn(tmp_path, monkeypatch)
     model = FakeModel(
         [
             [
-                ToolCallEvent("call_1", "grep", '{"pattern": "needle"}'),
+                ToolCallEvent("call_1", "grep", json.dumps(
+                    {"pattern": r"^needle\s+here$", "regex": True})),
                 StreamDone("tool_use"),
             ],
             [
@@ -287,3 +290,16 @@ async def test_grep_then_read_through_bootstrap_multiturn(tmp_path, monkeypatch)
         assert results[1].is_error is False
     finally:
         await app.aclose()
+
+
+async def test_regex_matching_respects_the_query_deadline(workspace, monkeypatch):
+    """真实匹配必须可中断, 不能等回溯结束后才检查超时并报告错误。"""
+    (workspace.root / "slow.txt").write_text("a" * 50000 + "!", encoding="utf-8")
+    monkeypatch.setattr(search, "QUERY_TIMEOUT_S", 0.2)
+    started = time.monotonic()
+    result = await run(tool_for(workspace), pattern="(a+)+$", regex=True, path="slow.txt")
+    elapsed = time.monotonic() - started
+    assert result.is_error is True
+    assert "deadline exceeded" in result.content
+    assert result.details is None
+    assert elapsed < 1.5
