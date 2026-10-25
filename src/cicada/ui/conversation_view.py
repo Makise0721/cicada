@@ -983,7 +983,7 @@ class ConversationView:
             target = aliases.get(argument.lower())
             if target is None:
                 self.transcript.append_system(
-                    "用法：/mode [read-only|approval|full]；无参数循环切换"
+                    "用法：/mode [read-only|approval|full]；菜单选择或直接输入档位，不带档位循环到下一档"
                 )
                 return True
         else:

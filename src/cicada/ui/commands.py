@@ -149,6 +149,18 @@ class SlashCommandMenu:
         self._option_command = None
         return True
 
+    def complete(self, text: str) -> None:
+        """选中后收起菜单并记住已完成的文案。
+
+        与 `dismiss` 的区别是同时把 `text` 记作当前草稿: 提交被拒后草稿仍是
+        这段文案, 重绘不会因为它"文本变了"而重新打开单行候选。
+        """
+        self._draft = text
+        self._dismissed = True
+        self._matches = ()
+        self._options = ()
+        self._option_command = None
+
     def render(self, width: int, max_rows: int) -> list[str]:
         if max_rows <= 0:
             return []

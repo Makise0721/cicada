@@ -568,7 +568,7 @@ class MainScreenFrontend:
             if (
                 self._on_shift_tab is not None
                 and not self._model_menu_active()
-                and (self._command_menu is None or self._command_menu.selected is None)
+                and (self._command_menu is None or not self._command_menu.is_open)
             ):
                 self._on_shift_tab()
             return
@@ -830,9 +830,9 @@ class MainScreenFrontend:
             # 固定参数选项 (/mode 三档): 选中即把 `命令 值` 写回草稿并走原提交
             # 路径, 选完直接执行, 不需要用户再手打参数。
             command, value = option
-            menu.dismiss()
             self._editor.set_text(f"{command.command} {value}")
             text = self._editor.get_text()
+            menu.complete(text)
             selected = None
         else:
             selected = menu.selected if menu is not None else None

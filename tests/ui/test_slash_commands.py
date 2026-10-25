@@ -326,3 +326,31 @@ def test_option_menu_renders_values_and_keeps_full_width_highlight():
     assert visible_width(strip_terminal_sequences(lines[0])) == 40
     menu.move(1)
     assert strip_terminal_sequences(menu.render(40, 4)[1]).startswith("→ approval")
+
+async def test_mode_option_submit_rejection_keeps_draft_and_closed_menu():
+    submitted = []
+    ready = False
+
+    def admit(text):
+        if not ready:
+            return False
+        submitted.append(text)
+        return True
+
+    h = Harness(commands=True, on_submit=admit)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/mode "))
+        await h.settle()
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert submitted == []
+        assert h.editor.get_text() == "/mode read-only"
+        assert not h.find("→ read-only")  # 被拒后菜单不因完成文案重开
+        ready = True
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert submitted == ["/mode read-only"]
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
