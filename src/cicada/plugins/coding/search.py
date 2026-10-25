@@ -402,7 +402,7 @@ async def run_grep(
             expression = regex_engine.compile(
                 needle, regex_engine.VERSION1 | (regex_engine.IGNORECASE if ignore_case else 0)
             )
-        except regex_engine.error as exc:
+        except (regex_engine.error, KeyError, RecursionError) as exc:
             raise SearchError("invalid_pattern", f"invalid regular expression: {exc}") from exc
     include_glob = (parse_include_glob(include),)
     record = await _list_inventory(inventory, cancel, started)

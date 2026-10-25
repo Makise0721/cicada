@@ -210,6 +210,8 @@ async def test_grep_long_filenames_keep_footer_and_narrowing_hint(workspace):
     [
         {"pattern": "a\nb"},
         {"pattern": "x" * 1200},
+        {"pattern": "(?V0)a", "regex": True},
+        {"pattern": "(" * 450 + "a" + ")" * 450, "regex": True},
         {"pattern": "needle", "include": "a**b"},
         {"pattern": "needle", "path": "../../outside"},
         {"pattern": "needle", "path": "missing"},
