@@ -279,6 +279,7 @@ class ContainerSpec:
     image_digest: str
     verifier_dir: Path
     owner_label: str
+    network_mode: str = "none"
 
 
 @dataclass
@@ -432,7 +433,7 @@ class ContainerEvaluator:
             "--label", f"{DOCKER_LABEL_OWNER}={spec.owner_label}",
             "--volume", f"{spec.verifier_dir.resolve()}:/tests:ro",
             "--workdir", "/app",
-            "--network", "none",
+            "--network", spec.network_mode,
             spec.image_digest, "sleep", "infinity",
             timeout_s=10,
         )
