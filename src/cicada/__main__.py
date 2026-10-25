@@ -1053,7 +1053,7 @@ v1仅适用于DeepSeek官方，输入上界1,100,000；其他实例必须使用�
     parser.add_argument('--cost-limit-cny', help='本次进程费用上界（元），须配 --cost-profile；重启新建额度')
     parser.add_argument('--cost-profile', help='本地价格 JSON（相对 workspace），记录来源、核对日期和模型单价')
     parser.add_argument('--max-model-calls', type=int, help='本次进程真实模型发送次数上限；普通与摘要共用')
-    parser.add_argument('--export-report', metavar='PATH', help='单次请求结束后导出 .md/.json 诊断报告；拒绝覆盖已有文件；TUI 用 /export <路径>')
+    parser.add_argument('--export-report', metavar='PATH', help='单次请求结束后导出 .md/.json 诊断报告；拒绝覆盖已有文件；TUI 用无参数 /export 导出会话 HTML')
     parser.add_argument(
         "--num-ctx", type=int, help="本地窗口上限 (默认 131072)"
     )
