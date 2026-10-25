@@ -65,9 +65,11 @@ class Broker:
     审计失败不得影响请求本身 (live 首题就是因为没有这份轨迹而无法判定根因)。
     """
 
-    def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None):
+    def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None,
+                 model_url="https://api.deepseek.com/chat/completions", model_headers=None):
         self.gate, self.check = gate, check
         self.deadline, self.credential, self.admission = deadline, credential, admission
+        self.model_url, self.model_headers = model_url, model_headers or {}
         self.token = uuid.uuid4().hex
         self.stopped = False
         self.stop_reason = None
@@ -122,8 +124,8 @@ class Broker:
             self.inflight = asyncio.current_task()
             response = None
             try:
-                request = httpx.Request("POST", "https://api.deepseek.com/chat/completions",
-                    content=body, headers={"Content-Type": "application/json",
+                request = httpx.Request("POST", self.model_url,
+                    content=body, headers={**self.model_headers, "Content-Type": "application/json",
                     "Authorization": "Bearer " + (self.credential or lifecycle.OFFLINE_CREDENTIAL)})
                 response = await self.gate.handle_async_request(request)
                 content = bytearray()
@@ -393,7 +395,7 @@ def _child_env(child_root: Path) -> dict:
 
 async def _supervise_child(config, config_path, broker, deadline):
     write_json(config_path, config)
-    child = isolation.LowProcess([sys.executable, "-m", "tests.support.swebench_live",
+    child = isolation.LowProcess([sys.executable, "-m", config.get("child_module", "tests.support.swebench_live"),
         "child", "--config", str(config_path)], PROJECT, _child_env(Path(config["child_root"])))
     timeout = False
     try:

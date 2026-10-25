@@ -21,6 +21,64 @@ from tests.support.swebench_live import (
 )
 
 
+def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
+    from cicada.core.ports import ModelMetrics, StreamDone
+    from tests.support.swebench_batch import CallBudget, MODEL, classify_go
+
+    seen = []
+
+    def respond(request):
+        seen.append((str(request.url), request.headers["x-opencode-session"], request.headers["Authorization"]))
+        return lifecycle._sse([lifecycle._text_frame(0, "fixture")])
+
+    async def run():
+        budget = CallBudget(tmp_path / "calls.json", 1)
+        gate = lifecycle.AttemptGateTransport(httpx.MockTransport(respond), budget,
+            phase=PROCESS_1, request_classifier=classify_go)
+        broker = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 10,
+            credential="parent-only-key", model_url=MODEL["base_url"] + "/chat/completions",
+            model_headers={"x-opencode-session": "frozen-session"})
+        body = json.dumps({"model": MODEL["model"], "stream": True,
+            "stream_options": {"include_usage": True}, "max_tokens": MODEL["max_tokens"],
+            "thinking": {"type": "disabled"}, "messages": []}).encode()
+        try:
+            _, headers, _ = await broker.dispatch("/model", body)
+            assert budget.calls[0]["state"] == "pending"
+            gate.confirm(headers["X-Call-Id"], StreamDone("stop", metrics=ModelMetrics(100, 10)))
+            with pytest.raises(AttemptBudgetError, match="physical call budget"):
+                await broker.dispatch("/model", body)
+            assert gate.handoffs == 1
+            assert budget.calls[0]["state"] == "complete"
+            assert seen == [(MODEL["base_url"] + "/chat/completions", "frozen-session", "Bearer parent-only-key")]
+            assert json.loads((tmp_path / "calls.json").read_text())["cost_cny"] is None
+        finally:
+            await broker.close()
+    asyncio.run(run())
+
+
+def test_go_missing_usage_remains_unknown_and_cannot_send_again(tmp_path):
+    from tests.support.swebench_batch import CallBudget, MODEL, classify_go
+
+    async def run():
+        frame = lifecycle._text_frame(0, "fixture")
+        frame.pop("usage")
+        budget = CallBudget(tmp_path / "calls.json", 2)
+        gate = lifecycle.AttemptGateTransport(httpx.MockTransport(lambda r: lifecycle._sse([frame])),
+            budget, phase=PROCESS_1, request_classifier=classify_go)
+        body = json.dumps({"model": MODEL["model"], "stream": True,
+            "stream_options": {"include_usage": True}, "max_tokens": 8192,
+            "thinking": {"type": "disabled"}}).encode()
+        response = await gate.handle_async_request(httpx.Request("POST", MODEL["base_url"], content=body))
+        await response.aread()
+        await response.aclose()
+        with pytest.raises(AttemptBudgetError):
+            await gate.handle_async_request(httpx.Request("POST", MODEL["base_url"], content=body))
+        assert gate.handoffs == 1
+        assert budget.calls[0]["state"] == "pending"
+        assert budget.calls[0]["input_tokens"] is None
+    asyncio.run(run())
+
+
 def _gate(tmp_path, inner):
     path = tmp_path / "profile.json"
     path.write_text(json.dumps({"schema_version": 1, "source": "https://example.org/pricing",

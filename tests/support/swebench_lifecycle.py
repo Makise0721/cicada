@@ -130,12 +130,14 @@ class AttemptGateTransport(httpx.AsyncBaseTransport):
 
     def __init__(self, inner: httpx.AsyncBaseTransport, budget: AttemptBudget, *,
                  phase: str, session: str | None = None,
-                 deadline_monotonic: float | None = None) -> None:
+                 deadline_monotonic: float | None = None,
+                 request_classifier=classify_request) -> None:
         self.inner = inner
         self.budget = budget
         self.phase = phase
         self.session = session
         self.deadline = deadline_monotonic
+        self.request_classifier = request_classifier
         self.observations: dict[str, GateObservation] = {}
         self.handoffs = 0
         self.settled_ids: list[str] = []
@@ -160,7 +162,7 @@ class AttemptGateTransport(httpx.AsyncBaseTransport):
         try:
             body = await request.aread()
             try:
-                kind, cap, _model = classify_request(body)
+                kind, cap, _model = self.request_classifier(body)
             except Exception as exc:  # noqa: BLE001 - 形态越界即拒发
                 self.budget.seal("request shape outside the frozen contract")
                 raise AttemptBudgetError(
