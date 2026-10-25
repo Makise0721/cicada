@@ -1,16 +1,16 @@
 # Cicada
 
-Cicada 是面向 Windows 的 Python coding agent，支持文件读写、PowerShell、指定检查、会话保存恢复与费用准入。本源码分支在 **0.1.0a2** 基础上增加 DeepSeek 与自定义 OpenAI Chat 兼容供应商，尚未发布；下方 Release 安装仍为 a2，公开状态见 [Releases](https://github.com/Makise0721/cicada/releases)。
+Cicada 是面向 Windows 的 Python coding agent，支持 DeepSeek 与自定义 OpenAI Chat 兼容供应商、文件读写、PowerShell、指定检查、会话保存恢复与费用准入。本分支版本为 **0.1.0a3**；公开发布状态见 [Releases](https://github.com/Makise0721/cicada/releases)，a2 用法见[历史说明](https://github.com/Makise0721/cicada/blob/v0.1.0a2/README.md)。
 
 ## 环境与安装
 
-验证环境：Windows 11、PowerShell 7、Python 3.12（a2 包验证为 3.12.10）；需要安装 `uv`。真实任务使用自己的供应商凭据，离线演示无需凭据。
+验证环境：Windows 11、PowerShell 7、Python 3.12（a3 包验证为 3.12.10）；需要安装 `uv`。真实任务使用自己的供应商凭据，离线演示无需凭据。
 
-发布后在空的下载目录运行以下 PowerShell 命令，从 [v0.1.0a2](https://github.com/Makise0721/cicada/releases/tag/v0.1.0a2) 下载；本地候选使用交付包内文件，跳过下载循环，从哈希校验开始。发布说明包含变更和已知问题。
+发布后在空的下载目录运行以下 PowerShell 命令，从 [v0.1.0a3](https://github.com/Makise0721/cicada/releases/tag/v0.1.0a3) 下载；本地候选使用交付包内文件，跳过下载循环，从哈希校验开始。发布说明包含变更和已知问题。
 
 ```powershell
-$release = 'https://github.com/Makise0721/cicada/releases/download/v0.1.0a2'
-$wheel = 'cicada-0.1.0a2-py3-none-any.whl'
+$release = 'https://github.com/Makise0721/cicada/releases/download/v0.1.0a3'
+$wheel = 'cicada-0.1.0a3-py3-none-any.whl'
 foreach ($file in @($wheel, 'requirements-windows-py312.txt', 'SHA256SUMS')) {
     Invoke-WebRequest "$release/$file" -OutFile $file
 }
@@ -42,7 +42,7 @@ cicada --list-sessions
 
 在目标工作区运行 `cicada` 进入 TUI；首次缺凭据时显示遮蔽输入向导。也可预先设置 `$env:DEEPSEEK_API_KEY`。用户配置位于 `~/.cicada/config.toml`，真实模型启动时若缺失会生成默认文件；凭据单独存放，登录不验证账号。
 
-源码分支中，`/login` 可添加供应商地址、凭据来源和多个模型；内置 OpenCode Go 只需 API Key，预设 DeepSeek V4.1 Flash（1,000,000窗口、32K输出，默认 high 思考，底栏点击或 F6 切换 low/high/max）。`/model` 输入搜索并切换当前对话，设置下次默认值是独立操作。CLI 用 `--provider <实例ID> --model <模型key>`；兼容范围与配置示例见 `--help`，目录和选择不会发网络请求。
+`/login` 可添加供应商地址、凭据来源和多个模型；内置 OpenCode Go 只需 API Key，预设 DeepSeek V4.1 Flash（1,000,000 窗口、32K 输出，默认 high 思考，Shift+Tab 或底栏思考强度徽标点击循环 low/high/max）。`/model` 输入搜索并切换当前对话，设置下次默认值是独立操作。CLI 用 `--provider <实例ID> --model <模型key>`；兼容范围与配置示例见 `--help`，目录和选择不会发网络请求。
 
 启动自动加载 `~/.cicada/AGENTS.md`、工作区根 `AGENTS.md`，以及 `~/.cicada/skills/`、工作区 `.agents/skills/` 下的 Skill。项目同名 Skill 优先；`--instructions-file` 和 `--skills-dir` 分别替换自动来源，`--no-auto-instructions`、`--no-auto-skills` 可关闭自动读取。普通恢复会核对资源是否变化。
 
@@ -54,7 +54,7 @@ cicada --max-model-calls 5 '阅读这个项目，说明入口和运行方法，�
 
 Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export` 导出 HTML，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
 
-源码分支可在空闲时用 `/mode [read-only|approval|full]` 切换执行档，默认 `full`；只读档拒绝写入和命令，审批档在 PowerShell 前确认，Ctrl+C 取消整轮请求。
+空闲时可用 `/mode [read-only|approval|full]` 切换执行档，默认 `full`；只读档拒绝写入和命令，审批档在 PowerShell 前确认（允许一次/本会话/拒绝），Ctrl+C 取消整轮请求。
 
 ## 检查、费用与恢复
 
@@ -67,9 +67,9 @@ Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默�
 
 先退出 Cicada，保留当前 wheel 和配套依赖清单。在目标版本下载目录重复安装步骤，将安装命令加上 `--force --reinstall`；回退使用先前保留版本的 wheel 和配套清单。不要只替换 wheel 而沿用另一版本的依赖清单。
 
-升级前保留旧档副本。a1→a2 的工具声明有变化，恢复时需 `--resume <ID> --resume-with-current-config` 显式采用当前配置。回退到 a1 会读取工作区旧档，a2 新增记录不自动回写，两版本交替续写会形成不同历史。`uv tool uninstall cicada` 保留会话、用户配置和费用账本。
+升级前保留旧档副本。a1 存档的工具声明已变，恢复需 `--resume <ID> --resume-with-current-config` 显式采用当前配置；a2 存档可直接恢复。`uv tool uninstall cicada` 保留会话、用户配置和费用账本。
 
-试用本源码分支前另行备份用户配置、凭据与会话目录；会话升级为 v5，保存多供应商配置时升级为 v2，a2 无法读取这些新格式。回退需同时恢复备份，不能只重装旧 wheel。
+a3 保存会话时把档从 v4 升为 v5，多供应商配置首次保存升为 v2；a2 读不了这些新格式，回退到 a2 前须同时恢复备份。回退到 a1 读取工作区旧档，a2/a3 的新增记录不自动回写，两版本交替续写会形成不同历史。
 
 问题反馈入口：[GitHub Issues](https://github.com/Makise0721/cicada/issues)。更多参数和退出码见 `cicada --help`。
 
