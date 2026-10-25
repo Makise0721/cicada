@@ -54,7 +54,7 @@ cicada --max-model-calls 5 '阅读这个项目，说明入口和运行方法，�
 
 Enter 发送，Shift+Enter 换行，Esc/Ctrl+C 中断，Ctrl+D 退出。TUI 默认保存，空闲 `/resume` 恢复、`/name 名称` 命名、`/export` 导出 HTML，输入 `/` 从菜单查看并选择命令。运行和收尾期间不能提交下一问。
 
-空闲时可用 `/mode [read-only|approval|full]` 切换执行档，默认 `full`；只读档拒绝写入和命令，审批档在 PowerShell 前确认（允许一次/本会话/拒绝），Ctrl+C 取消整轮请求。
+空闲时可用 `/mode` 切换执行档：`/mode` 补齐后菜单直接列出 read-only/approval/full，方向键选择、Enter 直接执行。默认 `full`；只读档拒绝写入和命令，审批档在 PowerShell 前确认（允许一次/本会话/拒绝），Ctrl+C 取消整轮请求。
 
 ## 检查、费用与恢复
 

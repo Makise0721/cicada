@@ -254,3 +254,75 @@ def test_v2_selected_row_narrow_width_truncates_description():
     menu.sync("/", at_end=True)
     for line in menu.render(12, 3):
         assert visible_width(strip_terminal_sequences(line)) <= 12
+# --- 固定参数选项 (2026-10-25 用户要求): 补齐后直接列出可选项, 方向键选、Enter 直接执行 ---
+
+
+async def test_mode_option_menu_appears_after_completion_and_submits_choice():
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/mo"))
+        await h.settle()
+        assert h.find("→ mode")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == []  # 补齐只留草稿, 不提交
+        assert h.editor.get_text() == "/mode "
+        assert h.find("→ read-only")  # 补齐后直接列出三档
+        assert h.find("approval")
+        assert h.find("full")
+        h.terminal.emit([DOWN])  # read-only -> approval
+        await h.settle()
+        assert h.find("→ approval")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["/mode approval"]  # 选中即执行
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
+
+
+async def test_mode_option_prefix_filters_to_matching_choice():
+    h = Harness(commands=True)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/mode re"))
+        await h.settle()
+        assert h.find("→ read-only")
+        assert not h.find("→ approval")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["/mode read-only"]
+        assert h.editor.is_empty()
+    finally:
+        await h.stop()
+
+
+async def test_mode_option_escape_keeps_draft_without_menu():
+    h = Harness(commands=True, escape_timeout=0.001)
+    try:
+        await h.start()
+        h.terminal.emit(text_keys("/mode "))
+        await h.settle()
+        assert h.find("→ read-only")
+        h.terminal.emit([ESCAPE])
+        await h.settle()
+        assert h.editor.get_text() == "/mode "
+        assert not h.find("→ read-only")
+        h.terminal.emit([ENTER])
+        await h.settle()
+        assert h.submitted == ["/mode"]  # 无参数: 原循环语义
+    finally:
+        await h.stop()
+
+
+def test_option_menu_renders_values_and_keeps_full_width_highlight():
+    menu = SlashCommandMenu()
+    menu.sync("/mode ", at_end=True)
+    lines = menu.render(40, 4)
+    assert len(lines) == 3
+    assert strip_terminal_sequences(lines[0]).startswith("→ read-only")
+    assert lines[0].startswith(SEL_BG) and lines[0].endswith("\x1b[0m")
+    assert visible_width(strip_terminal_sequences(lines[0])) == 40
+    menu.move(1)
+    assert strip_terminal_sequences(menu.render(40, 4)[1]).startswith("→ approval")

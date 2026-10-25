@@ -200,7 +200,7 @@ class MainScreenFrontend:
             # 候选窗放宽到 COMMAND_MENU_MAX_ROWS 行
             slash_open = (
                 self._command_menu is not None
-                and self._command_menu.selected is not None
+                and self._command_menu.is_open
                 and not self._model_menu_active()
                 and not (self._file_menu is not None and self._file_menu.visible)
             )
@@ -720,7 +720,7 @@ class MainScreenFrontend:
             return True
         if self._file_menu is not None and self._file_menu.candidates:
             return True  # C6: 候选打开时沿用菜单的指针捕获, v1 无点击选择
-        return self._command_menu is not None and self._command_menu.selected is not None
+        return self._command_menu is not None and self._command_menu.is_open
 
     def _dispatch_pointer(self, event: PointerEvent) -> str:
         """指针事件派发。返回 _POINTER_NONE/_POINTER_RENDER/_POINTER_POISON。
@@ -824,7 +824,18 @@ class MainScreenFrontend:
                 self._editor.clear()
             return
         self._sync_command_menu()
-        selected = self._command_menu.selected if self._command_menu is not None else None
+        menu = self._command_menu
+        option = menu.selected_option if menu is not None else None
+        if option is not None and menu is not None:
+            # 固定参数选项 (/mode 三档): 选中即把 `命令 值` 写回草稿并走原提交
+            # 路径, 选完直接执行, 不需要用户再手打参数。
+            command, value = option
+            menu.dismiss()
+            self._editor.set_text(f"{command.command} {value}")
+            text = self._editor.get_text()
+            selected = None
+        else:
+            selected = menu.selected if menu is not None else None
         if selected is not None and selected.takes_argument:
             # 需要参数的命令 (/export、/name、/skill 等): 菜单补齐只把命令写回
             # 草稿, 不提交 —— 参数由用户继续输入, 再次 Enter 才走准入。
