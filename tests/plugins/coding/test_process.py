@@ -166,12 +166,15 @@ async def test_grandchild_holding_pipe_is_bounded_and_incomplete(tmp_path):
     assert elapsed < 6
 
 
-async def test_grandchild_writing_forever_cannot_extend_deadline(tmp_path):
+async def test_grandchild_continuous_output_cannot_extend_deadline(tmp_path):
     ws = make(tmp_path)
     repo_root = Path(__file__).resolve().parents[3]
     command = (
         "Start-Process pwsh -ArgumentList '-NoProfile','-Command',"
-        "'while ($true) { Write-Output ticking }' -NoNewWindow "
+        # 输出窗口长于断言上限, 但会自行结束, 避免用例返回后遗留无限写入进程。
+        "'$until = [Environment]::TickCount64 + 8000; "
+        "while ([Environment]::TickCount64 -lt $until) { "
+        "Write-Output ticking; Start-Sleep -Milliseconds 10 }' -NoNewWindow "
         f"-WorkingDirectory '{repo_root}' -PassThru | Out-Null; Write-Output parent-exit"
     )
     t0 = time.monotonic()
@@ -622,13 +625,13 @@ async def test_timeout_cannot_be_extended_by_a_hanging_taskkill(tmp_path, monkey
     started = time.monotonic()
     try:
         result = await run_runner(runner, ws, command="Start-Sleep -Seconds 20", timeout=0.8)
+        elapsed = time.monotonic() - started
     finally:
         # kill 被替换为不返回: 用真实 taskkill 清掉遗留 pwsh, 不留孤儿进程
         for pid in set(attempted):
             subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True
             )
-    elapsed = time.monotonic() - started
     assert attempted, "超时路径必须尝试终止已知进程树"
     assert result.timed_out is True
     assert result.output_complete is False
