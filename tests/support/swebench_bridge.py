@@ -403,7 +403,11 @@ def grade_from_artifacts(
 # 不得进入模型可见摘要 (见 _public_check 白名单)。
 EXCERPT_MAX_TESTS = 3
 EXCERPT_MAX_CHARS = 400
-_FAILED_LINE = re.compile(r"^\s*FAILED\s+(\S+::\S+)\s+-\s+(.*)$", re.MULTILINE)
+# pytest short summary: 有 message 时是 "FAILED <nodeid> - <msg>", 也可能只有 nodeid。
+_SUMMARY_FAILED = re.compile(r"^\s*FAILED\s+(\S+::\S+)(?:\s+-\s+(.*))?$", re.MULTILINE)
+# traceback 段标题 "____ test_name[params] ____" 与其内最后一条 "E   ..." 行。
+_SECTION = re.compile(r"^_{4,}\s*(.+?)\s*_{4,}$")
+_E_LINE = re.compile(r"^E\s{3,}(\S.*)$")
 
 
 def extract_failure_excerpt(stdout_text: str, missing: list[str],
@@ -411,22 +415,32 @@ def extract_failure_excerpt(stdout_text: str, missing: list[str],
                             max_chars: int = EXCERPT_MAX_CHARS) -> list[dict]:
     """从官方 verifier 的 run-script stdout 取失败测试的最小断言证据。
 
-    官方 run_script.sh 对 selected_test_files 用 ``pytest -v``, 因此 short summary
-    里有 ``FAILED <nodeid> - <ExceptionType>: <message>`` 行。只取 missing 里的条目,
-    每条约一行、截断, 不含 traceback 正文、源码或路径上下文。
+    官方 run_script.sh 用 ``pytest -v``: short summary 里通常是
+    ``FAILED <nodeid> - <ExceptionType>: <message>``; 有些 runner 只给 nodeid,
+    此时退回该测试 traceback 段内最后一条 ``E   ...`` 行。只取 missing 里的条目,
+    每条一行、截断, 不含 traceback 正文、源码或路径上下文。
     """
-    wanted = set(missing)
-    seen: set[str] = set()
-    excerpt: list[dict] = []
-    for match in _FAILED_LINE.finditer(stdout_text or ""):
-        name, message = match.group(1), " ".join(match.group(2).split())
-        if name not in wanted or name in seen:
+    text = stdout_text or ""
+    wanted = list(dict.fromkeys(missing))
+    reasons: dict[str, str] = {}
+    for match in _SUMMARY_FAILED.finditer(text):
+        name, message = match.group(1), (match.group(2) or "").strip()
+        if name in wanted and message and name not in reasons:
+            reasons[name] = " ".join(message.split())
+    by_short = {name.split("::", 1)[-1]: name for name in wanted}
+    current = None
+    for line in text.splitlines():
+        section = _SECTION.match(line)
+        if section:
+            current = by_short.get(section.group(1).strip())
             continue
-        seen.add(name)
-        excerpt.append({"test": name, "reason": message[:max_chars]})
-        if len(excerpt) >= max_tests:
-            break
-    return excerpt
+        if current is None or current in reasons:
+            continue
+        detail = _E_LINE.match(line)
+        if detail:
+            reasons[current] = " ".join(detail.group(1).split())
+    return [{"test": name, "reason": reasons[name][:max_chars]}
+            for name in wanted if name in reasons][:max_tests]
 
 
 class ContainerEvaluator:

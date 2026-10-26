@@ -39,16 +39,39 @@ SOURCE_ROOTS = {"ansible": "lib/ansible/", "qutebrowser": "qutebrowser/"}
 WRITE_TO_ARGUMENT_LIMIT_BYTES = 48 * 1024
 
 # agent 侧只读测试旁路: 脚本生成在 child_root (workspace 之外), 不进补丁导出。
-REPO_TESTS_POLICY = "container-v1"
+REPO_TESTS_POLICY = "broker-v1"
 REPO_TESTS_SCRIPT = "repo-tests.ps1"
 REPO_TESTS_TEMPLATE = Path(__file__).with_name("repo_tests.ps1")
+REPO_TEST_MAX_CALLS = 20
+REPO_TEST_TIMEOUT_S = 120
+REPO_TEST_OUTPUT_CHARS = 8000
+# 每题官方 run_script.sh 的选测命令形状; 旁路容器不挂 /tests, 命令必须自包含。
+REPO_TEST_COMMANDS = {
+    "ansible": ("PYTHONPATH=/app/lib:/app/test/lib python -m pytest {paths} "
+                "-v --tb=line -p no:cacheprovider"),
+    "qutebrowser": ("QT_QPA_PLATFORM=offscreen dbus-run-session -- python -m pytest {paths} "
+                    "-v --tb=line -p no:cacheprovider --disable-warnings --benchmark-disable"),
+}
 
 
-def write_repo_tests_script(child_root: Path, image: str) -> Path:
-    """把固定模板实例化为 agent 可调用的 PowerShell 脚本。"""
+def repo_tests_profile(keys: list[str]) -> dict:
+    missing = [key for key in keys if key not in REPO_TEST_COMMANDS]
+    if missing:
+        raise ValueError(f"no repo test command for {missing}")
+    return {"policy": REPO_TESTS_POLICY,
+            "commands": {key: REPO_TEST_COMMANDS[key] for key in keys},
+            "max_calls": REPO_TEST_MAX_CALLS, "timeout_s": REPO_TEST_TIMEOUT_S}
+
+
+def write_repo_tests_script(child_root: Path, python: str, endpoint: str, token: str) -> Path:
+    """把固定模板实例化为 agent 可调用的 PowerShell 脚本。
+
+    脚本只是 broker 客户端: 容器由父进程 (Medium) 启动, Low 子进程自身没有 Docker 权限。
+    """
     script = child_root / REPO_TESTS_SCRIPT
-    script.write_text(REPO_TESTS_TEMPLATE.read_text(encoding="utf-8").replace("__IMAGE__", image),
-                      encoding="utf-8")
+    script.write_text(REPO_TESTS_TEMPLATE.read_text(encoding="utf-8")
+                      .replace("__PYTHON__", python).replace("__ENDPOINT__", endpoint)
+                      .replace("__TOKEN__", token), encoding="utf-8")
     return script
 
 
@@ -167,14 +190,15 @@ def compose_batch_prompt(workspace, command, profile=None, repo_tests=None):
         prompt = candidate + prompt[len(base):]
         info = replace(info, version="experimental:template:" + profile["sha256"],
             prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest())
-    if repo_tests == REPO_TESTS_POLICY:
+    if repo_tests and repo_tests.get("policy") == REPO_TESTS_POLICY:
         script = (workspace.parent / REPO_TESTS_SCRIPT).resolve()
         prompt += (
             "\nLocal repository tests (allowed, not a check):\n"
             f'- Run existing tests with the powershell tool: & "{script}" <test path> [more paths]\n'
-            "- It runs the task image with this workspace mounted at /app; only tests already in "
+            "- It runs the task image read-only over this workspace; only tests already in "
             "the repository are visible, hidden grading tests are not.\n"
             "- A test that passed before your change and fails here is a regression you introduced.\n"
+            "- Re-run the check after running tests so the receipt matches the final code.\n"
         )
         info = replace(info, version=info.version + "+repo-tests-v1",
             prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest())
@@ -207,11 +231,13 @@ def prepare(calibration_root: Path, package: Path, check_feedback="counts-only",
                       "base_commit": receipt["base_commit"], "image_digest": receipt["image"]["digest"],
                       "source_root": source_root, "network_mode": receipt["verifier_network"],
                       "allowed_extra_paths": selected.get("allowed_extra_paths", [])})
+    repo_profile = None
     if repo_tests is not None:
+        repo_profile = repo_tests_profile([task["key"] for task in tasks])
         hashes[str(REPO_TESTS_TEMPLATE)] = sha256_file(REPO_TESTS_TEMPLATE)
     manifest = {"schema_version": 1, "model": MODEL, "limits": LIMITS, "tasks": tasks,
                 "check_feedback": check_feedback, "trace_policy": "private-request-sse-v1",
-                "repo_tests": repo_tests,
+                "repo_tests": repo_profile,
                 "calibration_root": str(calibration_root), "input_hashes": hashes,
                 "candidate_coverage": selection.get("candidate_coverage",
                     {"qualified": 2, "original_candidates": 3}),
@@ -234,13 +260,20 @@ def verify(package: Path):
     task_pairs = [(t["key"], t["source_root"]) for t in manifest["tasks"]]
     if (manifest["model"] != MODEL or manifest["limits"] != LIMITS
             or manifest.get("check_feedback") not in ("counts-only", "required-tests-v1", "required-tests-v2")
-            or manifest.get("repo_tests") not in (None, REPO_TESTS_POLICY)
             or manifest.get("trace_policy") != "private-request-sse-v1"
             # 包可以是两题全量, 也可以是单题尝试包; 必须是有序无重复的子集。
             or not task_pairs or len(set(task_pairs)) != len(task_pairs)
             or task_pairs != [item for item in SOURCE_ROOTS.items() if item in task_pairs]
             or manifest["source_runtime"] != runtime_identity()):
         raise ValueError("execution profile or source runtime changed after freeze")
+    repo = manifest.get("repo_tests")
+    if repo is not None and (
+            repo.get("policy") != REPO_TESTS_POLICY
+            or repo.get("max_calls") != REPO_TEST_MAX_CALLS
+            or repo.get("timeout_s") != REPO_TEST_TIMEOUT_S
+            or set(repo.get("commands") or {}) != {task["key"] for task in manifest["tasks"]}
+            or any(repo["commands"][key] != REPO_TEST_COMMANDS.get(key) for key in repo["commands"])):
+        raise ValueError("repo test profile changed after freeze")
     if "system_prompt" in manifest:
         profile = manifest["system_prompt"]
         if prompt_profile(profile["template"]) != profile:
@@ -301,7 +334,7 @@ async def child(config_path):
     diagnostics = {"watch": {}, "streams": []}
     extra = config.get("allowed_extra_paths") or ()
     extra_note = f"此外还可修改这些配置数据文件：{'、'.join(extra)}。" if extra else ""
-    if config.get("repo_tests") == REPO_TESTS_POLICY:
+    if (config.get("repo_tests") or {}).get("policy") == REPO_TESTS_POLICY:
         host_note = ("宿主为 Windows/PowerShell，不在宿主运行或导入工作区代码；"
                      "需要运行仓库既有测试时用 repo-tests.ps1（固定 Linux 容器，用法见系统提示）；")
     else:
@@ -438,13 +471,58 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
             write_json(private / f"grade-{len(grades)}.json", result.to_json())
             return code, summary
 
+        repo_profile = manifest.get("repo_tests")
+        repo_calls = {"n": 0}
+
+        def repo_test(paths):
+            """父进程 (Medium) 在只读挂载的任务镜像里跑仓库既有测试。"""
+            repo_calls["n"] += 1
+            if not isinstance(paths, list) or not 1 <= len(paths) <= 5:
+                return {"exit_code": 2, "output": "repo test expects 1-5 test paths"}
+            if repo_calls["n"] > repo_profile["max_calls"]:
+                return {"exit_code": 2, "output": "repo test call limit reached"}
+            for path in paths:
+                if not isinstance(path, str) or not path or ".." in path or not all(
+                        char.isalnum() or char in "_./-" for char in path):
+                    return {"exit_code": 2, "output": "invalid test path"}
+            command = repo_profile["commands"][task["key"]].format(paths=" ".join(paths))
+            label = supervisor.owner_label("repo-test")
+            supervisor.register_intent(label, "repo-test", task["image_digest"], os.getpid())
+            create = docker.run("create", "--name", label, "--platform", bridge.IMAGE_PLATFORM,
+                "--label", f"{bridge.DOCKER_LABEL_OWNER}={label}",
+                "--workdir", "/app",
+                "--network", "none", task["image_digest"], "sleep", "infinity", timeout_s=10)
+            if create.exit_code != 0:
+                supervisor.stop_and_remove(label, None)
+                return {"exit_code": 2, "output": "repo test container create failed"}
+            container = create.stdout.strip()
+            try:
+                supervisor.register_container(label, container)
+                if docker.run("start", container, timeout_s=60).exit_code != 0:
+                    return {"exit_code": 2, "output": "repo test container start failed"}
+                # 复制而不是挂载: 测试的 __pycache__/.hypothesis 留在容器里, 不污染 workspace 快照。
+                copied = docker.run("cp", str(workspace.resolve()) + os.sep + ".",
+                    f"{container}:/app", timeout_s=120)
+                if copied.exit_code != 0:
+                    return {"exit_code": 2, "output": "repo test workspace copy failed"}
+                record = docker.run("exec", "-w", "/app", container, "bash", "-lc", command,
+                    timeout_s=repo_profile["timeout_s"])
+                output = (record.stdout + "\n" + record.stderr).strip()
+                return {"exit_code": record.exit_code,
+                        "output": output[-REPO_TEST_OUTPUT_CHARS:]}
+            finally:
+                supervisor.stop_and_remove(label, container)
+
         routing = uuid4().hex
         broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential,
             admission=admission, audit=private / "broker.jsonl",
             model_url=MODEL["base_url"] + "/chat/completions",
             model_headers={"User-Agent": "cicada/" + version("cicada"), "x-opencode-session": routing},
-            check_feedback=manifest["check_feedback"], trace_dir=private / "model-trace")
+            check_feedback=manifest["check_feedback"], trace_dir=private / "model-trace",
+            repo_test=repo_test if repo_profile else None)
         endpoint = broker.start()
+        if repo_profile:
+            write_repo_tests_script(child_root, sys.executable, endpoint, broker.token)
         config = {"workspace": str(workspace), "child_root": str(child_root),
                   "endpoint": endpoint, "token": broker.token, "routing_session": routing,
                   "phase": "process-1", "child_module": "tests.support.swebench_batch",
@@ -571,6 +649,24 @@ async def run(package, run_root, *, live=False, authorization=None, admission=No
     return result
 
 
+def _repo_test_cli(args):
+    """child 侧: 把测试路径转给父进程 broker, 由 Medium 进程跑只读容器。"""
+    body = json.dumps({"paths": args.paths}).encode("utf-8")
+    try:
+        with httpx.Client(trust_env=False, timeout=REPO_TEST_TIMEOUT_S + 30) as client:
+            response = client.post(args.endpoint + "/repo-test", content=body,
+                headers={"X-PV-Token": args.token, "Content-Type": "application/json"})
+    except httpx.HTTPError as exc:
+        print(json.dumps({"exit_code": 2, "output": f"repo test transport failed: {exc}"}))
+        return 2
+    if response.status_code != 200:
+        print(json.dumps({"exit_code": 2, "output": f"repo test refused: {response.status_code}"}))
+        return 2
+    data = response.json()
+    print(data.get("output", ""))
+    return 0 if data.get("exit_code") == 0 else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -595,6 +691,10 @@ def main():
     check = sub.add_parser("check")
     check.add_argument("--endpoint", required=True)
     check.add_argument("--token", required=True)
+    repo = sub.add_parser("repo-test")
+    repo.add_argument("--endpoint", required=True)
+    repo.add_argument("--token", required=True)
+    repo.add_argument("paths", nargs="+")
     args = parser.parse_args()
     if args.action == "check":
         with httpx.Client(trust_env=False, timeout=LIMITS["grader_seconds"] + 30) as client:
@@ -603,6 +703,8 @@ def main():
             data = response.json()
             print(json.dumps(data["summary"], ensure_ascii=False))
             return data["code"]
+    if args.action == "repo-test":
+        return _repo_test_cli(args)
     if args.action == "child":
         root = Path(load_json(args.config)["child_root"])
         # Low processes have no inherited output handles; preserve errors locally.

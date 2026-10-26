@@ -78,8 +78,9 @@ class Broker:
 
     def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None,
                  model_url="https://api.deepseek.com/chat/completions", model_headers=None,
-                 check_feedback="counts-only", trace_dir: Path | None = None):
+                 check_feedback="counts-only", trace_dir: Path | None = None, repo_test=None):
         self.gate, self.check = gate, check
+        self.repo_test = repo_test
         self.deadline, self.credential, self.admission = deadline, credential, admission
         self.model_url, self.model_headers = model_url, model_headers or {}
         self.check_feedback, self.trace_dir = check_feedback, trace_dir
@@ -202,6 +203,23 @@ class Broker:
             except BaseException as exc:
                 self.record("check-failed", detail=type(exc).__name__ + ": " + str(exc)[:200])
                 self.stop("evaluation-error")
+                raise
+            finally:
+                self.checking = False
+        if route == "/repo-test":
+            if self.repo_test is None:
+                raise AttemptBudgetError("repo test is not enabled")
+            if self.checking or self.gate.active_call_id is not None:
+                self.record("repo-test-refused", reason="overlapping")
+                raise AttemptBudgetError("overlapping repo test refused")
+            self.checking = True
+            try:
+                payload = json.loads(body)
+                result = await asyncio.to_thread(self.repo_test, payload.get("paths"))
+                self.record("repo-test-ok", exit_code=result.get("exit_code"))
+                return 200, {}, json.dumps(result).encode()
+            except BaseException as exc:
+                self.record("repo-test-failed", detail=type(exc).__name__ + ": " + str(exc)[:200])
                 raise
             finally:
                 self.checking = False

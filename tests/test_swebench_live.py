@@ -83,29 +83,48 @@ def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
 
 def test_repo_tests_section_and_script_stay_outside_workspace(tmp_path):
     from tests.support.swebench_batch import (
-        REPO_TESTS_POLICY,
         REPO_TESTS_SCRIPT,
         compose_batch_prompt,
+        repo_tests_profile,
         write_repo_tests_script,
     )
 
     child_root = tmp_path / "child"
     workspace = child_root / "workspace"
     workspace.mkdir(parents=True)
+    profile = repo_tests_profile(["ansible"])
     plain, _ = compose_batch_prompt(workspace, "frozen-check-command")
     prompt, info = compose_batch_prompt(
-        workspace, "frozen-check-command", repo_tests=REPO_TESTS_POLICY)
+        workspace, "frozen-check-command", repo_tests=profile)
     assert "Local repository tests" not in plain
     assert "Local repository tests" in prompt
     assert str((child_root / REPO_TESTS_SCRIPT).resolve()) in prompt
     assert info.version.endswith("+repo-tests-v1")
 
-    script = write_repo_tests_script(child_root, "img@sha256:deadbeef")
+    script = write_repo_tests_script(child_root, "py.exe", "http://127.0.0.1:9", "tok")
     text = script.read_text(encoding="utf-8")
-    assert "img@sha256:deadbeef" in text
-    assert "docker run --rm --network none" in text
-    assert "__IMAGE__" not in text
+    assert "--endpoint 'http://127.0.0.1:9' --token 'tok'" in text
+    assert "__PYTHON__" not in text and "__ENDPOINT__" not in text
+    assert "docker" not in text
     assert not (workspace / REPO_TESTS_SCRIPT).exists()
+
+
+def test_repo_test_route_is_opt_in_and_runs_the_parent_callback(tmp_path):
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(lambda r: lifecycle._sse([])))
+        plain = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 10)
+        enabled = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 10,
+                         repo_test=lambda paths: {"exit_code": 0, "output": f"ran {paths}"})
+        try:
+            with pytest.raises(AttemptBudgetError):
+                await plain.dispatch("/repo-test", b'{"paths": ["t.py"]}')
+            _, _, body = await enabled.dispatch("/repo-test", b'{"paths": ["t.py"]}')
+            assert json.loads(body) == {"exit_code": 0, "output": "ran ['t.py']"}
+        finally:
+            await plain.close()
+            await enabled.close()
+            gate.budget.release()
+    asyncio.run(run())
 
 
 def test_check_feedback_is_opt_in_bounded_and_keeps_private_results_parent_side(tmp_path):
@@ -153,6 +172,18 @@ def test_failure_excerpt_keeps_only_missing_assertion_lines():
         {"test": "test/units/x.py::test_a", "reason": "AssertionError: assert b'AAA' == b'BBB'"},
         {"test": "test/units/x.py::test_b", "reason": "ValueError: unsupported"},
     ]
+
+    traceback_only = (
+        "tests/unit/x.py::test_q[6.4] FAILED [ 51%]\n"
+        "________________ test_q[6.4] _________________\n"
+        "tests/unit/x.py:145: in test_q\n"
+        "    config_stub.set_obj('x', v)\n"
+        "E   NoOptionError: No option 'threshold.foreground'\n"
+        "FAILED tests/unit/x.py::test_q[6.4]\n"
+    )
+    assert bridge.extract_failure_excerpt(traceback_only, ["tests/unit/x.py::test_q[6.4]"]) == [
+        {"test": "tests/unit/x.py::test_q[6.4]",
+         "reason": "NoOptionError: No option 'threshold.foreground'"}]
 
 
 def test_required_tests_v2_excerpt_is_bounded_and_keeps_raw_logs_private(tmp_path):
