@@ -53,9 +53,15 @@ def archive_manifest(workspace: Path) -> dict:
             for path in sorted(root.rglob("*")) if path.is_file()}
 
 
-def _public_check(summary: dict) -> dict:
-    return {key: summary.get(key) for key in (
+def _public_check(summary: dict, policy: str = "counts-only") -> dict:
+    visible = {key: summary.get(key) for key in (
         "result", "required_passed", "required_total", "patch_empty", "grade_id", "cleanup")}
+    if policy == "required-tests-v1":
+        names = summary["not_passed_tests"]
+        visible.update(not_passed_tests=[name[:512] for name in names[:5]],
+                       not_passed_tests_total=len(names),
+                       not_passed_tests_truncated=len(names) > 5 or any(len(name) > 512 for name in names[:5]))
+    return visible
 
 
 class Broker:
@@ -66,10 +72,15 @@ class Broker:
     """
 
     def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None,
-                 model_url="https://api.deepseek.com/chat/completions", model_headers=None):
+                 model_url="https://api.deepseek.com/chat/completions", model_headers=None,
+                 check_feedback="counts-only", trace_dir: Path | None = None):
         self.gate, self.check = gate, check
         self.deadline, self.credential, self.admission = deadline, credential, admission
         self.model_url, self.model_headers = model_url, model_headers or {}
+        self.check_feedback, self.trace_dir = check_feedback, trace_dir
+        self.trace_count = 0
+        if trace_dir is not None:
+            trace_dir.mkdir(parents=True, exist_ok=False)
         self.token = uuid.uuid4().hex
         self.stopped = False
         self.stop_reason = None
@@ -124,6 +135,11 @@ class Broker:
             self.inflight = asyncio.current_task()
             response = None
             try:
+                trace = None
+                if self.trace_dir is not None:
+                    self.trace_count += 1
+                    trace = self.trace_dir / f"turn-{self.trace_count:04}"
+                    trace.with_suffix(".request.json").write_bytes(body)
                 request = httpx.Request("POST", self.model_url,
                     content=body, headers={**self.model_headers, "Content-Type": "application/json",
                     "Authorization": "Bearer " + (self.credential or lifecycle.OFFLINE_CREDENTIAL)})
@@ -133,6 +149,8 @@ class Broker:
                     content.extend(chunk)
                     if len(content) > WIRE_LIMIT:
                         raise AttemptBudgetError("response exceeds frozen wire cap")
+                if trace is not None:
+                    trace.with_suffix(".response.sse").write_bytes(content)
                 call_id = next(reversed(self.gate.observations))
                 self.record("model-ok", status=response.status_code, call_id=call_id,
                             request_bytes=len(body), response_bytes=len(content),
@@ -175,7 +193,7 @@ class Broker:
                 self.record("check-ok", code=code)
                 if code == 2:
                     self.stop("evaluation-anomaly")
-                return 200, {}, json.dumps({"code": code, "summary": _public_check(summary)}).encode()
+                return 200, {}, json.dumps({"code": code, "summary": _public_check(summary, self.check_feedback)}).encode()
             except BaseException as exc:
                 self.record("check-failed", detail=type(exc).__name__ + ": " + str(exc)[:200])
                 self.stop("evaluation-error")

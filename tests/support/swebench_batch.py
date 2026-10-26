@@ -92,7 +92,7 @@ def runtime_identity():
             "pyproject.toml": lifecycle.source_sha256(PROJECT / "pyproject.toml")}
 
 
-def prepare(calibration_root: Path, package: Path):
+def prepare(calibration_root: Path, package: Path, check_feedback="counts-only"):
     package.mkdir(parents=True, exist_ok=False)
     selection = load_json(calibration_root / "selection.json")
     tasks = []
@@ -111,6 +111,7 @@ def prepare(calibration_root: Path, package: Path):
                       "base_commit": receipt["base_commit"], "image_digest": receipt["image"]["digest"],
                       "source_root": source_root, "network_mode": receipt["verifier_network"]})
     manifest = {"schema_version": 1, "model": MODEL, "limits": LIMITS, "tasks": tasks,
+                "check_feedback": check_feedback, "trace_policy": "private-request-sse-v1",
                 "calibration_root": str(calibration_root), "input_hashes": hashes,
                 "candidate_coverage": {"qualified": 2, "original_candidates": 3},
                 "billing": "unknown; no monetary ceiling asserted", "source_runtime": runtime_identity()}
@@ -119,7 +120,8 @@ def prepare(calibration_root: Path, package: Path):
     write_json(package / "authorization-proposal.json", {
         "authorized": False, "scope": "two-tasks-once-stop-on-first-failure",
         "manifest_sha256": sha256_file(package / "manifest.json"), "limits": LIMITS,
-        "model": MODEL, "cost_cny": None, "offline_admission": "pending", "review": "pending"})
+        "model": MODEL, "check_feedback": check_feedback, "cost_cny": None,
+        "offline_admission": "pending", "review": "pending"})
 
 
 def verify(package: Path):
@@ -127,6 +129,8 @@ def verify(package: Path):
     if sha256_file(package / "manifest.json") != load_json(package / "lock.json")["manifest_sha256"]:
         raise ValueError("manifest changed after freeze")
     if (manifest["model"] != MODEL or manifest["limits"] != LIMITS
+            or manifest.get("check_feedback") not in ("counts-only", "required-tests-v1")
+            or manifest.get("trace_policy") != "private-request-sse-v1"
             or [(t["key"], t["source_root"]) for t in manifest["tasks"]] != list(SOURCE_ROOTS.items())
             or manifest["source_runtime"] != runtime_identity()):
         raise ValueError("execution profile or source runtime changed after freeze")
@@ -290,6 +294,7 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
                        "required_passed": result.required_passed, "required_total": result.required_total,
                        "patch_empty": exported.empty, "grade_id": str(len(grades) + 1),
                        "cleanup": result.cleanup, "elapsed_s": time.monotonic() - check_started,
+                       "not_passed_tests": result.missing_required,
                        "snapshot": exported.source_manifest}
             grades.append(summary)
             write_json(private / f"grade-{len(grades)}.json", result.to_json())
@@ -299,7 +304,8 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
         broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential,
             admission=admission, audit=private / "broker.jsonl",
             model_url=MODEL["base_url"] + "/chat/completions",
-            model_headers={"User-Agent": "cicada/" + version("cicada"), "x-opencode-session": routing})
+            model_headers={"User-Agent": "cicada/" + version("cicada"), "x-opencode-session": routing},
+            check_feedback=manifest["check_feedback"], trace_dir=private / "model-trace")
         endpoint = broker.start()
         config = {"workspace": str(workspace), "child_root": str(child_root),
                   "endpoint": endpoint, "token": broker.token, "routing_session": routing,
@@ -426,6 +432,7 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--calibration-root", type=Path, required=True)
     prep.add_argument("--package", type=Path, required=True)
+    prep.add_argument("--check-feedback", choices=("counts-only", "required-tests-v1"), default="counts-only")
     launch = sub.add_parser("run")
     launch.add_argument("--package", type=Path, required=True)
     launch.add_argument("--run-root", type=Path, required=True)
@@ -459,7 +466,7 @@ def main():
         return 0
     try:
         if args.action == "prepare":
-            prepare(args.calibration_root.resolve(), args.package.resolve())
+            prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback)
             print(json.dumps({"status": "prepared", "model_requests": 0}))
         else:
             result = asyncio.run(run(args.package.resolve(), args.run_root.resolve(), live=args.live,

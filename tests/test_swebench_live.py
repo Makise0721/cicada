@@ -37,7 +37,7 @@ def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
             phase=PROCESS_1, request_classifier=classify_go)
         broker = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 10,
             credential="parent-only-key", model_url=MODEL["base_url"] + "/chat/completions",
-            model_headers={"x-opencode-session": "frozen-session"})
+            model_headers={"x-opencode-session": "frozen-session"}, trace_dir=tmp_path / "model-trace")
         body = json.dumps({"model": MODEL["model"], "stream": True,
             "stream_options": {"include_usage": True}, "max_tokens": MODEL["max_tokens"],
             "thinking": {"type": "disabled"}, "messages": []}).encode()
@@ -51,8 +51,69 @@ def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
             assert budget.calls[0]["state"] == "complete"
             assert seen == [(MODEL["base_url"] + "/chat/completions", "frozen-session", "Bearer parent-only-key")]
             assert json.loads((tmp_path / "calls.json").read_text())["cost_cny"] is None
+            assert json.loads((tmp_path / "model-trace/turn-0001.request.json").read_text())["model"] == MODEL["model"]
+            assert "fixture" in (tmp_path / "model-trace/turn-0001.response.sse").read_text()
+            assert all("parent-only-key" not in p.read_text() for p in (tmp_path / "model-trace").iterdir())
         finally:
             await broker.close()
+    asyncio.run(run())
+
+
+def test_check_feedback_is_opt_in_bounded_and_keeps_private_results_parent_side(tmp_path):
+    names = ["long-test-" + "x" * 600, *(f"test-{i}" for i in range(6))]
+    summary = {"result": "failed", "required_passed": 3, "required_total": 10,
+               "patch_empty": False, "grade_id": "2", "cleanup": "confirmed",
+               "not_passed_tests": names, "raw_logs": "PRIVATE_ASSERTION_AND_SOURCE",
+               "snapshot": {"private": "PRIVATE_SNAPSHOT"}}
+
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(lambda r: lifecycle._sse([])))
+        baseline = Broker(gate=gate, check=lambda: (1, summary), deadline=time.monotonic() + 10)
+        candidate = Broker(gate=gate, check=lambda: (1, summary), deadline=time.monotonic() + 10,
+                           check_feedback="required-tests-v1")
+        try:
+            _, _, old_bytes = await baseline.dispatch("/check", b"")
+            assert set(json.loads(old_bytes)["summary"]) == {
+                "result", "required_passed", "required_total", "patch_empty", "grade_id", "cleanup"}
+            _, _, new_bytes = await candidate.dispatch("/check", b"")
+            visible = json.loads(new_bytes)["summary"]
+            assert visible["not_passed_tests"] == [name[:512] for name in names[:5]]
+            assert visible["not_passed_tests_total"] == 7
+            assert visible["not_passed_tests_truncated"] is True
+            assert b"PRIVATE_" not in new_bytes
+            assert candidate.checks[0]["not_passed_tests"] == names
+        finally:
+            await baseline.close()
+            await candidate.close()
+            gate.budget.release()
+    asyncio.run(run())
+
+
+def test_response_trace_write_failure_closes_response_and_seals_pending_call(tmp_path, monkeypatch):
+    original = Path.write_bytes
+
+    def write(path, data):
+        if path.suffix == ".sse":
+            raise OSError("trace disk failure")
+        return original(path, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write)
+
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(
+            lambda r: lifecycle._sse([lifecycle._text_frame(0, "fixture")])))
+        broker = Broker(gate=gate, check=lambda: None, deadline=time.monotonic() + 10,
+                        trace_dir=tmp_path / "model-trace")
+        try:
+            with pytest.raises(OSError, match="trace disk failure"):
+                await broker.dispatch("/model", _body())
+            assert gate.handoffs == 1
+            assert next(iter(gate.observations.values())).closed
+            assert gate.budget.sealed_reason
+            assert gate.budget.totals()["pending_cent"] > 0
+        finally:
+            await broker.close()
+            gate.budget.release()
     asyncio.run(run())
 
 
