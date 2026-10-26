@@ -513,13 +513,16 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
             finally:
                 supervisor.stop_and_remove(label, container)
 
+        repo_script = (child_root / REPO_TESTS_SCRIPT).resolve() if repo_profile else None
         routing = uuid4().hex
         broker = Broker(gate=gate, check=check, deadline=deadline, credential=credential,
             admission=admission, audit=private / "broker.jsonl",
             model_url=MODEL["base_url"] + "/chat/completions",
             model_headers={"User-Agent": "cicada/" + version("cicada"), "x-opencode-session": routing},
             check_feedback=manifest["check_feedback"], trace_dir=private / "model-trace",
-            repo_test=repo_test if repo_profile else None)
+            repo_test=repo_test if repo_profile else None,
+            repo_test_hint=(f"Existing repository tests can be run with: & '{repo_script}' "
+                            "<test path> [more paths]") if repo_script else None)
         endpoint = broker.start()
         if repo_profile:
             write_repo_tests_script(child_root, sys.executable, endpoint, broker.token)

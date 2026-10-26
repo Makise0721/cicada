@@ -197,12 +197,14 @@ def test_required_tests_v2_excerpt_is_bounded_and_keeps_raw_logs_private(tmp_pat
     async def run():
         gate = _gate(tmp_path, httpx.MockTransport(lambda r: lifecycle._sse([])))
         broker = Broker(gate=gate, check=lambda: (1, summary), deadline=time.monotonic() + 10,
-                        check_feedback="required-tests-v2")
+                        check_feedback="required-tests-v2",
+                        repo_test_hint="run existing tests with repo-tests.ps1")
         try:
             _, _, body = await broker.dispatch("/check", b"")
             visible = json.loads(body)["summary"]
             assert visible["failure_excerpt"] == [
                 {"test": "test/units/x.py::test_a", "reason": "A" * 400}]
+            assert visible["hint"] == "run existing tests with repo-tests.ps1"
             assert b"PRIVATE_" not in body
         finally:
             await broker.close()

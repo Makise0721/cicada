@@ -53,7 +53,7 @@ def archive_manifest(workspace: Path) -> dict:
             for path in sorted(root.rglob("*")) if path.is_file()}
 
 
-def _public_check(summary: dict, policy: str = "counts-only") -> dict:
+def _public_check(summary: dict, policy: str = "counts-only", hint: str | None = None) -> dict:
     visible = {key: summary.get(key) for key in (
         "result", "required_passed", "required_total", "patch_empty", "grade_id", "cleanup")}
     if policy in ("required-tests-v1", "required-tests-v2"):
@@ -66,6 +66,8 @@ def _public_check(summary: dict, policy: str = "counts-only") -> dict:
             {"test": str(item.get("test", ""))[:512], "reason": str(item.get("reason", ""))[:400]}
             for item in (summary.get("failure_excerpt") or [])[:3]
         ]
+        if hint:
+            visible["hint"] = hint
     return visible
 
 
@@ -78,9 +80,11 @@ class Broker:
 
     def __init__(self, *, gate, check, deadline, credential=None, admission=None, audit=None,
                  model_url="https://api.deepseek.com/chat/completions", model_headers=None,
-                 check_feedback="counts-only", trace_dir: Path | None = None, repo_test=None):
+                 check_feedback="counts-only", trace_dir: Path | None = None, repo_test=None,
+                 repo_test_hint: str | None = None):
         self.gate, self.check = gate, check
         self.repo_test = repo_test
+        self.repo_test_hint = repo_test_hint
         self.deadline, self.credential, self.admission = deadline, credential, admission
         self.model_url, self.model_headers = model_url, model_headers or {}
         self.check_feedback, self.trace_dir = check_feedback, trace_dir
@@ -199,7 +203,8 @@ class Broker:
                 self.record("check-ok", code=code)
                 if code == 2:
                     self.stop("evaluation-anomaly")
-                return 200, {}, json.dumps({"code": code, "summary": _public_check(summary, self.check_feedback)}).encode()
+                return 200, {}, json.dumps({"code": code, "summary": _public_check(
+                    summary, self.check_feedback, self.repo_test_hint)}).encode()
             except BaseException as exc:
                 self.record("check-failed", detail=type(exc).__name__ + ": " + str(exc)[:200])
                 self.stop("evaluation-error")
