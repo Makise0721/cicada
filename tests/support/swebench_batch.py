@@ -146,7 +146,8 @@ def prepare(calibration_root: Path, package: Path, check_feedback="counts-only",
     manifest = {"schema_version": 1, "model": MODEL, "limits": LIMITS, "tasks": tasks,
                 "check_feedback": check_feedback, "trace_policy": "private-request-sse-v1",
                 "calibration_root": str(calibration_root), "input_hashes": hashes,
-                "candidate_coverage": {"qualified": 2, "original_candidates": 3},
+                "candidate_coverage": selection.get("candidate_coverage",
+                    {"qualified": 2, "original_candidates": 3}),
                 "billing": "unknown; no monetary ceiling asserted", "source_runtime": runtime_identity()}
     if profile is not None:
         manifest["system_prompt"] = profile
@@ -287,14 +288,18 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
             gold = calibration / "private" / task["key"] / "solution/gold_patch.diff"
             names = subprocess.check_output(["git", "apply", "--numstat", str(gold)], encoding="utf-8").splitlines()
             paths = tuple(line.split("\t", 2)[2] for line in names)
-            if any(not p.startswith(task["source_root"]) or not p.endswith(".py") for p in paths):
-                raise ValueError("offline reference leaves business source scope")
-            fixed = lifecycle.learned_solution(workspace, task["base_commit"], gold, paths)
+            # Official gold may touch changelogs/docs/yml outside the agent protocol; the
+            # rehearsal must stay inside it (source_root .py only). If those extra files were
+            # required to pass, the fixture check below fails and admission is refused.
+            business = tuple(p for p in paths if p.startswith(task["source_root"]) and p.endswith(".py"))
+            if not business:
+                raise ValueError("offline reference has no in-scope python source files")
+            fixed = lifecycle.learned_solution(workspace, task["base_commit"], gold, business)
             edits = {name: {"tool": "write", "content": text} for name, text in fixed.items()}
             frames = [
-                lifecycle._call_frame(0, [("read", {"path": p}) for p in paths]
+                lifecycle._call_frame(0, [("read", {"path": p}) for p in business]
                     + [("check", {"action": "run", "check_id": "check-1"})], finish="tool_calls"),
-                lifecycle._call_frame(1, [("write", {"path": p, "content": edits[p]["content"]}) for p in paths]
+                lifecycle._call_frame(1, [("write", {"path": p, "content": edits[p]["content"]}) for p in business]
                     + [("check", {"action": "run", "check_id": "check-1"})], finish="tool_calls"),
                 lifecycle._text_frame(2, "offline rehearsal complete."),
             ]
@@ -393,10 +398,13 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
     return facts
 
 
-def seal_calibration(root):
+def seal_calibration(root, keys):
+    directories = [root / "private",
+                   *(root / "prepared" / k / "evidence" for k in keys)]
+    if (root / "history").is_dir():
+        directories.append(root / "history")
     records = []
-    for directory in [root / "private", root / "history",
-                      *(root / "prepared" / k / "evidence" for k in ("ansible", "openlibrary", "qutebrowser"))]:
+    for directory in directories:
         protection = isolation.seal_private(directory)
         problems = isolation.isolation_problems(directory, protection)
         records.append({"directory": str(directory), "problems": problems})
@@ -404,7 +412,7 @@ def seal_calibration(root):
             raise ValueError("calibration materials are reachable by low process")
     # These summaries embed verifier logs; stamp their actual files as well.
     summaries = [root / "offline-preflight.json", *(root / "prepared" / k / "prepare-receipt.json"
-                 for k in ("ansible", "openlibrary", "qutebrowser"))]
+                 for k in keys)]
     for path in summaries:
         isolation._icacls(str(path), "/grant", f"*{isolation.PROTECTED_PACKAGE_SID}:(R)")
         if isolation.low_child_exit_code(f'type "{path}" >nul 2>&1', root) == 0:
@@ -429,7 +437,7 @@ async def run(package, run_root, *, live=False, authorization=None, admission=No
     controller.mkdir()
     write_json(controller / "controller.json", {"pid": os.getpid(), "live": live})
     isolation.seal_private(controller)
-    protection = seal_calibration(Path(manifest["calibration_root"]))
+    protection = seal_calibration(Path(manifest["calibration_root"]), [t["key"] for t in manifest["tasks"]])
     deadline = time.monotonic() + LIMITS["seconds_batch"]
     result = {"status": "running", "live": live, "manifest_sha256": sha256_file(package / "manifest.json"),
               "model_requests": 0, "tasks": [], "candidate_coverage": manifest["candidate_coverage"],
