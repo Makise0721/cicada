@@ -157,13 +157,19 @@ def compose_batch_prompt(workspace, command, profile=None):
     return prompt, info
 
 
-def prepare(calibration_root: Path, package: Path, check_feedback="counts-only", prompt_template=None):
+def prepare(calibration_root: Path, package: Path, check_feedback="counts-only", prompt_template=None,
+            only_task=None):
     profile = None if prompt_template is None else prompt_profile(prompt_template.read_text(encoding="utf-8"))
     package.mkdir(parents=True, exist_ok=False)
     selection = load_json(calibration_root / "selection.json")
     tasks = []
     hashes = {}
-    for key, source_root in SOURCE_ROOTS.items():
+    package_roots = dict(SOURCE_ROOTS)
+    if only_task is not None:
+        if only_task not in SOURCE_ROOTS:
+            raise ValueError(f"unknown task key: {only_task}")
+        package_roots = {only_task: SOURCE_ROOTS[only_task]}
+    for key, source_root in package_roots.items():
         selected = next(t for t in selection["tasks"] if t["key"] == key)
         receipt = load_json(calibration_root / selected["prepare_receipt"])
         if receipt["status"] != "offline-qualified":
@@ -198,10 +204,13 @@ def verify(package: Path):
     manifest = load_json(package / "manifest.json")
     if sha256_file(package / "manifest.json") != load_json(package / "lock.json")["manifest_sha256"]:
         raise ValueError("manifest changed after freeze")
+    task_pairs = [(t["key"], t["source_root"]) for t in manifest["tasks"]]
     if (manifest["model"] != MODEL or manifest["limits"] != LIMITS
             or manifest.get("check_feedback") not in ("counts-only", "required-tests-v1")
             or manifest.get("trace_policy") != "private-request-sse-v1"
-            or [(t["key"], t["source_root"]) for t in manifest["tasks"]] != list(SOURCE_ROOTS.items())
+            # 包可以是两题全量, 也可以是单题尝试包; 必须是有序无重复的子集。
+            or not task_pairs or len(set(task_pairs)) != len(task_pairs)
+            or task_pairs != [item for item in SOURCE_ROOTS.items() if item in task_pairs]
             or manifest["source_runtime"] != runtime_identity()):
         raise ValueError("execution profile or source runtime changed after freeze")
     if "system_prompt" in manifest:
@@ -532,6 +541,8 @@ def main():
     prep.add_argument("--calibration-root", type=Path, required=True)
     prep.add_argument("--package", type=Path, required=True)
     prep.add_argument("--check-feedback", choices=("counts-only", "required-tests-v1"), default="counts-only")
+    prep.add_argument("--only-task", choices=tuple(SOURCE_ROOTS),
+                      help="Freeze a single-task attempt package instead of both tasks")
     prep.add_argument("--prompt-template", type=Path,
                       help="Freeze an experimental replacement for the built-in base prompt")
     launch = sub.add_parser("run")
@@ -567,7 +578,8 @@ def main():
         return 0
     try:
         if args.action == "prepare":
-            prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback, args.prompt_template)
+            prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback,
+                    args.prompt_template, only_task=args.only_task)
             print(json.dumps({"status": "prepared", "model_requests": 0}))
         else:
             result = asyncio.run(run(args.package.resolve(), args.run_root.resolve(), live=args.live,
