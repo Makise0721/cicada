@@ -56,11 +56,16 @@ def archive_manifest(workspace: Path) -> dict:
 def _public_check(summary: dict, policy: str = "counts-only") -> dict:
     visible = {key: summary.get(key) for key in (
         "result", "required_passed", "required_total", "patch_empty", "grade_id", "cleanup")}
-    if policy == "required-tests-v1":
+    if policy in ("required-tests-v1", "required-tests-v2"):
         names = summary["not_passed_tests"]
         visible.update(not_passed_tests=[name[:512] for name in names[:5]],
                        not_passed_tests_total=len(names),
                        not_passed_tests_truncated=len(names) > 5 or any(len(name) > 512 for name in names[:5]))
+    if policy == "required-tests-v2":
+        visible["failure_excerpt"] = [
+            {"test": str(item.get("test", ""))[:512], "reason": str(item.get("reason", ""))[:400]}
+            for item in (summary.get("failure_excerpt") or [])[:3]
+        ]
     return visible
 
 

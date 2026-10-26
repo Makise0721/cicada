@@ -38,6 +38,19 @@ SOURCE_ROOTS = {"ansible": "lib/ansible/", "qutebrowser": "qutebrowser/"}
 # (SSE 解析器对 tool arguments 有 64 KiB 上限, 真实模型同样流不出超限 write)。
 WRITE_TO_ARGUMENT_LIMIT_BYTES = 48 * 1024
 
+# agent 侧只读测试旁路: 脚本生成在 child_root (workspace 之外), 不进补丁导出。
+REPO_TESTS_POLICY = "container-v1"
+REPO_TESTS_SCRIPT = "repo-tests.ps1"
+REPO_TESTS_TEMPLATE = Path(__file__).with_name("repo_tests.ps1")
+
+
+def write_repo_tests_script(child_root: Path, image: str) -> Path:
+    """把固定模板实例化为 agent 可调用的 PowerShell 脚本。"""
+    script = child_root / REPO_TESTS_SCRIPT
+    script.write_text(REPO_TESTS_TEMPLATE.read_text(encoding="utf-8").replace("__IMAGE__", image),
+                      encoding="utf-8")
+    return script
+
 
 def large_file_edit_pairs(base_text: str, new_text: str) -> list[dict]:
     """行级 diff 出 edit 工具替换对; old_text 带上下文扩展到原文唯一。"""
@@ -141,7 +154,7 @@ def prompt_profile(template: str) -> dict:
     return {"template": template, "sha256": digest}
 
 
-def compose_batch_prompt(workspace, command, profile=None):
+def compose_batch_prompt(workspace, command, profile=None, repo_tests=None):
     from cicada.prompting import CheckPrompt, DEFAULT_TOOLS, build_builtin_prompt, compose_system_prompt
 
     tools = DEFAULT_TOOLS + ("check",)
@@ -154,11 +167,22 @@ def compose_batch_prompt(workspace, command, profile=None):
         prompt = candidate + prompt[len(base):]
         info = replace(info, version="experimental:template:" + profile["sha256"],
             prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+    if repo_tests == REPO_TESTS_POLICY:
+        script = (workspace.parent / REPO_TESTS_SCRIPT).resolve()
+        prompt += (
+            "\nLocal repository tests (allowed, not a check):\n"
+            f'- Run existing tests with the powershell tool: & "{script}" <test path> [more paths]\n'
+            "- It runs the task image with this workspace mounted at /app; only tests already in "
+            "the repository are visible, hidden grading tests are not.\n"
+            "- A test that passed before your change and fails here is a regression you introduced.\n"
+        )
+        info = replace(info, version=info.version + "+repo-tests-v1",
+            prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest())
     return prompt, info
 
 
 def prepare(calibration_root: Path, package: Path, check_feedback="counts-only", prompt_template=None,
-            only_task=None):
+            only_task=None, repo_tests=None):
     profile = None if prompt_template is None else prompt_profile(prompt_template.read_text(encoding="utf-8"))
     package.mkdir(parents=True, exist_ok=False)
     selection = load_json(calibration_root / "selection.json")
@@ -183,8 +207,11 @@ def prepare(calibration_root: Path, package: Path, check_feedback="counts-only",
                       "base_commit": receipt["base_commit"], "image_digest": receipt["image"]["digest"],
                       "source_root": source_root, "network_mode": receipt["verifier_network"],
                       "allowed_extra_paths": selected.get("allowed_extra_paths", [])})
+    if repo_tests is not None:
+        hashes[str(REPO_TESTS_TEMPLATE)] = sha256_file(REPO_TESTS_TEMPLATE)
     manifest = {"schema_version": 1, "model": MODEL, "limits": LIMITS, "tasks": tasks,
                 "check_feedback": check_feedback, "trace_policy": "private-request-sse-v1",
+                "repo_tests": repo_tests,
                 "calibration_root": str(calibration_root), "input_hashes": hashes,
                 "candidate_coverage": selection.get("candidate_coverage",
                     {"qualified": 2, "original_candidates": 3}),
@@ -206,7 +233,8 @@ def verify(package: Path):
         raise ValueError("manifest changed after freeze")
     task_pairs = [(t["key"], t["source_root"]) for t in manifest["tasks"]]
     if (manifest["model"] != MODEL or manifest["limits"] != LIMITS
-            or manifest.get("check_feedback") not in ("counts-only", "required-tests-v1")
+            or manifest.get("check_feedback") not in ("counts-only", "required-tests-v1", "required-tests-v2")
+            or manifest.get("repo_tests") not in (None, REPO_TESTS_POLICY)
             or manifest.get("trace_policy") != "private-request-sse-v1"
             # 包可以是两题全量, 也可以是单题尝试包; 必须是有序无重复的子集。
             or not task_pairs or len(set(task_pairs)) != len(task_pairs)
@@ -259,7 +287,8 @@ async def child(config_path):
             session_id_provider=lambda: config["routing_session"]))
 
     command = config["check_command"]
-    prompt, info = compose_batch_prompt(workspace, command, config.get("system_prompt"))
+    prompt, info = compose_batch_prompt(workspace, command, config.get("system_prompt"),
+                                        config.get("repo_tests"))
     plan = VerificationPlan(generate_verification_run_id(), workspace,
         (CheckDefinition("check-1", command, LIMITS["check_seconds"]),))
     session = await open_application(ApplicationConfig(workspace, prompt, info,
@@ -272,11 +301,15 @@ async def child(config_path):
     diagnostics = {"watch": {}, "streams": []}
     extra = config.get("allowed_extra_paths") or ()
     extra_note = f"此外还可修改这些配置数据文件：{'、'.join(extra)}。" if extra else ""
+    if config.get("repo_tests") == REPO_TESTS_POLICY:
+        host_note = ("宿主为 Windows/PowerShell，不在宿主运行或导入工作区代码；"
+                     "需要运行仓库既有测试时用 repo-tests.ps1（固定 Linux 容器，用法见系统提示）；")
+    else:
+        host_note = "宿主为 Windows/PowerShell，不在宿主运行或导入工作区代码；"
     text = config["instruction"] + (
         f"\n/app 是当前 Windows 工作区。自行读取并定位，只修改 {config['source_root']} 下的 Python 源码，"
         "允许新增 Python 文件；不得修改测试、依赖或项目指令。禁止联网、查找参考答案、提交。" + extra_note +
-        "宿主为 Windows/PowerShell，不在宿主运行或导入工作区代码；"
-        "先用 check-1 观察初始失败，修改后再次 check-1，检查在固定 Linux 容器执行。")
+        host_note + "先用 check-1 观察初始失败，修改后再次 check-1，检查在固定 Linux 容器执行。")
     facts = {}
     try:
         with patch.object(GoModel, "stream", lifecycle.observe_model_stream(GoModel.stream, remote, diagnostics)):
@@ -327,6 +360,8 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
         workspace = child_root / "workspace"
         preview.build_workspace(calibration / "prepared" / task["key"] / "workspace" / ".git",
                                 task["base_commit"], workspace, [], local_clone=True)
+        if manifest.get("repo_tests") == REPO_TESTS_POLICY:
+            write_repo_tests_script(child_root, task["image_digest"])
         for path in [child_root, workspace, *(child_root / p for p in ("temp", "cache", "uv-cache", "appdata", "localappdata"))]:
             isolation.allow_low_write(path)
         problems = isolation.isolation_problems(private, protection)
@@ -397,6 +432,7 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
                        "patch_empty": exported.empty, "grade_id": str(len(grades) + 1),
                        "cleanup": result.cleanup, "elapsed_s": time.monotonic() - check_started,
                        "not_passed_tests": result.missing_required,
+                       "failure_excerpt": result.failure_excerpt,
                        "snapshot": exported.source_manifest}
             grades.append(summary)
             write_json(private / f"grade-{len(grades)}.json", result.to_json())
@@ -415,7 +451,8 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
                   "source_root": task["source_root"],
                   "allowed_extra_paths": task.get("allowed_extra_paths", []),
                   "instruction": (calibration / "public" / task["key"] / "instruction.md").read_text(encoding="utf-8"),
-                  "check_command": f"& '{sys.executable}' -m tests.support.swebench_batch check --endpoint '{endpoint}' --token '{broker.token}'"}
+                  "check_command": f"& '{sys.executable}' -m tests.support.swebench_batch check --endpoint '{endpoint}' --token '{broker.token}'",
+                  "repo_tests": manifest.get("repo_tests")}
         if "system_prompt" in manifest:
             config["system_prompt"] = manifest["system_prompt"]
     except (Exception, asyncio.CancelledError) as exc:
@@ -540,9 +577,11 @@ def main():
     prep = sub.add_parser("prepare")
     prep.add_argument("--calibration-root", type=Path, required=True)
     prep.add_argument("--package", type=Path, required=True)
-    prep.add_argument("--check-feedback", choices=("counts-only", "required-tests-v1"), default="counts-only")
+    prep.add_argument("--check-feedback", choices=("counts-only", "required-tests-v1", "required-tests-v2"), default="counts-only")
     prep.add_argument("--only-task", choices=tuple(SOURCE_ROOTS),
                       help="Freeze a single-task attempt package instead of both tasks")
+    prep.add_argument("--repo-tests", choices=(REPO_TESTS_POLICY,),
+                      help="Expose a containerized runner for the repository's existing tests")
     prep.add_argument("--prompt-template", type=Path,
                       help="Freeze an experimental replacement for the built-in base prompt")
     launch = sub.add_parser("run")
@@ -579,7 +618,7 @@ def main():
     try:
         if args.action == "prepare":
             prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback,
-                    args.prompt_template, only_task=args.only_task)
+                    args.prompt_template, only_task=args.only_task, repo_tests=args.repo_tests)
             print(json.dumps({"status": "prepared", "model_requests": 0}))
         else:
             result = asyncio.run(run(args.package.resolve(), args.run_root.resolve(), live=args.live,

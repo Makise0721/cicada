@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -303,6 +304,7 @@ class EvaluationResult:
     cleanup: str
     wall_time_s: float
     artifacts: dict[str, str] = field(default_factory=dict)
+    failure_excerpt: list[dict] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -323,6 +325,7 @@ class EvaluationResult:
             "cleanup": self.cleanup,
             "wall_time_s": round(self.wall_time_s, 3),
             "artifacts": self.artifacts,
+            "failure_excerpt": self.failure_excerpt,
         }
 
 
@@ -394,6 +397,36 @@ def grade_from_artifacts(
         and not missing
     )
     return result
+
+
+# 失败证据只回"哪条测试 + 断言首行": 完整 stdout 里有测试源码与模型补丁上下文,
+# 不得进入模型可见摘要 (见 _public_check 白名单)。
+EXCERPT_MAX_TESTS = 3
+EXCERPT_MAX_CHARS = 400
+_FAILED_LINE = re.compile(r"^\s*FAILED\s+(\S+::\S+)\s+-\s+(.*)$", re.MULTILINE)
+
+
+def extract_failure_excerpt(stdout_text: str, missing: list[str],
+                            max_tests: int = EXCERPT_MAX_TESTS,
+                            max_chars: int = EXCERPT_MAX_CHARS) -> list[dict]:
+    """从官方 verifier 的 run-script stdout 取失败测试的最小断言证据。
+
+    官方 run_script.sh 对 selected_test_files 用 ``pytest -v``, 因此 short summary
+    里有 ``FAILED <nodeid> - <ExceptionType>: <message>`` 行。只取 missing 里的条目,
+    每条约一行、截断, 不含 traceback 正文、源码或路径上下文。
+    """
+    wanted = set(missing)
+    seen: set[str] = set()
+    excerpt: list[dict] = []
+    for match in _FAILED_LINE.finditer(stdout_text or ""):
+        name, message = match.group(1), " ".join(match.group(2).split())
+        if name not in wanted or name in seen:
+            continue
+        seen.add(name)
+        excerpt.append({"test": name, "reason": message[:max_chars]})
+        if len(excerpt) >= max_tests:
+            break
+    return excerpt
 
 
 class ContainerEvaluator:
@@ -489,6 +522,8 @@ class ContainerEvaluator:
             grade["artifacts_complete"] = all(name in result.artifacts for name in VERIFIER_ARTIFACTS)
             grade["grader_pass"] = grade["grader_pass"] and grade["artifacts_complete"]
             result.output_json = grade
+            result.failure_excerpt = extract_failure_excerpt(
+                result.artifacts.get("run-script-stdout.txt", ""), result.missing_required)
         finally:
             self.docker.deadline = None
             result.cleanup = self.supervisor.stop_and_remove(spec.owner_label, cid)

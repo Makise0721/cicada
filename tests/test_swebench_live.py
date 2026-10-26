@@ -81,6 +81,33 @@ def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
     asyncio.run(run())
 
 
+def test_repo_tests_section_and_script_stay_outside_workspace(tmp_path):
+    from tests.support.swebench_batch import (
+        REPO_TESTS_POLICY,
+        REPO_TESTS_SCRIPT,
+        compose_batch_prompt,
+        write_repo_tests_script,
+    )
+
+    child_root = tmp_path / "child"
+    workspace = child_root / "workspace"
+    workspace.mkdir(parents=True)
+    plain, _ = compose_batch_prompt(workspace, "frozen-check-command")
+    prompt, info = compose_batch_prompt(
+        workspace, "frozen-check-command", repo_tests=REPO_TESTS_POLICY)
+    assert "Local repository tests" not in plain
+    assert "Local repository tests" in prompt
+    assert str((child_root / REPO_TESTS_SCRIPT).resolve()) in prompt
+    assert info.version.endswith("+repo-tests-v1")
+
+    script = write_repo_tests_script(child_root, "img@sha256:deadbeef")
+    text = script.read_text(encoding="utf-8")
+    assert "img@sha256:deadbeef" in text
+    assert "docker run --rm --network none" in text
+    assert "__IMAGE__" not in text
+    assert not (workspace / REPO_TESTS_SCRIPT).exists()
+
+
 def test_check_feedback_is_opt_in_bounded_and_keeps_private_results_parent_side(tmp_path):
     names = ["long-test-" + "x" * 600, *(f"test-{i}" for i in range(6))]
     summary = {"result": "failed", "required_passed": 3, "required_total": 10,
@@ -107,6 +134,47 @@ def test_check_feedback_is_opt_in_bounded_and_keeps_private_results_parent_side(
         finally:
             await baseline.close()
             await candidate.close()
+            gate.budget.release()
+    asyncio.run(run())
+
+
+def test_failure_excerpt_keeps_only_missing_assertion_lines():
+    from tests.support import swebench_bridge as bridge
+
+    stdout = (
+        "test/units/x.py::test_a PASSED\n"
+        "FAILED test/units/x.py::test_a - AssertionError: assert b'AAA' == b'BBB'\n"
+        "FAILED test/units/x.py::test_b - ValueError: unsupported\n"
+        "FAILED test/units/x.py::test_c - AssertionError: not required\n"
+    )
+    excerpt = bridge.extract_failure_excerpt(
+        stdout, ["test/units/x.py::test_a", "test/units/x.py::test_b"])
+    assert excerpt == [
+        {"test": "test/units/x.py::test_a", "reason": "AssertionError: assert b'AAA' == b'BBB'"},
+        {"test": "test/units/x.py::test_b", "reason": "ValueError: unsupported"},
+    ]
+
+
+def test_required_tests_v2_excerpt_is_bounded_and_keeps_raw_logs_private(tmp_path):
+    names = ["test/units/x.py::test_a"]
+    summary = {"result": "failed", "required_passed": 8, "required_total": 9,
+               "patch_empty": False, "grade_id": "2", "cleanup": "confirmed",
+               "not_passed_tests": names,
+               "failure_excerpt": [{"test": "test/units/x.py::test_a", "reason": "A" * 900}],
+               "raw_logs": "PRIVATE_ASSERTION_AND_SOURCE"}
+
+    async def run():
+        gate = _gate(tmp_path, httpx.MockTransport(lambda r: lifecycle._sse([])))
+        broker = Broker(gate=gate, check=lambda: (1, summary), deadline=time.monotonic() + 10,
+                        check_feedback="required-tests-v2")
+        try:
+            _, _, body = await broker.dispatch("/check", b"")
+            visible = json.loads(body)["summary"]
+            assert visible["failure_excerpt"] == [
+                {"test": "test/units/x.py::test_a", "reason": "A" * 400}]
+            assert b"PRIVATE_" not in body
+        finally:
+            await broker.close()
             gate.budget.release()
     asyncio.run(run())
 
