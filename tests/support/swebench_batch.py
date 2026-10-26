@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import hashlib
 from importlib.metadata import version
 import json
 import os
 from pathlib import Path
 import subprocess
+from string import Formatter
 import sys
 import time
 from unittest.mock import patch
@@ -92,7 +94,38 @@ def runtime_identity():
             "pyproject.toml": lifecycle.source_sha256(PROJECT / "pyproject.toml")}
 
 
-def prepare(calibration_root: Path, package: Path, check_feedback="counts-only"):
+def prompt_profile(template: str) -> dict:
+    parsed = list(Formatter().parse(template))
+    fields = [field for _, field, _, _ in parsed
+              if field is not None]
+    if (sorted(fields) != ["tool_lines", "workspace"]
+            or len(template.encode("utf-8")) > 16 * 1024):
+        raise ValueError("prompt template requires workspace and tool_lines exactly once (16 KiB max)")
+    for _, field, spec, conversion in parsed:
+        if field is not None and (spec or conversion):
+            raise ValueError("prompt template fields cannot have format specs or conversions")
+    digest = hashlib.sha256(template.encode("utf-8")).hexdigest()
+    return {"template": template, "sha256": digest}
+
+
+def compose_batch_prompt(workspace, command, profile=None):
+    from cicada.prompting import CheckPrompt, DEFAULT_TOOLS, build_builtin_prompt, compose_system_prompt
+
+    tools = DEFAULT_TOOLS + ("check",)
+    prompt, info = compose_system_prompt(workspace, None, tools=tools,
+        checks=(CheckPrompt("check-1", command, LIMITS["check_seconds"]),))
+    if profile is not None:
+        base = build_builtin_prompt(workspace, tools)
+        candidate = profile["template"].format(workspace=workspace.resolve(),
+            tool_lines="\n".join(f"- {name}" for name in tools)).rstrip() + "\n"
+        prompt = candidate + prompt[len(base):]
+        info = replace(info, version="experimental:template:" + profile["sha256"],
+            prompt_sha256=hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+    return prompt, info
+
+
+def prepare(calibration_root: Path, package: Path, check_feedback="counts-only", prompt_template=None):
+    profile = None if prompt_template is None else prompt_profile(prompt_template.read_text(encoding="utf-8"))
     package.mkdir(parents=True, exist_ok=False)
     selection = load_json(calibration_root / "selection.json")
     tasks = []
@@ -115,6 +148,8 @@ def prepare(calibration_root: Path, package: Path, check_feedback="counts-only")
                 "calibration_root": str(calibration_root), "input_hashes": hashes,
                 "candidate_coverage": {"qualified": 2, "original_candidates": 3},
                 "billing": "unknown; no monetary ceiling asserted", "source_runtime": runtime_identity()}
+    if profile is not None:
+        manifest["system_prompt"] = profile
     write_json(package / "manifest.json", manifest)
     write_json(package / "lock.json", {"manifest_sha256": sha256_file(package / "manifest.json")})
     write_json(package / "authorization-proposal.json", {
@@ -134,6 +169,10 @@ def verify(package: Path):
             or [(t["key"], t["source_root"]) for t in manifest["tasks"]] != list(SOURCE_ROOTS.items())
             or manifest["source_runtime"] != runtime_identity()):
         raise ValueError("execution profile or source runtime changed after freeze")
+    if "system_prompt" in manifest:
+        profile = manifest["system_prompt"]
+        if prompt_profile(profile["template"]) != profile:
+            raise ValueError("frozen prompt template identity mismatch")
     for name, digest in manifest["input_hashes"].items():
         if sha256_file(Path(name)) != digest:
             raise ValueError("frozen task input changed")
@@ -162,7 +201,6 @@ async def child(config_path):
     from cicada.plugins.coding.verification import generate_verification_run_id
     from cicada.plugins.coding.verification_contracts import CheckDefinition, VerificationPlan
     from cicada.plugins.openai_chat.opencode_go import GoConfig, GoModel
-    from cicada.prompting import CheckPrompt, DEFAULT_TOOLS, compose_system_prompt
     from cicada.runtime.plugin import PluginDefinition
 
     config = load_json(config_path)
@@ -177,8 +215,7 @@ async def child(config_path):
             session_id_provider=lambda: config["routing_session"]))
 
     command = config["check_command"]
-    prompt, info = compose_system_prompt(workspace, None, tools=DEFAULT_TOOLS + ("check",),
-        checks=(CheckPrompt("check-1", command, LIMITS["check_seconds"]),))
+    prompt, info = compose_batch_prompt(workspace, command, config.get("system_prompt"))
     plan = VerificationPlan(generate_verification_run_id(), workspace,
         (CheckDefinition("check-1", command, LIMITS["check_seconds"]),))
     session = await open_application(ApplicationConfig(workspace, prompt, info,
@@ -208,7 +245,7 @@ async def child(config_path):
                      delivery=None if outcome.decision is None else asdict(outcome.decision),
                      completed_events=log.completed, diagnostics=diagnostics,
                      model_elapsed_s=sum(c.elapsed_s for c in outcome.result.model_calls),
-                     prompt_sha256=info.prompt_sha256)
+                     prompt_sha256=info.prompt_sha256, prompt_version=info.version)
     finally:
         await lifecycle.close_process(session, log, facts)
         write_json(root / "process-1-facts.json", facts)
@@ -313,6 +350,8 @@ async def run_task(manifest, task, root, *, offline, credential, admission, max_
                   "source_root": task["source_root"],
                   "instruction": (calibration / "public" / task["key"] / "instruction.md").read_text(encoding="utf-8"),
                   "check_command": f"& '{sys.executable}' -m tests.support.swebench_batch check --endpoint '{endpoint}' --token '{broker.token}'"}
+        if "system_prompt" in manifest:
+            config["system_prompt"] = manifest["system_prompt"]
     except (Exception, asyncio.CancelledError) as exc:
         # 准备段 (封印/克隆/参考解/评分装配) 失败也必须留任务级失败档案; 运行段由下方 finally 落盘。
         facts.update(failure_type=type(exc).__name__, elapsed_s=time.monotonic() - attempt_started)
@@ -433,6 +472,8 @@ def main():
     prep.add_argument("--calibration-root", type=Path, required=True)
     prep.add_argument("--package", type=Path, required=True)
     prep.add_argument("--check-feedback", choices=("counts-only", "required-tests-v1"), default="counts-only")
+    prep.add_argument("--prompt-template", type=Path,
+                      help="Freeze an experimental replacement for the built-in base prompt")
     launch = sub.add_parser("run")
     launch.add_argument("--package", type=Path, required=True)
     launch.add_argument("--run-root", type=Path, required=True)
@@ -466,7 +507,7 @@ def main():
         return 0
     try:
         if args.action == "prepare":
-            prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback)
+            prepare(args.calibration_root.resolve(), args.package.resolve(), args.check_feedback, args.prompt_template)
             print(json.dumps({"status": "prepared", "model_requests": 0}))
         else:
             result = asyncio.run(run(args.package.resolve(), args.run_root.resolve(), live=args.live,

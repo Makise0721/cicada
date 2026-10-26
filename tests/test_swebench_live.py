@@ -1,5 +1,6 @@
 """live 父子进程边界的关键回归; inner 全部为 MockTransport。"""
 import asyncio
+import hashlib
 import json
 import time
 import threading
@@ -19,6 +20,27 @@ from tests.support.swebench_live import (
     check_gate,
     watch_parent,
 )
+
+
+def test_experimental_prompt_replaces_only_base_and_updates_identity(tmp_path):
+    from cicada.prompting import DEFAULT_TOOLS, build_builtin_prompt
+    from tests.support.swebench_batch import compose_batch_prompt, prompt_profile
+
+    baseline, base_info = compose_batch_prompt(tmp_path, "frozen-check-command")
+    template = "Candidate for {workspace}\n{tool_lines}\nTest explanations before stopping.\n"
+    profile = prompt_profile(template)
+    candidate, info = compose_batch_prompt(tmp_path, "frozen-check-command", profile)
+    suffix = baseline[len(build_builtin_prompt(tmp_path, DEFAULT_TOOLS + ("check",))):]
+    assert candidate.endswith(suffix)
+    assert "frozen-check-command" in suffix and "How checks work:" in suffix
+    assert candidate.startswith("Candidate for ") and "How to work:" not in candidate
+    assert info.version != base_info.version
+    assert info.prompt_sha256 == hashlib.sha256(candidate.encode()).hexdigest()
+    assert profile["sha256"] == hashlib.sha256(template.encode()).hexdigest()
+    for invalid in ("{workspace}", "{workspace}{tool_lines}{other}",
+                    "{workspace!r}{tool_lines}", "{workspace}{tool_lines:>20}"):
+        with pytest.raises(ValueError):
+            prompt_profile(invalid)
 
 
 def test_go_broker_uses_frozen_route_and_stops_at_physical_send_limit(tmp_path):
