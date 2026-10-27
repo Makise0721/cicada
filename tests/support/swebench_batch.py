@@ -33,7 +33,8 @@ MODEL = {"provider": "opencode-go", "model_key": "deepseek-v4.1-flash",
          "reasoning_effort": "high"}
 LIMITS = {"calls_per_task": 24, "calls_batch": 48, "seconds_per_task": 1200,
           "seconds_batch": 2400, "grader_seconds": 240, "check_seconds": 300}
-SOURCE_ROOTS = {"ansible": "lib/ansible/", "qutebrowser": "qutebrowser/"}
+SOURCE_ROOTS = {"ansible": "lib/ansible/", "qutebrowser": "qutebrowser/",
+                "ansible2": "lib/ansible/"}
 # 单次 write 的整文件内容超过该字节数时, 离线 fixture 改用 edit 精确替换对
 # (SSE 解析器对 tool arguments 有 64 KiB 上限, 真实模型同样流不出超限 write)。
 WRITE_TO_ARGUMENT_LIMIT_BYTES = 48 * 1024
@@ -42,6 +43,9 @@ WRITE_TO_ARGUMENT_LIMIT_BYTES = 48 * 1024
 REPO_TESTS_POLICY = "broker-v1"
 REPO_TESTS_SCRIPT = "repo-tests.ps1"
 REPO_TESTS_TEMPLATE = Path(__file__).with_name("repo_tests.ps1")
+# 授权 scope 是一次运行停止策略的声明; 门禁按白名单比对, 新增策略须显式登记。
+ALLOWED_SCOPES = ("two-tasks-once-stop-on-first-failure",
+                  "three-tasks-three-repeats-single-task-packages")
 REPO_TEST_MAX_CALLS = 20
 REPO_TEST_TIMEOUT_S = 120
 REPO_TEST_OUTPUT_CHARS = 8000
@@ -51,6 +55,9 @@ REPO_TEST_COMMANDS = {
                 "-v --tb=line -p no:cacheprovider"),
     "qutebrowser": ("QT_QPA_PLATFORM=offscreen dbus-run-session -- python -m pytest {paths} "
                     "-v --tb=line -p no:cacheprovider --disable-warnings --benchmark-disable"),
+    # ansible2 与 ansible 同仓同镜像, 仅实例不同; 选测命令形状一致。
+    "ansible2": ("PYTHONPATH=/app/lib:/app/test/lib python -m pytest {paths} "
+                 "-v --tb=line -p no:cacheprovider"),
 }
 
 
@@ -293,7 +300,7 @@ def live_admission(package, run_root, authorization, admission, review):
                "run_root": str(run_root), "admission_sha256": sha256_file(admission),
                "review_sha256": sha256_file(review)}
     if (auth.get("authorized") is not True or auth.get("binding") != binding
-            or auth.get("scope") != "two-tasks-once-stop-on-first-failure"
+            or auth.get("scope") not in ALLOWED_SCOPES
             or offline.get("status") != "offline-passed" or offline.get("manifest_sha256") != binding["manifest_sha256"]
             or reviewed.get("status") != "passed" or reviewed.get("manifest_sha256") != binding["manifest_sha256"]):
         raise ValueError("authorization or offline evidence does not bind this execution")
