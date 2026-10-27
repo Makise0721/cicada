@@ -621,11 +621,23 @@ async def test_timeout_cannot_be_extended_by_a_hanging_taskkill(tmp_path, monkey
         attempted.append(pid)
         await asyncio.Event().wait()
 
+    original_create = process_module.asyncio.create_subprocess_exec
+    spawn_finished_at: float | None = None
+
+    async def timed_create(*args, **kwargs):
+        nonlocal spawn_finished_at
+        proc = await original_create(*args, **kwargs)
+        # run() 的命令截止点在进程创建之后建立, 不把 Windows 冷启动计入预算。
+        if spawn_finished_at is None:
+            spawn_finished_at = time.monotonic()
+        return proc
+
+    monkeypatch.setattr(process_module.asyncio, "create_subprocess_exec", timed_create)
     monkeypatch.setattr(runner, "_kill_tree", hanging_kill)
-    started = time.monotonic()
     try:
         result = await run_runner(runner, ws, command="Start-Sleep -Seconds 20", timeout=0.8)
-        elapsed = time.monotonic() - started
+        assert spawn_finished_at is not None
+        elapsed = time.monotonic() - spawn_finished_at
     finally:
         # kill 被替换为不返回: 用真实 taskkill 清掉遗留 pwsh, 不留孤儿进程
         for pid in set(attempted):
