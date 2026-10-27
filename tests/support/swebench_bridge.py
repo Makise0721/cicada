@@ -404,7 +404,10 @@ def grade_from_artifacts(
 EXCERPT_MAX_TESTS = 3
 EXCERPT_MAX_CHARS = 400
 # pytest short summary: 有 message 时是 "FAILED <nodeid> - <msg>", 也可能只有 nodeid。
-_SUMMARY_FAILED = re.compile(r"^\s*FAILED\s+(\S+::\S+)(?:\s+-\s+(.*))?$", re.MULTILINE)
+# xdist 会在行首加 "[gw0] [ 86%] " 前缀, 前缀存在时仍应识别。
+_SUMMARY_FAILED = re.compile(
+    r"^\s*(?:\[[^\]]+\]\s*)*FAILED\s+(\S+::\S+)(?:\s+-\s+(.*))?$", re.MULTILINE
+)
 # traceback 段标题 "____ test_name[params] ____" 与其内最后一条 "E   ..." 行。
 _SECTION = re.compile(r"^_{4,}\s*(.+?)\s*_{4,}$")
 _E_LINE = re.compile(r"^E\s{3,}(\S.*)$")
@@ -427,7 +430,13 @@ def extract_failure_excerpt(stdout_text: str, missing: list[str],
         name, message = match.group(1), (match.group(2) or "").strip()
         if name in wanted and message and name not in reasons:
             reasons[name] = " ".join(message.split())
-    by_short = {name.split("::", 1)[-1]: name for name in wanted}
+    # nodeid 用 "::" 连接类与方法, pytest 的 traceback 段标题用 "."; 两种短名都登记,
+    # 否则 unittest 类里的失败永远匹配不到段标题, 反馈只剩 nodeid。
+    by_short: dict[str, str] = {}
+    for name in wanted:
+        short = name.split("::", 1)[-1]
+        by_short.setdefault(short, name)
+        by_short.setdefault(short.replace("::", "."), name)
     current = None
     for line in text.splitlines():
         section = _SECTION.match(line)
