@@ -409,7 +409,8 @@ _SUMMARY_FAILED = re.compile(
     r"^\s*(?:\[[^\]]+\]\s*)*FAILED\s+(\S+::\S+)(?:\s+-\s+(.*))?$", re.MULTILINE
 )
 # traceback 段标题 "____ test_name[params] ____" 与其内最后一条 "E   ..." 行。
-_SECTION = re.compile(r"^_{4,}\s*(.+?)\s*_{4,}$")
+# 下划线数量随标题宽度变化: 名字长到占满终端宽度时两边可能只剩 1 个下划线。
+_SECTION = re.compile(r"^_{1,}\s*(.+?)\s*_{1,}$")
 _E_LINE = re.compile(r"^E\s{3,}(\S.*)$")
 
 

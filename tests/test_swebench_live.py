@@ -185,6 +185,32 @@ def test_failure_excerpt_keeps_only_missing_assertion_lines():
         {"test": "tests/unit/x.py::test_q[6.4]",
          "reason": "NoOptionError: No option 'threshold.foreground'"}]
 
+    # 类内用例: nodeid 用 "::", 段标题用 "."。
+    class_section = (
+        "FAILED tests/unit/x.py::TestCls::test_m\n"
+        "________ TestCls.test_m ________\n"
+        "E   AssertionError: assert 'a' == 'b'\n"
+    )
+    assert bridge.extract_failure_excerpt(
+        class_section, ["tests/unit/x.py::TestCls::test_m"]) == [
+        {"test": "tests/unit/x.py::TestCls::test_m", "reason": "AssertionError: assert 'a' == 'b'"}]
+
+    # xdist 会给失败行加 worker 与进度前缀。
+    xdist = "[gw0] [ 86%] FAILED tests/unit/x.py::TestCls::test_m - AssertionError: boom\n"
+    assert bridge.extract_failure_excerpt(
+        xdist, ["tests/unit/x.py::TestCls::test_m"]) == [
+        {"test": "tests/unit/x.py::TestCls::test_m", "reason": "AssertionError: boom"}]
+
+    # 长测试名占满宽度时段标题两侧只剩一个下划线。
+    long_name = (
+        "FAILED tests/unit/x.py::TestCls::test_long[SIP_VERSION_STR-expected_modules1]\n"
+        "_ TestCls.test_long[SIP_VERSION_STR-expected_modules1] _\n"
+        "E   AssertionError: assert equals failed\n"
+    )
+    long_node = "tests/unit/x.py::TestCls::test_long[SIP_VERSION_STR-expected_modules1]"
+    assert bridge.extract_failure_excerpt(long_name, [long_node]) == [
+        {"test": long_node, "reason": "AssertionError: assert equals failed"}]
+
 
 def test_required_tests_v2_excerpt_is_bounded_and_keeps_raw_logs_private(tmp_path):
     names = ["test/units/x.py::test_a"]
