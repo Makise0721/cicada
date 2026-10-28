@@ -4,7 +4,7 @@ Cicada 是跑在 Windows 终端里的 AI 编程助手。你用自然语言说要
 
 它不接管你的编辑器，也不用另开界面：一个终端窗口就是全部。它每一步做了什么都会显示出来，改过的文件可以撤回，对话会保存下来下次接着聊。模型可以用 DeepSeek，也可以用任何 OpenAI Chat 兼容的服务。
 
-当前版本 0.1.0a3，预览阶段，只支持 Windows。每个版本的变更和已知问题见 [Releases](https://github.com/Makise0721/cicada/releases)。
+当前版本 0.1.0a4，预览阶段，只支持 Windows。每个版本的变更和已知问题见 [Releases](https://github.com/Makise0721/cicada/releases)。
 
 ## 装好之后
 
@@ -19,7 +19,7 @@ cicada
 需要先装 Python 3.12 和 uv。安装时从 [Releases](https://github.com/Makise0721/cicada/releases) 下载最新 wheel 和同一发布里的 `requirements-windows-py312.txt`，在下载目录执行：
 
 ```powershell
-uv tool install --python 3.12 --constraints .\requirements-windows-py312.txt "cicada[tui] @ $((Resolve-Path .\cicada-0.1.0a3-py3-none-any.whl).Path)"
+uv tool install --python 3.12 --constraints .\requirements-windows-py312.txt "cicada[tui] @ $((Resolve-Path .\cicada-0.1.0a4-py3-none-any.whl).Path)"
 ```
 
 ## 会留下什么

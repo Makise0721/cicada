@@ -1,6 +1,6 @@
 [project]
 name = "cicada"
-version = "0.1.0a3"
+version = "0.1.0a4"
 description = "Cicada coding agent: kernel / plugin runtime / coding capabilities"
 requires-python = ">=3.12"
 dependencies = [
